@@ -25,6 +25,7 @@ kubectl apply -f secret.example.yaml   # copy and edit first; do NOT commit real
 kubectl apply -f configmap.yaml
 kubectl apply -f postgres.yaml         # dev only; use managed Postgres in production
 kubectl apply -f migrate-job.yaml      # wait for completion before the next two
+# optional: `varianthub-web seed` for a starter snapshot on an empty catalog
 kubectl apply -f api.yaml
 kubectl apply -f worker.yaml
 kubectl apply -f ingress.yaml
@@ -49,6 +50,9 @@ and no init container. For dev it compiles `varhub` from a local checkout via th
 fetches a released `varhub` binary, so the image is reproducible from tags alone
 rather than from whatever happens to be checked out.
 
-**Chunk 4b removes the annotation-data volume.** Today the worker needs the
-annotation tree on disk; once sources are read from S3 by range request, the
-worker becomes stateless and the PVC in `worker.yaml` can go.
+**The worker's PVC holds source *data*, not config.** Annotation config is
+materialized per job from the Postgres catalog into a temp dir, so there is no
+config tree to mount or keep in sync across pods. The PVC holds downloaded
+source files and the indexes built from them, which are expensive to refetch.
+Chunk 4b removes it by reading sources from S3 by range request, at which point
+the worker is stateless.

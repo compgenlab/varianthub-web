@@ -24,7 +24,9 @@ type Config struct {
 
 	Workers       int           // worker pool size
 	VarhubBin     string        // path to the varhub CLI
-	VarhubHome    string        // VARHUB_HOME for the exec runner (Chunk 1; Chunk 2 materializes per job)
+	VarhubHome    string        // fixed VARHUB_HOME; empty = materialize per job from the catalog
+	DataDir       string        // shared, persistent: downloaded source files
+	CacheDir      string        // shared, persistent: built indexes and the annotation cache
 	JobTimeout    time.Duration // per-job wall clock
 	JobTTL        time.Duration // terminal jobs GC'd after this
 	SubmitWaitCap time.Duration // ceiling on ?wait=
@@ -47,6 +49,8 @@ func Load() (*Config, error) {
 		Workers:       envInt("VHW_WORKERS", 2),
 		VarhubBin:     env("VHW_VARHUB_BIN", "varhub"),
 		VarhubHome:    os.Getenv("VHW_VARHUB_HOME"),
+		DataDir:       env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
+		CacheDir:      env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
 		JobTimeout:    envDur("VHW_JOB_TIMEOUT", time.Hour),
 		JobTTL:        envDur("VHW_JOB_TTL", 24*time.Hour),
 		SubmitWaitCap: envDur("VHW_SUBMIT_WAIT_CAP", 10*time.Second),

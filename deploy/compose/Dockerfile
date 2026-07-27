@@ -42,9 +42,10 @@ RUN apk add --no-cache ca-certificates tzdata \
 COPY --from=web-build    /out/varianthub-web /usr/local/bin/varianthub-web
 COPY --from=varhub-build /out/varhub         /usr/local/bin/varhub
 
-# The worker writes per-job scratch here and materializes annotation config into
-# VARHUB_HOME; both are volumes in compose and k8s.
-RUN mkdir -p /varhub-home && chown varianthub:varianthub /varhub-home
+# Shared, persistent storage for downloaded source files and built indexes. The
+# per-job annotation config is materialized into a temp dir instead, so there is
+# nothing to mount for it.
+RUN mkdir -p /var/lib/varianthub && chown varianthub:varianthub /var/lib/varianthub
 
 USER varianthub
 EXPOSE 8080

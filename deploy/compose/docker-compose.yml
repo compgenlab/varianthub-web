@@ -8,11 +8,11 @@
 #   make dev-reset  stop and DELETE volumes, for a genuinely clean start
 #
 # Startup order is enforced, not hoped for:
-#   postgres (healthy) -> migrate (completed) -> api, worker
-#   seed (completed) -----------------------------------> worker
+#   postgres (healthy) -> migrate (completed) -> seed (completed) -> api, worker
 #
-# So neither api nor worker can ever come up against an unmigrated schema, and
-# the worker cannot start before it has an annotation config to read.
+# So neither api nor worker can come up against an unmigrated schema or an empty
+# catalog. The worker materializes each job's annotation config from that catalog,
+# so there is no annotation tree to mount.
 
 name: varianthub-web
 
@@ -66,17 +66,15 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # Writes a starter annotation config into the varhub-home volume, then exits 0.
-  # Idempotent; safe to re-run.
+  # Puts a starter snapshot in the catalog if it is empty, then exits 0. A no-op
+  # once anything exists, so it never overwrites a real catalog.
   seed:
     <<: *web
-    entrypoint: ["/bin/sh", "/seed.sh"]
-    environment:
-      VARHUB_HOME: /varhub-home
-    volumes:
-      - varhub-home:/varhub-home
-      - ./seed.sh:/seed.sh:ro
-    user: root
+    command: ["seed"]
+    environment: *db-env
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     restart: "no"
 
   api:
@@ -91,7 +89,7 @@ services:
       # Not 8080: like postgres above, a dev machine usually already has one.
       - "${API_PORT:-18080}:8080"
     depends_on:
-      migrate:
+      seed:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
@@ -108,19 +106,20 @@ services:
       <<: *db-env
       VHW_WORKERS: ${VHW_WORKERS:-2}
       VHW_VARHUB_BIN: /usr/local/bin/varhub
-      VHW_VARHUB_HOME: /varhub-home
+      # No VHW_VARHUB_HOME: the worker materializes each job's config from the
+      # catalog. Set it to bypass the catalog and use a fixed tree instead.
+      VHW_DATA_DIR: /var/lib/varianthub/data
+      VHW_CACHE_DIR: /var/lib/varianthub/cache
     volumes:
-      - varhub-home:/varhub-home
+      # Downloaded source files and built indexes, shared across jobs. Only the
+      # per-job config tree is ephemeral; re-fetching this every job would cost
+      # gigabytes. Chunk 4b replaces it with S3 range reads.
+      - varhub-data:/var/lib/varianthub
     depends_on:
-      migrate:
-        condition: service_completed_successfully
       seed:
         condition: service_completed_successfully
     restart: unless-stopped
 
 volumes:
   pgdata:
-  # The annotation tree. Chunk 2 materializes this per job from the Postgres
-  # catalog and Chunk 4b reads source data from S3, at which point the worker
-  # becomes stateless and this volume goes away.
-  varhub-home:
+  varhub-data:

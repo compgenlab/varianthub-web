@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/api"
+	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
@@ -59,6 +60,8 @@ func run(args []string) error {
 	switch cmd {
 	case "migrate":
 		return store.Migrate(ctx, cfg.DatabaseURL)
+	case "seed":
+		return seed(ctx, cfg)
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -98,21 +101,57 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))
 
-	// Chunk 2 replaces FixedHome with a provider that materializes the annotation
-	// tree from the Postgres catalog per job.
+	home, err := homeProvider(ctx, cfg)
+	if err != nil {
+		return err
+	}
 	exec := &runner.ExecRunner{
 		Bin:     cfg.VarhubBin,
-		Home:    runner.FixedHome(cfg.VarhubHome),
+		Home:    home,
 		Timeout: cfg.JobTimeout,
 	}
 
-	log.Printf("worker: %d worker(s), varhub=%s home=%s", cfg.Workers, cfg.VarhubBin, cfg.VarhubHome)
+	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.StartWorkers(ctx, cfg.Workers, adapt(exec))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
 	q.Wait()
 	return nil
+}
+
+// homeProvider chooses where a job's annotation config comes from.
+//
+// Normally it is materialized per job from the Postgres catalog, so the service
+// holds no annotation config locally. VHW_VARHUB_HOME overrides that with a
+// fixed directory on disk — useful for debugging against a hand-built tree, and
+// the only mode available before the catalog existed.
+func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider, error) {
+	if cfg.VarhubHome != "" {
+		log.Printf("worker: using fixed annotation home %s (catalog bypassed)", cfg.VarhubHome)
+		return runner.FixedHome(cfg.VarhubHome), nil
+	}
+	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("worker: materializing annotation config from the catalog (data=%s cache=%s)",
+		cfg.DataDir, cfg.CacheDir)
+	return &catalog.Materializer{
+		Store:    cat,
+		DataDir:  cfg.DataDir,
+		CacheDir: cfg.CacheDir,
+	}, nil
+}
+
+// seed populates an empty catalog with a starter snapshot.
+func seed(ctx context.Context, cfg *config.Config) error {
+	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+	return cat.Seed(ctx)
 }
 
 // adapt bridges runner.Runner to queue.Runner. The two are deliberately separate
@@ -167,6 +206,7 @@ commands:
   serve     run the HTTP API (/api/v1 plus /healthz and /version)
   worker    run the annotation job pool (execs the varhub CLI)
   migrate   apply pending SQL migrations, then exit
+  seed      populate an empty catalog with a starter snapshot, then exit
   version   print the version
 
 Configuration is read from the environment; see README.md. VHW_DATABASE_URL is

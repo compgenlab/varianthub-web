@@ -17,9 +17,10 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 
 | Path | What |
 |---|---|
-| `cmd/varianthub-web/` | One binary, three subcommands: `serve`, `worker`, `migrate` |
+| `cmd/varianthub-web/` | One binary: `serve`, `worker`, `migrate`, `seed` |
 | `internal/api/` | HTTP handlers and router (`/api/v1`) |
 | `internal/queue/` | Postgres-backed job queue |
+| `internal/catalog/` | Sources and snapshots in Postgres; materializes config per job |
 | `internal/runner/` | The annotation seam — `Runner` interface + `ExecRunner` |
 | `internal/auth/` | HMAC bearer tokens |
 | `internal/limit/` | Per-IP rate limiting and client-IP resolution |
@@ -37,14 +38,13 @@ make dev                              # build and bring the stack up
 curl localhost:18080/healthz          # {"status":"ok"}
 ```
 
-That brings up Postgres, applies migrations, seeds a starter snapshot, and starts
-the API and a worker. Ordering is enforced by the compose file, so nothing ever
-comes up against an unmigrated schema:
+That brings up Postgres, applies migrations, seeds a starter snapshot into the
+catalog, and starts the API and a worker. Ordering is enforced by the compose
+file, so nothing comes up against an unmigrated schema or an empty catalog:
 
 ```
-postgres (healthy) ─► migrate (completed) ─┬─► api
-                                           └─► worker
-seed (completed) ──────────────────────────────┘
+postgres (healthy) ─► migrate ─► seed ─┬─► api
+                                       └─► worker
 ```
 
 | Command | |
@@ -85,12 +85,28 @@ and why.
 | `VHW_REQUIRE_TOKEN` | `true` | Bearer auth on `/api/v1` |
 | `VHW_WORKERS` | `2` | Worker pool size |
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
-| `VHW_VARHUB_HOME` | — | Annotation config dir the worker passes to the CLI |
+| `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |
+| `VHW_DATA_DIR` | `/var/lib/varianthub/data` | Shared, persistent: downloaded source files |
+| `VHW_CACHE_DIR` | `/var/lib/varianthub/cache` | Shared, persistent: built indexes and cache |
 | `VHW_JOB_TTL` | `24h` | Terminal jobs GC'd after this |
 | `VHW_RATE_PER_MIN` | `30` | Per-IP submit rate |
 | `VHW_MAX_JOBS_PER_IP` | `2` | Per-IP concurrent running jobs |
 
+## How a job runs
+
+1. A job row lands in Postgres (`queue`).
+2. A worker claims it with `FOR UPDATE SKIP LOCKED`, so N workers take N distinct jobs.
+3. The worker materializes that snapshot's config from the catalog into a temp
+   directory — `config.toml` plus an `annotations/` tree — and execs
+   `varhub annotate --format json` against it.
+4. The result JSON is stored verbatim; the temp directory is removed.
+
+Only the *config* is per-job. `VHW_DATA_DIR` and `VHW_CACHE_DIR` are shared and
+persistent: they hold downloaded source files and the indexes built from them,
+which would cost gigabytes to refetch per job.
+
 ## Status
 
-Early. The queue, runner seam, and ops endpoints work; the `/api/v1` surface described in
-`docs/api.md` is being built out. See the design handoff for the target product.
+Early. The queue, catalog, runner seam, and ops endpoints work; the `/api/v1`
+surface in `docs/api.md` is being built out. See the design handoff for the
+target product.

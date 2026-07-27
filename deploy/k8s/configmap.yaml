@@ -17,4 +17,7 @@ data:
   # the real client and every request shares one bucket.
   VHW_TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
   VHW_VARHUB_BIN: "/usr/local/bin/varhub"
-  VHW_VARHUB_HOME: "/varhub-home"
+  # No VHW_VARHUB_HOME: annotation config is materialized per job from the
+  # catalog. Setting it would bypass the catalog and pin every job to one tree.
+  VHW_DATA_DIR: "/var/lib/varianthub/data"
+  VHW_CACHE_DIR: "/var/lib/varianthub/cache"

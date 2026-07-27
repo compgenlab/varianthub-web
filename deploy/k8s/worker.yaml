@@ -27,7 +27,7 @@ spec:
             - configMapRef: {name: varianthub-web}
             - secretRef:    {name: varianthub-web}
           volumeMounts:
-            - {name: varhub-home, mountPath: /varhub-home}
+            - {name: varhub-data, mountPath: /var/lib/varianthub}
             - {name: scratch,     mountPath: /tmp}
           resources:
             requests: {cpu: 500m, memory: 512Mi}
@@ -39,19 +39,22 @@ spec:
       # generous grace period avoids killing work that is nearly done.
       terminationGracePeriodSeconds: 120
       volumes:
-        # Chunk 2 removes this: the annotation tree gets materialized per job
-        # from the Postgres catalog. Chunk 4b removes the need for local data
-        # entirely by reading sources from S3.
-        - name: varhub-home
+        # Downloaded source files and the indexes built from them, shared across
+        # jobs and pods. NOT the annotation config — that is materialized per job
+        # from the Postgres catalog into a temp dir under /tmp.
+        #
+        # Chunk 4b removes this volume entirely by reading sources from S3 by
+        # range request, at which point the worker is stateless.
+        - name: varhub-data
           persistentVolumeClaim:
-            claimName: varianthub-annotations
+            claimName: varianthub-data
         - name: scratch
           emptyDir: {sizeLimit: 20Gi}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: varianthub-annotations
+  name: varianthub-data
   namespace: varianthub
 spec:
   accessModes: [ReadWriteMany]
