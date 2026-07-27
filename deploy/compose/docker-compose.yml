@@ -1,0 +1,87 @@
+# Local development stack: postgres + migrate + api + worker.
+#
+#   make dev        bring it up
+#   make dev-logs   follow logs
+#   make dev-down   tear down (keeps the volume)
+#
+# The worker needs the varhub CLI. Until varianthub-cli publishes a release under
+# its new name, a host-built binary is bind-mounted in — set VARHUB_BIN to point
+# at it (default assumes a sibling checkout).
+
+name: varianthub-web
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: varianthub
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      POSTGRES_DB: varianthub
+    ports:
+      # Deliberately not 5432: this is a dev machine that may already have one.
+      - "${POSTGRES_PORT:-55441}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U varianthub -d varianthub"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: applies pending migrations, then exits. api and worker wait for it
+  # to complete successfully, so neither ever starts against an unmigrated schema.
+  migrate:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    command: ["migrate"]
+    environment:
+      VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
+      VHW_MASTER_KEY: ${VHW_MASTER_KEY:-dev-master-key-change-me}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    command: ["serve"]
+    environment:
+      VHW_ADDR: ":8080"
+      VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
+      VHW_MASTER_KEY: ${VHW_MASTER_KEY:-dev-master-key-change-me}
+      VHW_CORS_ORIGINS: ${VHW_CORS_ORIGINS:-http://localhost:5173}
+    ports:
+      - "${API_PORT:-8080}:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: deploy/compose/Dockerfile
+    command: ["worker"]
+    environment:
+      VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
+      VHW_MASTER_KEY: ${VHW_MASTER_KEY:-dev-master-key-change-me}
+      VHW_WORKERS: ${VHW_WORKERS:-2}
+      VHW_VARHUB_BIN: /usr/local/bin/varhub
+      VHW_VARHUB_HOME: /varhub-home
+    volumes:
+      # The CLI, host-built until there is a release to fetch.
+      - ${VARHUB_BIN:-../../../varianthub-cli/bin/varhub}:/usr/local/bin/varhub:ro
+      # The annotation tree. Chunk 2 makes this unnecessary by materializing the
+      # config from Postgres per job, which is what lets the server hold no
+      # annotation data locally.
+      - ${VARHUB_HOME:-./varhub-home}:/varhub-home
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:

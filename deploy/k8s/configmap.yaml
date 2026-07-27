@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: varianthub-web
+  namespace: varianthub
+data:
+  VHW_ADDR: ":8080"
+  VHW_REQUIRE_TOKEN: "true"
+  VHW_WORKERS: "4"
+  VHW_JOB_TTL: "24h"
+  VHW_JOB_TIMEOUT: "1h"
+  VHW_RATE_PER_MIN: "30"
+  VHW_RATE_BURST: "10"
+  VHW_MAX_JOBS_PER_IP: "2"
+  # Pod CIDRs whose X-Forwarded-For is believed. Must match the ingress
+  # controller's network, or client-IP fairness keys on the proxy instead of
+  # the real client and every request shares one bucket.
+  VHW_TRUSTED_PROXIES: "10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+  VHW_VARHUB_BIN: "/usr/local/bin/varhub"
+  VHW_VARHUB_HOME: "/varhub-home"

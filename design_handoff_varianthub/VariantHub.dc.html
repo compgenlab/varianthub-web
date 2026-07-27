@@ -1,0 +1,956 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet data-dc-atomics>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+*{box-sizing:border-box}
+html,body{height:100%}
+body{margin:0;background:#f7f8f8;color:#16181d;font-family:"IBM Plex Sans",system-ui,sans-serif;font-size:14.5px;line-height:1.55;-webkit-font-smoothing:antialiased}
+::selection{background:rgba(47,125,146,.2)}
+button{font-family:inherit}
+h1,h2,h3,h4{font-weight:600;letter-spacing:-.01em;margin:0}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(22,24,29,.16);border-radius:5px;border:2px solid #f7f8f8}
+::-webkit-scrollbar-track{background:transparent}
+@keyframes vs-spin{to{transform:rotate(360deg)}}
+@keyframes vs-blink{0%,100%{opacity:1}50%{opacity:.3}}
+</style>
+</helmet>
+
+<sc-if value="{{ isLogin }}" hint-placeholder-val="{{ false }}">
+<div style="min-height:100vh;display:grid;place-items:center;padding:40px;background:#f7f8f8">
+  <div style="width:min(392px,100%);background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:12px;box-shadow:0 8px 30px rgba(22,24,29,.06);padding:34px 32px">
+    <div style="display:flex;align-items:center;gap:9px;margin-bottom:22px">
+      <div style="width:22px;height:22px;border-radius:6px;background:#2f7d92;display:grid;place-items:center"><div style="width:7px;height:7px;border-radius:2px;background:#fff"></div></div>
+      <span style="font-weight:600;font-size:17px;letter-spacing:-.01em">VariantHub</span>
+    </div>
+    <h3 style="font-size:22px;margin:0 0 5px">Sign in</h3>
+    <p style="font-size:13px;color:rgba(22,24,29,.55);margin:0 0 22px;line-height:1.5">Login is required. Private sources such as COSMIC are unlocked per account.</p>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">Email</label><input value="a.researcher@lab.org" style="width:100%;height:40px;padding:0 12px;font-family:inherit;font-size:14px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;color:#16181d"></div>
+      <div><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">Password</label><input type="password" value="............" style="width:100%;height:40px;padding:0 12px;font-family:inherit;font-size:14px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;color:#16181d"></div>
+    </div>
+    <button onClick="{{ signIn }}" style="width:100%;margin-top:20px;height:42px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:14.5px;cursor:pointer">Sign in</button>
+    <button onClick="{{ signIn }}" style="width:100%;margin-top:10px;height:40px;background:#fff;color:#16181d;border:1px solid rgba(22,24,29,.14);border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer">Continue with institutional SSO</button>
+  </div>
+</div>
+</sc-if>
+
+<sc-if value="{{ authed }}" hint-placeholder-val="{{ true }}">
+<div style="display:flex;height:100vh;overflow:hidden">
+
+  <!-- SIDEBAR -->
+  <aside style="width:238px;flex:none;display:flex;flex-direction:column;background:#fff;border-right:1px solid rgba(22,24,29,.08)">
+    <div style="display:flex;align-items:center;gap:9px;padding:18px 18px 16px">
+      <div style="width:22px;height:22px;border-radius:6px;background:#2f7d92;display:grid;place-items:center;flex:none"><div style="width:7px;height:7px;border-radius:2px;background:#fff"></div></div>
+      <span style="font-weight:600;font-size:16px;letter-spacing:-.01em">VariantHub</span>
+    </div>
+    <nav style="padding:6px 12px;display:flex;flex-direction:column;gap:2px">
+      <button onClick="{{ goSources }}" style="{{ navAnnotate }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/><path d="M12 11v6M9 14h6"/></svg>New annotation</button>
+      <button onClick="{{ goResults }}" style="{{ navResults }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3h18v18H3z"/><path d="M3 9h18M3 15h18M9 3v18"/></svg>Results</button>
+      <button onClick="{{ goBrowse }}" style="{{ navBrowse }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/><circle cx="12" cy="12" r="4"/><path d="m19 5-3 3M8 16l-3 3"/></svg>Genome browser</button>
+      <button onClick="{{ goApi }}" style="{{ navApi }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="m8 9 3 3-3 3M13 15h3"/><rect x="3" y="4" width="18" height="16" rx="2"/></svg>API access</button>
+      <div style="display:flex;align-items:center;gap:7px;padding:14px 12px 5px"><span style="font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:rgba(22,24,29,.35)">Administration</span><span style="font-family:'IBM Plex Mono',monospace;font-size:9px;padding:1px 6px;border-radius:4px;background:#f6eaea;color:#8f2f2f">ADMIN</span></div>
+      <button onClick="{{ goAdmin }}" style="{{ navAdmin }}"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z"/><path d="m9 12 2 2 4-4"/></svg>Sources &amp; snapshots</button>
+    </nav>
+  </aside>
+
+  <!-- MAIN -->
+  <main style="flex:1;min-width:0;display:flex;flex-direction:column;overflow:hidden">
+
+    <!-- global top bar -->
+    <div style="flex:none;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:11px 30px;border-bottom:1px solid rgba(22,24,29,.08);background:#fff">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:rgba(22,24,29,.42)">Active reference</span>
+        <span style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;font-weight:500;padding:3px 10px;background:#f2f4f5;border-radius:6px">{{ buildLabel }}</span>
+        <span style="font-size:12.5px;color:rgba(22,24,29,.5)">{{ selectedCount }} sources</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:6px">
+        <div style="display:flex;align-items:center;gap:9px;padding:5px 6px 5px 12px">
+          <div style="line-height:1.2;text-align:right"><div style="font-size:13px;font-weight:500">A. Researcher</div><div style="font-size:11px;color:rgba(22,24,29,.45)">Org admin</div></div>
+          <div style="width:30px;height:30px;flex:none;border-radius:50%;background:#ecf3f5;color:#245f70;display:grid;place-items:center;font-weight:600;font-size:12px">AR</div>
+        </div>
+        <button onClick="{{ signOut }}" title="Sign out" style="width:34px;height:34px;border:1px solid rgba(22,24,29,.12);border-radius:8px;background:#fff;cursor:pointer;display:grid;place-items:center;color:rgba(22,24,29,.55)"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/></svg></button>
+      </div>
+    </div>
+
+    <sc-if value="{{ inAnnotate }}" hint-placeholder-val="{{ true }}">
+    <header style="flex:none;display:flex;align-items:center;padding:16px 30px;border-bottom:1px solid rgba(22,24,29,.08);background:#fff">
+      <sc-for list="{{ steps }}" as="s" hint-placeholder-count="3">
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="{{ s.dotStyle }}">{{ s.n }}</div>
+          <span style="{{ s.labelStyle }}">{{ s.label }}</span>
+        </div>
+        <div style="{{ s.sepStyle }}"></div>
+      </sc-for>
+    </header>
+    </sc-if>
+
+    <div style="flex:1;overflow:auto">
+
+    <!-- ===== STEP 1: SOURCES ===== -->
+    <sc-if value="{{ isSources }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:1020px;margin:0 auto;padding:34px 30px 60px">
+      <h2 style="font-size:26px;margin:0 0 5px">Choose annotations</h2>
+      <p style="font-size:14px;color:rgba(22,24,29,.55);margin:0 0 24px;max-width:64ch;line-height:1.55">Annotate with a curated <strong style="font-weight:600;color:#16181d">snapshot</strong> — a versioned, admin-locked bundle of sources — or hand-pick <strong style="font-weight:600;color:#16181d">individual sources</strong>. Every source is tabix-indexed; VEP runs a VCF through Ensembl VEP and re-indexes the output.</p>
+
+      <div style="display:inline-flex;gap:3px;padding:3px;background:#eceeef;border-radius:9px;margin-bottom:24px">
+        <button onClick="{{ modeSnapshot }}" style="{{ tabSnapshot }}">Snapshots</button>
+        <button onClick="{{ modeIndividual }}" style="{{ tabIndividual }}">Individual sources</button>
+      </div>
+
+      <sc-if value="{{ isSnapshotMode }}" hint-placeholder-val="{{ true }}">
+      <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">
+        <sc-for list="{{ snapshots }}" as="snap" hint-placeholder-count="4">
+          <button onClick="{{ snap.pick }}" style="{{ snap.cardStyle }}">
+            <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:10px">
+              <div style="font-size:17px;font-weight:600;line-height:1.2">{{ snap.name }}</div>
+              <div style="{{ snap.checkStyle }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></div>
+            </div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#2f7d92;margin:3px 0 10px">{{ snap.build }} · {{ snap.count }} sources</div>
+            <p style="font-size:12.5px;color:rgba(22,24,29,.58);margin:0 0 12px;text-align:left;line-height:1.5">{{ snap.desc }}</p>
+            <div style="display:flex;flex-wrap:wrap;gap:5px">
+              <sc-for list="{{ snap.tags }}" as="t" hint-placeholder-count="4">
+                <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;padding:2px 8px;background:#f2f4f5;border-radius:5px;color:rgba(22,24,29,.6)">{{ t }}</span>
+              </sc-for>
+            </div>
+            <sc-if value="{{ snap.locked }}" hint-placeholder-val="{{ false }}">
+              <div style="display:flex;align-items:center;gap:5px;margin-top:11px;font-size:11.5px;color:rgba(22,24,29,.5)"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>Contains private sources — unlocked for your account</div>
+            </sc-if>
+          </button>
+        </sc-for>
+      </div>
+      </sc-if>
+
+      <sc-if value="{{ isIndividualMode }}" hint-placeholder-val="{{ false }}">
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+        <div style="display:grid;grid-template-columns:26px 1.7fr 1fr .8fr 1fr;gap:12px;padding:11px 18px;border-bottom:1px solid rgba(22,24,29,.08);font-size:10.5px;letter-spacing:.07em;text-transform:uppercase;color:rgba(22,24,29,.45)">
+          <div></div><div>Source</div><div>Version</div><div>Type</div><div>Access</div>
+        </div>
+        <sc-for list="{{ sources }}" as="src" hint-placeholder-count="8">
+          <button onClick="{{ src.toggle }}" style="{{ src.rowStyle }}">
+            <div style="{{ src.boxStyle }}"><sc-if value="{{ src.selected }}" hint-placeholder-val="{{ false }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></sc-if></div>
+            <div style="text-align:left"><div style="font-weight:500;font-size:14px">{{ src.name }}</div><div style="font-size:11.5px;color:rgba(22,24,29,.48)">{{ src.detail }}</div></div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#245f70;text-align:left">{{ src.version }}</div>
+            <div style="text-align:left"><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;padding:2px 7px;background:#f2f4f5;border-radius:5px;color:rgba(22,24,29,.55)">{{ src.type }}</span></div>
+            <div style="{{ src.accessStyle }}">{{ src.access }}</div>
+          </button>
+        </sc-for>
+      </div>
+      </sc-if>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:26px">
+        <div style="font-size:13px;color:rgba(22,24,29,.55)"><strong style="color:#16181d;font-weight:600;font-size:15px">{{ selectedCount }}</strong> sources selected</div>
+        <button onClick="{{ goVariants }}" style="height:42px;padding:0 24px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:14.5px;cursor:pointer;display:inline-flex;align-items:center;gap:8px">Continue to variants<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== STEP 2: VARIANTS ===== -->
+    <sc-if value="{{ isVariants }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:880px;margin:0 auto;padding:34px 30px 60px">
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:20px;flex-wrap:wrap">
+        <div><h2 style="font-size:26px;margin:0 0 5px">Enter variants</h2>
+        <p style="font-size:14px;color:rgba(22,24,29,.55);margin:0">Accepts VCF-style coordinates, HGVS, or rsIDs. Mix formats freely.</p></div>
+        <div style="min-width:196px"><label style="display:block;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:rgba(22,24,29,.45);margin-bottom:6px">Reference build</label>
+          <div style="position:relative"><select onChange="{{ setBuild }}" style="width:100%;height:40px;padding:0 32px 0 12px;font-family:'IBM Plex Mono',monospace;font-size:13px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;color:#16181d;appearance:none;cursor:pointer">
+            <option>GRCh38 / hg38</option><option>GRCh37 / hg19</option><option>T2T-CHM13 v2.0</option><option>GRCm39 (mouse)</option></select>
+            <svg style="position:absolute;right:11px;top:13px;pointer-events:none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.45)" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg></div>
+        </div>
+      </div>
+
+      <div style="display:inline-flex;gap:3px;padding:3px;background:#eceeef;border-radius:9px;margin:24px 0 22px">
+        <button onClick="{{ inputSingle }}" style="{{ tabSingle }}">Single</button>
+        <button onClick="{{ inputBatch }}" style="{{ tabBatch }}">Batch paste</button>
+        <button onClick="{{ inputVcf }}" style="{{ tabVcf }}">VCF upload</button>
+      </div>
+
+      <sc-if value="{{ isSingle }}" hint-placeholder-val="{{ true }}">
+        <div style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap">
+          <div style="flex:1;min-width:300px"><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">Variant</label>
+            <input value="{{ draft }}" onInput="{{ setDraft }}" placeholder="chr17-7676154-C-T · NM_000546.6:c.215C>G · rs28934578" style="width:100%;height:42px;padding:0 13px;font-family:'IBM Plex Mono',monospace;font-size:13px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;color:#16181d"></div>
+          <button onClick="{{ addVariant }}" style="height:42px;padding:0 20px;background:#fff;color:#16181d;border:1px solid rgba(22,24,29,.16);border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add</button>
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px;margin-top:16px">
+          <sc-for list="{{ variants }}" as="v" hint-placeholder-count="4">
+            <span style="display:inline-flex;align-items:center;gap:8px;padding:6px 8px 6px 12px;background:#fff;border:1px solid rgba(22,24,29,.12);border-radius:7px;font-family:'IBM Plex Mono',monospace;font-size:12px">{{ v.label }}<button onClick="{{ v.remove }}" style="border:0;background:none;cursor:pointer;color:rgba(22,24,29,.4);display:grid;place-items:center;padding:0"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg></button></span>
+          </sc-for>
+        </div>
+      </sc-if>
+
+      <sc-if value="{{ isBatch }}" hint-placeholder-val="{{ false }}">
+        <div><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">One variant per line</label>
+          <textarea onInput="{{ setBatch }}" defaultValue="{{ batchDefault }}" style="width:100%;min-height:220px;padding:13px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;line-height:1.75;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;color:#16181d;resize:vertical"></textarea>
+          <div style="font-size:12.5px;color:rgba(22,24,29,.5);margin-top:8px"><strong style="color:#245f70;font-weight:600">{{ batchCount }}</strong> variants detected · formats auto-detected per line</div></div>
+      </sc-if>
+
+      <sc-if value="{{ isVcf }}" hint-placeholder-val="{{ false }}">
+        <div style="border:1.5px dashed rgba(47,125,146,.45);background:#f0f6f7;border-radius:10px;padding:36px;text-align:center">
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="#2f7d92" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" style="margin:0 auto 10px"><path d="M12 3v12M8 7l4-4 4 4"/><path d="M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
+          <div style="font-size:16px;font-weight:600">Drop a .vcf or .vcf.gz file</div>
+          <div style="font-size:13px;color:rgba(22,24,29,.5);margin-top:3px">or click to browse · bgzipped + tabix accepted</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;margin-top:14px;padding:13px 15px;background:#fff;border:1px solid rgba(22,24,29,.1);border-radius:9px">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2f7d92" stroke-width="1.6"><path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z"/><path d="M14 2v5h5"/></svg>
+          <div style="flex:1"><div style="font-family:'IBM Plex Mono',monospace;font-size:13px;font-weight:500">cohort_batch07.vcf.gz</div><div style="font-size:11.5px;color:rgba(22,24,29,.48)">4,812 variants · 14.2 MB · index OK</div></div>
+          <span style="font-family:'IBM Plex Mono',monospace;font-size:10px;padding:3px 9px;background:#eef4ee;color:#3c6642;border-radius:5px">READY</span>
+        </div>
+      </sc-if>
+
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:30px;padding-top:20px;border-top:1px solid rgba(22,24,29,.08)">
+        <button onClick="{{ goSources }}" style="background:none;border:0;color:#245f70;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer;display:inline-flex;align-items:center;gap:6px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>Back to sources</button>
+        <button onClick="{{ runJob }}" style="height:42px;padding:0 24px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:14.5px;cursor:pointer;display:inline-flex;align-items:center;gap:8px"><svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M6 4l14 8-14 8z"/></svg>Run annotation</button>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== STEP 3: RUNNING ===== -->
+    <sc-if value="{{ isRunning }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:600px;margin:64px auto 0;padding:0 30px">
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:12px;box-shadow:0 4px 20px rgba(22,24,29,.05);padding:30px">
+        <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#2f7d92" stroke-width="2" style="animation:vs-spin 1s linear infinite"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>
+          <h3 style="font-size:20px;margin:0">Annotating variants</h3>
+        </div>
+        <p style="font-size:13px;color:rgba(22,24,29,.55);margin:0 0 20px">Job <span style="font-family:'IBM Plex Mono',monospace">#a7f3-2e</span> · {{ selectedCount }} sources · {{ jobVariantCount }} variants</p>
+        <div style="height:6px;background:rgba(22,24,29,.08);border-radius:3px;position:relative;overflow:hidden;margin-bottom:8px">
+          <div style="{{ progressStyle }}"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(22,24,29,.5)"><span>{{ progressStage }}</span><span>{{ progress }}%</span></div>
+        <div style="margin-top:22px;display:flex;flex-direction:column;gap:10px">
+          <sc-for list="{{ jobSteps }}" as="j" hint-placeholder-count="4">
+            <div style="display:flex;align-items:center;gap:10px;font-size:13px;font-family:'IBM Plex Mono',monospace;color:{{ j.color }}"><span style="{{ j.iconStyle }}">{{ j.icon }}</span>{{ j.label }}</div>
+          </sc-for>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== JOBS LIST ===== -->
+    <sc-if value="{{ isJobs }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:1060px;margin:0 auto;padding:30px 30px 60px">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:18px">
+        <div><h2 style="font-size:26px;margin:0 0 4px">Jobs</h2>
+        <p style="font-size:13.5px;color:rgba(22,24,29,.55);margin:0">Submitted annotation runs. Open a completed job to review its variants.</p></div>
+        <button onClick="{{ goSources }}" style="flex:none;height:38px;padding:0 16px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:7px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New annotation</button>
+      </div>
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+        <div style="display:grid;grid-template-columns:.7fr 1.5fr 1.1fr .7fr .9fr 34px;gap:12px;padding:11px 18px;border-bottom:1px solid rgba(22,24,29,.08);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">
+          <div>Job</div><div>Input</div><div>Annotations</div><div style="text-align:right">Variants</div><div>Status</div><div></div>
+        </div>
+        <sc-for list="{{ jobs }}" as="j" hint-placeholder-count="6">
+          <button onClick="{{ j.open }}" style="{{ j.rowStyle }}">
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#245f70;text-align:left">{{ j.id }}</div>
+            <div style="text-align:left"><div style="font-size:13.5px;font-weight:500">{{ j.input }}</div><div style="font-size:11px;color:rgba(22,24,29,.45)">{{ j.submitted }}</div></div>
+            <div style="text-align:left"><div style="font-size:12.5px">{{ j.snapshot }}</div><div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:rgba(22,24,29,.45)">{{ j.build }}</div></div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:12.5px;text-align:right">{{ j.count }}</div>
+            <div style="display:flex;align-items:center;gap:7px"><span style="{{ j.dotStyle }}"></span><span style="font-size:12.5px;color:{{ j.statusColor }}">{{ j.status }}</span><sc-if value="{{ j.pct }}" hint-placeholder-val="{{ false }}"><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(22,24,29,.4)">{{ j.pct }}</span></sc-if></div>
+            <div style="{{ j.chevStyle }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18l6-6-6-6"/></svg></div>
+          </button>
+        </sc-for>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== RESULTS ===== -->
+    <sc-if value="{{ isResults }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;flex-direction:column;height:100%">
+      <div style="flex:none;padding:24px 30px 16px">
+        <button onClick="{{ goJobs }}" style="background:none;border:0;padding:0;color:#245f70;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-bottom:12px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>All jobs</button>
+        <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap">
+          <div>
+            <div style="font-size:11px;letter-spacing:.06em;text-transform:uppercase;color:#2f7d92;margin-bottom:3px">Job #a7f3-2e · {{ buildLabel }}</div>
+            <h2 style="font-size:24px;margin:0">Annotated variants</h2>
+          </div>
+          <div style="display:flex;gap:8px;align-items:center;position:relative">
+            <div style="display:flex;align-items:center;gap:7px;padding:0 12px;height:38px;background:#fff;border:1px solid rgba(22,24,29,.12);border-radius:8px">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.4)" stroke-width="1.7"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+              <input placeholder="Filter by gene, rsID, consequence…" style="border:0;background:none;font-family:inherit;font-size:13px;width:214px;outline:none;color:#16181d">
+            </div>
+            <button style="height:38px;padding:0 13px;background:#fff;border:1px solid rgba(22,24,29,.12);border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:inherit;font-weight:500;font-size:13px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 4h18l-7 8v6l-4 2v-8z"/></svg>Filter</button>
+            <button style="height:38px;padding:0 13px;background:#fff;border:1px solid rgba(22,24,29,.12);border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-family:inherit;font-weight:500;font-size:13px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"><path d="M3 6h18M7 12h10M11 18h2"/></svg>Columns</button>
+            <button onClick="{{ toggleDownload }}" style="height:38px;padding:0 16px;background:#2f7d92;color:#fff;border:0;border-radius:8px;cursor:pointer;display:inline-flex;align-items:center;gap:7px;font-family:inherit;font-weight:500;font-size:13px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M5 21h14"/></svg>Download</button>
+            <sc-if value="{{ downloadOpen }}" hint-placeholder-val="{{ false }}">
+              <div style="position:absolute;top:44px;right:0;z-index:20;width:210px;background:#fff;border:1px solid rgba(22,24,29,.1);border-radius:9px;box-shadow:0 10px 30px rgba(22,24,29,.12);overflow:hidden">
+                <div style="padding:9px 13px;font-size:10px;letter-spacing:.07em;text-transform:uppercase;color:rgba(22,24,29,.45);border-bottom:1px solid rgba(22,24,29,.07)">Export {{ totalCount }} variants</div>
+                <sc-for list="{{ formats }}" as="f" hint-placeholder-count="3">
+                  <button onClick="{{ f.pick }}" style="display:flex;align-items:center;justify-content:space-between;width:100%;padding:11px 13px;border:0;background:none;cursor:pointer;font-family:inherit;font-size:13px;text-align:left"><span style="font-family:'IBM Plex Mono',monospace;font-weight:500">{{ f.ext }}</span><span style="font-size:11px;color:rgba(22,24,29,.45)">{{ f.desc }}</span></button>
+                </sc-for>
+              </div>
+            </sc-if>
+          </div>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;margin-top:14px;font-size:12.5px;color:rgba(22,24,29,.55)">
+          <span>Showing <strong style="color:#16181d;font-weight:600">1–14</strong> of <strong style="color:#16181d;font-weight:600">{{ totalCount }}</strong></span>
+          <span style="color:rgba(22,24,29,.2)">|</span>
+          <span style="display:inline-flex;gap:6px;align-items:center"><span style="width:9px;height:9px;border-radius:50%;background:#a23c3c;display:inline-block"></span>Pathogenic / LP</span>
+          <span style="display:inline-flex;gap:6px;align-items:center"><span style="width:9px;height:9px;border-radius:50%;background:#b08a2e;display:inline-block"></span>VUS</span>
+          <span style="display:inline-flex;gap:6px;align-items:center"><span style="width:9px;height:9px;border-radius:50%;background:#4a7a52;display:inline-block"></span>Benign / LB</span>
+        </div>
+      </div>
+
+      <div style="flex:1;overflow:auto;background:#fff;border-top:1px solid rgba(22,24,29,.08);border-bottom:1px solid rgba(22,24,29,.08)">
+        <table style="width:100%;border-collapse:collapse;font-size:13.5px;min-width:1080px">
+          <thead><tr style="position:sticky;top:0;z-index:2;background:#fff;box-shadow:0 1px 0 rgba(22,24,29,.08)">
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45);width:34px"><input type="checkbox" style="accent-color:#2f7d92"></th>
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">Variant</th>
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">Gene</th>
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">Consequence <span style="text-transform:none;color:#2f7d92">VEP</span></th>
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">ClinVar</th>
+            <th style="text-align:right;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">gnomAD AF</th>
+            <th style="text-align:right;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">SpliceAI</th>
+            <th style="text-align:left;padding:11px 16px;font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">rsID</th>
+            <th style="width:44px"></th>
+          </tr></thead>
+          <tbody>
+            <sc-for list="{{ rows }}" as="r" hint-placeholder-count="14">
+              <tr style="border-bottom:1px solid rgba(22,24,29,.06)">
+                <td style="padding:10px 16px"><input type="checkbox" style="accent-color:#2f7d92"></td>
+                <td style="padding:10px 16px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;white-space:nowrap"><span style="color:#2f7d92">{{ r.chrom }}</span>-{{ r.pos }}-{{ r.ref }}-{{ r.alt }}</td>
+                <td style="padding:10px 16px;font-weight:500;font-style:italic">{{ r.gene }}</td>
+                <td style="padding:10px 16px"><span style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:rgba(22,24,29,.68)">{{ r.cons }}</span></td>
+                <td style="padding:10px 16px"><span style="{{ r.clinStyle }}">{{ r.clin }}</span></td>
+                <td style="padding:10px 16px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12.5px;color:{{ r.afColor }}">{{ r.af }}</td>
+                <td style="padding:10px 16px;text-align:right;font-family:'IBM Plex Mono',monospace;font-size:12.5px">{{ r.spliceai }}</td>
+                <td style="padding:10px 16px;font-family:'IBM Plex Mono',monospace;font-size:12px;color:#245f70">{{ r.rsid }}</td>
+                <td style="padding:10px 8px;text-align:center"><button onClick="{{ r.open }}" title="Open in genome browser" style="border:0;background:none;cursor:pointer;color:rgba(22,24,29,.35);display:grid;place-items:center;padding:5px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12h4M18 12h4M12 2v4M12 18v4"/><circle cx="12" cy="12" r="4"/></svg></button></td>
+              </tr>
+            </sc-for>
+          </tbody>
+        </table>
+      </div>
+
+      <div style="flex:none;display:flex;align-items:center;justify-content:space-between;padding:13px 30px">
+        <div style="font-size:12.5px;color:rgba(22,24,29,.5)">Page <strong style="color:#16181d;font-weight:600">1</strong> of <strong style="color:#16181d;font-weight:600">344</strong> · 14 rows / page</div>
+        <div style="display:flex;gap:6px">
+          <button style="width:34px;height:34px;border:1px solid rgba(22,24,29,.12);border-radius:7px;background:#fff;cursor:not-allowed;opacity:.4;display:grid;place-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M15 18l-6-6 6-6"/></svg></button>
+          <button style="width:34px;height:34px;border:0;border-radius:7px;background:#2f7d92;color:#fff;font-family:'IBM Plex Mono',monospace;font-size:13px;cursor:pointer">1</button>
+          <button style="width:34px;height:34px;border:1px solid rgba(22,24,29,.12);border-radius:7px;background:#fff;font-family:'IBM Plex Mono',monospace;font-size:13px;cursor:pointer">2</button>
+          <button style="width:34px;height:34px;border:1px solid rgba(22,24,29,.12);border-radius:7px;background:#fff;font-family:'IBM Plex Mono',monospace;font-size:13px;cursor:pointer">3</button>
+          <button style="width:34px;height:34px;border:1px solid rgba(22,24,29,.12);border-radius:7px;background:#fff;cursor:pointer;display:grid;place-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 18l6-6-6-6"/></svg></button>
+        </div>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== GENOME BROWSER ===== -->
+    <sc-if value="{{ isBrowse }}" hint-placeholder-val="{{ false }}">
+    <div style="display:flex;flex-direction:column;height:100%">
+      <div style="flex:none;display:flex;align-items:center;gap:10px;padding:14px 26px;border-bottom:1px solid rgba(22,24,29,.08);background:#fff;flex-wrap:wrap">
+        <div style="position:relative"><select style="height:36px;padding:0 30px 0 11px;font-family:'IBM Plex Mono',monospace;font-size:12px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;appearance:none;cursor:pointer"><option>GRCh38 / hg38</option><option>GRCh37 / hg19</option><option>T2T-CHM13</option></select><svg style="position:absolute;right:10px;top:12px;pointer-events:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.45)" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg></div>
+        <div style="display:flex;align-items:center;gap:7px;height:36px;padding:0 11px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;flex:1;min-width:220px;max-width:370px">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.4)" stroke-width="1.7"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/></svg>
+          <input value="{{ locus }}" style="border:0;background:none;font-family:'IBM Plex Mono',monospace;font-size:12px;width:100%;outline:none;color:#16181d">
+        </div>
+        <div style="display:flex;gap:6px">
+          <button style="width:36px;height:36px;border:1px solid rgba(22,24,29,.14);border-radius:8px;background:#fff;cursor:pointer;display:grid;place-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M5 12h14"/></svg></button>
+          <button style="width:36px;height:36px;border:1px solid rgba(22,24,29,.14);border-radius:8px;background:#fff;cursor:pointer;display:grid;place-items:center"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 5v14M5 12h14"/></svg></button>
+        </div>
+        <button style="margin-left:auto;height:36px;padding:0 13px;border:1px solid rgba(22,24,29,.14);border-radius:8px;background:#fff;cursor:pointer;font-family:inherit;font-weight:500;font-size:13px;display:inline-flex;align-items:center;gap:6px"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add track</button>
+      </div>
+
+      <div style="flex:none;padding:14px 26px 8px">
+        <div style="display:flex;align-items:center;gap:10px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(22,24,29,.5);margin-bottom:7px"><span style="font-weight:500;color:#16181d">chr17</span><span>p13.1</span></div>
+        <div style="position:relative;height:14px;border-radius:7px;background:#eceeef;overflow:hidden">
+          <div style="position:absolute;left:22%;top:0;bottom:0;width:1.4%;background:rgba(22,24,29,.35)"></div>
+          <div style="position:absolute;left:6.5%;top:0;bottom:0;width:3%;background:rgba(47,125,146,.35);border-radius:4px;box-shadow:0 0 0 1.5px #2f7d92 inset"></div>
+        </div>
+      </div>
+
+      <div style="flex:none;display:flex;padding:0 26px">
+        <div style="width:160px;flex:none"></div>
+        <div style="flex:1;position:relative;height:26px;border-bottom:1px solid rgba(22,24,29,.12);font-family:'IBM Plex Mono',monospace;font-size:10px;color:rgba(22,24,29,.45)">
+          <sc-for list="{{ ticks }}" as="tk" hint-placeholder-count="5">
+            <div style="position:absolute;top:0;bottom:0;left:{{ tk.left }}"><div style="width:1px;height:6px;background:rgba(22,24,29,.25);position:absolute;bottom:0"></div><span style="position:absolute;top:2px;left:3px;white-space:nowrap">{{ tk.label }}</span></div>
+          </sc-for>
+        </div>
+      </div>
+
+      <div style="flex:1;overflow:auto;padding:0 26px 20px">
+        <sc-for list="{{ tracks }}" as="tr" hint-placeholder-count="5">
+          <div style="display:flex;border-bottom:1px solid rgba(22,24,29,.06);min-height:{{ tr.h }}">
+            <div style="width:160px;flex:none;padding:10px 12px 10px 0;display:flex;flex-direction:column;justify-content:center">
+              <div style="display:flex;align-items:center;gap:6px;font-size:12.5px;font-weight:500">{{ tr.name }}<sc-if value="{{ tr.locked }}" hint-placeholder-val="{{ false }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.4)" stroke-width="1.7"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></sc-if></div>
+              <div style="font-family:'IBM Plex Mono',monospace;font-size:10px;color:rgba(22,24,29,.4)">{{ tr.meta }}</div>
+            </div>
+            <div style="flex:1;position:relative;border-left:1px solid rgba(22,24,29,.08)">{{ tr.body }}</div>
+          </div>
+        </sc-for>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== API ACCESS ===== -->
+    <sc-if value="{{ isApi }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:880px;margin:0 auto;padding:34px 30px 60px">
+      <h2 style="font-size:26px;margin:0 0 5px">API access</h2>
+      <p style="font-size:14px;color:rgba(22,24,29,.55);margin:0 0 26px;max-width:66ch;line-height:1.55">The companion REST server exposes every snapshot, source, and annotation job programmatically. Authenticate with a personal token; it inherits your account's private-source grants.</p>
+
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px">
+        <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;padding:17px">
+          <div style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:rgba(22,24,29,.45);margin-bottom:9px">Base URL</div>
+          <div style="font-family:'IBM Plex Mono',monospace;font-size:13px;word-break:break-all">https://varianthub.compgenlab.org/api/v1</div>
+          <div style="font-size:11.5px;color:rgba(22,24,29,.45);margin-top:6px">Server address is set per deployment</div>
+        </div>
+        <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;padding:17px">
+          <div style="font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:rgba(22,24,29,.45);margin-bottom:9px">Personal token</div>
+          <div style="display:flex;align-items:center;gap:10px"><span style="font-family:'IBM Plex Mono',monospace;font-size:13px;flex:1">cgl_vh_••••••••••4c1a</span><button style="border:1px solid rgba(22,24,29,.14);border-radius:6px;background:#fff;padding:4px 10px;font-family:inherit;font-weight:500;font-size:12px;cursor:pointer">Copy</button><button style="border:1px solid rgba(22,24,29,.14);border-radius:6px;background:#fff;padding:4px 10px;font-family:inherit;font-weight:500;font-size:12px;cursor:pointer">Rotate</button></div>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:24px">
+        <sc-for list="{{ endpoints }}" as="e" hint-placeholder-count="4">
+          <div style="display:flex;align-items:center;gap:12px;padding:12px 15px;background:#fff;border:1px solid rgba(22,24,29,.08);border-radius:9px">
+            <span style="{{ e.mStyle }}">{{ e.method }}</span>
+            <span style="font-family:'IBM Plex Mono',monospace;font-size:13px;flex:1">{{ e.path }}</span>
+            <span style="font-size:12px;color:rgba(22,24,29,.5)">{{ e.desc }}</span>
+          </div>
+        </sc-for>
+      </div>
+
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+        <div style="display:flex;gap:3px;padding:10px 12px 0;border-bottom:1px solid rgba(22,24,29,.07)">
+          <button onClick="{{ apiCurl }}" style="{{ tabCurl }}">cURL</button>
+          <button onClick="{{ apiPy }}" style="{{ tabPy }}">Python</button>
+        </div>
+        <pre style="margin:0;padding:18px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;line-height:1.8;color:#16181d;overflow:auto;white-space:pre">{{ codeSample }}</pre>
+      </div>
+    </div>
+    </sc-if>
+
+    <!-- ===== ADMIN ===== -->
+    <sc-if value="{{ isAdmin }}" hint-placeholder-val="{{ false }}">
+    <div style="max-width:1060px;margin:0 auto;padding:30px 30px 60px">
+
+      <!-- default: tabbed console -->
+      <sc-if value="{{ adminIdle }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:4px">
+        <h2 style="font-size:26px;margin:0">Administration</h2>
+        <div style="font-size:12.5px;color:rgba(22,24,29,.5)">Signed in as <strong style="font-weight:600;color:#16181d">A. Researcher</strong> · Org admin</div>
+      </div>
+      <div style="display:flex;gap:4px;border-bottom:1px solid rgba(22,24,29,.1);margin:16px 0 24px">
+        <button onClick="{{ atSources }}" style="{{ atabSources }}">Sources</button>
+        <button onClick="{{ atSnapshots }}" style="{{ atabSnapshots }}">Snapshots</button>
+        <button onClick="{{ atAccess }}" style="{{ atabAccess }}">Access</button>
+      </div>
+
+      <!-- Admin · Sources -->
+      <sc-if value="{{ isAtSources }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
+        <p style="font-size:13.5px;color:rgba(22,24,29,.55);margin:0;max-width:60ch">Any tabix-indexed file — BED, GTF, VCF or tab-delimited — plus curated gene lists. Reference sources are pulled from public registries; missing indexes are generated on registration.</p>
+        <button onClick="{{ openAddSource }}" style="flex:none;height:38px;padding:0 16px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:7px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>Add source</button>
+      </div>
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+        <div style="display:grid;grid-template-columns:1.6fr .8fr .7fr .8fr 1fr 34px;gap:12px;padding:11px 18px;border-bottom:1px solid rgba(22,24,29,.08);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">
+          <div>Source</div><div>Version</div><div>Format</div><div>Access</div><div>Index</div><div></div>
+        </div>
+        <sc-for list="{{ adminSources }}" as="a" hint-placeholder-count="8">
+          <div style="display:grid;grid-template-columns:1.6fr .8fr .7fr .8fr 1fr 34px;gap:12px;align-items:center;padding:12px 18px;border-bottom:1px solid rgba(22,24,29,.06)">
+            <div><div style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:14px">{{ a.name }}<span style="{{ a.kindStyle }}">{{ a.kind }}</span></div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(22,24,29,.42)">{{ a.origin }}</div></div>
+            <div style="font-family:'IBM Plex Mono',monospace;font-size:12px;color:#245f70">{{ a.version }}</div>
+            <div><span style="font-family:'IBM Plex Mono',monospace;font-size:10px;padding:2px 7px;background:#f2f4f5;border-radius:5px;color:rgba(22,24,29,.55)">{{ a.format }}</span></div>
+            <div style="{{ a.accessStyle }}">{{ a.access }}</div>
+            <div style="display:flex;align-items:center;gap:6px;font-size:12px;color:{{ a.statusColor }}"><span style="{{ a.dotStyle }}"></span>{{ a.status }}</div>
+            <button style="border:0;background:none;cursor:pointer;color:rgba(22,24,29,.35);display:grid;place-items:center;padding:4px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>
+          </div>
+        </sc-for>
+      </div>
+      </sc-if>
+
+      <!-- Admin · Snapshots -->
+      <sc-if value="{{ isAtSnapshots }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px">
+        <p style="font-size:13.5px;color:rgba(22,24,29,.55);margin:0;max-width:60ch">A snapshot bundles specific source versions so an annotation run is fully reproducible. Published snapshots are immutable.</p>
+        <button onClick="{{ openBuildSnapshot }}" style="flex:none;height:38px;padding:0 16px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:7px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>New snapshot</button>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <sc-for list="{{ adminSnapshots }}" as="s" hint-placeholder-count="4">
+          <div style="display:flex;align-items:center;gap:14px;padding:15px 18px;background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px">
+            <div style="flex:1"><div style="display:flex;align-items:center;gap:9px"><span style="font-weight:600;font-size:15px">{{ s.name }}</span><span style="{{ s.stateStyle }}">{{ s.state }}</span></div><div style="font-family:'IBM Plex Mono',monospace;font-size:11.5px;color:rgba(22,24,29,.45);margin-top:2px">{{ s.build }} · {{ s.count }} sources · pinned {{ s.date }}</div></div>
+            <button style="height:32px;padding:0 13px;background:#fff;border:1px solid rgba(22,24,29,.12);border-radius:7px;font-family:inherit;font-weight:500;font-size:12.5px;cursor:pointer">Duplicate</button>
+          </div>
+        </sc-for>
+      </div>
+      </sc-if>
+
+      <!-- Admin · Access -->
+      <sc-if value="{{ isAtAccess }}" hint-placeholder-val="{{ false }}">
+      <p style="font-size:13.5px;color:rgba(22,24,29,.55);margin:0 0 16px;max-width:64ch">Public sources are visible to everyone. Private sources (licensed data such as COSMIC, and in-house gene lists) are granted per team. Toggle a cell to grant a team access.</p>
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:auto">
+        <div style="{{ accessHeadStyle }}">
+          <div style="font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">Private source</div>
+          <sc-for list="{{ teams }}" as="t" hint-placeholder-count="4">
+            <div style="text-align:center;font-size:11.5px;font-weight:500;color:rgba(22,24,29,.6)">{{ t }}</div>
+          </sc-for>
+        </div>
+        <sc-for list="{{ accessRows }}" as="row" hint-placeholder-count="3">
+          <div style="{{ row.rowStyle }}">
+            <div><div style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:14px">{{ row.name }}<span style="{{ row.kindStyle }}">{{ row.kind }}</span></div><div style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:rgba(22,24,29,.42)">{{ row.meta }}</div></div>
+            <sc-for list="{{ row.cells }}" as="c" hint-placeholder-count="4">
+              <div style="display:flex;justify-content:center"><button onClick="{{ c.toggle }}" style="{{ c.style }}"><sc-if value="{{ c.on }}" hint-placeholder-val="{{ false }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></sc-if></button></div>
+            </sc-for>
+          </div>
+        </sc-for>
+      </div>
+      </sc-if>
+      </sc-if>
+
+      <!-- Add source flow -->
+      <sc-if value="{{ adminAdding }}" hint-placeholder-val="{{ false }}">
+      <button onClick="{{ closeAdminMode }}" style="background:none;border:0;color:#245f70;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-bottom:14px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>Back to sources</button>
+      <h2 style="font-size:24px;margin:0 0 5px">Register a source</h2>
+      <p style="font-size:13.5px;color:rgba(22,24,29,.55);margin:0 0 22px;max-width:64ch">Pull a reference dataset from a public registry, or write the source config directly. Everything resolves to a TOML manifest that pins where the file comes from and how it is indexed.</p>
+      <div style="display:grid;grid-template-columns:340px 1fr;gap:20px;align-items:start">
+        <div>
+          <label style="display:block;font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:rgba(22,24,29,.45);margin-bottom:6px">Registry</label>
+          <div style="position:relative;margin-bottom:14px"><select onChange="{{ setRegistry }}" style="width:100%;height:38px;padding:0 30px 0 11px;font-size:13px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;appearance:none;cursor:pointer"><option>Ensembl / EBI (public)</option><option>Broad resource bundle</option><option>UCSC goldenPath</option><option>Lab gene-list library</option></select><svg style="position:absolute;right:11px;top:12px;pointer-events:none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.45)" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg></div>
+          <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+            <div style="padding:9px 13px;border-bottom:1px solid rgba(22,24,29,.07);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)">Available datasets</div>
+            <sc-for list="{{ datasets }}" as="d" hint-placeholder-count="5">
+              <button onClick="{{ d.use }}" style="display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;padding:11px 13px;border:0;border-bottom:1px solid rgba(22,24,29,.06);background:none;cursor:pointer;text-align:left">
+                <div><div style="font-weight:500;font-size:13px">{{ d.name }}</div><div style="font-family:'IBM Plex Mono',monospace;font-size:10.5px;color:rgba(22,24,29,.45)">{{ d.meta }}</div></div>
+                <span style="font-size:12px;color:#245f70;font-weight:500;flex:none">Use →</span>
+              </button>
+            </sc-for>
+          </div>
+        </div>
+        <div>
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px"><label style="font-size:11px;letter-spacing:.05em;text-transform:uppercase;color:rgba(22,24,29,.45)">source.toml</label><span style="font-family:'IBM Plex Mono',monospace;font-size:11px;color:#4a7a52;display:inline-flex;align-items:center;gap:5px"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>valid</span></div>
+          <textarea onInput="{{ setToml }}" defaultValue="{{ toml }}" spellcheck="false" style="width:100%;min-height:300px;padding:15px;font-family:'IBM Plex Mono',monospace;font-size:12.5px;line-height:1.7;background:#1c2733;color:#d6e3ea;border:0;border-radius:10px;resize:vertical;tab-size:2"></textarea>
+          <div style="display:flex;justify-content:flex-end;gap:10px;margin-top:14px">
+            <button onClick="{{ closeAdminMode }}" style="height:40px;padding:0 18px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer">Cancel</button>
+            <button onClick="{{ closeAdminMode }}" style="height:40px;padding:0 20px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer">Validate &amp; register</button>
+          </div>
+        </div>
+      </div>
+      </sc-if>
+
+      <!-- Build snapshot flow -->
+      <sc-if value="{{ adminBuilding }}" hint-placeholder-val="{{ false }}">
+      <button onClick="{{ closeAdminMode }}" style="background:none;border:0;color:#245f70;font-family:inherit;font-weight:500;font-size:13px;cursor:pointer;display:inline-flex;align-items:center;gap:6px;margin-bottom:14px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M19 12H5M12 19l-7-7 7-7"/></svg>Back to snapshots</button>
+      <h2 style="font-size:24px;margin:0 0 18px">Build a snapshot</h2>
+      <div style="display:flex;gap:14px;flex-wrap:wrap;margin-bottom:20px">
+        <div style="flex:1;min-width:260px"><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">Snapshot name</label><input value="{{ snapName }}" onInput="{{ setSnapName }}" style="width:100%;height:40px;padding:0 12px;font-family:inherit;font-size:14px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px"></div>
+        <div style="min-width:190px"><label style="display:block;font-size:12px;color:rgba(22,24,29,.6);margin-bottom:6px">Build</label><div style="position:relative"><select style="width:100%;height:40px;padding:0 30px 0 12px;font-family:'IBM Plex Mono',monospace;font-size:13px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;appearance:none;cursor:pointer"><option>GRCh38 / hg38</option><option>GRCh37 / hg19</option></select><svg style="position:absolute;right:11px;top:13px;pointer-events:none" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.45)" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg></div></div>
+      </div>
+      <div style="background:#fff;border:1px solid rgba(22,24,29,.09);border-radius:10px;overflow:hidden">
+        <div style="display:grid;grid-template-columns:24px 1.6fr 1fr;gap:12px;padding:11px 18px;border-bottom:1px solid rgba(22,24,29,.08);font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;color:rgba(22,24,29,.45)"><div></div><div>Source</div><div>Pinned version</div></div>
+        <sc-for list="{{ snapBuild }}" as="b" hint-placeholder-count="6">
+          <div style="{{ b.rowStyle }}">
+            <button onClick="{{ b.toggle }}" style="{{ b.boxStyle }}"><sc-if value="{{ b.on }}" hint-placeholder-val="{{ false }}"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg></sc-if></button>
+            <div style="display:flex;align-items:center;gap:8px;font-weight:500;font-size:14px">{{ b.name }}<span style="{{ b.kindStyle }}">{{ b.kind }}</span></div>
+            <div style="position:relative;max-width:180px"><select style="{{ b.selStyle }}"><sc-for list="{{ b.versions }}" as="v" hint-placeholder-count="2"><option>{{ v }}</option></sc-for></select><svg style="position:absolute;right:9px;top:9px;pointer-events:none" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="rgba(22,24,29,.4)" stroke-width="1.8"><path d="m6 9 6 6 6-6"/></svg></div>
+          </div>
+        </sc-for>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:18px">
+        <div style="font-size:13px;color:rgba(22,24,29,.55)"><strong style="color:#16181d;font-weight:600;font-size:15px">{{ snapSelCount }}</strong> sources pinned</div>
+        <div style="display:flex;gap:10px"><button onClick="{{ closeAdminMode }}" style="height:40px;padding:0 18px;background:#fff;border:1px solid rgba(22,24,29,.14);border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer">Save draft</button><button onClick="{{ closeAdminMode }}" style="height:40px;padding:0 20px;background:#2f7d92;color:#fff;border:0;border-radius:8px;font-family:inherit;font-weight:500;font-size:14px;cursor:pointer">Publish snapshot</button></div>
+      </div>
+      </sc-if>
+
+    </div>
+    </sc-if>
+
+    </div>
+  </main>
+</div>
+</sc-if>
+</x-dc>
+<script type="text/x-dc" data-dc-script>
+class Component extends DCLogic {
+  state = {
+    authed: true, view: "sources",
+    sourceMode: "snapshot", snapshot: "clinical",
+    sel: { vep: true, clinvar: true, gnomad: true, spliceai: true, dbsnp: false, cosmic: false, dbnsfp: false, panel: false },
+    inputMode: "batch", build: "GRCh38 / hg38",
+    draft: "", variants: [
+      { id: 1, label: "chr17-7676154-C-T" },
+      { id: 2, label: "NM_004333.6:c.1799T>A" },
+      { id: 3, label: "rs113488022" },
+    ],
+    batchDefault: "chr7-140753336-A-T\nchr17-7676154-C-T\nNM_000546.6:c.743G>A\nrs28934578\nchr13-32340301-G-A\n17-43091983-CT-C",
+    batchCount: 6,
+    progress: 0, stage: "init",
+    downloadOpen: false, apiTab: "curl",
+    adminTab: "sources", adminMode: null, registry: "ensembl",
+    toml: '[source]\nname = "ClinVar"\nbuild = "GRCh38"\nformat = "vcf"          # bed | gtf | vcf | tsv | genelist\n\n[source.download]\nregistry = "ncbi-clinvar"\nurl = "https://ftp.ncbi.nlm.nih.gov/pub/\\\n       clinvar/vcf_GRCh38/clinvar.vcf.gz"\nindex = "tabix"         # auto-generate if absent\nchecksum = "md5:9f3c1a…"\n\n[source.access]\nvisibility = "public"   # public | private\n# grant = ["oncology-lab", "clinical-genetics"]',
+    snapName: "GRCh38 Clinical v5 (draft)",
+    snapSel: { vep: true, clinvar: true, gnomad: true, spliceai: true, dbsnp: false, cancergenes: true },
+    access: {
+      cosmic: { onc: true, clin: true, bioinf: false, ext: false },
+      panel: { onc: true, clin: false, bioinf: true, ext: false },
+      germline: { onc: true, clin: true, bioinf: false, ext: false },
+    },
+  };
+
+  componentWillUnmount() { clearInterval(this.timer); }
+  go = (v) => { this.setState({ view: v, downloadOpen: false }); };
+
+  runJob = () => {
+    this.setState({ view: "running", progress: 0, stage: "parse" });
+    clearInterval(this.timer);
+    this.timer = setInterval(() => {
+      this.setState(s => {
+        const p = Math.min(100, s.progress + 6 + Math.random() * 7);
+        let stage = "parse";
+        if (p > 20) stage = "fetch";
+        if (p > 55) stage = "vep";
+        if (p > 82) stage = "merge";
+        if (p >= 100) { clearInterval(this.timer); setTimeout(() => this.setState({ view: "results" }), 350); }
+        return { progress: Math.round(p), stage };
+      });
+    }, 150);
+  };
+
+  renderVals() {
+    const S = this.state;
+    const view = S.view;
+    const inAnnotate = ["sources", "variants", "running"].includes(view);
+
+    const navBase = "display:flex;align-items:center;gap:11px;padding:9px 12px;border-radius:7px;font-family:'IBM Plex Sans',sans-serif;font-weight:500;font-size:14px;cursor:pointer;background:none;width:100%;text-align:left;border:0";
+    const nav = (grps) => navBase + (grps.includes(view) ? ";background:#ecf3f5;color:#245f70" : ";color:rgba(22,24,29,.6)");
+
+    // segmented control — white active pill
+    const tab = (on) => `height:34px;padding:0 16px;border:0;border-radius:7px;background:${on ? "#fff" : "transparent"};color:${on ? "#16181d" : "rgba(22,24,29,.55)"};box-shadow:${on ? "0 1px 2px rgba(22,24,29,.1)" : "none"};font-family:'IBM Plex Sans',sans-serif;font-weight:500;font-size:13px;cursor:pointer`;
+    // api tabs — underline style
+    const atab = (on) => `padding:8px 14px;border:0;border-bottom:2px solid ${on ? "#2f7d92" : "transparent"};background:none;color:${on ? "#16181d" : "rgba(22,24,29,.5)"};font-family:'IBM Plex Sans',sans-serif;font-weight:500;font-size:13px;cursor:pointer;margin-bottom:-1px`;
+
+    const order = { sources: 1, variants: 2, running: 2, results: 3 };
+    const cur = order[view] || 1;
+    const mkStep = (n, label, last) => {
+      const done = n < cur, active = n === cur;
+      const ring = active || done ? "#2f7d92" : "rgba(22,24,29,.2)";
+      const dotStyle = `width:24px;height:24px;flex:none;border-radius:50%;display:grid;place-items:center;font-family:'IBM Plex Mono',monospace;font-size:11px;border:1.5px solid ${ring};background:${done ? "#2f7d92" : active ? "#ecf3f5" : "transparent"};color:${done ? "#fff" : active ? "#245f70" : "rgba(22,24,29,.4)"}`;
+      const labelStyle = `font-weight:500;font-size:14px;color:${active ? "#16181d" : done ? "rgba(22,24,29,.65)" : "rgba(22,24,29,.4)"}`;
+      const sepStyle = last ? "display:none" : `width:52px;height:1px;margin:0 16px;background:${done ? "#2f7d92" : "rgba(22,24,29,.15)"}`;
+      return { n: done ? "✓" : String(n), label, dotStyle, labelStyle, sepStyle };
+    };
+    const steps = [mkStep(1, "Sources", false), mkStep(2, "Variants", false), mkStep(3, "Results", true)];
+
+    const snapData = [
+      { id: "clinical", name: "GRCh38 Clinical v4", build: "GRCh38", count: 6, desc: "Curated for germline variant review — significance, population frequency and splicing.", tags: ["VEP·110", "ClinVar", "gnomAD·4.1", "SpliceAI"], locked: false },
+      { id: "research", name: "GRCh38 Research v2", build: "GRCh38", count: 9, desc: "Everything in Clinical plus deleteriousness meta-predictors and conservation.", tags: ["+dbNSFP·4.7", "+dbSNP", "+phyloP"], locked: false },
+      { id: "somatic", name: "Somatic Oncology v3", build: "GRCh38", count: 8, desc: "Tumour annotation with COSMIC census and cancer hotspots.", tags: ["COSMIC·99", "CancerHotspots", "OncoKB"], locked: true },
+      { id: "legacy", name: "GRCh37 Legacy v1", build: "GRCh37", count: 5, desc: "For pipelines still on hg19. Sources lifted over and re-indexed.", tags: ["VEP·110", "ClinVar", "gnomAD·2.1"], locked: false },
+    ];
+    const snapshots = snapData.map(s => {
+      const on = S.sourceMode === "snapshot" && S.snapshot === s.id;
+      return { ...s,
+        pick: () => this.setState({ snapshot: s.id }),
+        cardStyle: `position:relative;text-align:left;cursor:pointer;padding:17px;border-radius:11px;border:1.5px solid ${on ? "#2f7d92" : "rgba(22,24,29,.09)"};background:${on ? "#f3f8f9" : "#fff"};box-shadow:${on ? "0 2px 12px rgba(47,125,146,.1)" : "0 1px 2px rgba(22,24,29,.03)"};display:flex;flex-direction:column`,
+        checkStyle: `width:20px;height:20px;flex:none;border-radius:6px;display:grid;place-items:center;border:1.5px solid ${on ? "#2f7d92" : "rgba(22,24,29,.18)"};background:${on ? "#2f7d92" : "transparent"};color:#fff;${on ? "" : "visibility:hidden"}`,
+      };
+    });
+
+    const srcData = [
+      { k: "vep", name: "Ensembl VEP", detail: "Consequence & transcript effects", version: "release-110", type: "VCF→VCF", priv: false },
+      { k: "clinvar", name: "ClinVar", detail: "Clinical significance", version: "2026-06", type: "VCF.gz", priv: false },
+      { k: "gnomad", name: "gnomAD", detail: "Population allele frequencies", version: "v4.1", type: "VCF.gz", priv: false },
+      { k: "spliceai", name: "SpliceAI", detail: "Splice-altering prediction", version: "v1.3", type: "VCF.gz", priv: false },
+      { k: "dbsnp", name: "dbSNP", detail: "Reference SNP identifiers", version: "b156", type: "VCF.gz", priv: false },
+      { k: "dbnsfp", name: "dbNSFP", detail: "Meta-predictors & conservation", version: "v4.7a", type: "tabix", priv: false },
+      { k: "cosmic", name: "COSMIC", detail: "Somatic mutation census", version: "v99", type: "BED.gz", priv: true },
+      { k: "panel", name: "Lab panel (custom)", detail: "In-house curated BED", version: "v2.1", type: "BED.gz", priv: true },
+    ];
+    const sources = srcData.map(s => {
+      const on = S.sourceMode === "individual" && S.sel[s.k];
+      return { name: s.name, detail: s.detail, version: s.version, type: s.type, selected: on,
+        access: s.priv ? "Private" : "Public",
+        toggle: () => this.setState(st => ({ sel: { ...st.sel, [s.k]: !st.sel[s.k] } })),
+        rowStyle: `display:grid;grid-template-columns:26px 1.7fr 1fr .8fr 1fr;gap:12px;align-items:center;width:100%;padding:12px 18px;border:0;border-bottom:1px solid rgba(22,24,29,.06);cursor:pointer;background:${on ? "#f3f8f9" : "transparent"}`,
+        boxStyle: `width:18px;height:18px;border-radius:5px;display:grid;place-items:center;border:1.5px solid ${on ? "#2f7d92" : "rgba(22,24,29,.2)"};background:${on ? "#2f7d92" : "transparent"}`,
+        accessStyle: `text-align:left;font-size:11px;font-family:'IBM Plex Mono',monospace;color:${s.priv ? "#a86a1e" : "rgba(22,24,29,.45)"}`,
+      };
+    });
+
+    const selCount = S.sourceMode === "snapshot"
+      ? (snapData.find(s => s.id === S.snapshot)?.count || 0)
+      : Object.values(S.sel).filter(Boolean).length;
+
+    const stages = ["parse", "fetch", "vep", "merge"];
+    const stageLabels = { parse: "Parsing & normalising variants", fetch: "Querying tabix-indexed sources", vep: "Running Ensembl VEP", merge: "Merging annotations" };
+    const curStageIdx = stages.indexOf(S.stage);
+    const jobSteps = [
+      { label: "Normalise & left-align variants" },
+      { label: "Query tabix sources (ClinVar, gnomAD, SpliceAI)" },
+      { label: "Ensembl VEP consequence calling" },
+      { label: "Merge & write output index" },
+    ].map((j, i) => {
+      const done = i < curStageIdx, active = i === curStageIdx;
+      return { label: j.label, color: done || active ? "#16181d" : "rgba(22,24,29,.4)",
+        icon: done ? "✓" : active ? "▸" : "·",
+        iconStyle: `width:16px;display:inline-block;color:${done || active ? "#2f7d92" : "rgba(22,24,29,.3)"};${active ? "animation:vs-blink 1s infinite" : ""}` };
+    });
+
+    const rowData = [
+      { chrom: "chr17", pos: "7676154", ref: "C", alt: "T", gene: "TP53", cons: "missense_variant", clin: "Pathogenic", k: "path", af: "—", spliceai: "0.02", rsid: "rs28934578" },
+      { chrom: "chr7", pos: "140753336", ref: "A", alt: "T", gene: "BRAF", cons: "missense_variant", clin: "Pathogenic", k: "path", af: "—", spliceai: "0.01", rsid: "rs113488022" },
+      { chrom: "chr13", pos: "32340301", ref: "G", alt: "A", gene: "BRCA2", cons: "stop_gained", clin: "Pathogenic", k: "path", af: "0.00002", spliceai: "0.00", rsid: "rs80359550" },
+      { chrom: "chr17", pos: "43091983", ref: "CT", alt: "C", gene: "BRCA1", cons: "frameshift_variant", clin: "Likely path.", k: "lp", af: "—", spliceai: "0.03", rsid: "novel" },
+      { chrom: "chr2", pos: "47478462", ref: "G", alt: "A", gene: "MSH2", cons: "splice_donor_variant", clin: "VUS", k: "vus", af: "0.00011", spliceai: "0.88", rsid: "rs267607929" },
+      { chrom: "chr3", pos: "37067240", ref: "C", alt: "T", gene: "MLH1", cons: "missense_variant", clin: "VUS", k: "vus", af: "0.00043", spliceai: "0.12", rsid: "rs63750217" },
+      { chrom: "chr12", pos: "25245350", ref: "C", alt: "T", gene: "KRAS", cons: "missense_variant", clin: "VUS", k: "vus", af: "—", spliceai: "0.05", rsid: "novel" },
+      { chrom: "chr9", pos: "21971120", ref: "G", alt: "C", gene: "CDKN2A", cons: "missense_variant", clin: "VUS", k: "vus", af: "0.0021", spliceai: "0.07", rsid: "rs11515" },
+      { chrom: "chr10", pos: "87957915", ref: "T", alt: "C", gene: "PTEN", cons: "synonymous_variant", clin: "Benign", k: "ben", af: "0.031", spliceai: "0.00", rsid: "rs701848" },
+      { chrom: "chr17", pos: "31226846", ref: "A", alt: "G", gene: "NF1", cons: "intron_variant", clin: "Benign", k: "ben", af: "0.187", spliceai: "0.01", rsid: "rs2953015" },
+      { chrom: "chr11", pos: "108236167", ref: "C", alt: "T", gene: "ATM", cons: "missense_variant", clin: "Likely benign", k: "lb", af: "0.014", spliceai: "0.02", rsid: "rs1800057" },
+      { chrom: "chr5", pos: "112839514", ref: "C", alt: "T", gene: "APC", cons: "stop_gained", clin: "Pathogenic", k: "path", af: "—", spliceai: "0.00", rsid: "rs121913332" },
+      { chrom: "chr1", pos: "45331556", ref: "G", alt: "A", gene: "MUTYH", cons: "missense_variant", clin: "Likely path.", k: "lp", af: "0.0009", spliceai: "0.04", rsid: "rs36053993" },
+      { chrom: "chr16", pos: "23636106", ref: "T", alt: "C", gene: "PALB2", cons: "5_prime_UTR_variant", clin: "VUS", k: "vus", af: "0.0006", spliceai: "0.31", rsid: "novel" },
+    ];
+    const clinStyle = (k) => {
+      const base = "display:inline-flex;align-items:center;font-weight:500;font-size:12px;padding:2px 10px;border-radius:20px;white-space:nowrap;";
+      if (k === "path") return base + "background:#f6eaea;color:#8f2f2f";
+      if (k === "lp") return base + "background:#f9f0ec;color:#a85a3a";
+      if (k === "vus") return base + "background:#f6f0e0;color:#8a6a1e";
+      if (k === "ben") return base + "background:#eef4ee;color:#3c6642";
+      return base + "background:#f1f5f1;color:#5a7a5f";
+    };
+    const rows = rowData.map((r) => ({ ...r,
+      clinStyle: clinStyle(r.k),
+      afColor: r.af === "—" ? "rgba(22,24,29,.3)" : "#16181d",
+      open: () => this.setState({ view: "browse" }),
+    }));
+
+    const pins = (arr) => React.createElement(React.Fragment, null, arr.map((p, i) =>
+      React.createElement("div", { key: i, title: p.t || "", style: { position: "absolute", left: p.x, top: "50%", transform: "translate(-50%,-50%)", width: p.r || 10, height: p.r || 10, background: p.c, border: p.o ? `1.5px solid ${p.o}` : "none", borderRadius: "50%", boxShadow: "0 1px 2px rgba(22,24,29,.15)" } })));
+
+    const geneModel = React.createElement("div", { style: { position: "absolute", top: "50%", left: 0, right: 0, transform: "translateY(-50%)", height: 0 } },
+      React.createElement("div", { style: { position: "absolute", left: "8%", right: "6%", top: 0, height: 1.5, background: "#2f7d92", transform: "translateY(-.75px)" } }),
+      ...[[10, 4], [22, 8], [38, 6], [52, 10], [70, 7], [84, 5]].map(([l, w], i) =>
+        React.createElement("div", { key: i, style: { position: "absolute", left: l + "%", width: w + "%", height: 13, top: -6.5, background: "#2f7d92", borderRadius: 2 } })));
+
+    const afHist = React.createElement("div", { style: { position: "absolute", inset: "8px 0", display: "flex", alignItems: "flex-end", gap: 1.5, paddingLeft: "8%", paddingRight: "6%" } },
+      [3, 8, 2, 14, 5, 22, 4, 9, 30, 6, 12, 3, 18, 7, 2, 11, 5, 26, 8, 4, 15, 3, 9, 6].map((h, i) =>
+        React.createElement("div", { key: i, style: { flex: 1, height: h + "%", background: "rgba(47,125,146,.5)", borderRadius: "2px 2px 0 0" } })));
+
+    const tracks = [
+      { name: "RefSeq genes", meta: "TP53 ×3 iso", h: "58px", locked: false, body: geneModel },
+      { name: "User variants", meta: "6 loaded", h: "44px", locked: false, body: pins([{ x: "38%", c: "#2f7d92", r: 12, t: "chr17-7676154-C-T" }, { x: "52%", c: "#2f7d92", r: 12 }, { x: "70%", c: "#2f7d92", r: 12 }]) },
+      { name: "ClinVar", meta: "VCF · 2026-06", h: "44px", locked: false, body: pins([{ x: "22%", c: "#4a7a52", t: "Benign" }, { x: "38%", c: "#a23c3c", t: "Pathogenic" }, { x: "52%", c: "#a23c3c" }, { x: "84%", c: "#b08a2e", t: "VUS" }]) },
+      { name: "gnomAD AF", meta: "v4.1 · density", h: "44px", locked: false, body: afHist },
+      { name: "COSMIC", meta: "private · v99", h: "44px", locked: true, body: React.createElement("div", { style: { position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", gap: 8, background: "repeating-linear-gradient(45deg,rgba(22,24,29,.025) 0 7px,transparent 7px 14px)", fontSize: 11.5, color: "rgba(22,24,29,.45)", fontFamily: "'IBM Plex Mono',monospace" } }, "Private source — access granted") },
+    ];
+
+    const ticks = [
+      { left: "3%", label: "7,668 kb" }, { left: "27%", label: "7,674 kb" }, { left: "51%", label: "7,680 kb" }, { left: "75%", label: "7,686 kb" }, { left: "96%", label: "7,690 kb" },
+    ];
+
+    const formats = [
+      { ext: "variants.json", desc: "JSON", pick: () => this.setState({ downloadOpen: false }) },
+      { ext: "variants.tsv", desc: "TSV", pick: () => this.setState({ downloadOpen: false }) },
+      { ext: "variants.csv", desc: "CSV", pick: () => this.setState({ downloadOpen: false }) },
+    ];
+
+    const mStyle = (m) => `font-family:'IBM Plex Mono',monospace;font-size:10px;font-weight:500;padding:3px 8px;border-radius:5px;width:52px;text-align:center;color:${m === "POST" ? "#a85a3a" : "#245f70"};background:${m === "POST" ? "#f9f0ec" : "#ecf3f5"}`;
+    const endpoints = [
+      { method: "GET", path: "/snapshots", desc: "List available snapshots" },
+      { method: "GET", path: "/sources", desc: "List sources + versions" },
+      { method: "POST", path: "/annotate", desc: "Submit variants for annotation" },
+      { method: "GET", path: "/jobs/{id}", desc: "Poll job status & fetch results" },
+    ].map(e => ({ ...e, mStyle: mStyle(e.method) }));
+
+    const curlCode = `curl -X POST https://varianthub.compgenlab.org/api/v1/annotate \\
+  -H "Authorization: Bearer $VH_TOKEN" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "build": "GRCh38",
+    "snapshot": "clinical-v4",
+    "variants": ["chr17-7676154-C-T", "rs28934578"],
+    "format": "json"
+  }'`;
+    const pyCode = `import requests
+
+r = requests.post(
+    "https://varianthub.compgenlab.org/api/v1/annotate",
+    headers={"Authorization": f"Bearer {token}"},
+    json={
+        "build": "GRCh38",
+        "snapshot": "clinical-v4",
+        "variants": ["chr17-7676154-C-T", "rs28934578"],
+    },
+)
+job = r.json()["job_id"]`;
+
+    // ── admin ──
+    const kindStyle = (kind) => {
+      const c = kind === "gene list" ? "#8a6a1e;background:#f6f0e0" : kind === "VEP" ? "#a85a3a;background:#f9f0ec" : "#245f70;background:#ecf3f5";
+      return `font-family:'IBM Plex Mono',monospace;font-size:9.5px;padding:1px 6px;border-radius:4px;color:${c}`;
+    };
+    const stat = (s) => s === "Indexed" ? "#4a7a52" : s === "Building" ? "#b08a2e" : "#a23c3c";
+    const adminSources = [
+      { name: "Ensembl VEP", kind: "VEP", origin: "registry: ensembl", version: "release-110", format: "vcf→vcf", priv: false, status: "Indexed" },
+      { name: "ClinVar", kind: "vcf", origin: "registry: ncbi-clinvar", version: "2026-06", format: "vcf.gz", priv: false, status: "Indexed" },
+      { name: "gnomAD", kind: "vcf", origin: "registry: broad", version: "v4.1", format: "vcf.gz", priv: false, status: "Indexed" },
+      { name: "GENCODE", kind: "gtf", origin: "registry: ensembl", version: "v46", format: "gtf.gz", priv: false, status: "Indexed" },
+      { name: "COSMIC", kind: "bed", origin: "licensed · uploaded", version: "v99", format: "bed.gz", priv: true, status: "Indexed" },
+      { name: "Cancer gene census", kind: "gene list", origin: "lab library", version: "2026-05", format: "genelist", priv: false, status: "Indexed" },
+      { name: "Germline-cancer genes", kind: "gene list", origin: "lab library", version: "v3", format: "genelist", priv: true, status: "Indexed" },
+      { name: "Lab panel (custom)", kind: "bed", origin: "uploaded", version: "v2.1", format: "bed.gz", priv: true, status: "Building" },
+    ].map(a => ({ ...a,
+      kindStyle: kindStyle(a.kind),
+      access: a.priv ? "Private" : "Public",
+      accessStyle: `font-size:12.5px;color:${a.priv ? "#a86a1e" : "rgba(22,24,29,.5)"}`,
+      statusColor: stat(a.status),
+      dotStyle: `width:8px;height:8px;border-radius:50%;background:${stat(a.status)};${a.status === "Building" ? "animation:vs-blink 1s infinite" : ""}`,
+    }));
+
+    const adminSnapshots = [
+      { name: "GRCh38 Clinical v4", state: "Published", build: "GRCh38", count: 6, date: "2026-06-12" },
+      { name: "GRCh38 Research v2", state: "Published", build: "GRCh38", count: 9, date: "2026-05-30" },
+      { name: "Somatic Oncology v3", state: "Published", build: "GRCh38", count: 8, date: "2026-05-18" },
+      { name: "GRCh38 Clinical v5", state: "Draft", build: "GRCh38", count: 6, date: "2026-07-20" },
+    ].map(s => ({ ...s,
+      stateStyle: `font-family:'IBM Plex Mono',monospace;font-size:9.5px;padding:2px 7px;border-radius:5px;` + (s.state === "Draft" ? "background:#f6f0e0;color:#8a6a1e" : "background:#eef4ee;color:#3c6642"),
+    }));
+
+    const teams = ["Oncology Lab", "Clinical Genetics", "Bioinformatics Core", "External"];
+    const teamKeys = ["onc", "clin", "bioinf", "ext"];
+    const gridCols = "grid-template-columns:1.6fr repeat(4,1fr)";
+    const accessHeadStyle = `display:grid;${gridCols};gap:12px;align-items:center;padding:11px 18px;border-bottom:1px solid rgba(22,24,29,.08);min-width:640px`;
+    const privRows = [
+      { key: "cosmic", name: "COSMIC", kind: "bed", meta: "licensed · v99" },
+      { key: "germline", name: "Germline-cancer genes", kind: "gene list", meta: "lab · v3" },
+      { key: "panel", name: "Lab panel (custom)", kind: "bed", meta: "uploaded · v2.1" },
+    ];
+    const accessRows = privRows.map(r => ({
+      name: r.name, kind: r.kind, meta: r.meta, kindStyle: kindStyle(r.kind),
+      rowStyle: `display:grid;${gridCols};gap:12px;align-items:center;padding:13px 18px;border-bottom:1px solid rgba(22,24,29,.06);min-width:640px`,
+      cells: teamKeys.map(tk => {
+        const on = !!(S.access[r.key] && S.access[r.key][tk]);
+        return { on,
+          toggle: () => this.setState(st => ({ access: { ...st.access, [r.key]: { ...st.access[r.key], [tk]: !(st.access[r.key] && st.access[r.key][tk]) } } })),
+          style: `width:22px;height:22px;border-radius:6px;display:grid;place-items:center;cursor:pointer;border:1.5px solid ${on ? "#2f7d92" : "rgba(22,24,29,.18)"};background:${on ? "#2f7d92" : "#fff"}`,
+        };
+      }),
+    }));
+
+    const datasets = [
+      { name: "ClinVar (GRCh38)", meta: "vcf.gz · 82 MB" },
+      { name: "GENCODE v46", meta: "gtf.gz · 48 MB" },
+      { name: "dbSNP b156", meta: "vcf.gz · 24 GB" },
+      { name: "Regulatory build", meta: "gff.gz · 9 MB" },
+      { name: "phyloP 100way", meta: "bigwig · 6 GB" },
+    ].map(d => ({ ...d, use: () => {} }));
+
+    const snapSrc = [
+      { key: "vep", name: "Ensembl VEP", kind: "VEP", versions: ["release-110", "release-109"] },
+      { key: "clinvar", name: "ClinVar", kind: "vcf", versions: ["2026-06", "2026-03", "2025-12"] },
+      { key: "gnomad", name: "gnomAD", kind: "vcf", versions: ["v4.1", "v4.0", "v2.1.1"] },
+      { key: "spliceai", name: "SpliceAI", kind: "vcf", versions: ["v1.3"] },
+      { key: "dbsnp", name: "dbSNP", kind: "vcf", versions: ["b156", "b155"] },
+      { key: "cancergenes", name: "Cancer gene census", kind: "gene list", versions: ["2026-05", "2025-11"] },
+    ];
+    const snapBuild = snapSrc.map(s => {
+      const on = !!S.snapSel[s.key];
+      return { name: s.name, kind: s.kind, kindStyle: kindStyle(s.kind), versions: s.versions, on,
+        toggle: () => this.setState(st => ({ snapSel: { ...st.snapSel, [s.key]: !st.snapSel[s.key] } })),
+        rowStyle: `display:grid;grid-template-columns:24px 1.6fr 1fr;gap:12px;align-items:center;padding:12px 18px;border-bottom:1px solid rgba(22,24,29,.06);background:${on ? "#f3f8f9" : "transparent"}`,
+        boxStyle: `width:18px;height:18px;border-radius:5px;display:grid;place-items:center;cursor:pointer;border:1.5px solid ${on ? "#2f7d92" : "rgba(22,24,29,.2)"};background:${on ? "#2f7d92" : "transparent"}`,
+        selStyle: `width:100%;height:34px;padding:0 28px 0 10px;font-family:'IBM Plex Mono',monospace;font-size:12px;background:${on ? "#fff" : "#f7f8f8"};border:1px solid rgba(22,24,29,.14);border-radius:7px;appearance:none;cursor:pointer;color:${on ? "#16181d" : "rgba(22,24,29,.4)"}`,
+      };
+    });
+    const snapSelCount = Object.values(S.snapSel).filter(Boolean).length;
+
+    // ── jobs list ──
+    const jstat = (s) => s === "Complete" ? "#4a7a52" : s === "Running" ? "#b08a2e" : s === "Queued" ? "rgba(22,24,29,.4)" : "#a23c3c";
+    const jobs = [
+      { id: "#a7f3-2e", input: "cohort_batch07.vcf.gz", submitted: "Today, 14:22", snapshot: "GRCh38 Clinical v4", build: "GRCh38", count: "4,812", status: "Complete", pct: "" },
+      { id: "#b1c9-77", input: "Batch paste · 6 variants", submitted: "Today, 11:05", snapshot: "Somatic Oncology v3", build: "GRCh38", count: "6", status: "Running", pct: "68%" },
+      { id: "#c4e2-01", input: "trio_proband.vcf.gz", submitted: "Today, 09:41", snapshot: "GRCh38 Research v2", build: "GRCh38", count: "1,204", status: "Queued", pct: "" },
+      { id: "#d8a5-19", input: "panel_run_92.vcf.gz", submitted: "Yesterday, 17:30", snapshot: "GRCh38 Clinical v4", build: "GRCh38", count: "318", status: "Complete", pct: "" },
+      { id: "#e2b7-44", input: "Single · chr17-7676154-C-T", submitted: "Yesterday, 15:12", snapshot: "Custom · 4 sources", build: "GRCh38", count: "1", status: "Complete", pct: "" },
+      { id: "#f0d3-88", input: "legacy_hg19.vcf.gz", submitted: "Jul 23, 16:58", snapshot: "GRCh37 Legacy v1", build: "GRCh37", count: "2,140", status: "Failed", pct: "" },
+    ].map(j => {
+      const done = j.status === "Complete";
+      return { ...j,
+        statusColor: jstat(j.status),
+        dotStyle: `width:8px;height:8px;border-radius:50%;flex:none;background:${jstat(j.status)};${j.status === "Running" ? "animation:vs-blink 1s infinite" : ""}`,
+        chevStyle: `display:grid;place-items:center;color:rgba(22,24,29,${done ? ".35" : ".12"})`,
+        rowStyle: `display:grid;grid-template-columns:.7fr 1.5fr 1.1fr .7fr .9fr 34px;gap:12px;align-items:center;width:100%;padding:13px 18px;border:0;border-bottom:1px solid rgba(22,24,29,.06);background:none;text-align:left;cursor:${done ? "pointer" : "default"}`,
+        open: () => { if (done) this.go("results"); },
+      };
+    });
+
+    const asub = (on) =>
+ `padding:9px 15px;border:0;border-bottom:2px solid ${on ? "#2f7d92" : "transparent"};background:none;color:${on ? "#16181d" : "rgba(22,24,29,.5)"};font-family:'IBM Plex Sans',sans-serif;font-weight:${on ? 600 : 500};font-size:14px;cursor:pointer;margin-bottom:-1px`;
+
+    return {
+      authed: S.authed, isLogin: !S.authed,
+      signIn: () => this.setState({ authed: true, view: "sources" }),
+      signOut: () => this.setState({ authed: false }),
+      goSources: () => this.go("sources"), goVariants: () => this.go("variants"),
+      goResults: () => this.go("jobs"), goJobs: () => this.go("jobs"), goBrowse: () => this.go("browse"), goApi: () => this.go("api"),
+      goAdmin: () => this.setState({ view: "admin", downloadOpen: false }),
+      navAnnotate: nav(["sources", "variants", "running"]), navResults: nav(["jobs", "results"]),
+      navBrowse: nav(["browse"]), navApi: nav(["api"]), navAdmin: nav(["admin"]),
+      inAnnotate, steps,
+      isSources: view === "sources", isVariants: view === "variants",
+      isRunning: view === "running", isResults: view === "results", isJobs: view === "jobs", jobs,
+      isBrowse: view === "browse", isApi: view === "api",
+      isAdmin: view === "admin",
+      adminIdle: view === "admin" && !S.adminMode,
+      adminAdding: view === "admin" && S.adminMode === "addSource",
+      adminBuilding: view === "admin" && S.adminMode === "buildSnapshot",
+      atSources: () => this.setState({ adminTab: "sources" }),
+      atSnapshots: () => this.setState({ adminTab: "snapshots" }),
+      atAccess: () => this.setState({ adminTab: "access" }),
+      atabSources: asub(S.adminTab === "sources"), atabSnapshots: asub(S.adminTab === "snapshots"), atabAccess: asub(S.adminTab === "access"),
+      isAtSources: S.adminTab === "sources", isAtSnapshots: S.adminTab === "snapshots", isAtAccess: S.adminTab === "access",
+      openAddSource: () => this.setState({ adminMode: "addSource" }),
+      openBuildSnapshot: () => this.setState({ adminMode: "buildSnapshot" }),
+      closeAdminMode: () => this.setState({ adminMode: null }),
+      setRegistry: (e) => this.setState({ registry: e.target.value }),
+      toml: S.toml, setToml: (e) => this.setState({ toml: e.target.value }),
+      snapName: S.snapName, setSnapName: (e) => this.setState({ snapName: e.target.value }),
+      adminSources, adminSnapshots, teams, accessHeadStyle, accessRows, datasets, snapBuild, snapSelCount,
+      buildLabel: S.build, selectedCount: selCount,
+
+      isSnapshotMode: S.sourceMode === "snapshot", isIndividualMode: S.sourceMode === "individual",
+      modeSnapshot: () => this.setState({ sourceMode: "snapshot" }),
+      modeIndividual: () => this.setState({ sourceMode: "individual" }),
+      tabSnapshot: tab(S.sourceMode === "snapshot"), tabIndividual: tab(S.sourceMode === "individual"),
+      snapshots, sources,
+
+      setBuild: (e) => this.setState({ build: e.target.value }),
+      isSingle: S.inputMode === "single", isBatch: S.inputMode === "batch", isVcf: S.inputMode === "vcf",
+      inputSingle: () => this.setState({ inputMode: "single" }),
+      inputBatch: () => this.setState({ inputMode: "batch" }),
+      inputVcf: () => this.setState({ inputMode: "vcf" }),
+      tabSingle: tab(S.inputMode === "single"), tabBatch: tab(S.inputMode === "batch"), tabVcf: tab(S.inputMode === "vcf"),
+      draft: S.draft, setDraft: (e) => this.setState({ draft: e.target.value }),
+      addVariant: () => this.setState(s => s.draft.trim() ? { variants: [...s.variants, { id: Date.now(), label: s.draft.trim() }], draft: "" } : {}),
+      variants: S.variants.map(v => ({ label: v.label, remove: () => this.setState(s => ({ variants: s.variants.filter(x => x.id !== v.id) })) })),
+      batchDefault: S.batchDefault, batchCount: S.batchCount,
+      setBatch: (e) => this.setState({ batchCount: e.target.value.split("\n").filter(l => l.trim()).length }),
+      runJob: this.runJob,
+
+      progress: S.progress, progressStage: stageLabels[S.stage] || "",
+      progressStyle: `position:absolute;top:0;bottom:0;left:0;width:${S.progress}%;background:#2f7d92;border-radius:3px;transition:width .15s linear`,
+      jobSteps, jobVariantCount: "4,812",
+
+      rows, totalCount: "4,812",
+      downloadOpen: S.downloadOpen, toggleDownload: () => this.setState(s => ({ downloadOpen: !s.downloadOpen })),
+      formats,
+
+      locus: "chr17:7,668,000-7,690,000", tracks, ticks,
+
+      endpoints,
+      apiCurl: () => this.setState({ apiTab: "curl" }), apiPy: () => this.setState({ apiTab: "python" }),
+      tabCurl: atab(S.apiTab === "curl"), tabPy: atab(S.apiTab === "python"),
+      codeSample: S.apiTab === "curl" ? curlCode : pyCode,
+    };
+  }
+}
+</script>
+</body>
+</html>

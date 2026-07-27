@@ -1,0 +1,23 @@
+# build output
+/varianthub-web
+/bin/
+/dist/
+
+# local config + secrets
+.env
+*.local.yaml
+
+# node / react
+/web/node_modules/
+/web/dist/
+/web/.vite/
+
+# local scratch
+/tmp/
+
+# go workspace (machine-local)
+go.work
+go.work.sum
+
+# design handoff bundle (kept, but not the zip)
+*.zip

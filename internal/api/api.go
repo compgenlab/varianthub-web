@@ -1,0 +1,195 @@
+// Package api is the HTTP surface.
+//
+// Chunk 1 ships the router, middleware, and ops endpoints. The /api/v1 handlers
+// described in docs/api.md land in Chunk 5, once the Postgres catalog (Chunk 2)
+// gives them multiple snapshots to serve — today's engine is pinned to one.
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"log"
+	"net"
+	"net/http"
+	"time"
+
+	"github.com/compgenlab/varianthub-web/internal/auth"
+	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/limit"
+	"github.com/compgenlab/varianthub-web/internal/queue"
+)
+
+// Server is the API server.
+type Server struct {
+	cfg     *config.Config
+	queue   *queue.Queue
+	trusted []*net.IPNet
+	limiter *limit.Limiter
+}
+
+// New builds the server.
+func New(cfg *config.Config, q *queue.Queue) *Server {
+	return &Server{
+		cfg:     cfg,
+		queue:   q,
+		trusted: limit.ParseCIDRs(cfg.TrustedProxy),
+		limiter: limit.New(cfg.RatePerMin, cfg.RateBurst),
+	}
+}
+
+// Routes builds the handler.
+func (s *Server) Routes() http.Handler {
+	mux := http.NewServeMux()
+
+	// Ops endpoints are never token-gated: a readiness probe cannot hold a secret.
+	mux.HandleFunc("GET /healthz", s.handleHealthz)
+	mux.HandleFunc("GET /version", s.handleVersion)
+
+	// The /api/v1 surface. Handlers arrive in Chunk 5; the auth, throttle, and
+	// routing scaffolding around them is in place now so the shape is settled.
+	v1 := http.NewServeMux()
+	v1.HandleFunc("GET /api/v1/ping", s.handlePing)
+
+	var v1h http.Handler = v1
+	if s.cfg.RequireToken {
+		v1h = auth.RequireToken(s.cfg.MasterKey, v1h)
+	}
+	mux.Handle("/api/v1/", v1h)
+
+	return s.withCORS(logRequests(mux))
+}
+
+// Run serves until ctx is cancelled, then shuts down gracefully.
+func (s *Server) Run(ctx context.Context) error {
+	srv := &http.Server{
+		Addr:              s.cfg.Addr,
+		Handler:           s.Routes(),
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       5 * time.Minute,
+		WriteTimeout:      5 * time.Minute,
+		IdleTimeout:       2 * time.Minute,
+	}
+	go s.limiterGC(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		log.Printf("api: listening on %s", s.cfg.Addr)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- err
+		}
+	}()
+
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		return srv.Shutdown(shutdown)
+	}
+}
+
+func (s *Server) limiterGC(ctx context.Context) {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.limiter.GC(30 * time.Minute)
+		}
+	}
+}
+
+// throttle rate-limits by resolved client IP. Wraps submit routes only.
+func (s *Server) throttle(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.limiter.Allow(limit.ClientIP(r, s.trusted)) {
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded — slow down")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// withCORS allows the SPA's origin when one is configured. With no configured
+// origins the header is omitted entirely, which is the correct default for a
+// same-origin deployment.
+func (s *Server) withCORS(h http.Handler) http.Handler {
+	if len(s.cfg.CORSOrigins) == 0 {
+		return h
+	}
+	allowed := map[string]bool{}
+	for _, o := range s.cfg.CORSOrigins {
+		allowed[o] = true
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if origin := r.Header.Get("Origin"); origin != "" && allowed[origin] {
+			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Set("Vary", "Origin")
+			w.Header().Set("Access-Control-Allow-Credentials", "true")
+			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func logRequests(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
+		h.ServeHTTP(sw, r)
+		log.Printf("api: %s %s %d %s", r.Method, r.URL.Path, sw.status,
+			time.Since(start).Round(time.Millisecond))
+	})
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (w *statusWriter) WriteHeader(code int) {
+	w.status = code
+	w.ResponseWriter.WriteHeader(code)
+}
+
+// --- handlers ---
+
+func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if err := s.queue.Ping(ctx); err != nil {
+		// A readiness probe must fail when the database is unreachable, otherwise
+		// the pod takes traffic it cannot serve.
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+			"status": "unavailable", "reason": "database",
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"version": s.cfg.Version})
+}
+
+func (s *Server) handlePing(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]string{"pong": "ok"})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
+}

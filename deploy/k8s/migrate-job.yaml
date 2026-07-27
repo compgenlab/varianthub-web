@@ -1,0 +1,25 @@
+# Applies pending migrations, then exits. Run to completion BEFORE rolling api
+# and worker. A completed Job is immutable — on upgrade, bump the name suffix
+# (or delete this Job first).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: varianthub-web-migrate
+  namespace: varianthub
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: varianthub-web:latest
+          args: ["migrate"]
+          envFrom:
+            - configMapRef:
+                name: varianthub-web
+            - secretRef:
+                name: varianthub-web
+          resources:
+            requests: {cpu: 50m, memory: 64Mi}
+            limits:   {memory: 256Mi}

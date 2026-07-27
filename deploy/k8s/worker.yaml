@@ -1,0 +1,60 @@
+# The job pool. Serves no HTTP, so it has no probes — liveness is "the process
+# is running"; a stuck worker is caught by job TTL, not by the kubelet.
+#
+# Scale by replicas: workers claim with FOR UPDATE SKIP LOCKED, so N pods take N
+# distinct jobs without coordination.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: varianthub-web-worker
+  namespace: varianthub
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: varianthub-web, role: worker}
+  template:
+    metadata:
+      labels: {app: varianthub-web, role: worker}
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: worker
+          image: varianthub-web:latest
+          args: ["worker"]
+          envFrom:
+            - configMapRef: {name: varianthub-web}
+            - secretRef:    {name: varianthub-web}
+          volumeMounts:
+            - {name: varhub-home, mountPath: /varhub-home}
+            - {name: scratch,     mountPath: /tmp}
+          resources:
+            requests: {cpu: 500m, memory: 512Mi}
+            limits:   {memory: 4Gi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities: {drop: ["ALL"]}
+      # Jobs run to completion or are re-queued by the next process start, so a
+      # generous grace period avoids killing work that is nearly done.
+      terminationGracePeriodSeconds: 120
+      volumes:
+        # Chunk 2 removes this: the annotation tree gets materialized per job
+        # from the Postgres catalog. Chunk 4b removes the need for local data
+        # entirely by reading sources from S3.
+        - name: varhub-home
+          persistentVolumeClaim:
+            claimName: varianthub-annotations
+        - name: scratch
+          emptyDir: {sizeLimit: 20Gi}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: varianthub-annotations
+  namespace: varianthub
+spec:
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 100Gi
