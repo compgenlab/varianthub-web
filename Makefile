@@ -16,7 +16,7 @@ TEST_DB_URL  ?= postgres://postgres:test@localhost:$(TEST_DB_PORT)/varianthub?ss
 
 .DEFAULT_GOAL := build
 .PHONY: build test test-unit test-integration vet fmt tidy clean run-api run-worker \
-        migrate dev dev-down dev-logs image test-db test-db-stop help
+        migrate dev dev-down dev-reset dev-logs dev-psql image test-db test-db-stop help
 
 ## build: compile for the host platform into bin/
 build:
@@ -65,18 +65,28 @@ fmt:
 tidy:
 	go mod tidy
 
-## dev: bring up postgres + api + worker via docker compose
+## dev: build and bring up postgres + migrate + seed + api + worker
 dev:
 	$(COMPOSE) up --build -d
-	@echo "api: http://localhost:8080/healthz"
+	@echo
+	@echo "api:      http://localhost:$${API_PORT:-18080}/healthz"
+	@echo "postgres: localhost:$${POSTGRES_PORT:-55441}"
 
-## dev-down: tear down the compose stack (keeps the volume)
+## dev-down: stop the stack (keeps volumes, so data survives)
 dev-down:
 	$(COMPOSE) down
+
+## dev-reset: stop the stack and DELETE its volumes (database + annotation config)
+dev-reset:
+	$(COMPOSE) down -v
 
 ## dev-logs: follow compose logs
 dev-logs:
 	$(COMPOSE) logs -f
+
+## dev-psql: open a psql shell against the dev database
+dev-psql:
+	$(COMPOSE) exec postgres psql -U varianthub -d varianthub
 
 ## migrate: apply pending migrations against VHW_DATABASE_URL
 migrate: build
