@@ -27,7 +27,7 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 | `migrations/` | Numbered SQL, applied by `migrate` |
 | `web/` | React app |
 | `deploy/compose/` | Dev stack (postgres + migrate + seed + api + worker) |
-| `deploy/k8s/` | Production manifests |
+| `deploy/k8s/` | Reference k8s manifests (production lives in a separate deploy repo) |
 | `docs/api.md` | The `/api/v1` contract |
 | `design_handoff_varianthub/` | Design reference (prototype HTML + spec) |
 
@@ -69,11 +69,14 @@ since a dev machine usually already has something on those. Override with
 
 Building outside Docker needs Go 1.25+ and a `varhub` on `PATH` for the worker.
 
-## Production
+## Deploying
 
-Production deploys from [`deploy/k8s`](deploy/k8s), which is kept separate from
-the dev compose stack on purpose — see that directory's README for what differs
-and why.
+`deploy/compose` is the supported path that ships with this repo: it works from a
+clean checkout and is what self-hosters should use.
+
+`deploy/k8s` holds reference manifests. Our own production deployment is managed
+in a separate k8s deploy repo, so those files are examples and seed material, not
+the live configuration — see that directory's README.
 
 ## Configuration
 

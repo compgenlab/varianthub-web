@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,7 +21,11 @@ import (
 //	export VHW_TEST_DATABASE_URL='postgres://postgres:test@localhost:55440/varianthub?sslmode=disable'
 //
 // Each test gets its own schema so they can run in parallel without interference.
-const migration = "../../migrations/0001_job_queue.sql"
+// 0002 (the catalog) is not needed here; 0003 adds job_variant and job.columns.
+var migrationFiles = []string{
+	"../../migrations/0001_job_queue.sql",
+	"../../migrations/0003_job_variant.sql",
+}
 
 func testQueue(t *testing.T) *Queue {
 	t.Helper()
@@ -30,9 +35,14 @@ func testQueue(t *testing.T) *Queue {
 	}
 	ctx := context.Background()
 
-	ddl, err := os.ReadFile(migration)
-	if err != nil {
-		t.Fatalf("read migration: %v", err)
+	var ddl strings.Builder
+	for _, f := range migrationFiles {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		ddl.Write(b)
+		ddl.WriteString("\n")
 	}
 
 	// Isolate this test in its own schema, and get the schema in place *before*
@@ -46,7 +56,7 @@ func testQueue(t *testing.T) *Queue {
 		setup.Close()
 		t.Fatalf("create schema: %v", err)
 	}
-	if _, err := setup.Exec(ctx, `SET search_path TO `+schema+`; `+string(ddl)); err != nil {
+	if _, err := setup.Exec(ctx, `SET search_path TO `+schema+`; `+ddl.String()); err != nil {
 		setup.Close()
 		t.Fatalf("apply migration: %v", err)
 	}
@@ -94,9 +104,16 @@ func TestEnqueueProcessDone(t *testing.T) {
 	defer cancel()
 
 	gotInput := make(chan string, 1)
-	q.StartWorkers(ctx, 2, func(_ context.Context, _ Job, input []byte) ([]byte, int, error) {
+	q.StartWorkers(ctx, 2, func(_ context.Context, _ Job, input []byte) (Outcome, error) {
 		gotInput <- string(input)
-		return []byte(`["` + string(input) + `"]`), 1, nil
+		// A real result shape, so the job_variant projection is exercised too.
+		body := `[{"chrom":"chr1","pos":100,"ref":"A","alt":"G","annotations":{"echo":"` +
+			string(input) + `"}}]`
+		return Outcome{
+			Result:  []byte(body),
+			N:       1,
+			Columns: []byte(`[{"key":"echo","label":"echo"}]`),
+		}, nil
 	})
 
 	id, err := q.Enqueue(ctx, NewJob{
@@ -129,8 +146,24 @@ func TestEnqueueProcessDone(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("Result: ok=%v err=%v", ok, err)
 	}
-	if string(result) != `["chr1:100:A:G"]` {
+	if !strings.Contains(string(result), `"echo":"chr1:100:A:G"`) {
 		t.Errorf("result = %s", result)
+	}
+
+	// The blob is projected into queryable rows in the same transaction, so a job
+	// observed as done always has results that can be paged.
+	page, err := q.Results(ctx, id, ResultQuery{})
+	if err != nil {
+		t.Fatalf("Results: %v", err)
+	}
+	if page.Total != 1 || len(page.Rows) != 1 {
+		t.Fatalf("Results total=%d rows=%d, want 1 and 1", page.Total, len(page.Rows))
+	}
+	if page.Rows[0].Chrom != "chr1" || page.Rows[0].Pos != 100 {
+		t.Errorf("row = %+v", page.Rows[0])
+	}
+	if len(page.Columns) != 1 || page.Columns[0].Key != "echo" {
+		t.Errorf("columns = %+v", page.Columns)
 	}
 }
 
@@ -139,8 +172,8 @@ func TestRunnerErrorMarksJobFailed(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	q.StartWorkers(ctx, 1, func(_ context.Context, _ Job, _ []byte) ([]byte, int, error) {
-		return nil, 0, context.DeadlineExceeded
+	q.StartWorkers(ctx, 1, func(_ context.Context, _ Job, _ []byte) (Outcome, error) {
+		return Outcome{}, context.DeadlineExceeded
 	})
 	id, _ := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("bad")})
 
@@ -180,9 +213,9 @@ func TestWaitForReturnsOnDone(t *testing.T) {
 	defer cancel()
 	q.StartListener(ctx)
 
-	q.StartWorkers(ctx, 1, func(_ context.Context, _ Job, _ []byte) ([]byte, int, error) {
+	q.StartWorkers(ctx, 1, func(_ context.Context, _ Job, _ []byte) (Outcome, error) {
 		time.Sleep(50 * time.Millisecond)
-		return []byte(`[]`), 0, nil
+		return Outcome{Result: []byte(`[]`)}, nil
 	})
 	id, _ := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("x")})
 

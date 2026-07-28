@@ -65,6 +65,7 @@ func (s *Server) Routes() http.Handler {
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	v1.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
+	v1.HandleFunc("GET /api/v1/jobs/{id}/results", s.handleResults)
 	v1.HandleFunc("GET /api/v1/jobs/{id}/export", s.handleExport)
 
 	var v1h http.Handler = v1

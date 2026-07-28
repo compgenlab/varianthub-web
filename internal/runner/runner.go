@@ -19,9 +19,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -43,8 +45,35 @@ type Request struct {
 
 // Result is a completed annotation.
 type Result struct {
-	Variants []byte // the raw JSON array, stored and served verbatim
-	N        int    // number of variants
+	Variants []byte   // the raw JSON array, stored and served verbatim
+	N        int      // number of variants
+	Columns  []Column // the column model for these results, in snapshot order
+}
+
+// Column describes one annotation column of a result set: what to label it, how
+// to render it, and which source produced it. The design's results table tags
+// each column with its source, so a reader can tell which dataset a value came
+// from.
+type Column struct {
+	Key       string `json:"key"`
+	Label     string `json:"label"`
+	Type      string `json:"type,omitempty"`   // categorical|text|numeric|flag
+	Source    string `json:"source,omitempty"` // producing source name
+	SourceRef string `json:"source_ref,omitempty"`
+	Default   bool   `json:"default"`
+}
+
+// annotationListing mirrors `varhub annotation list --format json`.
+type annotationListing struct {
+	Annotations []struct {
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		Description string `json:"description"`
+		Default     bool   `json:"default"`
+		Source      string `json:"source"`
+		SourceRef   string `json:"source_ref"`
+		SourceTitle string `json:"source_title"`
+	} `json:"annotations"`
 }
 
 // Runner annotates one request.
@@ -224,13 +253,100 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	if len(out) == 0 {
 		return Result{}, &ExitError{Err: errors.New("no output"), Stderr: tail}
 	}
-	// Count variants without materializing the whole array into structs — the
-	// result blob is stored verbatim, so only the length is needed here.
-	var probe []json.RawMessage
+	// Decode just enough to count rows and learn which annotation keys the engine
+	// actually emitted. The blob itself is stored verbatim.
+	var probe []struct {
+		Annotations map[string]json.RawMessage `json:"annotations"`
+	}
 	if err := json.Unmarshal(out, &probe); err != nil {
 		return Result{}, &ExitError{Err: fmt.Errorf("parse annotation output: %w", err), Stderr: tail}
 	}
-	return Result{Variants: out, N: len(probe)}, nil
+
+	present := map[string]bool{}
+	for _, v := range probe {
+		for k := range v.Annotations {
+			present[k] = true
+		}
+	}
+	cols, err := r.columns(ctx, bin, home, req.Snapshot, present)
+	if err != nil {
+		// Columns are presentation metadata; a job that annotated successfully
+		// should not fail because labelling them did. Fall back to bare keys.
+		log.Printf("runner: column metadata unavailable (%v); falling back to keys", err)
+		cols = fallbackColumns(present)
+	}
+	return Result{Variants: out, N: len(probe), Columns: cols}, nil
+}
+
+// columns asks the CLI for the snapshot's annotation catalog and keeps the
+// entries the engine actually emitted, in snapshot order.
+//
+// The CLI is the authority on annotation types and which source produces each
+// one — that lives in the source fragments it already parses. Re-deriving it
+// here would be a second implementation of that model, free to drift.
+func (r *ExecRunner) columns(ctx context.Context, bin, home, snapshot string, present map[string]bool) ([]Column, error) {
+	args := []string{"-home", home}
+	if snapshot != "" {
+		args = append(args, "-snapshot", snapshot)
+	}
+	args = append(args, "annotation", "list", "--format", "json", "--", snapshot)
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "VARHUB_HOME="+home)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	if err := cmd.Run(); err != nil {
+		return nil, fmt.Errorf("%w: %s", err, strings.TrimSpace(stderr.String()))
+	}
+
+	var listing annotationListing
+	if err := json.Unmarshal(stdout.Bytes(), &listing); err != nil {
+		return nil, fmt.Errorf("parse annotation listing: %w", err)
+	}
+
+	var cols []Column
+	seen := map[string]bool{}
+	for _, a := range listing.Annotations {
+		if !present[a.Name] || seen[a.Name] {
+			continue
+		}
+		seen[a.Name] = true
+		label := a.Name
+		if a.Description != "" {
+			label = a.Description
+		}
+		source := a.Source
+		if a.SourceTitle != "" {
+			source = a.SourceTitle
+		}
+		cols = append(cols, Column{
+			Key: a.Name, Label: label, Type: a.Type,
+			Source: source, SourceRef: a.SourceRef, Default: a.Default,
+		})
+	}
+	// Anything the engine emitted that the catalog did not describe still needs a
+	// column, or the value would be invisible in the table.
+	for k := range present {
+		if !seen[k] {
+			cols = append(cols, Column{Key: k, Label: k})
+		}
+	}
+	return cols, nil
+}
+
+// fallbackColumns builds bare columns from the emitted keys, sorted for a stable
+// order.
+func fallbackColumns(present map[string]bool) []Column {
+	keys := make([]string, 0, len(present))
+	for k := range present {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	cols := make([]Column, len(keys))
+	for i, k := range keys {
+		cols[i] = Column{Key: k, Label: k}
+	}
+	return cols
 }
 
 // maxArgLen bounds a single argv entry. Real loci and HGVS strings are far

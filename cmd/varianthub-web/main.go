@@ -5,6 +5,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -169,7 +170,7 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // types: the queue knows nothing about how annotation happens, and the runner
 // knows nothing about job persistence.
 func adapt(r runner.Runner) queue.Runner {
-	return func(ctx context.Context, job queue.Job, input []byte) ([]byte, int, error) {
+	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
 			Snapshot:  job.Snapshot,
@@ -183,9 +184,17 @@ func adapt(r runner.Runner) queue.Runner {
 			if errors.As(err, &ee) {
 				log.Printf("worker: job %s: %s", job.ID, ee.Detail())
 			}
-			return nil, 0, err
+			return queue.Outcome{}, err
 		}
-		return res.Variants, res.N, nil
+		var cols []byte
+		if len(res.Columns) > 0 {
+			if b, mErr := json.Marshal(res.Columns); mErr == nil {
+				cols = b
+			} else {
+				log.Printf("worker: job %s: encode columns: %v", job.ID, mErr)
+			}
+		}
+		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols}, nil
 	}
 }
 

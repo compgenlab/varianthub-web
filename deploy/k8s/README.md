@@ -1,12 +1,16 @@
-# Kubernetes deploy (production)
+# Kubernetes deploy (reference)
 
-Production runs from these manifests. Development runs from
-[`../compose`](../compose). The two are deliberately **not** shared: dev
-optimizes for a one-command clean start with throwaway data, production for
-rolling upgrades, managed Postgres, and real secrets. Trying to express both in
-one definition makes each worse.
+**These manifests are a starting point, not the deployed configuration.** The
+production deployment is managed in a separate k8s deploy repo, which owns the
+real secrets, storage classes, ingress, and Postgres. Treat this directory as
+worked examples for anyone self-hosting from the published repo — and as seed
+material for that deploy repo — rather than something to keep in lockstep with
+production.
 
-What differs, concretely:
+The supported published path is [`../compose`](../compose), which ships with the
+code and works out of the box.
+
+What differs between the compose stack and a real k8s deployment:
 
 | | compose (dev) | k8s (production) |
 |---|---|---|

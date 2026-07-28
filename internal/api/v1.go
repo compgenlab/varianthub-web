@@ -458,41 +458,6 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // annotating a whole site catalog wants every row exactly as the engine emitted
 // it, and the stored blob is already that -- so it is copied through verbatim
 // rather than decoded and re-encoded.
-func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.job(w, r)
-	if !ok {
-		return
-	}
-	if format := strings.TrimSpace(r.URL.Query().Get("format")); format != "" && format != "json" {
-		// tsv/csv need the column model that comes with the results work.
-		writeError(w, http.StatusNotImplemented, "only format=json is supported today")
-		return
-	}
-	switch job.Status {
-	case queue.StatusQueued, queue.StatusRunning:
-		writeError(w, http.StatusConflict, "job is not finished")
-		return
-	case queue.StatusError:
-		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
-			"error": "job failed", "detail": job.Error, "job_id": job.ID,
-		})
-		return
-	}
-	body, ok, err := s.queue.Result(r.Context(), job.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if !ok || len(body) == 0 {
-		writeError(w, http.StatusNotFound, "no result stored for this job")
-		return
-	}
-	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(body)
-}
-
 // writeJobWithResult returns the job object with its results embedded, which is
 // what ?wait= promises on completion within the window.
 func (s *Server) writeJobWithResult(w http.ResponseWriter, r *http.Request, job queue.Job) {

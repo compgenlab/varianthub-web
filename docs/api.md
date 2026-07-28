@@ -3,12 +3,11 @@
 The contract the React app is built against. Derived from the design handoff's
 "Data the frontend needs from the backend" (`design_handoff_varianthub/README.md`).
 
-**Implementation status.** The catalog, annotation, and job endpoints are
-**implemented**. Still outstanding: `GET /jobs/{id}/results` (blocked on the
-results-storage open question at the end of this document), `tsv`/`csv` export, the
-admin surface, and the genome-browser tracks endpoint. Each section is marked, and
-where the implementation deviates from the shape sketched here it says so inline
-rather than leaving the doc aspirational.
+**Implementation status.** The catalog, annotation, job, results and export
+endpoints are **implemented**. Still outstanding: the admin surface, the
+genome-browser tracks endpoint, job stage/percent, and HGVS/rsID input. Each
+section is marked, and where the implementation deviates from the shape sketched
+here it says so inline rather than leaving the doc aspirational.
 
 This document is the agreed shape front-end work is built against; treat a change
 here as a change to a shared contract.
@@ -206,7 +205,7 @@ Same responses as `/annotate`.
 
 ---
 
-## Jobs — **implemented** (except `/results`)
+## Jobs — **implemented**
 
 ### `GET /api/v1/jobs`
 
@@ -252,53 +251,62 @@ knowing a job id was sufficient to read it.
 
 ### `GET /api/v1/jobs/{id}/results`
 
-Paginated, sorted, filtered rows plus the column definitions to render them.
-Query: `page`, `per_page`, `sort`, `order`, `q`, and per-column filters.
+One page of annotated variants plus the column definitions needed to render them.
+
+Query: `page` + `per_page` (default 100, max 1000), or `limit` + `offset` — if
+`limit` is present it wins. `sort` and `order=asc|desc`. `q` for a
+case-insensitive substring search across annotation values and the locus text.
 
 ```json
 {
   "columns": [
-    {"key": "gene",        "label": "Gene",       "source": "VEP",     "type": "text"},
-    {"key": "clinvar_sig", "label": "ClinVar",    "source": "ClinVar", "type": "significance"},
-    {"key": "gnomad_af",   "label": "gnomAD AF",  "source": "gnomAD",  "type": "number", "align": "right"}
+    {"key": "tstv", "label": "tstv", "type": "categorical",
+     "source": "builtins", "source_ref": "builtins:1", "default": true}
   ],
   "rows": [
-    {
-      "chrom": "chr17", "pos": 7676154, "ref": "C", "alt": "T",
-      "annotations": {"gene": "TP53", "clinvar_sig": "Pathogenic", "gnomad_af": null}
-    }
+    {"chrom": "chr1", "pos": 115256529, "ref": "T", "alt": "C",
+     "annotations": {"auto_id": "chr1_115256529_T_C", "tstv": "TS", "indel": null}}
   ],
-  "page": 1, "per_page": 100, "total": 4812
+  "total": 3, "limit": 100, "offset": 0
 }
 ```
 
-Columns are dynamic — they depend on the sources the job selected — and each
-carries the `source` that produced it, which the results table renders as a tag.
-An annotation with no value is `null`, never omitted.
+Columns are dynamic — they depend on the job's selection — and each carries the
+`source` that produced it, which the results table renders as a tag. An
+annotation with no value is `null`, never omitted.
+
+**Columns are recorded per job, not read from the catalog at render time.** A
+snapshot can be re-pinned after a job runs; a job's results must stay renderable
+as they were computed, or a column would change meaning under a result that never
+contained it.
+
+`sort` accepts `idx` (the engine's output order, the default), `locus`
+(chrom then pos), or any annotation key present in the results. An unknown key is
+`400` rather than silently ignored. Annotation sorts are numeric when the value
+parses as a number and textual otherwise, and empty values sort last in both
+directions — an absent value is not "smallest".
+
+`total` reflects the active search, not the whole result set, so the pager stays
+honest under a filter.
 
 Status codes: `409` while queued or running, `422` if the job failed.
 
-> **Not implemented.** Paginated, sorted, filtered rows need the results-storage
-> question below settled first — a result is stored as one opaque JSON blob, which
-> cannot serve a sorted page. That blocks this endpoint but not `export`, and bulk
-> consumers want the whole set anyway, so `export` ships first.
-
 ### `GET /api/v1/jobs/{id}/export?format=json|tsv|csv`
 
-Streams the **entire** result set (not the current page), honoring active
-filters. `?selected=<ids>` limits it to checkbox-selected rows.
+Streams the **entire** matching set — not the current page — honoring the active
+`q` and `sort`. Sends `Content-Disposition: attachment` with a filename derived
+from the job id.
 
-**As implemented**, only `format=json` is supported (`501` otherwise) and filter /
-`?selected=` narrowing is not yet applied — the stored blob is copied through
-verbatim, which is what a bulk consumer wants. `tsv`/`csv` need the column model
-that comes with `/results`.
+Rows are streamed, never buffered, so a large export does not have to fit in
+memory. The consequence is that response headers are committed before the first
+row: a database error mid-stream cannot be turned into a clean error response, so
+it truncates the body and is logged server-side.
 
-Ownership is enforced here as on `/jobs/{id}`: an untrusted caller must present the
-session that submitted the job, and a mismatch is `404` rather than `403`, since
-confirming a job exists is itself a small leak. A token-bearing service account may
-read any job and is exempt from the submit throttle — the per-IP limit exists to
-stop an anonymous browser flooding the queue, and applying it to a bulk ingest
-would make that ingest throttle itself.
+Delimited output puts `chrom,pos,ref,alt` first, then one column per entry in the
+column model, in that order. Numbers are formatted plainly — a large integer
+prints as `1200000`, not `1.2e+06`.
+
+Selecting a subset of rows (`?selected=`) is not implemented.
 
 ---
 
@@ -350,10 +358,11 @@ expiry has to outlast a browsing session or tracks break mid-use.
 
 Carried from the handoff and from implementation review:
 
-1. **Results storage.** Pagination, sorting, and filtering cannot be served from
-   one opaque JSON blob, which is how results are stored today. A `job_variant`
-   table or a queryable JSONB column has to be chosen *before* the results
-   handler is written.
+1. ~~**Results storage.**~~ Settled: a `job_variant` table with a JSONB
+   `annotations` column, written in the same transaction as the result blob. The
+   blob is kept as the verbatim record of what the CLI produced; the rows are a
+   derived projection for querying. Revisit if a single job ever holds enough
+   variants that a per-key index matters.
 2. **HGVS resolution** needs an authoritative transcript set when input is
    ambiguous.
 3. **Failed-job detail** — what the error view shows (stage, stderr, per-variant

@@ -95,9 +95,21 @@ const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.er
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, j.label, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
-// Runner annotates one job's input, returning the result JSON and the number of
-// variants. An error marks the job failed (its message is stored on the job).
-type Runner func(ctx context.Context, job Job, input []byte) (result []byte, nVariants int, err error)
+// Outcome is what a Runner produces for a completed job.
+type Outcome struct {
+	// Result is the annotation JSON, stored verbatim. It is what the CLI emitted,
+	// and what the inline ?wait= path returns without touching job_variant.
+	Result []byte
+	// N is the number of variants.
+	N int
+	// Columns is the JSON column model for these results (may be nil). Stored on
+	// the job so its results stay renderable even if the snapshot is re-pinned.
+	Columns []byte
+}
+
+// Runner annotates one job's input. An error marks the job failed (its message
+// is stored on the job).
+type Runner func(ctx context.Context, job Job, input []byte) (Outcome, error)
 
 // Queue is the job queue and its worker pool.
 type Queue struct {
@@ -451,22 +463,22 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 func (q *Queue) process(ctx context.Context, job Job, input []byte, runner Runner) {
 	start := time.Now()
 	log.Printf("queue: job %s running (kind=%s, ip=%s)", job.ID, job.Kind, job.ClientIP)
-	result, nVar, err := runner(ctx, job, input)
+	out, err := runner(ctx, job, input)
 	if err != nil {
 		log.Printf("queue: job %s failed after %s: %v",
 			job.ID, time.Since(start).Round(time.Millisecond), err)
-		q.finish(ctx, job.ID, StatusError, err.Error(), 0, nil)
+		q.finish(ctx, job.ID, StatusError, err.Error(), Outcome{})
 		return
 	}
-	q.finish(ctx, job.ID, StatusDone, "", nVar, result)
+	q.finish(ctx, job.ID, StatusDone, "", out)
 	log.Printf("queue: job %s done (%d variant(s) in %s)",
-		job.ID, nVar, time.Since(start).Round(time.Millisecond))
+		job.ID, out.N, time.Since(start).Round(time.Millisecond))
 }
 
 // finish records a job's terminal state and its result (if any), then notifies
 // anyone blocked in WaitFor. Status, result and notification commit together, so
 // a waiter woken by the NOTIFY always finds the row already terminal.
-func (q *Queue) finish(ctx context.Context, id, status, errMsg string, nVar int, result []byte) {
+func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outcome) {
 	// Use a background context for the write: the job itself may have been
 	// cancelled, but its outcome still has to be persisted.
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -479,12 +491,18 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, nVar int,
 	}
 	defer tx.Rollback(wctx) //nolint:errcheck // no-op after Commit
 
-	if result != nil {
+	if out.Result != nil {
 		if _, err := tx.Exec(wctx,
 			`INSERT INTO job_result (job_id,json) VALUES ($1,$2)
 			 ON CONFLICT (job_id) DO UPDATE SET json = excluded.json`,
-			id, string(result)); err != nil {
+			id, string(out.Result)); err != nil {
 			log.Printf("queue: store job %s result: %v", id, err)
+			return
+		}
+		// Rows for querying. Same transaction as the blob and the status change, so
+		// a job is never observably "done" with results that are not yet queryable.
+		if err := insertVariants(wctx, tx, id, out.Result); err != nil {
+			log.Printf("queue: store job %s variants: %v", id, err)
 			return
 		}
 	}
@@ -492,9 +510,13 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, nVar int,
 	if errMsg != "" {
 		errArg = errMsg
 	}
+	var colArg any
+	if len(out.Columns) > 0 {
+		colArg = string(out.Columns)
+	}
 	if _, err := tx.Exec(wctx,
-		`UPDATE job SET status=$1, error=$2, n_variants=$3, finished_at=$4 WHERE id=$5`,
-		status, errArg, nVar, q.nowFn(), id); err != nil {
+		`UPDATE job SET status=$1, error=$2, n_variants=$3, finished_at=$4, columns=$5 WHERE id=$6`,
+		status, errArg, out.N, q.nowFn(), colArg, id); err != nil {
 		log.Printf("queue: finish job %s: %v", id, err)
 		return
 	}
