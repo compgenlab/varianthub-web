@@ -83,10 +83,21 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	// The API listens so ?wait= can be woken by a worker in another replica.
 	q.StartListener(ctx)
 
+	// The catalog backs the snapshot/source endpoints. It shares the database, so
+	// a failure here is not survivable in practice -- but the server is still
+	// useful for submitting and polling, so report it rather than refusing to
+	// start, and let those endpoints answer 503.
+	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		log.Printf("serve: catalog unavailable, /api/v1/snapshots and /sources will 503: %v", err)
+	} else {
+		defer cat.Close()
+	}
+
 	if !cfg.RequireToken {
 		log.Printf("serve: /api/v1 is OPEN (VHW_REQUIRE_TOKEN=false)")
 	}
-	return api.New(cfg, q).Run(ctx)
+	return api.New(cfg, q, cat).Run(ctx)
 }
 
 // worker runs the job pool. It serves no HTTP.

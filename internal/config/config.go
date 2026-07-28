@@ -22,14 +22,15 @@ type Config struct {
 
 	RequireToken bool // bearer auth on /api/v1
 
-	Workers       int           // worker pool size
-	VarhubBin     string        // path to the varhub CLI
-	VarhubHome    string        // fixed VARHUB_HOME; empty = materialize per job from the catalog
-	DataDir       string        // shared, persistent: downloaded source files
-	CacheDir      string        // shared, persistent: built indexes and the annotation cache
-	JobTimeout    time.Duration // per-job wall clock
-	JobTTL        time.Duration // terminal jobs GC'd after this
-	SubmitWaitCap time.Duration // ceiling on ?wait=
+	Workers        int           // worker pool size
+	VarhubBin      string        // path to the varhub CLI
+	VarhubHome     string        // fixed VARHUB_HOME; empty = materialize per job from the catalog
+	DataDir        string        // shared, persistent: downloaded source files
+	CacheDir       string        // shared, persistent: built indexes and the annotation cache
+	JobTimeout     time.Duration // per-job wall clock
+	JobTTL         time.Duration // terminal jobs GC'd after this
+	SubmitWaitCap  time.Duration // ceiling on ?wait=
+	MaxUploadBytes int64         // cap on a POST /annotate/vcf body
 
 	RatePerMin   int      // per-IP submit rate
 	RateBurst    int      // per-IP burst
@@ -42,21 +43,22 @@ type Config struct {
 // Load reads the configuration from the environment, applying defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:          env("VHW_ADDR", ":8080"),
-		DatabaseURL:   os.Getenv("VHW_DATABASE_URL"),
-		MasterKey:     os.Getenv("VHW_MASTER_KEY"),
-		RequireToken:  envBool("VHW_REQUIRE_TOKEN", true),
-		Workers:       envInt("VHW_WORKERS", 2),
-		VarhubBin:     env("VHW_VARHUB_BIN", "varhub"),
-		VarhubHome:    os.Getenv("VHW_VARHUB_HOME"),
-		DataDir:       env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
-		CacheDir:      env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
-		JobTimeout:    envDur("VHW_JOB_TIMEOUT", time.Hour),
-		JobTTL:        envDur("VHW_JOB_TTL", 24*time.Hour),
-		SubmitWaitCap: envDur("VHW_SUBMIT_WAIT_CAP", 10*time.Second),
-		RatePerMin:    envInt("VHW_RATE_PER_MIN", 30),
-		RateBurst:     envInt("VHW_RATE_BURST", 10),
-		MaxJobsPerIP:  envInt("VHW_MAX_JOBS_PER_IP", 2),
+		Addr:           env("VHW_ADDR", ":8080"),
+		DatabaseURL:    os.Getenv("VHW_DATABASE_URL"),
+		MasterKey:      os.Getenv("VHW_MASTER_KEY"),
+		RequireToken:   envBool("VHW_REQUIRE_TOKEN", true),
+		Workers:        envInt("VHW_WORKERS", 2),
+		VarhubBin:      env("VHW_VARHUB_BIN", "varhub"),
+		VarhubHome:     os.Getenv("VHW_VARHUB_HOME"),
+		DataDir:        env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
+		CacheDir:       env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),
+		JobTTL:         envDur("VHW_JOB_TTL", 24*time.Hour),
+		SubmitWaitCap:  envDur("VHW_SUBMIT_WAIT_CAP", 10*time.Second),
+		MaxUploadBytes: int64(envInt("VHW_MAX_UPLOAD_BYTES", 64<<20)),
+		RatePerMin:     envInt("VHW_RATE_PER_MIN", 30),
+		RateBurst:      envInt("VHW_RATE_BURST", 10),
+		MaxJobsPerIP:   envInt("VHW_MAX_JOBS_PER_IP", 2),
 		TrustedProxy: envList("VHW_TRUSTED_PROXIES",
 			[]string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}),
 		CORSOrigins: envList("VHW_CORS_ORIGINS", nil),

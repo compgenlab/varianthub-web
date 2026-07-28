@@ -1,8 +1,7 @@
 // Package api is the HTTP surface.
 //
-// Chunk 1 ships the router, middleware, and ops endpoints. The /api/v1 handlers
-// described in docs/api.md land in Chunk 5, once the Postgres catalog (Chunk 2)
-// gives them multiple snapshots to serve — today's engine is pinned to one.
+// Ops endpoints (/healthz, /version) are open; everything under /api/v1 is
+// bearer-gated when VHW_REQUIRE_TOKEN is set. The v1 handlers live in v1.go.
 package api
 
 import (
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/auth"
+	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -23,15 +23,19 @@ import (
 type Server struct {
 	cfg     *config.Config
 	queue   *queue.Queue
+	catalog *catalog.Store // nil disables the catalog endpoints
 	trusted []*net.IPNet
 	limiter *limit.Limiter
 }
 
-// New builds the server.
-func New(cfg *config.Config, q *queue.Queue) *Server {
+// New builds the server. cat may be nil, in which case the catalog endpoints
+// report 503 rather than the process refusing to start -- annotation submission
+// and job polling do not need the catalog.
+func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store) *Server {
 	return &Server{
 		cfg:     cfg,
 		queue:   q,
+		catalog: cat,
 		trusted: limit.ParseCIDRs(cfg.TrustedProxy),
 		limiter: limit.New(cfg.RatePerMin, cfg.RateBurst),
 	}
@@ -45,10 +49,23 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /version", s.handleVersion)
 
-	// The /api/v1 surface. Handlers arrive in Chunk 5; the auth, throttle, and
-	// routing scaffolding around them is in place now so the shape is settled.
 	v1 := http.NewServeMux()
 	v1.HandleFunc("GET /api/v1/ping", s.handlePing)
+
+	// Catalog: what can be annotated, and what a snapshot pins.
+	v1.HandleFunc("GET /api/v1/snapshots", s.handleSnapshots)
+	v1.HandleFunc("GET /api/v1/snapshots/{id}", s.handleSnapshot)
+	v1.HandleFunc("GET /api/v1/sources", s.handleSources)
+
+	// Submission. Throttled per client IP, which the handler skips for a
+	// token-bearing service account -- see trustedCaller.
+	v1.Handle("POST /api/v1/annotate", s.throttle(http.HandlerFunc(s.handleAnnotate)))
+	v1.Handle("POST /api/v1/annotate/vcf", s.throttle(http.HandlerFunc(s.handleAnnotateVCF)))
+
+	// Jobs. Reads are ownership-enforced, not throttled.
+	v1.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
+	v1.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
+	v1.HandleFunc("GET /api/v1/jobs/{id}/export", s.handleExport)
 
 	var v1h http.Handler = v1
 	if s.cfg.RequireToken {
@@ -103,8 +120,16 @@ func (s *Server) limiterGC(ctx context.Context) {
 }
 
 // throttle rate-limits by resolved client IP. Wraps submit routes only.
+//
+// A token-bearing service account is exempt: the limit exists to stop an
+// anonymous browser flooding the queue, and applying it to a bulk ingest would
+// make that ingest throttle itself.
 func (s *Server) throttle(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.trustedCaller(r) {
+			h.ServeHTTP(w, r)
+			return
+		}
 		if !s.limiter.Allow(limit.ClientIP(r, s.trusted)) {
 			writeError(w, http.StatusTooManyRequests, "rate limit exceeded — slow down")
 			return

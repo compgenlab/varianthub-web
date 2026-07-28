@@ -3,12 +3,15 @@
 The contract the React app is built against. Derived from the design handoff's
 "Data the frontend needs from the backend" (`design_handoff_varianthub/README.md`).
 
-**Implementation status.** Chunk 1 ships the router, auth, throttling, and the ops
-endpoints. Everything under `/api/v1` below is *specified but not yet implemented*
-— it lands in Chunk 5, once the Postgres catalog (Chunk 2) provides multiple
-snapshots to serve. Each endpoint is marked accordingly. This document is the
-agreed shape so front-end work can proceed in parallel; treat a change here as a
-change to a shared contract.
+**Implementation status.** The catalog, annotation, and job endpoints are
+**implemented**. Still outstanding: `GET /jobs/{id}/results` (blocked on the
+results-storage open question at the end of this document), `tsv`/`csv` export, the
+admin surface, and the genome-browser tracks endpoint. Each section is marked, and
+where the implementation deviates from the shape sketched here it says so inline
+rather than leaving the doc aspirational.
+
+This document is the agreed shape front-end work is built against; treat a change
+here as a change to a shared contract.
 
 ---
 
@@ -23,6 +26,12 @@ change to a shared contract.
 - Errors are `{"error": "<human-readable message>"}` with a meaningful status.
   Error text is safe to display; it never contains internal paths or stack traces.
 - Genomic coordinates are 1-based, matching VCF.
+- A variant may be written **either** dash-delimited (`chr17-7676154-C-T`) or
+  colon-delimited (`chr17:7676154:C:T`). The engine parses the colon form, and the
+  API rewrites the dash form to it. Translation is narrow by design: a token is
+  only rewritten when it has no colon, exactly four non-empty dash-separated
+  fields, and a numeric position — so colon-bearing HGVS and rsIDs pass through
+  untouched.
 
 ### Authentication
 
@@ -78,7 +87,7 @@ brief Postgres outage should drain pods, not restart them.
 
 ---
 
-## Catalog — *Chunk 5*
+## Catalog — **implemented**
 
 ### `GET /api/v1/snapshots`
 
@@ -106,6 +115,15 @@ Curated, versioned bundles. Feeds Step 1's snapshot cards.
 what the caller may see — a snapshot whose private sources they lack grants for
 must not appear.
 
+### `GET /api/v1/snapshots/{id}`
+
+One snapshot with its **pinned source versions** (`snapshot.sources[]`, each
+carrying `name`, `version` and `ref`), plus `contains_private`.
+
+This is the reproducibility hook: a consumer that records "annotated under
+snapshot X" needs to know which ClinVar and gnomAD releases that meant, so a count
+can be reproduced later or diffed against a refresh.
+
 ### `GET /api/v1/sources`
 
 Individual sources, for Step 1's table and the admin Sources tab.
@@ -132,9 +150,15 @@ Individual sources, for Step 1's table and the admin Sources tab.
 `index_status` ∈ `indexed | building | error` — `building` is the state after
 registration while an index is generated.
 
+**As implemented**, rows are flat — one per `(name, version)`, each with a `ref`
+of `"name:version"` — rather than grouped with a `versions[]` array. A consumer
+pinning annotations must address an exact version, and grouping loses which
+version a given snapshot pinned; the grouped view is a presentation concern the
+SPA can derive.
+
 ---
 
-## Annotation — *Chunk 5*
+## Annotation — **implemented**
 
 ### `POST /api/v1/annotate`
 
@@ -159,6 +183,15 @@ Submit variants. Rate limited per client IP.
 
 `202` → `{"job_id": "…"}`.
 
+Capped at **10,000 variants** per request. Loci reach the engine as argv, so a
+larger batch would not fail cleanly — it trips the kernel's `ARG_MAX` and the exec
+fails for a reason unrelated to the variants. Over the cap returns `413` pointing
+at the VCF endpoint, which streams through a file and has no such ceiling.
+
+An ad-hoc `sources` list is **not** implemented: the engine selects sources
+through a snapshot. Supplying `sources` returns `400` rather than silently
+annotating under something else.
+
 `?wait=<seconds|duration>` blocks up to a server-capped interval
 (`VHW_SUBMIT_WAIT_CAP`, default 10s) so fast jobs return inline. On completion
 within the window the response is a `200` job object with `results` embedded.
@@ -173,7 +206,7 @@ Same responses as `/annotate`.
 
 ---
 
-## Jobs — *Chunk 5*
+## Jobs — **implemented** (except `/results`)
 
 ### `GET /api/v1/jobs`
 
@@ -245,10 +278,27 @@ An annotation with no value is `null`, never omitted.
 
 Status codes: `409` while queued or running, `422` if the job failed.
 
+> **Not implemented.** Paginated, sorted, filtered rows need the results-storage
+> question below settled first — a result is stored as one opaque JSON blob, which
+> cannot serve a sorted page. That blocks this endpoint but not `export`, and bulk
+> consumers want the whole set anyway, so `export` ships first.
+
 ### `GET /api/v1/jobs/{id}/export?format=json|tsv|csv`
 
 Streams the **entire** result set (not the current page), honoring active
 filters. `?selected=<ids>` limits it to checkbox-selected rows.
+
+**As implemented**, only `format=json` is supported (`501` otherwise) and filter /
+`?selected=` narrowing is not yet applied — the stored blob is copied through
+verbatim, which is what a bulk consumer wants. `tsv`/`csv` need the column model
+that comes with `/results`.
+
+Ownership is enforced here as on `/jobs/{id}`: an untrusted caller must present the
+session that submitted the job, and a mismatch is `404` rather than `403`, since
+confirming a job exists is itself a small leak. A token-bearing service account may
+read any job and is exempt from the submit throttle — the per-IP limit exists to
+stop an anonymous browser flooding the queue, and applying it to a bulk ingest
+would make that ingest throttle itself.
 
 ---
 
