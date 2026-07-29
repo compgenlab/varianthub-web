@@ -24,6 +24,7 @@ type Server struct {
 	cfg     *config.Config
 	queue   *queue.Queue
 	catalog *catalog.Store // nil disables the catalog endpoints
+	spa     *SPA           // nil serves no web UI (API-only)
 	trusted []*net.IPNet
 	limiter *limit.Limiter
 }
@@ -31,11 +32,12 @@ type Server struct {
 // New builds the server. cat may be nil, in which case the catalog endpoints
 // report 503 rather than the process refusing to start -- annotation submission
 // and job polling do not need the catalog.
-func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store) *Server {
+func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, spa *SPA) *Server {
 	return &Server{
 		cfg:     cfg,
 		queue:   q,
 		catalog: cat,
+		spa:     spa,
 		trusted: limit.ParseCIDRs(cfg.TrustedProxy),
 		limiter: limit.New(cfg.RatePerMin, cfg.RateBurst),
 	}
@@ -73,6 +75,13 @@ func (s *Server) Routes() http.Handler {
 		v1h = auth.RequireToken(s.cfg.MasterKey, v1h)
 	}
 	mux.Handle("/api/v1/", v1h)
+
+	// The SPA is mounted last and matches "/", so every route above wins. An
+	// unknown /api path therefore 404s as JSON rather than returning the app
+	// shell, which would be a confusing thing to debug from a client.
+	if s.spa != nil {
+		mux.Handle("/", s.spa.Handler())
+	}
 
 	return s.withCORS(logRequests(mux))
 }

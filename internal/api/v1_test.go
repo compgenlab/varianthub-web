@@ -51,7 +51,7 @@ func TestSelectionNormalization(t *testing.T) {
 }
 
 func TestWaitForClamping(t *testing.T) {
-	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil)
+	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil)
 	cases := []struct {
 		raw  string
 		want time.Duration
@@ -98,7 +98,7 @@ func openServer(t *testing.T) http.Handler {
 	return New(&config.Config{
 		MasterKey: "test-key", RequireToken: false, Version: "test",
 		RatePerMin: 1000, RateBurst: 1000, SubmitWaitCap: time.Second,
-	}, nil, nil).Routes()
+	}, nil, nil, nil).Routes()
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
@@ -245,7 +245,7 @@ func TestV1RoutesAreTokenGated(t *testing.T) {
 	h := New(&config.Config{
 		MasterKey: "test-key", RequireToken: true, Version: "test",
 		RatePerMin: 1000, RateBurst: 1000,
-	}, nil, nil).Routes()
+	}, nil, nil, nil).Routes()
 
 	paths := []struct{ method, path string }{
 		{"GET", "/api/v1/snapshots"},
@@ -268,7 +268,7 @@ func TestV1RoutesAreTokenGated(t *testing.T) {
 }
 
 func TestTrustedCallerNeedsValidToken(t *testing.T) {
-	s := New(&config.Config{MasterKey: "k"}, nil, nil)
+	s := New(&config.Config{MasterKey: "k"}, nil, nil, nil)
 
 	r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
 	if s.trustedCaller(r) {
@@ -290,7 +290,7 @@ func TestTrustedCallerNeedsValidToken(t *testing.T) {
 	}
 
 	// With no master key configured nothing can be verified, so nothing is trusted.
-	noKey := New(&config.Config{}, nil, nil)
+	noKey := New(&config.Config{}, nil, nil, nil)
 	if noKey.trustedCaller(r) {
 		t.Fatal("an empty master key must not trust anything")
 	}

@@ -25,7 +25,7 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 | `internal/auth/` | HMAC bearer tokens |
 | `internal/limit/` | Per-IP rate limiting and client-IP resolution |
 | `migrations/` | Numbered SQL, applied by `migrate` |
-| `web/` | React app |
+| `web/` | React app (embedded into the binary at build time) |
 | `deploy/compose/` | Dev stack (postgres + migrate + seed + api + worker) |
 | `deploy/k8s/` | Reference k8s manifests (production lives in a separate deploy repo) |
 | `docs/api.md` | The `/api/v1` contract |
@@ -35,8 +35,12 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 
 ```sh
 make dev                              # build and bring the stack up
-curl localhost:18080/healthz          # {"status":"ok"}
+open http://localhost:18080           # the web app
 ```
+
+The stack builds the React app into the Go binary, so one container serves both
+the UI and the API. On first load the app asks for an API token — mint one with
+the deployment's `VHW_MASTER_KEY`; the dev default is `dev-master-key-change-me`.
 
 That brings up Postgres, applies migrations, seeds a starter snapshot into the
 catalog, and starts the API and a worker. Ordering is enforced by the compose
@@ -54,6 +58,9 @@ postgres (healthy) ─► migrate ─► seed ─┬─► api
 | `make dev-down` | stop, **keep** data |
 | `make dev-reset` | stop, **delete** volumes for a clean start |
 | `make dev-psql` | psql shell on the dev database |
+| `make ui` | build the React app |
+| `make ui-dev` | Vite dev server on :5173, proxying to the API |
+| `make all-build` | UI + binary, for running outside Docker |
 
 The image contains both `varianthub-web` and `varhub`; the CLI is compiled from
 your local checkout, so the stack exercises the CLI you actually have. Point

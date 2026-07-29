@@ -109,9 +109,20 @@ func TestResultsTextSortAndDesc(t *testing.T) {
 	}
 }
 
+// Chromosomes sort naturally, not lexically: chr2 before chr10, chr7 before
+// chr13. Sorted as text those invert, which reads as a bug to anyone looking at
+// genomic coordinates.
 func TestResultsSortByLocus(t *testing.T) {
 	q := testQueue(t)
-	seedResults(t, q, "j1", testBody, testColumns)
+	body := `[
+	 {"chrom":"chr13","pos":10,"ref":"A","alt":"G","annotations":{}},
+	 {"chrom":"chr7","pos":10,"ref":"A","alt":"G","annotations":{}},
+	 {"chrom":"chr2","pos":20,"ref":"A","alt":"G","annotations":{}},
+	 {"chrom":"chr2","pos":10,"ref":"A","alt":"G","annotations":{}},
+	 {"chrom":"chrX","pos":10,"ref":"A","alt":"G","annotations":{}},
+	 {"chrom":"chr10","pos":10,"ref":"A","alt":"G","annotations":{}}
+	]`
+	seedResults(t, q, "j1", body, `[]`)
 
 	page, err := q.Results(context.Background(), "j1", ResultQuery{Sort: "locus"})
 	if err != nil {
@@ -120,7 +131,11 @@ func TestResultsSortByLocus(t *testing.T) {
 	want := []struct {
 		chrom string
 		pos   int64
-	}{{"chr1", 100}, {"chr1", 200}, {"chr2", 50}}
+	}{
+		{"chr2", 10}, {"chr2", 20}, {"chr7", 10},
+		{"chr10", 10}, {"chr13", 10},
+		{"chrX", 10}, // non-numeric contigs come after the numbered ones
+	}
 	for i, w := range want {
 		if page.Rows[i].Chrom != w.chrom || page.Rows[i].Pos != w.pos {
 			t.Errorf("row %d = %s:%d, want %s:%d", i,

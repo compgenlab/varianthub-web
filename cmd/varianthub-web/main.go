@@ -21,6 +21,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
+	webui "github.com/compgenlab/varianthub-web/web/embed"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…".
@@ -98,7 +99,19 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	if !cfg.RequireToken {
 		log.Printf("serve: /api/v1 is OPEN (VHW_REQUIRE_TOKEN=false)")
 	}
-	return api.New(cfg, q, cat).Run(ctx)
+
+	// The web UI is embedded at build time. A binary built without running the
+	// frontend build still serves the API, which is what CI and API-only
+	// deployments want — so this is a log line, not a fatal.
+	var spa *api.SPA
+	if files := webui.FS(); files != nil {
+		spa = api.NewSPA(files)
+		log.Printf("serve: web UI embedded")
+	} else {
+		log.Printf("serve: no web UI embedded (run `npm --prefix web run build`)")
+	}
+
+	return api.New(cfg, q, cat, spa).Run(ctx)
 }
 
 // worker runs the job pool. It serves no HTTP.

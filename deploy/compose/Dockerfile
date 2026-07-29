@@ -16,11 +16,21 @@
 # production, swap this stage for one that fetches a released varhub binary once
 # varianthub-cli publishes one under its new name.
 
+# The React app, built first so its output can be embedded in the Go binary.
+FROM node:22-alpine AS ui-build
+WORKDIR /ui
+COPY web/package.json web/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm npm ci
+COPY web/ ./
+RUN npm run build
+
 FROM golang:1.25-alpine AS web-build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY . .
+# Replace the placeholder embed dir with the real build.
+COPY --from=ui-build /ui/embed/dist ./web/embed/dist
 ARG VERSION=dev
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -ldflags "-s -w -X main.version=${VERSION}" \

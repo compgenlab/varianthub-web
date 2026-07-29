@@ -18,7 +18,7 @@ func testServer(t *testing.T, requireToken bool) *Server {
 		Version:      "test",
 		RatePerMin:   1000,
 		RateBurst:    1000,
-	}, nil, nil)
+	}, nil, nil, nil)
 }
 
 func TestVersionIsOpen(t *testing.T) {
@@ -99,7 +99,7 @@ func TestCORSAllowsConfiguredOrigin(t *testing.T) {
 	s := New(&config.Config{
 		MasterKey: "k", RequireToken: true, Version: "test",
 		CORSOrigins: []string{"https://app.example"},
-	}, nil, nil)
+	}, nil, nil, nil)
 	h := s.Routes()
 
 	r := httptest.NewRequest("GET", "/version", nil)

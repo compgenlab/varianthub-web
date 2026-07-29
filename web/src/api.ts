@@ -1,0 +1,230 @@
+// Typed client for /api/v1. Shapes mirror docs/api.md — treat a change here as a
+// change to a shared contract.
+
+export interface Snapshot {
+  id: string;
+  title?: string;
+  description?: string;
+  build: string;
+  state: string;
+  source_count?: number;
+  contains_private?: boolean;
+  defaults?: string[];
+  tags?: string[];
+  sources?: Source[];
+}
+
+export interface Source {
+  id: string;
+  name: string;
+  version: string;
+  ref?: string;
+  title?: string;
+  detail?: string;
+  kind: string;
+  build?: string;
+  visibility: string;
+  index_status: string;
+  origin?: string;
+}
+
+export interface Job {
+  job_id: string;
+  kind: string;
+  snapshot: string;
+  selection?: string;
+  status: "queued" | "running" | "done" | "error";
+  error?: string;
+  n_variants: number;
+  label?: string;
+  created_at: number;
+  started_at?: number;
+  finished_at?: number;
+  results?: Variant[];
+}
+
+export interface Column {
+  key: string;
+  label: string;
+  type?: string;
+  source?: string;
+  source_ref?: string;
+  default: boolean;
+}
+
+export interface Variant {
+  chrom: string;
+  pos: number;
+  ref: string;
+  alt: string;
+  annotations: Record<string, unknown>;
+}
+
+export interface ResultPage {
+  columns: Column[] | null;
+  rows: Variant[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Thrown for any non-2xx response, carrying the server's message. */
+export class ApiError extends Error {
+  status: number;
+  constructor(status: number, message: string) {
+    super(message);
+    this.status = status;
+  }
+}
+
+// The API base is per-deployment, never hardcoded: same-origin by default, or
+// VITE_API_BASE when the dev server runs separately from the API.
+const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+
+// The token is held in sessionStorage rather than localStorage so it does not
+// outlive the browser session. Auth is a single shared token until per-user
+// tokens land; see docs/api.md.
+const TOKEN_KEY = "vh_token";
+
+export function getToken(): string {
+  return sessionStorage.getItem(TOKEN_KEY) ?? "";
+}
+
+export function setToken(t: string) {
+  if (t) sessionStorage.setItem(TOKEN_KEY, t);
+  else sessionStorage.removeItem(TOKEN_KEY);
+}
+
+function headers(extra: Record<string, string> = {}): Record<string, string> {
+  const h: Record<string, string> = { ...extra };
+  const t = getToken();
+  if (t) h.Authorization = `Bearer ${t}`;
+  return h;
+}
+
+async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${BASE}/api/v1${path}`, {
+    ...init,
+    headers: headers(init.headers as Record<string, string>),
+  });
+  if (!res.ok) {
+    // The server sends {"error": "..."} and promises it is safe to display.
+    let msg = `${res.status} ${res.statusText}`;
+    try {
+      const body = await res.json();
+      if (body?.error) msg = body.error;
+      if (body?.detail) msg += `: ${body.detail}`;
+    } catch {
+      /* non-JSON error body; keep the status line */
+    }
+    throw new ApiError(res.status, msg);
+  }
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
+
+export const api = {
+  snapshots: () => req<{ snapshots: Snapshot[] }>("/snapshots"),
+  snapshot: (id: string) => req<Snapshot>(`/snapshots/${encodeURIComponent(id)}`),
+  sources: () => req<{ sources: Source[] }>("/sources"),
+
+  annotate: (body: {
+    snapshot: string;
+    variants: string[];
+    annotations?: string | string[];
+    wait?: number;
+  }) => {
+    const { wait, ...rest } = body;
+    const qs = wait ? `?wait=${wait}` : "";
+    return req<{ job_id: string } & Partial<Job>>(`/annotate${qs}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(rest),
+    });
+  },
+
+  annotateVCF: (file: File, opts: { snapshot: string; annotations?: string }) => {
+    const fd = new FormData();
+    fd.append("vcf", file);
+    fd.append("snapshot", opts.snapshot);
+    if (opts.annotations) fd.append("annotations", opts.annotations);
+    return req<{ job_id: string } & Partial<Job>>("/annotate/vcf", {
+      method: "POST",
+      body: fd,
+    });
+  },
+
+  jobs: (params: { status?: string; limit?: number; offset?: number } = {}) => {
+    const q = new URLSearchParams();
+    if (params.status) q.set("status", params.status);
+    if (params.limit) q.set("limit", String(params.limit));
+    if (params.offset) q.set("offset", String(params.offset));
+    const qs = q.toString();
+    return req<{ jobs: Job[]; total?: number; scoped?: boolean }>(
+      `/jobs${qs ? `?${qs}` : ""}`,
+    );
+  },
+
+  job: (id: string) => req<Job>(`/jobs/${encodeURIComponent(id)}`),
+
+  results: (
+    id: string,
+    p: { page?: number; per_page?: number; sort?: string; order?: string; q?: string } = {},
+  ) => {
+    const q = new URLSearchParams();
+    if (p.page) q.set("page", String(p.page));
+    if (p.per_page) q.set("per_page", String(p.per_page));
+    if (p.sort) q.set("sort", p.sort);
+    if (p.order) q.set("order", p.order);
+    if (p.q) q.set("q", p.q);
+    const qs = q.toString();
+    return req<ResultPage>(`/jobs/${encodeURIComponent(id)}/results${qs ? `?${qs}` : ""}`);
+  },
+
+  /**
+   * Downloads a job's full export, honoring the active filter and sort.
+   *
+   * Fetched with the Authorization header and saved as a blob rather than
+   * navigating to the URL. A plain navigation cannot carry a header, which would
+   * force the token into the query string — where it lands in browser history and
+   * every intermediary's access log. Buffering the body in the tab is the cost;
+   * at the scale the design targets (thousands of rows) that is a few MB.
+   */
+  downloadExport: async (
+    id: string,
+    format: "json" | "tsv" | "csv",
+    p: { sort?: string; order?: string; q?: string } = {},
+  ) => {
+    const q = new URLSearchParams({ format });
+    if (p.sort) q.set("sort", p.sort);
+    if (p.order) q.set("order", p.order);
+    if (p.q) q.set("q", p.q);
+
+    const res = await fetch(
+      `${BASE}/api/v1/jobs/${encodeURIComponent(id)}/export?${q}`,
+      { headers: headers() },
+    );
+    if (!res.ok) {
+      let msg = `${res.status} ${res.statusText}`;
+      try {
+        const body = await res.json();
+        if (body?.error) msg = body.error;
+      } catch {
+        /* keep the status line */
+      }
+      throw new ApiError(res.status, msg);
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `variants-${id.slice(0, 8)}.${format}`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  },
+
+  health: () => fetch(`${BASE}/healthz`).then((r) => r.json()),
+  version: () => fetch(`${BASE}/version`).then((r) => r.json()),
+};

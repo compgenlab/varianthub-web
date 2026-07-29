@@ -16,11 +16,24 @@ TEST_DB_URL  ?= postgres://postgres:test@localhost:$(TEST_DB_PORT)/varianthub?ss
 
 .DEFAULT_GOAL := build
 .PHONY: build test test-unit test-integration vet fmt tidy clean run-api run-worker \
-        migrate dev dev-down dev-reset dev-logs dev-psql image test-db test-db-stop help
+        migrate dev dev-down dev-reset dev-logs dev-psql image test-db test-db-stop \
+        ui ui-dev all-build help
 
-## build: compile for the host platform into bin/
+## build: compile for the host platform into bin/ (embeds web/ if it is built)
 build:
 	$(GO) build -ldflags '$(LDFLAGS)' -o bin/$(BIN) $(PKG)
+
+## ui: install deps and build the React app into web/embed/dist
+ui:
+	npm --prefix web ci
+	npm --prefix web run build
+
+## ui-dev: run the Vite dev server (proxies /api to a local API on 18080)
+ui-dev:
+	npm --prefix web run dev
+
+## all-build: build the UI then the binary, so the binary serves the web app
+all-build: ui build
 
 ## test: run every test (integration tests skip unless their env vars are set)
 test:

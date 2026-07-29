@@ -138,7 +138,15 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 	case "", "idx":
 		order = "ORDER BY idx " + dir
 	case "locus":
-		order = "ORDER BY chrom " + dir + ", pos " + dir + ", idx ASC"
+		// Natural chromosome order, not lexical. Sorted as text, chr10 lands
+		// between chr1 and chr2 and chr7 lands after chr13 — which a reader of
+		// genomic data reads as a bug. Numeric contigs sort numerically first,
+		// then the rest (X, Y, M, scaffolds) textually after them.
+		const chromKey = `regexp_replace(chrom, '^chr', '', 'i')`
+		order = fmt.Sprintf(`ORDER BY
+			(CASE WHEN %s ~ '^[0-9]+$' THEN %s::int ELSE 1000000 END) %s,
+			%s %s, pos %s, idx ASC`,
+			chromKey, chromKey, dir, chromKey, dir, dir)
 	default:
 		if !contains(qy.Keys, qy.Sort) {
 			return "", "", nil, nil, fmt.Errorf("unknown sort key %q", qy.Sort)
