@@ -15,7 +15,8 @@ export function humanSize(n: number): string {
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
 }
 
-export default function Files({ sources }: { sources: Source[] }) {
+export default function Files() {
+  const [sources, setSources] = useState<Source[]>([]);
   const [storage, setStorage] = useState<StorageLocation[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
   const [total, setTotal] = useState(0);
@@ -28,8 +29,9 @@ export default function Files({ sources }: { sources: Source[] }) {
 
   async function load() {
     try {
-      const [s, f] = await Promise.all([api.storage(), api.files()]);
+      const [s, f, src] = await Promise.all([api.storage(), api.files(), api.sources()]);
       setStorage(s.storage ?? []);
+      setSources(src.sources ?? []);
       setFiles(f.files ?? []);
       setTotal(f.total_bytes ?? 0);
       const usable = (s.storage ?? []).find((l) => l.usable);
@@ -75,8 +77,9 @@ export default function Files({ sources }: { sources: Source[] }) {
   const chosen = Object.entries(picked).filter(([, v]) => v).map(([k]) => k);
 
   return (
-    <>
-      <div className="between" style={{ marginBottom: 14 }}>
+    <div className="page page-wide" style={{ paddingTop: 30 }}>
+      <h1 className="title">Storage &amp; files</h1>
+      <div className="between" style={{ margin: "6px 0 18px" }}>
         <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
           Source data has to be downloaded before it can annotate. Provisioning is
           per source; the same source can be downloaded into more than one location.
@@ -261,7 +264,7 @@ export default function Files({ sources }: { sources: Source[] }) {
         Files are not individually deletable: each belongs to a source, and removing
         it would break that source. Delete the source instead.
       </p>
-    </>
+    </div>
   );
 }
 

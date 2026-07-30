@@ -1,8 +1,16 @@
 import { useEffect, useState } from "react";
 import { Check, Plus, X } from "lucide-react";
 
-import { api, type Registry, type RegistryEntry, type Snapshot, type Source } from "../api";
-import Files from "./Files";
+import {
+  api,
+  type Registry,
+  type RegistryEntry,
+  type Snapshot,
+  type Source,
+  type SourceFile,
+  type StorageLocation,
+} from "../api";
+import { humanSize } from "./Files";
 
 const DEFAULT_TOML = `[[sources]]
   type    = "vcf"          # builtin | vcf | bed | gtf | tab | genelist | tool
@@ -32,7 +40,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots" | "files";
+type Tab = "sources" | "snapshots";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -40,13 +48,22 @@ export default function Admin() {
   const [building, setBuilding] = useState(false);
   const [sources, setSources] = useState<Source[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [files, setFiles] = useState<SourceFile[]>([]);
+  const [storage, setStorage] = useState<StorageLocation[]>([]);
   const [err, setErr] = useState("");
 
   async function load() {
     try {
-      const [s, n] = await Promise.all([api.sources(), api.snapshots(true)]);
+      const [s, n, f, st] = await Promise.all([
+        api.sources(),
+        api.snapshots(true),
+        api.files(),
+        api.storage(),
+      ]);
       setSources(s.sources ?? []);
       setSnapshots(n.snapshots ?? []);
+      setFiles(f.files ?? []);
+      setStorage(st.storage ?? []);
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -95,7 +112,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots", "files"] as Tab[]).map((t) => (
+        {(["sources", "snapshots"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -110,16 +127,14 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "Files"}
+            {t === "sources" ? "Sources" : "Snapshots"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "files" ? (
-        <Files sources={sources} />
-      ) : tab === "sources" ? (
+      {tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
@@ -130,7 +145,12 @@ export default function Admin() {
               <Plus size={15} /> Add source
             </button>
           </div>
-          <SourceTable sources={sources} />
+          <SourceTable
+            sources={sources}
+            files={files}
+            storage={storage}
+            onChange={load}
+          />
         </>
       ) : (
         <>
@@ -154,8 +174,30 @@ export default function Admin() {
   );
 }
 
-function SourceTable({ sources }: { sources: Source[] }) {
-  const cols = "1.6fr .8fr .7fr .8fr 1fr";
+function SourceTable({
+  sources,
+  files,
+  storage,
+  onChange,
+}: {
+  sources: Source[];
+  files: SourceFile[];
+  storage: StorageLocation[];
+  onChange: () => void;
+}) {
+  const cols = "1.5fr .7fr .6fr .7fr 1.6fr";
+
+  // A source is "provisioned" when files are recorded for it. Summarize per
+  // source so the row can show a footprint instead of a bare yes/no.
+  const provisioned = new Map<string, { bytes: number; count: number }>();
+  for (const f of files) {
+    const cur = provisioned.get(f.source_id) ?? { bytes: 0, count: 0 };
+    cur.bytes += f.size_bytes;
+    cur.count += 1;
+    provisioned.set(f.source_id, cur);
+  }
+  const targets = storage.filter((l) => l.usable);
+
   return (
     <div className="card">
       <div className="rowgrid thead" style={{ gridTemplateColumns: cols }}>
@@ -163,7 +205,7 @@ function SourceTable({ sources }: { sources: Source[] }) {
         <span>Version</span>
         <span>Kind</span>
         <span>Access</span>
-        <span>Index</span>
+        <span>Data</span>
       </div>
       {sources.length === 0 && <div className="empty">No sources registered yet.</div>}
       {sources.map((s) => (
@@ -195,23 +237,121 @@ function SourceTable({ sources }: { sources: Source[] }) {
           >
             {s.visibility === "private" ? "Private" : "Public"}
           </span>
-          <span className="row gap-8">
-            <i
-              className={`status-dot ${s.index_status === "building" ? "blink" : ""}`}
-              style={{
-                background:
-                  s.index_status === "indexed"
-                    ? "var(--benign-dot)"
-                    : s.index_status === "building"
-                      ? "var(--vus-dot)"
-                      : "var(--path-dot)",
-              }}
-            />
-            <span style={{ fontSize: 12 }}>{s.index_status}</span>
-          </span>
+          <ProvisionCell
+            source={s}
+            have={provisioned.get(s.id)}
+            targets={targets}
+            onChange={onChange}
+          />
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Shows a source's data footprint, or offers to fetch it.
+ *
+ * A registered source is not usable until its data is downloaded — annotating
+ * without it fails with "sources not downloaded". Putting the action on the row
+ * means the gap and the fix are in the same place, rather than sending someone
+ * to a different screen to work out which sources are missing.
+ */
+function ProvisionCell({
+  source,
+  have,
+  targets,
+  onChange,
+}: {
+  source: Source;
+  have?: { bytes: number; count: number };
+  targets: StorageLocation[];
+  onChange: () => void;
+}) {
+  const [target, setTarget] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [err, setErr] = useState("");
+
+  if (have) {
+    return (
+      <span className="row gap-8">
+        <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
+        <span style={{ fontSize: 12.5 }}>
+          {humanSize(have.bytes)}{" "}
+          <span style={{ color: "var(--text-3)" }}>
+            ({have.count} file{have.count === 1 ? "" : "s"})
+          </span>
+        </span>
+      </span>
+    );
+  }
+
+  if (msg) {
+    return (
+      <span style={{ fontSize: 12, color: "var(--accent-text)" }}>
+        {msg}
+      </span>
+    );
+  }
+
+  if (targets.length === 0) {
+    return (
+      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>
+        no usable storage configured
+      </span>
+    );
+  }
+
+  async function provision() {
+    setBusy(true);
+    setErr("");
+    try {
+      const r = await api.download({
+        sources: [source.id],
+        storage_id: target || targets[0].id,
+      });
+      setMsg(`queued #${r.job_id.slice(0, 8)}`);
+      onChange();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <span>
+      <span className="row gap-8">
+        <select
+          className="select"
+          style={{ height: 30, fontSize: 12, padding: "0 8px", flex: 1, minWidth: 0 }}
+          value={target || targets[0].id}
+          onChange={(e) => setTarget(e.target.value)}
+          disabled={busy}
+          aria-label={`Storage location for ${source.name}`}
+        >
+          {targets.map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name}
+            </option>
+          ))}
+        </select>
+        <button
+          className="btn secondary"
+          style={{ height: 30, padding: "0 11px", fontSize: 12 }}
+          disabled={busy}
+          onClick={provision}
+        >
+          {busy ? "…" : "Download"}
+        </button>
+      </span>
+      {err && (
+        <span className="err" style={{ fontSize: 11.5, display: "block", marginTop: 4 }}>
+          {err}
+        </span>
+      )}
+    </span>
   );
 }
 

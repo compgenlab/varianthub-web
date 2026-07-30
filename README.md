@@ -91,10 +91,15 @@ A registered source declares where its data comes from; it still has to be
 downloaded before it can annotate. Until it is, annotating fails with
 `sources not downloaded — run varhub download`.
 
-Do it from **Sources & snapshots → Files**: tick the sources to fetch, choose a
-storage location, and the download runs as a queued job. Watch it under **System
-jobs**; when it finishes, the files it produced are listed with their sizes,
-grouped by source.
+Two ways to do it:
+
+- **Sources & snapshots → Sources.** An unprovisioned source shows a storage
+  dropdown and a Download button on its own row; a provisioned one shows its
+  footprint instead. The gap and the fix are in the same place.
+- **Storage & files.** Tick several sources at once, choose a location, and
+  review what is already on disk.
+
+Either way it runs as a queued job — watch it under **System jobs**.
 
 Provisioning is per **source**, not per snapshot — a source is the unit of data,
 and a newly registered one has to be downloadable before anyone bundles it.

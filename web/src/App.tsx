@@ -7,7 +7,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { FilePlus2, Table2, KeyRound, ShieldCheck, ServerCog } from "lucide-react";
+import { FilePlus2, Table2, KeyRound, ShieldCheck, ServerCog, HardDrive } from "lucide-react";
 
 import { api, getToken, setToken } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -19,6 +19,7 @@ import JobResults from "./screens/JobResults";
 import TokenGate from "./screens/TokenGate";
 import Admin from "./screens/Admin";
 import SystemJobs from "./screens/SystemJobs";
+import Files from "./screens/Files";
 
 /** Steps are shown only during the annotation flow, per the handoff. */
 function StepHeader() {
@@ -108,6 +109,9 @@ function Shell({ children }: { children: React.ReactNode }) {
           <NavLink to="/admin">
             <ShieldCheck /> Sources &amp; snapshots
           </NavLink>
+          <NavLink to="/admin/storage">
+            <HardDrive /> Storage &amp; files
+          </NavLink>
           <NavLink to="/admin/jobs">
             <ServerCog /> System jobs
           </NavLink>
@@ -164,6 +168,7 @@ export default function App() {
             <Route path="/jobs" element={<JobsList />} />
             <Route path="/jobs/:jobId" element={<JobResults />} />
             <Route path="/admin" element={<Admin />} />
+            <Route path="/admin/storage" element={<Files />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>
