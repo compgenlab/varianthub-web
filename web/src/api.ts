@@ -215,9 +215,18 @@ export const api = {
     });
   },
 
-  jobs: (params: { status?: string; limit?: number; offset?: number } = {}) => {
+  // kind defaults to annotation jobs; the admin job log asks for "download".
+  jobs: (
+    params: {
+      status?: string;
+      kind?: "annotation" | "download" | "all";
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) => {
     const q = new URLSearchParams();
     if (params.status) q.set("status", params.status);
+    if (params.kind) q.set("kind", params.kind);
     if (params.limit) q.set("limit", String(params.limit));
     if (params.offset) q.set("offset", String(params.offset));
     const qs = q.toString();
@@ -367,14 +376,10 @@ export const api = {
       `/admin/files${source ? `?source=${encodeURIComponent(source)}` : ""}`,
     ),
 
-  download: (body: {
-    snapshot?: string;
-    sources?: string[];
-    build?: string;
-    storage_id?: string;
-    force?: boolean;
-  }) =>
-    req<{ job_id: string; snapshot: string; storage: StorageLocation }>("/admin/downloads", {
+  // Provisioning is per source: a source is the unit of data, and a newly
+  // registered one must be downloadable before anyone bundles it in a snapshot.
+  download: (body: { sources: string[]; storage_id?: string; force?: boolean }) =>
+    req<{ job_id: string; sources: string[]; storage: StorageLocation }>("/admin/downloads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),

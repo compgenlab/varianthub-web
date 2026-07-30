@@ -490,6 +490,24 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	offset := clampInt(q.Get("offset"), 0, 0, 1<<30)
 
 	f := queue.JobFilter{Status: strings.TrimSpace(q.Get("status"))}
+
+	// Annotation jobs only, by default. A download is operational work — it has no
+	// variants and no results table — so listing it alongside someone's
+	// annotations is noise in the view they actually came for. ?kind=download (or
+	// =all) is how the admin job log asks for the rest.
+	switch strings.TrimSpace(q.Get("kind")) {
+	case "", "annotation":
+		f.Kinds = []string{queue.KindLocus, queue.KindVCF}
+	case "all":
+		// no kind constraint
+	case "download":
+		f.Kinds = []string{queue.KindDownload}
+	default:
+		writeError(w, http.StatusBadRequest,
+			"invalid kind filter (want annotation, download or all)")
+		return
+	}
+
 	scoped := !s.trustedCaller(r)
 	if scoped {
 		// An untrusted caller sees only their own submissions. With no session at

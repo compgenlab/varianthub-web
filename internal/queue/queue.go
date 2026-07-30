@@ -264,9 +264,10 @@ func scanJob(row rowScanner) (Job, error) {
 
 // JobFilter narrows a List query. Empty fields are not constrained.
 type JobFilter struct {
-	Status   string // queued|running|done|error
-	Session  string // scope to one submitter's session id
-	ClientIP string // scope to one client IP
+	Status   string   // queued|running|done|error
+	Session  string   // scope to one submitter's session id
+	ClientIP string   // scope to one client IP
+	Kinds    []string // restrict to these job kinds
 }
 
 // List returns jobs newest-first matching the filter, with limit/offset paging.
@@ -291,6 +292,10 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 	}
 	if f.ClientIP != "" {
 		add("client_ip=$%d", f.ClientIP)
+	}
+	if len(f.Kinds) > 0 {
+		args = append(args, f.Kinds)
+		where = append(where, fmt.Sprintf("kind = ANY($%d)", len(args)))
 	}
 	query := `SELECT ` + jobCols + ` FROM job`
 	if len(where) > 0 {

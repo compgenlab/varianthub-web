@@ -16,12 +16,13 @@ import (
 // so the catalog can be listed and filtered without re-reading every manifest.
 type fragment struct {
 	Sources []struct {
-		Type    string `toml:"type"`
-		Name    string `toml:"name"`
-		Version string `toml:"version"`
-		Title   string `toml:"title"`
-		Format  string `toml:"format"`
-		Desc    string `toml:"description"`
+		Type     string `toml:"type"`
+		Name     string `toml:"name"`
+		Version  string `toml:"version"`
+		Title    string `toml:"title"`
+		Format   string `toml:"format"`
+		Desc     string `toml:"description"`
+		Assembly string `toml:"assembly"`
 	} `toml:"sources"`
 }
 
@@ -56,7 +57,10 @@ func SourceFromTOML(text string) (Source, error) {
 		Title:   s.Title,
 		Detail:  s.Desc,
 		Kind:    kindOf(s.Type, s.Format),
-		TOML:    text,
+		// The assembly a source declares. A synthesized manifest has to state one
+		// that matches, or varhub rejects the snapshot as inconsistent.
+		Build: s.Assembly,
+		TOML:  text,
 	}, nil
 }
 

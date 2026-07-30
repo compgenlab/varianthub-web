@@ -7,7 +7,7 @@ import { useFlow } from "../flow";
 
 type Mode = "single" | "batch" | "vcf";
 
-const PLACEHOLDER = "chr17-7676154-C-T · chr17:7676154:C:T";
+const PLACEHOLDER = "chr17:7676154:C:T · chr17-7676154-C-T";
 
 export default function EnterVariants() {
   const nav = useNavigate();
@@ -80,8 +80,8 @@ export default function EnterVariants() {
     <div className="page page-narrow">
       <h1 className="title">Enter variants</h1>
       <p className="lede">
-        Accepts VCF-style coordinates, dash- or colon-delimited. HGVS and rsIDs are
-        not resolved yet.
+        Accepts VCF-style coordinates — <span className="mono">chr:pos:ref:alt</span>,
+        as varhub uses, or the dash form. HGVS and rsIDs are not resolved yet.
       </p>
 
       <div className="segmented" style={{ margin: "24px 0 22px" }}>
@@ -157,7 +157,7 @@ export default function EnterVariants() {
             className="textarea"
             value={batch}
             onChange={(e) => setBatch(e.target.value)}
-            placeholder={"chr7-140753336-A-T\nchr17-7676154-C-T\nchr13:32340301:G:A"}
+            placeholder={"chr7:140753336:A:T\nchr17:7676154:C:T\nchr13-32340301-G-A"}
           />
           <p style={{ fontSize: 12.5, color: "var(--text-2)", marginTop: 8 }}>
             <strong style={{ color: "var(--accent-text)" }}>{batchLines.length}</strong>{" "}

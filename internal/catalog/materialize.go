@@ -127,3 +127,69 @@ func tomlStringList(items []string) string {
 	}
 	return "[" + strings.Join(quoted, ", ") + "]"
 }
+
+// HomeForSources materializes a home for an explicit set of sources, without
+// persisting a snapshot.
+//
+// Provisioning is per source: a source is the unit of data, and requiring it to
+// belong to a snapshot first would mean a newly registered source could not be
+// downloaded until someone bundled it. The engine still needs a manifest, so one
+// is synthesized in the temp home — but nothing is written to the catalog, since
+// a download is not a reproducibility claim the way an annotation is.
+func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (string, func(), error) {
+	if m.Store == nil {
+		return "", nil, fmt.Errorf("materializer has no catalog store")
+	}
+	if m.DataDir == "" || m.CacheDir == "" {
+		return "", nil, fmt.Errorf("materializer needs DataDir and CacheDir")
+	}
+	if len(sourceIDs) == 0 {
+		return "", nil, fmt.Errorf("no sources selected")
+	}
+
+	all, err := m.Store.ListSources(ctx)
+	if err != nil {
+		return "", nil, err
+	}
+	byID := map[string]Source{}
+	for _, s := range all {
+		byID[s.ID] = s
+	}
+
+	snap := Snapshot{ID: "provision", Title: "Provisioning", State: StateAdhoc}
+	for _, id := range sourceIDs {
+		src, ok := byID[id]
+		if !ok {
+			return "", nil, fmt.Errorf("unknown source %q: %w", id, ErrNotFound)
+		}
+		// Every source in one manifest must agree on the assembly, or varhub
+		// rejects the snapshot. Sources that declare none inherit whatever the
+		// others state.
+		if src.Build != "" {
+			if snap.Build != "" && snap.Build != src.Build {
+				return "", nil, fmt.Errorf(
+					"cannot provision %s (%s) together with %s sources — "+
+						"download one assembly at a time",
+					src.Ref(), src.Build, snap.Build)
+			}
+			snap.Build = src.Build
+		}
+		snap.Sources = append(snap.Sources, src)
+	}
+	if snap.Build == "" {
+		// No source declared one. varhub needs a value; the assembly is not
+		// consulted while fetching, so any consistent choice works.
+		snap.Build = "GRCh38"
+	}
+
+	dir, err := os.MkdirTemp(m.Root, "varhub-provision-")
+	if err != nil {
+		return "", nil, fmt.Errorf("create provisioning home: %w", err)
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	if err := m.write(dir, snap); err != nil {
+		cleanup()
+		return "", nil, err
+	}
+	return dir, cleanup, nil
+}

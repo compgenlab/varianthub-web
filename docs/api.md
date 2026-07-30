@@ -223,8 +223,11 @@ Same responses as `/annotate`.
 
 ### `GET /api/v1/jobs`
 
-Paginated list, newest first. Query: `status`, `limit` (default 50, max 500),
-`offset`.
+Paginated list, newest first. Query: `status`, `limit` (default 50, max 500), `offset`, and `kind`.
+
+`kind` defaults to `annotation` — a provisioning run has no variants and no
+results table, so listing it beside someone's annotations is noise in the view
+they came for. `kind=download` is the admin job log; `kind=all` is both.
 
 ```json
 {
@@ -349,8 +352,14 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 
 ### Provisioning
 
-`POST /admin/downloads` queues a job that runs `varhub download` for a snapshot's
-sources into a storage location. It rides the same queue as annotation rather
+`POST /admin/downloads` queues a job that runs `varhub download` for a set of
+**sources** into a storage location. Sources, not snapshots: a source is the unit
+of data, and requiring it to belong to a snapshot first would mean a newly
+registered source could not be downloaded until someone bundled it — which is
+backwards, since you bundle sources you already have. The engine still needs a
+manifest, so one is synthesized in the job's temp home; nothing is written to the
+catalog, because a download is not a reproducibility claim the way an annotation
+is. All selected sources must agree on an assembly, since one manifest states one. It rides the same queue as annotation rather
 than running inline — a download can take hours and move gigabytes — so it gets
 the same persistence, scheduling and error reporting, and shows up in
 `GET /jobs` with `kind: "download"`.

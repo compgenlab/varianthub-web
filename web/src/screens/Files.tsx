@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Download, HardDrive, Trash2, TriangleAlert } from "lucide-react";
 
-import { api, type Snapshot, type SourceFile, type StorageLocation } from "../api";
+import { api, type Source, type SourceFile, type StorageLocation } from "../api";
 
 export function humanSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -15,11 +15,11 @@ export function humanSize(n: number): string {
   return `${v.toFixed(v < 10 ? 1 : 0)} ${units[i]}`;
 }
 
-export default function Files({ snapshots }: { snapshots: Snapshot[] }) {
+export default function Files({ sources }: { sources: Source[] }) {
   const [storage, setStorage] = useState<StorageLocation[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
   const [total, setTotal] = useState(0);
-  const [snapshot, setSnapshot] = useState("");
+  const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [storageID, setStorageID] = useState("");
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
@@ -46,20 +46,17 @@ export default function Files({ snapshots }: { snapshots: Snapshot[] }) {
     return () => window.clearInterval(t);
   }, []);
 
-  useEffect(() => {
-    if (!snapshot && snapshots.length) setSnapshot(snapshots[0].id);
-  }, [snapshots, snapshot]);
-
   async function startDownload() {
     setBusy(true);
     setErr("");
     setMsg("");
     try {
-      const r = await api.download({ snapshot, storage_id: storageID });
+      const r = await api.download({ sources: chosen, storage_id: storageID });
       setMsg(
         `Queued as job ${r.job_id.slice(0, 8)} → ${r.storage.name}. ` +
           `Watch it under Results; files appear here when it finishes.`,
       );
+      setPicked({});
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -74,33 +71,67 @@ export default function Files({ snapshots }: { snapshots: Snapshot[] }) {
     list.push(f);
     bySource.set(f.source_id, list);
   }
+  const provisioned = new Set(bySource.keys());
+  const chosen = Object.entries(picked).filter(([, v]) => v).map(([k]) => k);
 
   return (
     <>
       <div className="between" style={{ marginBottom: 14 }}>
         <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
-          Source data has to be downloaded before it can annotate. Files live in a
-          storage location; the same source can be provisioned into more than one.
+          Source data has to be downloaded before it can annotate. Provisioning is
+          per source; the same source can be downloaded into more than one location.
         </p>
       </div>
 
       <div className="card" style={{ padding: 16, marginBottom: 18 }}>
+        <label className="label">Sources to provision</label>
+        <div
+          style={{
+            maxHeight: 220,
+            overflow: "auto",
+            border: "1px solid var(--border-card)",
+            borderRadius: 8,
+            marginBottom: 14,
+          }}
+        >
+          {sources.length === 0 && <div className="empty">No sources registered.</div>}
+          {sources.map((s) => {
+            const on = !!picked[s.id];
+            const have = provisioned.has(s.id);
+            return (
+              <button
+                key={s.id}
+                className="trow row gap-10"
+                aria-pressed={on}
+                style={{ cursor: "pointer", padding: "9px 14px" }}
+                onClick={() => setPicked({ ...picked, [s.id]: !on })}
+              >
+                <span className={`check sm ${on ? "on" : ""}`}>
+                  {on && <span style={{ fontSize: 11, color: "#fff" }}>✓</span>}
+                </span>
+                <span style={{ flex: 1 }}>
+                  <span style={{ fontWeight: 500 }}>{s.title || s.name}</span>{" "}
+                  <span className="mono" style={{ fontSize: 11.5, color: "var(--accent-text)" }}>
+                    {s.version}
+                  </span>
+                  {s.build && <span className="tag" style={{ marginLeft: 6 }}>{s.build}</span>}
+                </span>
+                <span className="tag">{s.kind}</span>
+                <span
+                  style={{
+                    fontSize: 11.5,
+                    color: have ? "var(--benign-fg)" : "var(--text-4)",
+                    minWidth: 90,
+                    textAlign: "right",
+                  }}
+                >
+                  {have ? "downloaded" : "not downloaded"}
+                </span>
+              </button>
+            );
+          })}
+        </div>
         <div className="row gap-14" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div style={{ minWidth: 220, flex: 1 }}>
-            <label className="label">Snapshot to provision</label>
-            <select
-              className="select"
-              value={snapshot}
-              onChange={(e) => setSnapshot(e.target.value)}
-            >
-              {snapshots.length === 0 && <option value="">(no snapshots)</option>}
-              {snapshots.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.title || s.id} ({s.build})
-                </option>
-              ))}
-            </select>
-          </div>
           <div style={{ minWidth: 220, flex: 1 }}>
             <label className="label">Download to</label>
             <select
@@ -116,8 +147,13 @@ export default function Files({ snapshots }: { snapshots: Snapshot[] }) {
               ))}
             </select>
           </div>
-          <button className="btn" disabled={busy || !snapshot || !storageID} onClick={startDownload}>
-            <Download size={15} /> {busy ? "Queueing…" : "Download"}
+          <button
+            className="btn"
+            disabled={busy || chosen.length === 0 || !storageID}
+            onClick={startDownload}
+          >
+            <Download size={15} />{" "}
+            {busy ? "Queueing…" : `Download ${chosen.length || ""}`.trim()}
           </button>
         </div>
         {msg && <p style={{ fontSize: 13, color: "var(--accent-text)", marginTop: 12 }}>{msg}</p>}

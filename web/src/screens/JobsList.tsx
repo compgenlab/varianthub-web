@@ -16,14 +16,23 @@ function when(sec: number) {
   return new Date(sec * 1000).toLocaleString();
 }
 
-export default function JobsList() {
+export default function JobsList({
+  kind = "annotation",
+  title = "Jobs",
+  lede = "Submitted annotation runs. Open a completed job to review its variants.",
+}: {
+  kind?: "annotation" | "download";
+  title?: string;
+  lede?: string;
+} = {}) {
   const nav = useNavigate();
   const [jobs, setJobs] = useState<Job[] | null>(null);
   const [err, setErr] = useState("");
+  const isDownloads = kind === "download";
 
   async function load() {
     try {
-      const r = await api.jobs({ limit: 100 });
+      const r = await api.jobs({ limit: 100, kind });
       setJobs(r.jobs ?? []);
       setErr("");
     } catch (e) {
@@ -45,18 +54,20 @@ export default function JobsList() {
     <div className="page page-wide" style={{ paddingTop: 30 }}>
       <div className="between" style={{ marginBottom: 18 }}>
         <div>
-          <h1 className="title">Jobs</h1>
+          <h1 className="title">{title}</h1>
           <p className="lede" style={{ fontSize: 13.5 }}>
-            Submitted annotation runs. Open a completed job to review its variants.
+            {lede}
           </p>
         </div>
         <div className="row gap-8">
           <button className="icon-btn" onClick={load} title="Refresh">
             <RefreshCw size={15} />
           </button>
-          <button className="btn sm" onClick={() => nav("/annotate/sources")}>
-            <Plus size={15} /> New annotation
-          </button>
+          {!isDownloads && (
+            <button className="btn sm" onClick={() => nav("/annotate/sources")}>
+              <Plus size={15} /> New annotation
+            </button>
+          )}
         </div>
       </div>
 
@@ -67,7 +78,7 @@ export default function JobsList() {
           <span>Job</span>
           <span>Input</span>
           <span>Snapshot</span>
-          <span style={{ textAlign: "right" }}>Variants</span>
+          <span style={{ textAlign: "right" }}>{isDownloads ? "Files" : "Variants"}</span>
           <span>Status</span>
           <span />
         </div>
@@ -75,13 +86,16 @@ export default function JobsList() {
         {jobs === null && !err && <div className="empty">Loading…</div>}
         {jobs?.length === 0 && (
           <div className="empty">
-            No jobs yet. Start one from <strong>New annotation</strong>.
+            {isDownloads
+              ? "No provisioning jobs yet. Start one from Sources & snapshots → Files."
+              : "No jobs yet. Start one from New annotation."}
           </div>
         )}
 
         {jobs?.map((j) => {
           const st = STATUS[j.status] ?? STATUS.queued;
-          const open = j.status === "done";
+          // A download has no results table to open.
+          const open = j.status === "done" && !isDownloads;
           return (
             <button
               key={j.job_id}
@@ -104,7 +118,7 @@ export default function JobsList() {
                   {when(j.created_at)}
                 </span>
               </span>
-              <span style={{ fontSize: 12.5 }}>{j.snapshot}</span>
+              <span style={{ fontSize: 12.5 }}>{j.snapshot || "—"}</span>
               <span className="num">{j.n_variants || "—"}</span>
               <span className="row gap-8">
                 <i

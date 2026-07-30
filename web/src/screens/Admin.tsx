@@ -118,7 +118,7 @@ export default function Admin() {
       {err && <p className="err">{err}</p>}
 
       {tab === "files" ? (
-        <Files snapshots={snapshots} />
+        <Files sources={sources} />
       ) : tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>

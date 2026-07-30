@@ -3,8 +3,10 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/catalog"
@@ -534,7 +536,12 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// handleDownload queues a provisioning job for a snapshot's sources.
+// handleDownload queues a provisioning job for a set of sources.
+//
+// Sources, not snapshots: a source is the unit of data. Requiring one to belong
+// to a snapshot first would mean a newly registered source could not be
+// downloaded until someone bundled it, which is backwards — you bundle sources
+// you already have.
 //
 // It goes through the same queue as annotation rather than running inline: a
 // download can take hours and move gigabytes, which is not something to hold an
@@ -546,14 +553,16 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Snapshot  string   `json:"snapshot"`
 		Sources   []string `json:"sources"`
-		Build     string   `json:"build"`
 		StorageID string   `json:"storage_id"`
 		Force     bool     `json:"force"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if len(req.Sources) == 0 {
+		writeError(w, http.StatusBadRequest, "`sources` is required — select at least one source")
 		return
 	}
 
@@ -573,34 +582,50 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(req.Snapshot), req.Sources,
-		req.Build, nil)
+	// Validate the ids here so an unknown source is a 400 now, rather than a job
+	// that fails a minute later in a worker log.
+	all, err := s.catalog.ListSources(r.Context())
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	known := map[string]catalog.Source{}
+	for _, src := range all {
+		known[src.ID] = src
+	}
+	labels := make([]string, 0, len(req.Sources))
+	for _, id := range req.Sources {
+		src, ok := known[id]
+		if !ok {
+			writeError(w, http.StatusBadRequest, "unknown source "+strconv.Quote(id))
+			return
+		}
+		labels = append(labels, src.Ref())
+	}
 
-	// The job body carries the target, so the worker does not have to re-resolve
-	// it — and a job stays reproducible even if the location is edited later.
 	body, err := json.Marshal(map[string]any{
-		"storage_id": loc.ID, "cache_dir": loc.URI, "force": req.Force,
+		"storage_id": loc.ID, "cache_dir": loc.URI,
+		"sources": req.Sources, "force": req.Force,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	label := strings.Join(labels, ", ")
+	if len(label) > 80 {
+		label = fmt.Sprintf("%d sources", len(labels))
+	}
 	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
-		Kind:     queue.KindDownload,
-		Snapshot: snapshot,
-		Session:  sessionOf(r),
-		Label:    "download " + snapshot + " → " + loc.Name,
-		Body:     body,
+		Kind:    queue.KindDownload,
+		Session: sessionOf(r),
+		Label:   "download " + label + " → " + loc.Name,
+		Body:    body,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
 		return
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
-		"job_id": id, "snapshot": snapshot, "storage": loc,
+		"job_id": id, "sources": req.Sources, "storage": loc,
 	})
 }

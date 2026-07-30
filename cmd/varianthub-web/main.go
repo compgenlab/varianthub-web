@@ -261,16 +261,17 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		return queue.Outcome{}, errors.New("download requires the exec runner")
 	}
 	var req struct {
-		StorageID string `json:"storage_id"`
-		CacheDir  string `json:"cache_dir"`
-		Force     bool   `json:"force"`
+		StorageID string   `json:"storage_id"`
+		CacheDir  string   `json:"cache_dir"`
+		Sources   []string `json:"sources"`
+		Force     bool     `json:"force"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
 	}
 
 	res, err := exec.Download(ctx, runner.DownloadRequest{
-		Snapshot: job.Snapshot,
+		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
 		Force:    req.Force,
 	})
@@ -285,11 +286,19 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 	// Attribute files to their source by the directory varhub lays out per
 	// source: <cache>/<name>/<version>/... A file outside that shape belongs to no
 	// source we can name, so it is inventoried but not attributed.
-	snap, err := cat.GetSnapshot(ctx, job.Snapshot)
+	all, err := cat.ListSources(ctx)
 	if err != nil {
 		return queue.Outcome{}, err
 	}
-	for _, src := range snap.Sources {
+	byID := map[string]catalog.Source{}
+	for _, s := range all {
+		byID[s.ID] = s
+	}
+	for _, id := range req.Sources {
+		src, ok := byID[id]
+		if !ok {
+			continue // removed between enqueue and run
+		}
 		prefix := src.Name + string(os.PathSeparator) + src.Version + string(os.PathSeparator)
 		var mine []catalog.SourceFile
 		for _, f := range res.Files {

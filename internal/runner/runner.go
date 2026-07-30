@@ -451,12 +451,19 @@ func cliMessage(stderr, home string) string {
 // progress and the same error surfacing as an annotation.
 const KindDownload = "download"
 
-// DownloadRequest provisions one snapshot's sources into a storage location.
+// SourceHomeProvider materializes a home for an explicit set of sources.
+//
+// Provisioning is per source, not per snapshot: a source is the unit of data,
+// and a newly registered one must be downloadable before anyone bundles it.
+type SourceHomeProvider interface {
+	HomeForSources(ctx context.Context, sourceIDs []string) (string, func(), error)
+}
+
+// DownloadRequest provisions a set of sources into a storage location.
 type DownloadRequest struct {
-	Snapshot string // snapshot whose sources to fetch
-	CacheDir string // where the files land — the storage location's path
-	DataDir  string // varhub's data dir (tool images, reference files)
-	Source   string // optional: just this "name:version"
+	Sources  []string // catalog source ids to fetch
+	CacheDir string   // where the files land — the storage location's path
+	DataDir  string   // varhub's data dir (tool images, reference files)
 	Force    bool
 }
 
@@ -490,15 +497,23 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	if req.CacheDir == "" {
 		return DownloadResult{}, errors.New("no storage location for the download")
 	}
-	for _, a := range []string{req.Snapshot, req.Source, req.CacheDir, req.DataDir} {
+	if len(req.Sources) == 0 {
+		return DownloadResult{}, errors.New("no sources selected")
+	}
+	for _, a := range append([]string{req.CacheDir, req.DataDir}, req.Sources...) {
 		if err := safeArg(a); err != nil {
 			return DownloadResult{}, err
 		}
 	}
 
-	home, cleanup, err := r.Home.Home(ctx, req.Snapshot)
+	provider, ok := r.Home.(SourceHomeProvider)
+	if !ok {
+		return DownloadResult{}, errors.New(
+			"this deployment cannot provision sources (no catalog-backed home provider)")
+	}
+	home, cleanup, err := provider.HomeForSources(ctx, req.Sources)
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("prepare annotation home: %w", err)
+		return DownloadResult{}, fmt.Errorf("prepare provisioning home: %w", err)
 	}
 	defer cleanup()
 
@@ -509,10 +524,9 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		return DownloadResult{}, err
 	}
 
-	args := []string{"-home", home, "-snapshot", req.Snapshot, "download"}
-	if req.Source != "" {
-		args = append(args, "--source", req.Source)
-	}
+	// The synthesized manifest contains exactly the selected sources, so a plain
+	// `download` fetches those and nothing else — no --source filtering needed.
+	args := []string{"-home", home, "-snapshot", "provision", "download"}
 	if req.Force {
 		args = append(args, "--force")
 	}
