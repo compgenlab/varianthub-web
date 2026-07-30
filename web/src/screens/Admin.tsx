@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { Check, Plus, X } from "lucide-react";
 
-import { api, type Snapshot, type Source } from "../api";
+import { api, type Registry, type RegistryEntry, type Snapshot, type Source } from "../api";
 
 const DEFAULT_TOML = `[[sources]]
   type    = "vcf"          # builtin | vcf | bed | gtf | tab | genelist | tool
@@ -276,11 +276,44 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   const [toml, setToml] = useState(DEFAULT_TOML);
   const [check, setCheck] = useState<{ valid: boolean; error?: string; id?: string; kind?: string } | null>(null);
   const [priv, setPriv] = useState(false);
+  const [origin, setOrigin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  // Validate server-side as you type: the TOML parser lives there, and a typo
-  // should surface while editing rather than on submit.
+  const [registries, setRegistries] = useState<Registry[]>([]);
+  const [regID, setRegID] = useState("");
+  const [entries, setEntries] = useState<RegistryEntry[] | null>(null);
+  const [regErr, setRegErr] = useState("");
+  const [loadingRef, setLoadingRef] = useState("");
+  const [addingReg, setAddingReg] = useState(false);
+
+  async function loadRegistries(select?: string) {
+    try {
+      const r = await api.registries();
+      setRegistries(r.registries ?? []);
+      const pick = select ?? r.registries?.[0]?.id ?? "";
+      setRegID(pick);
+    } catch (e) {
+      setRegErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+  useEffect(() => {
+    loadRegistries();
+  }, []);
+
+  // Fetching a registry's catalog hits a remote; keep it out of the render path
+  // and show its own error, since an unreachable registry is not a fault of this
+  // form and must not block writing a manifest by hand.
+  useEffect(() => {
+    if (!regID) return;
+    setEntries(null);
+    setRegErr("");
+    api
+      .registryDatasets(regID)
+      .then((d) => setEntries(d.sources ?? []))
+      .catch((e) => setRegErr(e instanceof Error ? e.message : String(e)));
+  }, [regID]);
+
   useEffect(() => {
     const t = window.setTimeout(() => {
       api
@@ -291,11 +324,30 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
     return () => window.clearTimeout(t);
   }, [toml]);
 
+  async function use(entry: RegistryEntry) {
+    const ref = entry.version ? `${entry.name}:${entry.version}` : entry.name;
+    setLoadingRef(ref);
+    setErr("");
+    try {
+      const d = await api.registryFetch(regID, ref);
+      setToml(d.toml);
+      setOrigin(d.origin);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLoadingRef("");
+    }
+  }
+
   async function register() {
     setBusy(true);
     setErr("");
     try {
-      await api.createSource({ toml, visibility: priv ? "private" : "public" });
+      await api.createSource({
+        toml,
+        visibility: priv ? "private" : "public",
+        origin: origin || undefined,
+      });
       onDone();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -313,53 +365,221 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         Register a source
       </h1>
       <p className="lede" style={{ fontSize: 13.5 }}>
-        Paste a varhub source manifest — the same TOML{" "}
-        <code className="mono">varhub source add</code> writes. It is stored
-        verbatim and handed to the engine unchanged.
+        Pull a dataset from a registry, or write the manifest directly. Everything
+        resolves to a TOML manifest that pins where the file comes from and how it
+        is indexed — stored verbatim and handed to the engine unchanged.
       </p>
 
-      <div className="between" style={{ margin: "20px 0 6px" }}>
-        <span className="label" style={{ margin: 0 }}>
-          source.toml
-        </span>
-        {check && (
-          <span
-            className="mono row gap-8"
-            style={{ fontSize: 11, color: check.valid ? "var(--benign-fg)" : "var(--path-fg)" }}
-          >
-            {check.valid ? (
-              <>
-                <Check size={12} /> valid · {check.id} ({check.kind})
-              </>
-            ) : (
-              <>
-                <X size={12} /> {check.error}
-              </>
+      <div
+        style={{
+          display: "grid",
+          gridTemplateColumns: "340px 1fr",
+          gap: 20,
+          alignItems: "start",
+          marginTop: 20,
+        }}
+      >
+        <div>
+          <div className="between" style={{ marginBottom: 6 }}>
+            <span className="label" style={{ margin: 0 }}>
+              Registry
+            </span>
+            <button
+              className="btn link"
+              style={{ fontSize: 12 }}
+              onClick={() => setAddingReg(!addingReg)}
+            >
+              {addingReg ? "Cancel" : "+ Add registry"}
+            </button>
+          </div>
+
+          {addingReg ? (
+            <AddRegistry
+              onCancel={() => setAddingReg(false)}
+              onDone={(id) => {
+                setAddingReg(false);
+                loadRegistries(id);
+              }}
+            />
+          ) : (
+            <select
+              className="select mono"
+              style={{ marginBottom: 14 }}
+              value={regID}
+              onChange={(e) => setRegID(e.target.value)}
+            >
+              {registries.length === 0 && <option value="">(no registries)</option>}
+              {registries.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.name}
+                  {r.builtin ? " (default)" : ""}
+                </option>
+              ))}
+            </select>
+          )}
+
+          <div className="card">
+            <div className="thead">Available datasets</div>
+            {regErr && (
+              <div className="empty err" style={{ padding: "16px 13px", fontSize: 12.5 }}>
+                {regErr}
+              </div>
             )}
-          </span>
-        )}
+            {!regErr && entries === null && <div className="empty">Loading…</div>}
+            {!regErr && entries?.length === 0 && (
+              <div className="empty">This registry lists no sources.</div>
+            )}
+            {entries?.map((e) => {
+              const ref = e.version ? `${e.name}:${e.version}` : e.name;
+              return (
+                <button
+                  key={ref}
+                  className="trow between"
+                  style={{ cursor: "pointer", padding: "11px 13px" }}
+                  disabled={!!loadingRef}
+                  onClick={() => use(e)}
+                >
+                  <span>
+                    <span style={{ fontSize: 13, fontWeight: 500 }}>
+                      {e.title || e.name}
+                    </span>
+                    <br />
+                    <span className="mono" style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+                      {ref}
+                      {e.assembly ? ` · ${e.assembly}` : ""}
+                      {e.non_commercial ? " · non-commercial" : ""}
+                    </span>
+                  </span>
+                  <span style={{ fontSize: 12, fontWeight: 500, color: "var(--accent-text)" }}>
+                    {loadingRef === ref ? "…" : "Use →"}
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div>
+          <div className="between" style={{ marginBottom: 6 }}>
+            <span className="label" style={{ margin: 0 }}>
+              source.toml
+            </span>
+            {check && (
+              <span
+                className="mono row gap-8"
+                style={{ fontSize: 11, color: check.valid ? "var(--benign-fg)" : "var(--path-fg)" }}
+              >
+                {check.valid ? (
+                  <>
+                    <Check size={12} /> valid · {check.id} ({check.kind})
+                  </>
+                ) : (
+                  <>
+                    <X size={12} /> {check.error}
+                  </>
+                )}
+              </span>
+            )}
+          </div>
+
+          <textarea
+            style={CODE_STYLE}
+            spellCheck={false}
+            value={toml}
+            onChange={(e) => {
+              setToml(e.target.value);
+              setOrigin(""); // hand-edited: no longer straight from the registry
+            }}
+          />
+
+          <label className="row gap-8" style={{ marginTop: 14, fontSize: 13 }}>
+            <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
+            Private (licensed data — access grants are not implemented yet)
+          </label>
+          {origin && (
+            <p className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
+              origin: {origin}
+            </p>
+          )}
+
+          {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
+
+          <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
+            <button className="btn secondary" onClick={onCancel}>
+              Cancel
+            </button>
+            <button className="btn" disabled={busy || !check?.valid} onClick={register}>
+              {busy ? "Registering…" : "Validate & register"}
+            </button>
+          </div>
+        </div>
       </div>
+    </div>
+  );
+}
 
-      <textarea
-        style={CODE_STYLE}
-        spellCheck={false}
-        value={toml}
-        onChange={(e) => setToml(e.target.value)}
+function AddRegistry({
+  onCancel,
+  onDone,
+}: {
+  onCancel: () => void;
+  onDone: (id: string) => void;
+}) {
+  const [name, setName] = useState("");
+  const [url, setUrl] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const [warn, setWarn] = useState("");
+
+  async function save() {
+    setBusy(true);
+    setErr("");
+    setWarn("");
+    try {
+      const r = await api.addRegistry({ name: name.trim(), url: url.trim() });
+      // Saved but unreadable is a warning, not a failure: the registry may be
+      // temporarily down, and refusing to save would lose the operator's input.
+      if (r.warning) {
+        setWarn(r.warning);
+        return;
+      }
+      onDone(r.id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="card" style={{ padding: 14, marginBottom: 14 }}>
+      <label className="label">Name</label>
+      <input
+        className="input"
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="Lab registry"
       />
-
-      <label className="row gap-8" style={{ marginTop: 14, fontSize: 13 }}>
-        <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
-        Private (licensed data — access grants are not implemented yet)
+      <label className="label" style={{ marginTop: 10 }}>
+        registry.toml URL
       </label>
-
-      {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
-
-      <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
-        <button className="btn secondary" onClick={onCancel}>
+      <input
+        className="input mono"
+        style={{ fontSize: 12 }}
+        value={url}
+        onChange={(e) => setUrl(e.target.value)}
+        placeholder="https://example.org/registry.toml"
+      />
+      {err && <p className="err" style={{ fontSize: 12, marginTop: 8 }}>{err}</p>}
+      {warn && (
+        <p style={{ fontSize: 12, marginTop: 8, color: "var(--vus-fg)" }}>{warn}</p>
+      )}
+      <div className="row gap-8" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+        <button className="btn secondary sm" onClick={onCancel}>
           Cancel
         </button>
-        <button className="btn" disabled={busy || !check?.valid} onClick={register}>
-          {busy ? "Registering…" : "Validate & register"}
+        <button className="btn sm" disabled={busy || !name.trim() || !url.trim()} onClick={save}>
+          {busy ? "Checking…" : "Add"}
         </button>
       </div>
     </div>

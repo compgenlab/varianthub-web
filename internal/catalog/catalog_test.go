@@ -18,6 +18,7 @@ import (
 var migrationFiles = []string{
 	"../../migrations/0001_job_queue.sql",
 	"../../migrations/0002_catalog.sql",
+	"../../migrations/0004_registry.sql",
 }
 
 func testStore(t *testing.T) *Store {

@@ -70,6 +70,11 @@ func (s *Server) Routes() http.Handler {
 	v1.HandleFunc("POST /api/v1/admin/sources", s.handleCreateSource)
 	v1.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
 	v1.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
+	v1.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)
+	v1.HandleFunc("POST /api/v1/admin/registries", s.handleCreateRegistry)
+	v1.HandleFunc("DELETE /api/v1/admin/registries/{id}", s.handleDeleteRegistry)
+	v1.HandleFunc("GET /api/v1/admin/registries/{id}/datasets", s.handleRegistryDatasets)
+	v1.HandleFunc("GET /api/v1/admin/registries/{id}/fetch", s.handleRegistryFetch)
 
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.HandleFunc("GET /api/v1/jobs", s.handleListJobs)

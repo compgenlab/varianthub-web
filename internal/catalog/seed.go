@@ -29,6 +29,11 @@ const builtinsTOML = `[[sources]]
 // annotate immediately. It is a no-op once anything exists — it will not
 // overwrite a real catalog, which is what makes it safe to run on every start.
 func (s *Store) Seed(ctx context.Context) error {
+	// The default registry is seeded independently of the starter snapshot: a
+	// deployment with a real catalog still wants somewhere to import from.
+	if err := s.SeedRegistry(ctx); err != nil {
+		return err
+	}
 	snapshots, sources, err := s.Count(ctx)
 	if err != nil {
 		return err

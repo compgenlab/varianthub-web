@@ -320,7 +320,11 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `POST` | `/api/v1/admin/snapshots/{id}/publish` | **implemented** |
 | `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
 | `DELETE` | `/api/v1/admin/sources/{id}` | not implemented |
-| `GET` | `/api/v1/admin/registries[/{id}/datasets]` | not implemented |
+| `GET` | `/api/v1/admin/registries` | **implemented** |
+| `POST` | `/api/v1/admin/registries` | **implemented** — validates by fetching once |
+| `DELETE` | `/api/v1/admin/registries/{id}` | **implemented** (not the builtin default) |
+| `GET` | `/api/v1/admin/registries/{id}/datasets` | **implemented** — live listing |
+| `GET` | `/api/v1/admin/registries/{id}/fetch?ref=` | **implemented** — returns a manifest for review |
 | `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | not implemented |
 | `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
 
@@ -336,6 +340,28 @@ still being edited; the admin view passes `?state=all` to see them.
 
 The response is the snapshot re-read from the database, which is what proves the
 pins resolved — a bad set would otherwise look accepted and fail at job time.
+
+### Registries
+
+A registry is a static `registry.toml` listing source and snapshot *configs* — the
+same file `varhub registry` reads, so a registry published for the CLI works here
+unchanged. Only the location is stored; the catalog is fetched live, because a
+registry gains sources over time and a mirrored copy would quietly hide them.
+
+`/fetch` returns an entry's manifest **for review** rather than registering it.
+That is deliberate: the fragment is executed by `varhub` and can name build
+recipes and container images, so it lands in the editor to be read before it is
+adopted. Registering is still the same `POST /admin/sources` call.
+
+A bare `ref` resolves to the entry the publisher marked `latest`. Versions are not
+reliably sortable — semver `1.3`, dbSNP `b157`, dates — so choosing "the newest"
+by string order would silently pick wrong.
+
+Entry `file` paths are resolved against the manifest's directory and required to
+stay under it, so a registry cannot point a fetch at another host or elsewhere on
+the one it lives on. Registry URLs must be http(s). Note this is a guard rail, not
+a security boundary: only an admin can add a registry, and an admin can already
+run code on a worker via a build recipe.
 
 The TOML manifest is the primary configuration mechanism; direct upload is
 secondary because the files are large. Registration validates the TOML, checks

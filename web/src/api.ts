@@ -28,6 +28,24 @@ export interface Source {
   origin?: string;
 }
 
+export interface Registry {
+  id: string;
+  name: string;
+  url: string;
+  builtin: boolean;
+}
+
+export interface RegistryEntry {
+  name: string;
+  version?: string;
+  title?: string;
+  assembly?: string;
+  file: string;
+  description?: string;
+  non_commercial?: boolean;
+  latest?: boolean;
+}
+
 export interface Job {
   job_id: string;
   kind: string;
@@ -278,6 +296,30 @@ export const api = {
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
       method: "POST",
     }),
+
+  registries: () => req<{ registries: Registry[] }>("/admin/registries"),
+
+  addRegistry: (body: { name: string; url: string; id?: string }) =>
+    req<{ id: string; name: string; url: string; warning?: string }>("/admin/registries", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  deleteRegistry: (id: string) =>
+    req<void>(`/admin/registries/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  registryDatasets: (id: string) =>
+    req<{ registry: Registry; sources: RegistryEntry[]; snapshots: RegistryEntry[] }>(
+      `/admin/registries/${encodeURIComponent(id)}/datasets`,
+    ),
+
+  // Returns the entry's manifest for review. Not a one-click import: the
+  // fragment is executed by varhub, so it goes into the editor to be read first.
+  registryFetch: (id: string, ref: string) =>
+    req<{ ref: string; entry: RegistryEntry; toml: string; origin: string }>(
+      `/admin/registries/${encodeURIComponent(id)}/fetch?ref=${encodeURIComponent(ref)}`,
+    ),
 
   health: () => fetch(`${BASE}/healthz`).then((r) => r.json()),
   version: () => fetch(`${BASE}/version`).then((r) => r.json()),
