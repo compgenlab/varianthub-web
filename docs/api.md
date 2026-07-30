@@ -336,7 +336,7 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `POST` | `/api/v1/admin/snapshots` | **implemented** — create/update with pinned sources |
 | `POST` | `/api/v1/admin/snapshots/{id}/publish` | **implemented** |
 | `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
-| `DELETE` | `/api/v1/admin/sources/{id}` | not implemented |
+| `DELETE` | `/api/v1/admin/sources/{id}` | **implemented** — refused with 409 while a snapshot pins it |
 | `GET` | `/api/v1/admin/registries` | **implemented** |
 | `POST` | `/api/v1/admin/registries` | **implemented** — validates by fetching once |
 | `DELETE` | `/api/v1/admin/registries/{id}` | **implemented** (not the builtin default) |
@@ -364,9 +364,29 @@ than running inline — a download can take hours and move gigabytes — so it g
 the same persistence, scheduling and error reporting, and shows up in
 `GET /jobs` with `kind: "download"`.
 
+Sources that compute their annotation from the variant itself carry
+`needs_data: false` in `GET /sources` and are skipped here — there is nothing to
+fetch. A selection containing only such sources is a 400 rather than a job that
+would do nothing.
+
 The worker takes the file inventory after the download, because only the worker
 is guaranteed to have the storage volume mounted. Files are attributed to a
 source by varhub's cache layout, `<root>/<name>/<version>/…`.
+
+### Removing a source
+
+`DELETE /admin/sources/{id}` unregisters a source and queues a cleanup job per
+storage location holding its files, returning their job ids as `cleanup_jobs`.
+Deletion is refused with `409` while any snapshot pins the source, naming them:
+a snapshot is a reproducibility claim, and letting a member vanish would break
+every future annotation against it.
+
+Ad-hoc snapshots are exempt from that check. They are generated per submission
+from an individual-source selection and are hidden from every listing, so
+counting them would make a source permanently undeletable behind something the
+caller cannot see or remove. They are regenerable — the same selection yields the
+same id — and past results carry their own column model, so the ad-hoc rows are
+deleted along with the source rather than blocking it.
 
 Filesystem locations are declared by the deployment (`VHW_STORAGE_PATHS`) and
 reconciled at startup; the API refuses to add one, since a path is meaningless

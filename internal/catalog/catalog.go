@@ -63,6 +63,15 @@ type Source struct {
 // Ref is the "name:version" reference a snapshot manifest uses.
 func (s Source) Ref() string { return s.Name + ":" + s.Version }
 
+// NeedsData reports whether the source has files to download.
+//
+// A builtin annotator computes its values from the variant itself — auto_id,
+// tstv, indel need nothing on disk — so it is usable the moment it is
+// registered. Offering to provision one is offering to fetch nothing: the job
+// runs, downloads zero files, and reports success, which reads as though
+// something happened.
+func (s Source) NeedsData() bool { return s.Kind != "builtin" }
+
 // Snapshot is a versioned bundle of pinned sources.
 type Snapshot struct {
 	ID          string   `json:"id"`
@@ -453,4 +462,100 @@ func (s *Store) Count(ctx context.Context) (snapshots, sources int, err error) {
 		`SELECT (SELECT count(*) FROM snapshot), (SELECT count(*) FROM source)`).
 		Scan(&snapshots, &sources)
 	return
+}
+
+// SourceSnapshots lists the real snapshots pinning a source.
+//
+// Ad-hoc rows are excluded: they are generated per submission from an
+// individual-source selection, are hidden from every listing, and would
+// otherwise make a source permanently undeletable after one ad-hoc annotation —
+// blocked by a snapshot the user has no way to find or remove.
+func (s *Store) SourceSnapshots(ctx context.Context, sourceID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT ss.snapshot_id
+		  FROM snapshot_source ss
+		  JOIN snapshot sn ON sn.id = ss.snapshot_id
+		 WHERE ss.source_id = $1 AND sn.state <> $2
+		 ORDER BY ss.snapshot_id`, sourceID, StateAdhoc)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// ErrSourcePinned is returned when deleting a source a snapshot still pins.
+var ErrSourcePinned = errors.New("source is pinned by a snapshot")
+
+// DeleteSource removes a source that no snapshot pins, and returns where its
+// files were so the caller can reclaim the disk.
+//
+// A pinned source is refused rather than cascaded: removing it would silently
+// change what those snapshots mean, and a published snapshot is a promise that
+// its pinned versions do not move. Detach it first.
+//
+// The file *records* go with the row (ON DELETE CASCADE); the bytes do not —
+// only the worker mounts the storage, so reclaiming them is a job.
+func (s *Store) DeleteSource(ctx context.Context, id string) (src Source, locations []StorageLocation, err error) {
+	pinned, err := s.SourceSnapshots(ctx, id)
+	if err != nil {
+		return Source{}, nil, err
+	}
+	if len(pinned) > 0 {
+		return Source{}, nil, fmt.Errorf("%w (%s)", ErrSourcePinned, strings.Join(pinned, ", "))
+	}
+
+	// Ad-hoc snapshots pinning it are regenerable — the same selection produces
+	// the same id — and past job results are self-contained, carrying their own
+	// column model. So they go with the source rather than blocking it.
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM snapshot
+		 WHERE state = $1
+		   AND id IN (SELECT snapshot_id FROM snapshot_source WHERE source_id = $2)`,
+		StateAdhoc, id); err != nil {
+		return Source{}, nil, err
+	}
+
+	row := s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM source WHERE id=$1`, id)
+	src, err = scanSource(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Source{}, nil, fmt.Errorf("source %q: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return Source{}, nil, err
+	}
+
+	// Capture the locations before the cascade removes the file rows.
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT sl.id, sl.name, sl.kind, sl.uri
+		  FROM source_file sf JOIN storage_location sl ON sl.id = sf.storage_id
+		 WHERE sf.source_id = $1`, id)
+	if err != nil {
+		return Source{}, nil, err
+	}
+	for rows.Next() {
+		var l StorageLocation
+		if err := rows.Scan(&l.ID, &l.Name, &l.Kind, &l.URI); err != nil {
+			rows.Close()
+			return Source{}, nil, err
+		}
+		locations = append(locations, l)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return Source{}, nil, err
+	}
+
+	if _, err := s.pool.Exec(ctx, `DELETE FROM source WHERE id=$1`, id); err != nil {
+		return Source{}, nil, err
+	}
+	return src, locations, nil
 }

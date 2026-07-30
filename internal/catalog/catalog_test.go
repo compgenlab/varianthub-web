@@ -604,3 +604,102 @@ func TestStorageForSources(t *testing.T) {
 		t.Errorf("err = %v, want a split-locations error", err)
 	}
 }
+
+// A builtin computes from the variant and has nothing on disk, so it is usable
+// the moment it is registered. Treating it as unprovisioned offers a download
+// that fetches nothing and then reports success.
+func TestBuiltinNeedsNoData(t *testing.T) {
+	for _, tc := range []struct {
+		kind string
+		want bool
+	}{
+		{"builtin", false},
+		{"vcf", true},
+		{"bed", true},
+		{"gtf", true},
+		{"genelist", true}, // needs its genes_file and the GTF it references
+		{"tool", true},     // needs an image acquire + one-time setup
+	} {
+		if got := (Source{Kind: tc.kind}).NeedsData(); got != tc.want {
+			t.Errorf("Source{Kind:%q}.NeedsData() = %v, want %v", tc.kind, got, tc.want)
+		}
+	}
+}
+
+// A pinned source cannot be removed: doing so would silently change what those
+// snapshots mean. Unpinned, it goes — and the caller learns where its files were
+// so the bytes can be reclaimed.
+func TestDeleteSource(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+
+	_, _, err := s.DeleteSource(ctx, "builtins")
+	if !errors.Is(err, ErrSourcePinned) {
+		t.Fatalf("err = %v, want ErrSourcePinned", err)
+	}
+	if !strings.Contains(err.Error(), "dev") {
+		t.Errorf("error should name the pinning snapshot, got %q", err)
+	}
+
+	if err := s.PutSource(ctx, Source{
+		ID: "loose", Name: "loose", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncConfigStorage(ctx, []StorageLocation{
+		{ID: "a", Name: "a", Kind: StoragePath, URI: "/mnt/a", IsDefault: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ReplaceSourceFiles(ctx, "loose", "a", []SourceFile{
+		{Path: "loose/1/x.gz", SizeBytes: 5, ModifiedAt: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	src, locs, err := s.DeleteSource(ctx, "loose")
+	if err != nil {
+		t.Fatalf("DeleteSource: %v", err)
+	}
+	if src.Ref() != "loose:1" {
+		t.Errorf("returned %+v", src)
+	}
+	if len(locs) != 1 || locs[0].URI != "/mnt/a" {
+		t.Fatalf("locations = %+v, want the location holding its files", locs)
+	}
+	// The file records go with the row, so nothing is left pointing at a source
+	// that no longer exists.
+	if f, _ := s.SourceFiles(ctx, "loose", ""); len(f) != 0 {
+		t.Errorf("%d orphaned file rows", len(f))
+	}
+	if _, _, err := s.DeleteSource(ctx, "loose"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("second delete = %v, want ErrNotFound", err)
+	}
+}
+
+// An ad-hoc snapshot is generated per submission and hidden from every listing.
+// If it blocked deletion, one ad-hoc annotation would make a source permanently
+// undeletable — blocked by something the user cannot see or remove.
+func TestAdhocSnapshotDoesNotBlockSourceDeletion(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.PutSource(ctx, Source{
+		ID: "loose", Name: "loose", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	adhoc, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"loose"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned, err := s.SourceSnapshots(ctx, "loose"); err != nil || len(pinned) != 0 {
+		t.Fatalf("SourceSnapshots = %v, %v; ad-hoc rows must not count", pinned, err)
+	}
+	if _, _, err := s.DeleteSource(ctx, "loose"); err != nil {
+		t.Fatalf("DeleteSource: %v", err)
+	}
+	// The ad-hoc snapshot goes with it rather than dangling.
+	if _, err := s.GetSnapshot(ctx, adhoc); !errors.Is(err, ErrNotFound) {
+		t.Errorf("ad-hoc snapshot survived: %v", err)
+	}
+}

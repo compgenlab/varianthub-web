@@ -218,6 +218,9 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// Annotations lets the flow show which fields a source contributes before
 		// it is chosen, so picking sources and picking fields are one step.
 		Annotations []catalog.Annotation `json:"annotations"`
+		// NeedsData is false for builtins, which compute from the variant and have
+		// nothing to download.
+		NeedsData bool `json:"needs_data"`
 	}
 	out := make([]item, 0, len(srcs))
 	for _, src := range srcs {
@@ -225,7 +228,9 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		if anns == nil {
 			anns = []catalog.Annotation{}
 		}
-		out = append(out, item{Source: src, Ref: src.Ref(), Annotations: anns})
+		out = append(out, item{
+			Source: src, Ref: src.Ref(), Annotations: anns, NeedsData: src.NeedsData(),
+		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": out})
 }
@@ -500,11 +505,12 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		f.Kinds = []string{queue.KindLocus, queue.KindVCF}
 	case "all":
 		// no kind constraint
-	case "download":
-		f.Kinds = []string{queue.KindDownload}
+	case "download", "system":
+		// "download" kept as an alias; the admin log wants every operational job.
+		f.Kinds = []string{queue.KindDownload, queue.KindCleanup}
 	default:
 		writeError(w, http.StatusBadRequest,
-			"invalid kind filter (want annotation, download or all)")
+			"invalid kind filter (want annotation, download, system or all)")
 		return
 	}
 

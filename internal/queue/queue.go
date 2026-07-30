@@ -47,6 +47,9 @@ const (
 	// shares the queue so it gets the same persistence, scheduling and error
 	// reporting; the worker dispatches on this.
 	KindDownload = "download"
+	// KindCleanup reclaims a removed source's files, for the same reason
+	// downloads are jobs: only the worker mounts the storage.
+	KindCleanup = "cleanup"
 )
 
 // Postgres NOTIFY channels.

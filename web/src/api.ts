@@ -16,6 +16,8 @@ export interface Snapshot {
 
 export interface Source {
   id: string;
+  /** False for builtins, which compute from the variant and have no files. */
+  needs_data?: boolean;
   name: string;
   version: string;
   ref?: string;
@@ -350,6 +352,12 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+
+  deleteSource: (id: string) =>
+    req<{ id: string; ref: string; cleanup_jobs: string[] }>(
+      `/admin/sources/${encodeURIComponent(id)}`,
+      { method: "DELETE" },
+    ),
 
   deleteSnapshot: (id: string) =>
     req<void>(`/admin/snapshots/${encodeURIComponent(id)}`, { method: "DELETE" }),

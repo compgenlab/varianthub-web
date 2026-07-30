@@ -652,3 +652,53 @@ func inventory(root string) ([]DownloadedFile, error) {
 	}
 	return out, err
 }
+
+// KindCleanup reclaims a removed source's files. It rides the queue for the same
+// reason downloads do: only the worker mounts the storage.
+const KindCleanup = "cleanup"
+
+// CleanupRequest removes one source's directory from a storage location.
+type CleanupRequest struct {
+	Root    string // the storage location's path
+	Name    string // source name
+	Version string // source version
+}
+
+// Cleanup removes <root>/<name>/<version> and reports the bytes reclaimed.
+//
+// The path is rebuilt from the source's name and version rather than taken from
+// the caller, and is required to stay under the root — a removal driven by
+// catalog values must not be able to walk out of the storage directory.
+func Cleanup(req CleanupRequest) (freed int64, err error) {
+	if req.Root == "" || req.Name == "" || req.Version == "" {
+		return 0, errors.New("cleanup needs a root, name and version")
+	}
+	for _, part := range []string{req.Name, req.Version} {
+		if part == "." || part == ".." || strings.ContainsAny(part, `/\`) {
+			return 0, fmt.Errorf("refusing to remove %q: not a single path element", part)
+		}
+	}
+	root, err := filepath.Abs(req.Root)
+	if err != nil {
+		return 0, err
+	}
+	target := filepath.Join(root, req.Name, req.Version)
+	rel, err := filepath.Rel(root, target)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return 0, fmt.Errorf("refusing to remove %s: outside %s", target, root)
+	}
+
+	files, err := inventory(target)
+	if err != nil {
+		return 0, err
+	}
+	for _, f := range files {
+		freed += f.SizeBytes
+	}
+	if err := os.RemoveAll(target); err != nil {
+		return 0, fmt.Errorf("remove %s: %w", target, err)
+	}
+	// Drop the now-empty parent, so a removed source leaves no stub directory.
+	_ = os.Remove(filepath.Join(root, req.Name))
+	return freed, nil
+}

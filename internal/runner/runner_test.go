@@ -389,3 +389,74 @@ default_snapshot = "dev"
 		t.Errorf("rewrite damaged the config:\n%s", got)
 	}
 }
+
+func TestCleanup(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "gencode", "48")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range []string{"a.gz", "a.gz.tbi"} {
+		if err := os.WriteFile(filepath.Join(dir, f), make([]byte, 500), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A sibling that must survive.
+	other := filepath.Join(root, "clinvar", "2026-06")
+	if err := os.MkdirAll(other, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(other, "c.gz"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	freed, err := Cleanup(CleanupRequest{Root: root, Name: "gencode", Version: "48"})
+	if err != nil {
+		t.Fatalf("Cleanup: %v", err)
+	}
+	if freed != 1000 {
+		t.Errorf("freed = %d, want 1000", freed)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Error("target directory survived")
+	}
+	// The empty parent goes too, but a sibling source is untouched.
+	if _, err := os.Stat(filepath.Join(root, "gencode")); !os.IsNotExist(err) {
+		t.Error("empty parent left behind")
+	}
+	if _, err := os.Stat(filepath.Join(other, "c.gz")); err != nil {
+		t.Errorf("cleanup removed an unrelated source: %v", err)
+	}
+
+	// Removing something already gone is not an error.
+	if _, err := Cleanup(CleanupRequest{Root: root, Name: "gencode", Version: "48"}); err != nil {
+		t.Errorf("second cleanup: %v", err)
+	}
+}
+
+// name/version come from catalog rows. A traversal in either must not be able to
+// walk out of the storage root and delete something else.
+func TestCleanupRefusesEscapes(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(root, "..", "sentinel")
+	if err := os.WriteFile(outside, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(outside)
+
+	for _, tc := range []CleanupRequest{
+		{Root: root, Name: "..", Version: "sentinel"},
+		{Root: root, Name: "../..", Version: "x"},
+		{Root: root, Name: "a/b", Version: "1"},
+		{Root: root, Name: "gencode", Version: "../.."},
+		{Root: "", Name: "a", Version: "1"},
+		{Root: root, Name: "a", Version: ""},
+	} {
+		if _, err := Cleanup(tc); err == nil {
+			t.Errorf("Cleanup(%+v) should be refused", tc)
+		}
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatal("cleanup escaped the storage root")
+	}
+}

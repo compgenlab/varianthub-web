@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Plus, X } from "lucide-react";
+import { Check, Plus, Trash2, X } from "lucide-react";
 
 import {
   api,
@@ -185,7 +185,7 @@ function SourceTable({
   storage: StorageLocation[];
   onChange: () => void;
 }) {
-  const cols = "1.5fr .7fr .6fr .7fr 1.6fr";
+  const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
 
   // A source is "provisioned" when files are recorded for it. Summarize per
   // source so the row can show a footprint instead of a bare yes/no.
@@ -206,6 +206,7 @@ function SourceTable({
         <span>Kind</span>
         <span>Access</span>
         <span>Data</span>
+        <span />
       </div>
       {sources.length === 0 && <div className="empty">No sources registered yet.</div>}
       {sources.map((s) => (
@@ -243,9 +244,57 @@ function SourceTable({
             targets={targets}
             onChange={onChange}
           />
+          <DeleteSource source={s} onChange={onChange} />
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Removes a source. Refused server-side while a snapshot pins it — removing it
+ * would silently change what those snapshots mean — so the error names the
+ * snapshots to detach rather than the button being pre-disabled on a guess.
+ */
+function DeleteSource({ source, onChange }: { source: Source; onChange: () => void }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  return (
+    <span>
+      <button
+        className="icon-btn"
+        title={`Remove ${source.name}`}
+        disabled={busy}
+        onClick={async () => {
+          if (
+            !confirm(
+              `Remove source "${source.title || source.name}"?\n\n` +
+                `Its downloaded files are reclaimed in the background. ` +
+                `This is refused if any snapshot pins it.`,
+            )
+          )
+            return;
+          setBusy(true);
+          setErr("");
+          try {
+            await api.deleteSource(source.id);
+            onChange();
+          } catch (e) {
+            setErr(e instanceof Error ? e.message : String(e));
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <Trash2 size={14} />
+      </button>
+      {err && (
+        <span className="err" style={{ fontSize: 11, display: "block", marginTop: 4 }}>
+          {err}
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -272,6 +321,16 @@ function ProvisionCell({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+
+  // A builtin computes from the variant; there is nothing to fetch, and it is
+  // usable the moment it is registered.
+  if (source.needs_data === false) {
+    return (
+      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
+        no data required
+      </span>
+    );
+  }
 
   if (have) {
     return (

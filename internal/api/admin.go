@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -595,14 +596,30 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		known[src.ID] = src
 	}
 	labels := make([]string, 0, len(req.Sources))
+	wanted := make([]string, 0, len(req.Sources))
+	var skipped []string
 	for _, id := range req.Sources {
 		src, ok := known[id]
 		if !ok {
 			writeError(w, http.StatusBadRequest, "unknown source "+strconv.Quote(id))
 			return
 		}
+		// Builtins compute from the variant and have nothing on disk. Silently
+		// including one would queue a job that downloads nothing and reports
+		// success, which looks like it did something.
+		if !src.NeedsData() {
+			skipped = append(skipped, src.Ref())
+			continue
+		}
+		wanted = append(wanted, id)
 		labels = append(labels, src.Ref())
 	}
+	if len(wanted) == 0 {
+		writeError(w, http.StatusBadRequest, "nothing to download: "+
+			strings.Join(skipped, ", ")+" compute from the variant and need no data")
+		return
+	}
+	req.Sources = wanted
 
 	body, err := json.Marshal(map[string]any{
 		"storage_id": loc.ID, "cache_dir": loc.URI,
@@ -628,5 +645,67 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{
 		"job_id": id, "sources": req.Sources, "storage": loc,
+	})
+}
+
+// handleDeleteSource removes a source no snapshot pins, and queues the reclaim
+// of its files.
+//
+// Refused while pinned rather than cascaded: removing it would silently change
+// what those snapshots mean, and a published snapshot is a promise that its
+// pinned versions do not move. The error names the snapshots so the caller knows
+// what to detach.
+func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	src, locations, err := s.catalog.DeleteSource(r.Context(), id)
+	if err != nil {
+		switch {
+		case errors.Is(err, catalog.ErrSourcePinned):
+			// 409: the request conflicts with the resource's state, and the fix is
+			// to change that state rather than to retry.
+			writeError(w, http.StatusConflict, err.Error()+
+				" — remove it from those snapshots first")
+		case errors.Is(err, catalog.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+
+	// The row is gone; the bytes are not. Only the worker mounts the storage, so
+	// reclaiming them is a job — one per location the source occupied.
+	jobs := []string{}
+	for _, loc := range locations {
+		if loc.Kind != catalog.StoragePath {
+			continue // nothing to remove for a location we never wrote to
+		}
+		body, mErr := json.Marshal(map[string]any{
+			"root": loc.URI, "name": src.Name, "version": src.Version,
+		})
+		if mErr != nil {
+			continue
+		}
+		jobID, qErr := s.queue.Enqueue(r.Context(), queue.NewJob{
+			Kind:    queue.KindCleanup,
+			Session: sessionOf(r),
+			Label:   "remove " + src.Ref() + " from " + loc.Name,
+			Body:    body,
+		})
+		if qErr != nil {
+			// The source is already deleted; failing the response now would imply
+			// otherwise. Report the orphan instead.
+			log.Printf("api: source %s deleted but cleanup could not be queued for %s: %v",
+				src.Ref(), loc.Name, qErr)
+			continue
+		}
+		jobs = append(jobs, jobID)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": id, "ref": src.Ref(), "cleanup_jobs": jobs,
 	})
 }

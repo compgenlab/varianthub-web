@@ -219,8 +219,11 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // knows nothing about job persistence.
 func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
-		if job.Kind == queue.KindDownload {
+		switch job.Kind {
+		case queue.KindDownload:
 			return runDownload(ctx, r, cat, job, input)
+		case queue.KindCleanup:
+			return runCleanup(job, input)
 		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
@@ -322,6 +325,37 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		return queue.Outcome{}, err
 	}
 	return queue.Outcome{Result: body, N: len(res.Files)}, nil
+}
+
+// runCleanup reclaims a removed source's files.
+//
+// The source row is already gone by the time this runs — the API deletes it and
+// queues this — so there is nothing to reconcile afterwards; the job just frees
+// the bytes and reports how many.
+func runCleanup(job queue.Job, input []byte) (queue.Outcome, error) {
+	var req struct {
+		Root    string `json:"root"`
+		Name    string `json:"name"`
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return queue.Outcome{}, fmt.Errorf("malformed cleanup job: %w", err)
+	}
+	freed, err := runner.Cleanup(runner.CleanupRequest{
+		Root: req.Root, Name: req.Name, Version: req.Version,
+	})
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	log.Printf("worker: cleanup job %s: reclaimed %d bytes from %s/%s",
+		job.ID, freed, req.Name, req.Version)
+	body, err := json.Marshal(map[string]any{
+		"freed_bytes": freed, "name": req.Name, "version": req.Version,
+	})
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	return queue.Outcome{Result: body}, nil
 }
 
 // sweepInterval scales GC frequency to the TTL, clamped to a sane band: often
