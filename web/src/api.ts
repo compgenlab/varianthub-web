@@ -46,6 +46,17 @@ export interface RegistryEntry {
   latest?: boolean;
 }
 
+export interface Annotation {
+  name: string;
+  field?: string;
+  type?: string;
+  description?: string;
+  builtin?: string;
+  source?: string;
+  source_ref?: string;
+  default?: boolean;
+}
+
 export interface Job {
   job_id: string;
   kind: string;
@@ -146,11 +157,16 @@ export const api = {
   // a snapshot that can still be re-pinned.
   snapshots: (includeDrafts = false) =>
     req<{ snapshots: Snapshot[] }>(`/snapshots${includeDrafts ? "?state=all" : ""}`),
-  snapshot: (id: string) => req<Snapshot>(`/snapshots/${encodeURIComponent(id)}`),
-  sources: () => req<{ sources: Source[] }>("/sources"),
+  snapshot: (id: string) =>
+    req<{ snapshot: Snapshot; contains_private: boolean; annotations: Annotation[] }>(
+      `/snapshots/${encodeURIComponent(id)}`,
+    ),
+  sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
 
   annotate: (body: {
-    snapshot: string;
+    snapshot?: string;
+    sources?: string[];
+    build?: string;
     variants: string[];
     annotations?: string | string[];
     wait?: number;
@@ -164,10 +180,15 @@ export const api = {
     });
   },
 
-  annotateVCF: (file: File, opts: { snapshot: string; annotations?: string }) => {
+  annotateVCF: (
+    file: File,
+    opts: { snapshot?: string; sources?: string[]; build?: string; annotations?: string },
+  ) => {
     const fd = new FormData();
     fd.append("vcf", file);
-    fd.append("snapshot", opts.snapshot);
+    if (opts.snapshot) fd.append("snapshot", opts.snapshot);
+    if (opts.sources?.length) fd.append("sources", opts.sources.join(","));
+    if (opts.build) fd.append("build", opts.build);
     if (opts.annotations) fd.append("annotations", opts.annotations);
     return req<{ job_id: string } & Partial<Job>>("/annotate/vcf", {
       method: "POST",
@@ -291,6 +312,19 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
     }),
+
+  updateSnapshotMeta: (
+    id: string,
+    body: { title?: string; description?: string; defaults?: string[]; tags?: string[] },
+  ) =>
+    req<Snapshot>(`/admin/snapshots/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  deleteSnapshot: (id: string) =>
+    req<void>(`/admin/snapshots/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   publishSnapshot: (id: string) =>
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {

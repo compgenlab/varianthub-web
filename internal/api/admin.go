@@ -174,6 +174,13 @@ func (s *Server) handleCreateSnapshot(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// Changing a published snapshot's pins is refused, not a failure: 409
+		// says the request conflicts with the resource's state.
+		if errors.Is(err, catalog.ErrPinsFrozen) {
+			writeError(w, http.StatusConflict, err.Error()+
+				" — edit its title or defaults instead, or create a new snapshot")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -372,4 +379,64 @@ func slug(s string) string {
 		}
 	}
 	return strings.Trim(b.String(), "-")
+}
+
+// handleUpdateSnapshotMeta edits a snapshot's presentation and default fields.
+//
+// Allowed on a published snapshot: publishing fixes the pinned source versions,
+// which is what reproducibility depends on. A title or a default field selection
+// is a convenience, and a job records what it actually ran with anyway — so
+// freezing those too would only mean a typo could never be corrected.
+func (s *Server) handleUpdateSnapshotMeta(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		Title       *string  `json:"title"`
+		Description *string  `json:"description"`
+		Defaults    []string `json:"defaults"`
+		Tags        []string `json:"tags"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	id := r.PathValue("id")
+	cur, err := s.catalog.GetSnapshot(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	// Absent fields keep their value; an explicit empty list clears one.
+	if req.Title != nil {
+		cur.Title = *req.Title
+	}
+	if req.Description != nil {
+		cur.Description = *req.Description
+	}
+	if req.Defaults != nil {
+		cur.Defaults = req.Defaults
+	}
+	if req.Tags != nil {
+		cur.Tags = req.Tags
+	}
+	if err := s.catalog.UpdateSnapshotMeta(r.Context(), cur); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, cur)
+}
+
+// handleDeleteSnapshot removes a snapshot, published or not.
+func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.DeleteSnapshot(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

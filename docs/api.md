@@ -117,7 +117,17 @@ must not appear.
 ### `GET /api/v1/snapshots/{id}`
 
 One snapshot with its **pinned source versions** (`snapshot.sources[]`, each
-carrying `name`, `version` and `ref`), plus `contains_private`.
+carrying `name`, `version` and `ref`), `contains_private`, and `annotations[]` —
+every field its sources can contribute, each attributed to its source and flagged
+`default` if the snapshot applies it. That list is what the flow's field picker
+renders.
+
+Fields are derived from each source's stored manifest on read, not kept as a
+column: they are a projection of `toml_text` like the rest, and deriving them
+means a source registered before this existed needs no backfill.
+
+`GET /sources` carries the same `annotations[]` per source, so choosing individual
+sources and choosing fields can happen in one step.
 
 This is the reproducibility hook: a consumer that records "annotated under
 snapshot X" needs to know which ClinVar and gnomAD releases that meant, so a count
@@ -173,7 +183,8 @@ Submit variants. Rate limited per client IP.
 }
 ```
 
-- Exactly one of `snapshot` or `sources` is required.
+- Exactly one of `snapshot` or `sources` is required. With `sources`, `build` is
+  also required.
 - `variants` accepts VCF-style coordinates, HGVS, and rsIDs, mixed freely.
   **Only VCF-style coordinates are supported today**; HGVS and rsID resolution
   is Chunk 5 work and needs an authoritative transcript set (open question).
@@ -187,9 +198,12 @@ larger batch would not fail cleanly — it trips the kernel's `ARG_MAX` and the 
 fails for a reason unrelated to the variants. Over the cap returns `413` pointing
 at the VCF endpoint, which streams through a file and has no such ceiling.
 
-An ad-hoc `sources` list is **not** implemented: the engine selects sources
-through a snapshot. Supplying `sources` returns `400` rather than silently
-annotating under something else.
+An ad-hoc `sources` list **is** supported. The engine annotates against a
+snapshot, so the selection is persisted as one — a real snapshot in state
+`adhoc`, materialized and reproducible like any other, but never listed in
+`GET /snapshots`. Its id is derived from the sorted source set plus the build, so
+resubmitting the same selection reuses one row instead of accumulating a snapshot
+per job.
 
 `?wait=<seconds|duration>` blocks up to a server-capped interval
 (`VHW_SUBMIT_WAIT_CAP`, default 10s) so fast jobs return inline. On completion
@@ -335,8 +349,22 @@ name build recipes and container images — anyone who can register a source can
 run code on a worker, so treat the token as an administrative credential.
 
 `POST /admin/snapshots` creates a **draft** unless `"publish": true`. Drafts are
-excluded from `GET /snapshots` so the annotation flow cannot select something
-still being edited; the admin view passes `?state=all` to see them.
+**selectable** in the annotation flow — a snapshot has to be usable before anyone
+can judge whether it is worth publishing — and every entry carries its `state` so
+a client can mark a draft as not-yet-fixed. `?state=published` narrows to fixed
+ones.
+
+**What publishing fixes is the pinned source versions, and only that.**
+`POST /admin/snapshots` returns `409` if it would change a published snapshot's
+pins. Title, description, tags and default fields stay editable via
+`PATCH /admin/snapshots/{id}`, because a job records the annotations it actually
+ran with — changing a default does not rewrite history, and freezing a title
+would mean a typo could never be fixed.
+
+`DELETE /admin/snapshots/{id}` works on a published snapshot too: publishing fixes
+what a snapshot *means*, not that the row exists forever. Existing job results
+stay readable — each job stores its own column model — but new annotation against
+that name stops working.
 
 The response is the snapshot re-read from the database, which is what proves the
 pins resolved — a bad set would otherwise look accepted and fail at job time.

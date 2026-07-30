@@ -220,54 +220,196 @@ function SnapshotList({
   onChange: () => void;
 }) {
   const [busy, setBusy] = useState("");
+  const [editing, setEditing] = useState("");
+  const [err, setErr] = useState("");
+
+  async function act(id: string, fn: () => Promise<unknown>) {
+    setBusy(id);
+    setErr("");
+    try {
+      await fn();
+      onChange();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy("");
+    }
+  }
+
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {err && <p className="err">{err}</p>}
       {snapshots.length === 0 && <div className="card empty">No snapshots yet.</div>}
       {snapshots.map((s) => (
-        <div
-          key={s.id}
-          className="card between"
-          style={{ padding: "15px 18px", gap: 14 }}
-        >
-          <div>
-            <div className="row gap-10">
-              <span style={{ fontSize: 15, fontWeight: 600 }}>{s.title || s.id}</span>
-              <span
-                className="mono"
-                style={{
-                  fontSize: 9.5,
-                  padding: "2px 7px",
-                  borderRadius: 5,
-                  background: s.state === "published" ? "var(--benign-bg)" : "var(--vus-bg)",
-                  color: s.state === "published" ? "var(--benign-fg)" : "var(--vus-fg)",
+        <div key={s.id} className="card" style={{ padding: "15px 18px" }}>
+          <div className="between" style={{ gap: 14 }}>
+            <div>
+              <div className="row gap-10">
+                <span style={{ fontSize: 15, fontWeight: 600 }}>{s.title || s.id}</span>
+                <span
+                  className="mono"
+                  style={{
+                    fontSize: 9.5,
+                    padding: "2px 7px",
+                    borderRadius: 5,
+                    background: s.state === "published" ? "var(--benign-bg)" : "var(--vus-bg)",
+                    color: s.state === "published" ? "var(--benign-fg)" : "var(--vus-fg)",
+                  }}
+                >
+                  {s.state}
+                </span>
+              </div>
+              <div className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+                {s.id} · {s.build} · {s.source_count ?? 0} sources
+                {s.defaults?.length ? ` · defaults: ${s.defaults.join(", ")}` : " · no defaults"}
+              </div>
+            </div>
+            <div className="row gap-8">
+              <button
+                className="btn secondary sm"
+                onClick={() => setEditing(editing === s.id ? "" : s.id)}
+              >
+                {editing === s.id ? "Close" : "Edit"}
+              </button>
+              {s.state !== "published" && (
+                <button
+                  className="btn sm"
+                  disabled={busy === s.id}
+                  onClick={() => act(s.id, () => api.publishSnapshot(s.id))}
+                >
+                  Publish
+                </button>
+              )}
+              <button
+                className="btn secondary sm"
+                disabled={busy === s.id}
+                style={{ color: "var(--path-fg)" }}
+                onClick={() => {
+                  if (
+                    confirm(
+                      `Delete snapshot "${s.id}"?\n\nExisting job results stay readable — they keep their own column model — but new annotation against this name will fail.`,
+                    )
+                  ) {
+                    act(s.id, () => api.deleteSnapshot(s.id));
+                  }
                 }}
               >
-                {s.state}
-              </span>
-            </div>
-            <div className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
-              {s.id} · {s.build} · {s.source_count ?? 0} sources
+                Delete
+              </button>
             </div>
           </div>
-          {s.state !== "published" && (
-            <button
-              className="btn secondary sm"
-              disabled={busy === s.id}
-              onClick={async () => {
-                setBusy(s.id);
-                try {
-                  await api.publishSnapshot(s.id);
-                  onChange();
-                } finally {
-                  setBusy("");
-                }
+
+          {editing === s.id && (
+            <EditSnapshot
+              snapshot={s}
+              onDone={() => {
+                setEditing("");
+                onChange();
               }}
-            >
-              Publish
-            </button>
+            />
           )}
         </div>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Edits a snapshot's title and default fields.
+ *
+ * Available on a published snapshot too. Publishing fixes the pinned source
+ * *versions* — that is what reproducibility rests on — not the label or which
+ * fields are pre-checked. A job records the annotations it actually ran with, so
+ * changing a default does not rewrite history.
+ */
+function EditSnapshot({ snapshot, onDone }: { snapshot: Snapshot; onDone: () => void }) {
+  const [title, setTitle] = useState(snapshot.title ?? "");
+  const [defaults, setDefaults] = useState((snapshot.defaults ?? []).join(", "));
+  const [fields, setFields] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    api
+      .snapshot(snapshot.id)
+      .then((d) => setFields((d.annotations ?? []).map((a) => a.name)))
+      .catch(() => {});
+  }, [snapshot.id]);
+
+  const chosen = defaults.split(",").map((d) => d.trim()).filter(Boolean);
+
+  return (
+    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--hairline)" }}>
+      <div className="row gap-14" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
+        <div style={{ flex: 1, minWidth: 240 }}>
+          <label className="label">Title</label>
+          <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
+        </div>
+        <div style={{ flex: 2, minWidth: 280 }}>
+          <label className="label">Default fields (comma-separated)</label>
+          <input
+            className="input mono"
+            style={{ fontSize: 12 }}
+            value={defaults}
+            onChange={(e) => setDefaults(e.target.value)}
+          />
+        </div>
+      </div>
+
+      {fields.length > 0 && (
+        <div className="row gap-8" style={{ flexWrap: "wrap", marginTop: 10 }}>
+          {fields.map((f) => {
+            const on = chosen.includes(f);
+            return (
+              <button
+                key={f}
+                className="tag"
+                style={{
+                  cursor: "pointer",
+                  border: "none",
+                  background: on ? "var(--accent-tint)" : "var(--neutral-fill)",
+                  color: on ? "var(--accent-text)" : "var(--text-2)",
+                }}
+                onClick={() =>
+                  setDefaults(
+                    (on ? chosen.filter((c) => c !== f) : [...chosen, f]).join(", "),
+                  )
+                }
+              >
+                {on ? "✓ " : "+ "}
+                {f}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {err && <p className="err" style={{ fontSize: 12.5, marginTop: 10 }}>{err}</p>}
+
+      <div className="row gap-8" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+        <button
+          className="btn sm"
+          disabled={busy}
+          onClick={async () => {
+            setBusy(true);
+            setErr("");
+            try {
+              await api.updateSnapshotMeta(snapshot.id, { title, defaults: chosen });
+              onDone();
+            } catch (e) {
+              setErr(e instanceof Error ? e.message : String(e));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? "Saving…" : "Save"}
+        </button>
+      </div>
+      <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
+        Pinned source versions cannot be changed once published — that is what makes
+        a snapshot reproducible. Create a new snapshot to change them.
+      </p>
     </div>
   );
 }

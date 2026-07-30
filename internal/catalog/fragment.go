@@ -71,3 +71,77 @@ func kindOf(typ, format string) string {
 	}
 	return "vcf" // varhub's own default for a data source with no format
 }
+
+// Annotation is one field a source can contribute, derived from its manifest.
+type Annotation struct {
+	Name        string `json:"name"`
+	Field       string `json:"field,omitempty"` // source INFO id / column / GTF field
+	Type        string `json:"type,omitempty"`  // categorical|text|numeric|flag
+	Description string `json:"description,omitempty"`
+	Builtin     string `json:"builtin,omitempty"` // builtin annotator name, if any
+	Source      string `json:"source,omitempty"`  // populated by the caller
+	SourceRef   string `json:"source_ref,omitempty"`
+}
+
+// annotationFragment is the annotation half of a source manifest.
+type annotationFragment struct {
+	Sources []struct {
+		Annotations []struct {
+			Name        string `toml:"name"`
+			Field       string `toml:"field"`
+			Type        string `toml:"type"`
+			Description string `toml:"description"`
+			Builtin     string `toml:"builtin"`
+		} `toml:"annotations"`
+	} `toml:"sources"`
+}
+
+// AnnotationsFromTOML lists the fields a source manifest declares.
+//
+// Derived on read rather than stored as a column: it is a projection of
+// toml_text like the rest, and computing it here means a source registered
+// before this existed needs no backfill. A manifest is a few KB, so parsing one
+// per request is not worth a migration to avoid.
+func AnnotationsFromTOML(text string) []Annotation {
+	var f annotationFragment
+	if _, err := toml.Decode(text, &f); err != nil {
+		// A manifest that does not parse was rejected at registration; if one is
+		// somehow stored, report no fields rather than failing the whole listing.
+		return nil
+	}
+	var out []Annotation
+	for _, s := range f.Sources {
+		for _, a := range s.Annotations {
+			name := a.Name
+			if name == "" {
+				name = a.Builtin // a builtin may name itself
+			}
+			if name == "" {
+				continue
+			}
+			out = append(out, Annotation{
+				Name: name, Field: a.Field, Type: a.Type,
+				Description: a.Description, Builtin: a.Builtin,
+			})
+		}
+	}
+	return out
+}
+
+// Annotations returns the source's declared fields, attributed to it.
+func (s Source) Annotations() []Annotation {
+	anns := AnnotationsFromTOML(s.TOML)
+	for i := range anns {
+		anns[i].Source = s.DisplayName()
+		anns[i].SourceRef = s.Ref()
+	}
+	return anns
+}
+
+// DisplayName is the source's title, falling back to its name.
+func (s Source) DisplayName() string {
+	if s.Title != "" {
+		return s.Title
+	}
+	return s.Name
+}

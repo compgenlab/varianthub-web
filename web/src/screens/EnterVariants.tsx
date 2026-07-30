@@ -25,10 +25,13 @@ export default function EnterVariants() {
   // button doesn't work" looked like. With it in the URL the step is a real,
   // reloadable location and browser history behaves.
   const snapshot = params.get("snapshot") ?? "";
+  const sources = (params.get("sources") ?? "").split(",").filter(Boolean);
+  const build = params.get("build") ?? "";
+  const annotations = (params.get("annotations") ?? "").split(",").filter(Boolean);
 
   // Declarative redirect: calling navigate() during render is not supported and
   // fights the history stack.
-  if (!snapshot) return <Navigate to="/annotate/sources" replace />;
+  if (!snapshot && sources.length === 0) return <Navigate to="/annotate/sources" replace />;
 
   const chips = flow.variants;
   const batchLines = batch.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -48,11 +51,22 @@ export default function EnterVariants() {
       let job: { job_id: string };
       if (mode === "vcf") {
         if (!flow.file) throw new Error("Choose a VCF file first.");
-        job = await api.annotateVCF(flow.file, { snapshot });
+        job = await api.annotateVCF(flow.file, {
+          snapshot: snapshot || undefined,
+          sources: sources.length ? sources : undefined,
+          build: build || undefined,
+          annotations: annotations.length ? annotations.join(",") : undefined,
+        });
       } else {
         const variants = mode === "single" ? chips : batchLines;
         if (variants.length === 0) throw new Error("Enter at least one variant.");
-        job = await api.annotate({ snapshot, variants });
+        job = await api.annotate({
+          snapshot: snapshot || undefined,
+          sources: sources.length ? sources : undefined,
+          build: build || undefined,
+          variants,
+          annotations: annotations.length ? annotations : undefined,
+        });
       }
       nav(`/annotate/running/${job.job_id}`);
     } catch (e) {

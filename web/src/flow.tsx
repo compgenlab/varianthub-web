@@ -11,7 +11,13 @@ import { createContext, useContext, useMemo, useState } from "react";
 export interface AnnotateState {
   snapshot: string;
   setSnapshot: (s: string) => void;
-  /** Selected annotation keys; empty means the snapshot's defaults. */
+  /** Individual-source selection, used instead of a snapshot. */
+  sources: string[];
+  setSources: (s: string[]) => void;
+  /** Assembly, required when selecting individual sources. */
+  build: string;
+  setBuild: (b: string) => void;
+  /** Selected annotation field names. */
   annotations: string[];
   setAnnotations: (a: string[]) => void;
   variants: string[];
@@ -24,6 +30,8 @@ const Ctx = createContext<AnnotateState | null>(null);
 
 export function AnnotateProvider({ children }: { children: React.ReactNode }) {
   const [snapshot, setSnapshot] = useState("");
+  const [sources, setSources] = useState<string[]>([]);
+  const [build, setBuild] = useState("GRCh38");
   const [annotations, setAnnotations] = useState<string[]>([]);
   const [variants, setVariants] = useState<string[]>([]);
   const [file, setFile] = useState<File | null>(null);
@@ -32,6 +40,10 @@ export function AnnotateProvider({ children }: { children: React.ReactNode }) {
     () => ({
       snapshot,
       setSnapshot,
+      sources,
+      setSources,
+      build,
+      setBuild,
       annotations,
       setAnnotations,
       variants,
@@ -39,7 +51,7 @@ export function AnnotateProvider({ children }: { children: React.ReactNode }) {
       file,
       setFile,
     }),
-    [snapshot, annotations, variants, file],
+    [snapshot, sources, build, annotations, variants, file],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

@@ -19,6 +19,7 @@ var migrationFiles = []string{
 	"../../migrations/0001_job_queue.sql",
 	"../../migrations/0002_catalog.sql",
 	"../../migrations/0004_registry.sql",
+	"../../migrations/0005_adhoc_snapshot.sql",
 }
 
 func testStore(t *testing.T) *Store {
@@ -166,13 +167,20 @@ func TestPutSnapshotReplacesPins(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
+	// A draft: re-pinning is exactly what a draft is for. (Re-pinning a published
+	// snapshot is refused — see TestPublishedPinsAreFrozenButMetaIsNot.)
+	if err := s.PutSnapshot(ctx, Snapshot{
+		ID: "wip", Build: "GRCh38", State: StateDraft,
+	}, []string{"builtins"}); err != nil {
+		t.Fatal(err)
+	}
 	// Re-pin with both, in a specific order.
 	if err := s.PutSnapshot(ctx, Snapshot{
-		ID: "dev", Build: "GRCh38", State: StatePublished,
+		ID: "wip", Build: "GRCh38", State: StateDraft,
 	}, []string{"extra", "builtins"}); err != nil {
 		t.Fatal(err)
 	}
-	snap, err := s.GetSnapshot(ctx, "dev")
+	snap, err := s.GetSnapshot(ctx, "wip")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,11 +193,11 @@ func TestPutSnapshotReplacesPins(t *testing.T) {
 
 	// Re-pin with one: the removed pin must be gone, not accumulated.
 	if err := s.PutSnapshot(ctx, Snapshot{
-		ID: "dev", Build: "GRCh38", State: StatePublished,
+		ID: "wip", Build: "GRCh38", State: StateDraft,
 	}, []string{"builtins"}); err != nil {
 		t.Fatal(err)
 	}
-	snap, _ = s.GetSnapshot(ctx, "dev")
+	snap, _ = s.GetSnapshot(ctx, "wip")
 	if len(snap.Sources) != 1 || snap.Sources[0].ID != "builtins" {
 		t.Errorf("re-pin did not replace: %+v", snap.Sources)
 	}
@@ -310,5 +318,147 @@ func TestMaterializeRequiresDirs(t *testing.T) {
 	m := &Materializer{Store: s, Root: t.TempDir()}
 	if _, _, err := m.Home(context.Background(), "dev"); err == nil {
 		t.Error("Home should require DataDir and CacheDir")
+	}
+}
+
+// Publishing fixes the pinned versions — that is what reproducibility depends
+// on. It must not fix the title or the default field selection, or a typo could
+// never be corrected.
+func TestPublishedPinsAreFrozenButMetaIsNot(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.PutSource(ctx, Source{
+		ID: "other", Name: "other", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Same pins, published: allowed (this is what publish itself does).
+	if err := s.PutSnapshot(ctx, Snapshot{
+		ID: "dev", Build: "GRCh38", State: StatePublished,
+	}, []string{"builtins"}); err != nil {
+		t.Fatalf("re-put with identical pins: %v", err)
+	}
+
+	// Different pins on a published snapshot: refused.
+	err := s.PutSnapshot(ctx, Snapshot{
+		ID: "dev", Build: "GRCh38", State: StatePublished,
+	}, []string{"builtins", "other"})
+	if !errors.Is(err, ErrPinsFrozen) {
+		t.Fatalf("err = %v, want ErrPinsFrozen", err)
+	}
+
+	// Metadata and defaults still editable.
+	if err := s.UpdateSnapshotMeta(ctx, Snapshot{
+		ID: "dev", Title: "Renamed", Defaults: []string{"auto_id"},
+	}); err != nil {
+		t.Fatalf("UpdateSnapshotMeta: %v", err)
+	}
+	got, err := s.GetSnapshot(ctx, "dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Title != "Renamed" || len(got.Defaults) != 1 {
+		t.Errorf("meta not updated: %+v", got)
+	}
+	// ...and the pins are untouched by a meta edit.
+	if len(got.Sources) != 1 || got.Sources[0].ID != "builtins" {
+		t.Errorf("meta edit changed pins: %+v", got.Sources)
+	}
+}
+
+// Publishing fixes what a snapshot means, not that the row exists forever.
+func TestPublishedSnapshotCanBeDeleted(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.DeleteSnapshot(ctx, "dev"); err != nil {
+		t.Fatalf("DeleteSnapshot: %v", err)
+	}
+	if _, err := s.GetSnapshot(ctx, "dev"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("snapshot still present: %v", err)
+	}
+	if err := s.DeleteSnapshot(ctx, "dev"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("deleting twice should report not-found, got %v", err)
+	}
+}
+
+// An ad-hoc selection is a real snapshot, but must never appear in a list a
+// person picks from — and the same selection must reuse one row.
+func TestAdhocSnapshot(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+
+	id, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"builtins"}, []string{"tstv"})
+	if err != nil {
+		t.Fatalf("EnsureAdhocSnapshot: %v", err)
+	}
+	again, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"builtins"}, []string{"tstv"})
+	if err != nil || again != id {
+		t.Errorf("same selection produced %q then %q", id, again)
+	}
+	// Order must not matter: the same set is the same selection.
+	if a, _ := AdhocID("GRCh38", []string{"a", "b"}), 0; a != AdhocID("GRCh38", []string{"b", "a"}) {
+		t.Error("AdhocID depends on order")
+	}
+	// A different build is a different selection.
+	if AdhocID("GRCh37", []string{"builtins"}) == id {
+		t.Error("AdhocID ignores the build")
+	}
+
+	snaps, err := s.ListSnapshots(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, sn := range snaps {
+		if sn.State == StateAdhoc {
+			t.Errorf("ad-hoc snapshot %q leaked into the list", sn.ID)
+		}
+	}
+	// It still resolves and materializes like any snapshot.
+	full, err := s.GetSnapshot(ctx, id)
+	if err != nil {
+		t.Fatalf("ad-hoc snapshot does not load: %v", err)
+	}
+	if len(full.Sources) != 1 || full.Build != "GRCh38" {
+		t.Errorf("unexpected ad-hoc snapshot: %+v", full)
+	}
+
+	if _, err := s.EnsureAdhocSnapshot(ctx, "", []string{"builtins"}, nil); err == nil {
+		t.Error("a build should be required")
+	}
+	if _, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", nil, nil); err == nil {
+		t.Error("at least one source should be required")
+	}
+}
+
+func TestAnnotationsFromTOML(t *testing.T) {
+	anns := AnnotationsFromTOML(builtinsTOML)
+	if len(anns) != 3 {
+		t.Fatalf("got %d annotations, want 3", len(anns))
+	}
+	names := map[string]bool{}
+	for _, a := range anns {
+		names[a.Name] = true
+	}
+	for _, want := range []string{"auto_id", "tstv", "indel"} {
+		if !names[want] {
+			t.Errorf("missing %q: %+v", want, anns)
+		}
+	}
+	// A field-bearing source carries its field and type through.
+	withField := AnnotationsFromTOML(`[[sources]]
+  name = "clinvar"
+  [[sources.annotations]]
+    name = "clinvar_sig"
+    field = "CLNSIG"
+    type = "categorical"
+    description = "Clinical significance"
+`)
+	if len(withField) != 1 || withField[0].Field != "CLNSIG" ||
+		withField[0].Type != "categorical" || withField[0].Description == "" {
+		t.Errorf("field metadata lost: %+v", withField)
+	}
+	if got := AnnotationsFromTOML("not ][ toml"); got != nil {
+		t.Errorf("unparseable manifest should yield no fields, got %+v", got)
 	}
 }

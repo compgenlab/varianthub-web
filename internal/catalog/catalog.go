@@ -10,8 +10,13 @@ package catalog
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -32,6 +37,10 @@ const (
 const (
 	StateDraft     = "draft"
 	StatePublished = "published"
+	// StateAdhoc marks a snapshot generated from an individual-source selection.
+	// It is a real snapshot — materialized and reproducible like any other — but
+	// never offered in the picker or the admin list.
+	StateAdhoc = "adhoc"
 )
 
 // Source is one registered annotation source.
@@ -149,8 +158,11 @@ func (s *Store) ListSources(ctx context.Context) ([]Source, error) {
 
 // ListSnapshots returns every snapshot without its sources.
 func (s *Store) ListSnapshots(ctx context.Context) ([]Snapshot, error) {
+	// Ad-hoc rows are machine-generated per submission; they are snapshots for the
+	// engine's purposes but not things a person picks from a list.
 	rows, err := s.pool.Query(ctx,
-		`SELECT `+snapshotCols+` FROM snapshot ORDER BY created_at DESC, id`)
+		`SELECT `+snapshotCols+` FROM snapshot WHERE state <> $1
+		 ORDER BY created_at DESC, id`, StateAdhoc)
 	if err != nil {
 		return nil, err
 	}
@@ -235,9 +247,88 @@ func (s *Store) PutSource(ctx context.Context, src Source) error {
 	return err
 }
 
+// ErrPinsFrozen is returned when a published snapshot's source pins would change.
+var ErrPinsFrozen = errors.New("a published snapshot's pinned versions cannot change")
+
+// UpdateSnapshotMeta edits a snapshot's presentation and default annotations
+// without touching its pins.
+//
+// This is allowed on a published snapshot. What makes a snapshot reproducible is
+// the set of pinned source *versions*; a title, a description, or which fields
+// are checked by default are conveniences, and a job records the annotations it
+// actually ran with regardless. Freezing those too would mean a typo in a title
+// could never be fixed.
+func (s *Store) UpdateSnapshotMeta(ctx context.Context, snap Snapshot) error {
+	if snap.Defaults == nil {
+		snap.Defaults = []string{}
+	}
+	if snap.Tags == nil {
+		snap.Tags = []string{}
+	}
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE snapshot
+		   SET title=$2, description=$3, defaults=$4, tags=$5, updated_at=$6
+		 WHERE id=$1`,
+		snap.ID, snap.Title, snap.Description, snap.Defaults, snap.Tags, s.nowFn())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("snapshot %q: %w", snap.ID, ErrNotFound)
+	}
+	return nil
+}
+
+// DeleteSnapshot removes a snapshot and its pins.
+//
+// Allowed for a published snapshot: publishing fixes what a snapshot *means*, it
+// does not make the row permanent. Jobs reference a snapshot by name and store
+// their own column model, so existing results stay readable — only new
+// annotation against that name stops working.
+func (s *Store) DeleteSnapshot(ctx context.Context, id string) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM snapshot WHERE id=$1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("snapshot %q: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
+// pinsOf returns a snapshot's pinned source ids, sorted, plus whether the
+// snapshot exists and its current state.
+func (s *Store) pinsOf(ctx context.Context, id string) (ids []string, state string, ok bool, err error) {
+	err = s.pool.QueryRow(ctx, `SELECT state FROM snapshot WHERE id=$1`, id).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, "", false, nil
+	}
+	if err != nil {
+		return nil, "", false, err
+	}
+	rows, qErr := s.pool.Query(ctx,
+		`SELECT source_id FROM snapshot_source WHERE snapshot_id=$1`, id)
+	if qErr != nil {
+		return nil, "", false, qErr
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var sid string
+		if err := rows.Scan(&sid); err != nil {
+			return nil, "", false, err
+		}
+		ids = append(ids, sid)
+	}
+	sort.Strings(ids)
+	return ids, state, true, rows.Err()
+}
+
 // PutSnapshot inserts or updates a snapshot and replaces its source pins. The
 // whole thing is one transaction: a snapshot is never briefly visible with a
 // partial source list, which would materialize into a manifest missing sources.
+//
+// Refuses to change the pins of an already-published snapshot — that is the one
+// thing publishing fixes. Use UpdateSnapshotMeta for everything else.
 func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []string) error {
 	if snap.ID == "" {
 		return errors.New("snapshot needs an id")
@@ -256,6 +347,17 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 	}
 	if snap.Tags == nil {
 		snap.Tags = []string{}
+	}
+	existing, state, found, err := s.pinsOf(ctx, snap.ID)
+	if err != nil {
+		return err
+	}
+	if found && state == StatePublished {
+		want := append([]string(nil), sourceIDs...)
+		sort.Strings(want)
+		if !slices.Equal(existing, want) {
+			return fmt.Errorf("%w (snapshot %q)", ErrPinsFrozen, snap.ID)
+		}
 	}
 	now := s.nowFn()
 
@@ -305,6 +407,43 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// AdhocID is the deterministic id for a selection of sources on a build.
+//
+// Deterministic so repeat submissions of the same selection reuse one row rather
+// than accumulating a snapshot per job. Sorted first, because the same set chosen
+// in a different order is the same selection.
+func AdhocID(build string, sourceIDs []string) string {
+	ids := append([]string(nil), sourceIDs...)
+	sort.Strings(ids)
+	h := sha256.Sum256([]byte(build + "\x00" + strings.Join(ids, "\x00")))
+	return "adhoc-" + hex.EncodeToString(h[:6])
+}
+
+// EnsureAdhocSnapshot creates (or reuses) a snapshot for an ad-hoc selection and
+// returns its id.
+func (s *Store) EnsureAdhocSnapshot(ctx context.Context, build string, sourceIDs []string,
+	defaults []string) (string, error) {
+
+	if build == "" {
+		return "", errors.New("a build is required to annotate with individual sources")
+	}
+	if len(sourceIDs) == 0 {
+		return "", errors.New("select at least one source")
+	}
+	id := AdhocID(build, sourceIDs)
+	if err := s.PutSnapshot(ctx, Snapshot{
+		ID:          id,
+		Title:       "Ad-hoc selection",
+		Description: "Generated from an individual-source selection.",
+		Build:       build,
+		State:       StateAdhoc,
+		Defaults:    defaults,
+	}, sourceIDs); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
 // Count returns the number of snapshots and sources. Used by the seed command to

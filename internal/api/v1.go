@@ -15,6 +15,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -108,17 +109,18 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Drafts are hidden by default: a snapshot is a promise of reproducibility,
-	// and an unpublished one can still be re-pinned. The admin view asks for them
-	// explicitly with ?state=all, since it is where they get published.
-	if r.URL.Query().Get("state") != "all" {
-		published := snaps[:0]
+	// Drafts are selectable: a snapshot has to be usable before anyone can tell
+	// whether it is worth publishing. Every entry carries its state so the client
+	// can mark a draft as not-yet-fixed rather than the server hiding it.
+	// ?state=published narrows to fixed ones for a caller that wants only those.
+	if want := r.URL.Query().Get("state"); want != "" && want != "all" {
+		kept := snaps[:0]
 		for _, sn := range snaps {
-			if sn.State == catalog.StatePublished {
-				published = append(published, sn)
+			if sn.State == want {
+				kept = append(kept, sn)
 			}
 		}
-		snaps = published
+		snaps = kept
 	}
 	type item struct {
 		catalog.Snapshot
@@ -163,7 +165,35 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"snapshot":         snap,
 		"contains_private": snap.ContainsPrivate(),
+		"annotations":      snapshotAnnotations(snap),
 	})
+}
+
+// snapshotAnnotations lists every field the snapshot's sources can contribute,
+// each attributed to its source and flagged if the snapshot applies it by
+// default. This is what the annotation flow's field picker renders.
+func snapshotAnnotations(snap catalog.Snapshot) []annotationOption {
+	def := map[string]bool{}
+	for _, d := range snap.Defaults {
+		def[d] = true
+	}
+	out := []annotationOption{}
+	seen := map[string]bool{}
+	for _, src := range snap.Sources {
+		for _, a := range src.Annotations() {
+			if seen[a.Name] {
+				continue // two sources naming the same field: first wins, as varhub does
+			}
+			seen[a.Name] = true
+			out = append(out, annotationOption{Annotation: a, Default: def[a.Name]})
+		}
+	}
+	return out
+}
+
+type annotationOption struct {
+	catalog.Annotation
+	Default bool `json:"default"`
 }
 
 // handleSources lists sources one row per (name, version).
@@ -185,10 +215,17 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	type item struct {
 		catalog.Source
 		Ref string `json:"ref"` // "name:version", how a snapshot manifest pins it
+		// Annotations lets the flow show which fields a source contributes before
+		// it is chosen, so picking sources and picking fields are one step.
+		Annotations []catalog.Annotation `json:"annotations"`
 	}
 	out := make([]item, 0, len(srcs))
 	for _, src := range srcs {
-		out = append(out, item{Source: src, Ref: src.Ref()})
+		anns := src.Annotations()
+		if anns == nil {
+			anns = []catalog.Annotation{}
+		}
+		out = append(out, item{Source: src, Ref: src.Ref(), Annotations: anns})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": out})
 }
@@ -198,9 +235,37 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 // annotateRequest is the JSON body of POST /api/v1/annotate.
 type annotateRequest struct {
 	Snapshot    string   `json:"snapshot"`
-	Sources     []string `json:"sources"`
+	Sources     []string `json:"sources"` // individual-source selection (needs Build)
+	Build       string   `json:"build"`   // assembly, required with Sources
 	Variants    []string `json:"variants"`
 	Annotations any      `json:"annotations"` // omitted | "all" | "a,b" | ["a","b"]
+}
+
+// resolveSnapshot turns a request's snapshot-or-sources into a snapshot name.
+//
+// An individual-source selection still becomes a snapshot: that is what the
+// engine annotates against, what gets materialized, and what makes the job
+// reproducible afterwards. The row is deterministic in the selection, so
+// resubmitting the same set reuses it instead of accumulating one per job.
+func (s *Server) resolveSnapshot(r *http.Request, snapshot string, sources []string,
+	build string, defaults []string) (string, error) {
+
+	if snapshot != "" && len(sources) > 0 {
+		return "", errors.New(`give either "snapshot" or "sources", not both`)
+	}
+	if snapshot != "" {
+		return snapshot, nil
+	}
+	if len(sources) == 0 {
+		return "", errors.New(`"snapshot" or "sources" is required`)
+	}
+	if s.catalog == nil {
+		return "", errors.New("catalog unavailable; annotate with a snapshot instead")
+	}
+	if strings.TrimSpace(build) == "" {
+		return "", errors.New(`"build" is required when selecting individual sources`)
+	}
+	return s.catalog.EnsureAdhocSnapshot(r.Context(), build, sources, defaults)
 }
 
 // selection normalizes the `annotations` field to the runner's Selection string:
@@ -228,17 +293,19 @@ func selection(v any) (string, error) {
 	}
 }
 
+// splitSelection turns a stored selection back into names, for seeding an
+// ad-hoc snapshot's defaults. "all" and "" carry no explicit list.
+func splitSelection(sel string) []string {
+	if sel == "" || sel == "all" {
+		return nil
+	}
+	return strings.Split(sel, ",")
+}
+
 func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	var in annotateRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<24)).Decode(&in); err != nil {
 		writeError(w, http.StatusBadRequest, "malformed JSON body")
-		return
-	}
-	if len(in.Sources) > 0 {
-		// The engine selects sources through a snapshot; there is no ad-hoc
-		// source-list mode. Rejecting is better than silently annotating under
-		// something the caller did not ask for.
-		writeError(w, http.StatusBadRequest, "an ad-hoc `sources` list is not supported; name a `snapshot`")
 		return
 	}
 	loci := make([]string, 0, len(in.Variants))
@@ -263,13 +330,23 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// An individual-source selection becomes a snapshot here, so everything
+	// downstream — materialization, results columns, reproducibility — is
+	// identical whichever way the caller chose.
+	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(in.Snapshot), in.Sources,
+		in.Build, splitSelection(sel))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	label := loci[0]
 	if len(loci) > 1 {
 		label = fmt.Sprintf("%s +%d more", loci[0], len(loci)-1)
 	}
 	s.submit(w, r, queue.NewJob{
 		Kind:      queue.KindLocus,
-		Snapshot:  strings.TrimSpace(in.Snapshot),
+		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
 		Label:     label,
@@ -320,13 +397,23 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	var sources []string
 	if v := strings.TrimSpace(r.FormValue("sources")); v != "" {
-		writeError(w, http.StatusBadRequest, "an ad-hoc `sources` list is not supported; name a `snapshot`")
+		for _, id := range strings.Split(v, ",") {
+			if id = strings.TrimSpace(id); id != "" {
+				sources = append(sources, id)
+			}
+		}
+	}
+	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(r.FormValue("snapshot")),
+		sources, strings.TrimSpace(r.FormValue("build")), splitSelection(sel))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	s.submit(w, r, queue.NewJob{
 		Kind:      queue.KindVCF,
-		Snapshot:  strings.TrimSpace(r.FormValue("snapshot")),
+		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
 		Label:     hdr.Filename,
