@@ -110,9 +110,10 @@ func TestEnqueueProcessDone(t *testing.T) {
 		body := `[{"chrom":"chr1","pos":100,"ref":"A","alt":"G","annotations":{"echo":"` +
 			string(input) + `"}}]`
 		return Outcome{
-			Result:  []byte(body),
-			N:       1,
-			Columns: []byte(`[{"key":"echo","label":"echo"}]`),
+			Result:   []byte(body),
+			N:        1,
+			Columns:  []byte(`[{"key":"echo","label":"echo"}]`),
+			Variants: true,
 		}, nil
 	})
 

@@ -85,6 +85,31 @@ clean checkout and is what self-hosters should use.
 in a separate k8s deploy repo, so those files are examples and seed material, not
 the live configuration — see that directory's README.
 
+## Provisioning source data
+
+A registered source declares where its data comes from; it still has to be
+downloaded before it can annotate. Until it is, annotating fails with
+`sources not downloaded — run varhub download`.
+
+Do it from **Sources & snapshots → Files**: pick a snapshot and a storage
+location, and the download runs as a queued job (visible under Results). When it
+finishes, the files it produced are listed with their sizes, grouped by source.
+
+**Storage locations** come from two places, deliberately:
+
+- **Filesystem paths** are declared by the deployment in `VHW_STORAGE_PATHS`. A
+  path only means anything if the worker has it mounted, so it is a deployment
+  decision, not a runtime one. They are reconciled at startup — a path removed
+  from the config stops being offered.
+- **S3 buckets** are added through the admin UI, since they need no mount.
+
+S3 targets can be configured but are **not yet selectable**: `varhub` cannot
+download to a bucket yet. The UI shows them and says why rather than offering a
+target that would fail at job time.
+
+Files are not individually deletable. Each belongs to a source, and removing one
+would break that source — delete the source instead.
+
 ## Adding sources and snapshots
 
 There is no admin UI yet, so the catalog is managed from the command line. A
@@ -128,7 +153,8 @@ row directly if you need to.
 | `VHW_WORKERS` | `2` | Worker pool size |
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
 | `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |
-| `VHW_DATA_DIR` | `/var/lib/varianthub/data` | Shared, persistent: downloaded source files |
+| `VHW_DATA_DIR` | `/var/lib/varianthub/data` | Shared, persistent: tool images and reference files |
+| `VHW_STORAGE_PATHS` | `default=/var/lib/varianthub/sources` | Filesystem download targets, `name=/abs/path`, comma-separated; first is the default |
 | `VHW_CACHE_DIR` | `/var/lib/varianthub/cache` | Shared, persistent: built indexes and cache |
 | `VHW_JOB_TTL` | `24h` | Terminal jobs GC'd after this |
 | `VHW_RATE_PER_MIN` | `30` | Per-IP submit rate |

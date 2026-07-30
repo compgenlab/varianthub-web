@@ -57,6 +57,25 @@ export interface Annotation {
   default?: boolean;
 }
 
+export interface StorageLocation {
+  id: string;
+  name: string;
+  kind: "path" | "s3";
+  uri: string;
+  from_config: boolean;
+  is_default: boolean;
+  usable: boolean;
+  unusable_reason?: string;
+}
+
+export interface SourceFile {
+  source_id: string;
+  storage_id: string;
+  path: string;
+  size_bytes: number;
+  modified_at: number;
+}
+
 export interface Job {
   job_id: string;
   kind: string;
@@ -329,6 +348,36 @@ export const api = {
   publishSnapshot: (id: string) =>
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
       method: "POST",
+    }),
+
+  storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
+
+  addStorage: (body: { name: string; kind: "s3"; uri: string }) =>
+    req<{ id: string }>("/admin/storage", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  deleteStorage: (id: string) =>
+    req<void>(`/admin/storage/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  files: (source?: string) =>
+    req<{ files: SourceFile[]; total_bytes: number; count: number }>(
+      `/admin/files${source ? `?source=${encodeURIComponent(source)}` : ""}`,
+    ),
+
+  download: (body: {
+    snapshot?: string;
+    sources?: string[];
+    build?: string;
+    storage_id?: string;
+    force?: boolean;
+  }) =>
+    req<{ job_id: string; snapshot: string; storage: StorageLocation }>("/admin/downloads", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
     }),
 
   registries: () => req<{ registries: Registry[] }>("/admin/registries"),

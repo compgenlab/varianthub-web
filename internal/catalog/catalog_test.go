@@ -20,6 +20,7 @@ var migrationFiles = []string{
 	"../../migrations/0002_catalog.sql",
 	"../../migrations/0004_registry.sql",
 	"../../migrations/0005_adhoc_snapshot.sql",
+	"../../migrations/0006_storage.sql",
 }
 
 func testStore(t *testing.T) *Store {
@@ -460,5 +461,98 @@ func TestAnnotationsFromTOML(t *testing.T) {
 	}
 	if got := AnnotationsFromTOML("not ][ toml"); got != nil {
 		t.Errorf("unparseable manifest should yield no fields, got %+v", got)
+	}
+}
+
+func TestStorageAndFiles(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+
+	// Config-declared locations are reconciled, not merged: one dropped from the
+	// config must stop being offered, or a download could target a path the
+	// deployment no longer mounts.
+	if err := s.SyncConfigStorage(ctx, []StorageLocation{
+		{ID: "cfg-a", Name: "a", Kind: StoragePath, URI: "/mnt/a", IsDefault: true},
+		{ID: "cfg-b", Name: "b", Kind: StoragePath, URI: "/mnt/b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutStorage(ctx, StorageLocation{
+		ID: "s3", Name: "bucket", Kind: StorageS3, URI: "s3://x/y",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncConfigStorage(ctx, []StorageLocation{
+		{ID: "cfg-a", Name: "a", Kind: StoragePath, URI: "/mnt/a", IsDefault: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	locs, _ := s.ListStorage(ctx)
+	ids := map[string]bool{}
+	for _, l := range locs {
+		ids[l.ID] = true
+	}
+	if ids["cfg-b"] {
+		t.Error("a location removed from the config is still offered")
+	}
+	if !ids["s3"] {
+		t.Error("sync removed a user-added location")
+	}
+
+	// The default is the first usable one; S3 is not usable as a target yet.
+	def, err := s.DefaultStorage(ctx)
+	if err != nil || def.ID != "cfg-a" {
+		t.Errorf("DefaultStorage = %+v, %v", def, err)
+	}
+	if (StorageLocation{Kind: StorageS3}).Usable() {
+		t.Error("S3 should not be a usable download target yet")
+	}
+
+	// Config-managed locations cannot be deleted through the API path: they come
+	// back on the next start, so it would only look like it worked.
+	if err := s.DeleteStorage(ctx, "cfg-a"); err == nil {
+		t.Error("deleting a config-managed location should be refused")
+	}
+	if err := s.DeleteStorage(ctx, "s3"); err != nil {
+		t.Errorf("deleting a user location: %v", err)
+	}
+
+	// File records replace rather than merge, so a re-download that yields fewer
+	// files does not leave stale ones listed.
+	if err := s.ReplaceSourceFiles(ctx, "builtins", "cfg-a", []SourceFile{
+		{Path: "builtins/1/a.gz", SizeBytes: 10, ModifiedAt: 1},
+		{Path: "builtins/1/b.gz", SizeBytes: 20, ModifiedAt: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if f, _ := s.SourceFiles(ctx, "builtins"); len(f) != 2 {
+		t.Fatalf("got %d files, want 2", len(f))
+	}
+	if err := s.ReplaceSourceFiles(ctx, "builtins", "cfg-a", []SourceFile{
+		{Path: "builtins/1/a.gz", SizeBytes: 11, ModifiedAt: 2},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := s.SourceFiles(ctx, "builtins")
+	if len(f) != 1 || f[0].SizeBytes != 11 {
+		t.Errorf("replace did not clear stale rows: %+v", f)
+	}
+}
+
+func TestValidateStorage(t *testing.T) {
+	for _, bad := range []StorageLocation{
+		{ID: "", Name: "n", Kind: StoragePath, URI: "/a"},
+		{ID: "i", Name: "n", Kind: StoragePath, URI: "relative/path"},
+		{ID: "i", Name: "n", Kind: StorageS3, URI: "/not/s3"},
+		{ID: "i", Name: "n", Kind: "ftp", URI: "/a"},
+	} {
+		if err := ValidateStorage(bad); err == nil {
+			t.Errorf("ValidateStorage(%+v) should fail", bad)
+		}
+	}
+	if err := ValidateStorage(StorageLocation{
+		ID: "i", Name: "n", Kind: StoragePath, URI: "/mnt/data",
+	}); err != nil {
+		t.Errorf("valid location rejected: %v", err)
 	}
 }

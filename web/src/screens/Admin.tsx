@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Check, Plus, X } from "lucide-react";
 
 import { api, type Registry, type RegistryEntry, type Snapshot, type Source } from "../api";
+import Files from "./Files";
 
 const DEFAULT_TOML = `[[sources]]
   type    = "vcf"          # builtin | vcf | bed | gtf | tab | genelist | tool
@@ -31,7 +32,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots";
+type Tab = "sources" | "snapshots" | "files";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -94,7 +95,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots"] as Tab[]).map((t) => (
+        {(["sources", "snapshots", "files"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -109,14 +110,16 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : "Snapshots"}
+            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "Files"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "sources" ? (
+      {tab === "files" ? (
+        <Files snapshots={snapshots} />
+      ) : tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>

@@ -9,6 +9,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -22,11 +23,15 @@ type Config struct {
 
 	RequireToken bool // bearer auth on /api/v1
 
-	Workers        int           // worker pool size
-	VarhubBin      string        // path to the varhub CLI
-	VarhubHome     string        // fixed VARHUB_HOME; empty = materialize per job from the catalog
-	DataDir        string        // shared, persistent: downloaded source files
-	CacheDir       string        // shared, persistent: built indexes and the annotation cache
+	Workers    int    // worker pool size
+	VarhubBin  string // path to the varhub CLI
+	VarhubHome string // fixed VARHUB_HOME; empty = materialize per job from the catalog
+	DataDir    string // shared, persistent: downloaded source files
+	CacheDir   string // shared, persistent: built indexes and the annotation cache
+	// StoragePaths are filesystem download targets declared by the deployment, as
+	// "name=/abs/path" entries. The first is the default. They are reconciled into
+	// the catalog at startup so the config file stays authoritative for them.
+	StoragePaths   []string
 	JobTimeout     time.Duration // per-job wall clock
 	JobTTL         time.Duration // terminal jobs GC'd after this
 	SubmitWaitCap  time.Duration // ceiling on ?wait=
@@ -43,15 +48,17 @@ type Config struct {
 // Load reads the configuration from the environment, applying defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:           env("VHW_ADDR", ":8080"),
-		DatabaseURL:    os.Getenv("VHW_DATABASE_URL"),
-		MasterKey:      os.Getenv("VHW_MASTER_KEY"),
-		RequireToken:   envBool("VHW_REQUIRE_TOKEN", true),
-		Workers:        envInt("VHW_WORKERS", 2),
-		VarhubBin:      env("VHW_VARHUB_BIN", "varhub"),
-		VarhubHome:     os.Getenv("VHW_VARHUB_HOME"),
-		DataDir:        env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
-		CacheDir:       env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		Addr:         env("VHW_ADDR", ":8080"),
+		DatabaseURL:  os.Getenv("VHW_DATABASE_URL"),
+		MasterKey:    os.Getenv("VHW_MASTER_KEY"),
+		RequireToken: envBool("VHW_REQUIRE_TOKEN", true),
+		Workers:      envInt("VHW_WORKERS", 2),
+		VarhubBin:    env("VHW_VARHUB_BIN", "varhub"),
+		VarhubHome:   os.Getenv("VHW_VARHUB_HOME"),
+		DataDir:      env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
+		CacheDir:     env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		StoragePaths: envList("VHW_STORAGE_PATHS",
+			[]string{"default=/var/lib/varianthub/sources"}),
 		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),
 		JobTTL:         envDur("VHW_JOB_TTL", 24*time.Hour),
 		SubmitWaitCap:  envDur("VHW_SUBMIT_WAIT_CAP", 10*time.Second),
@@ -120,4 +127,43 @@ func envList(k string, def []string) []string {
 		}
 	}
 	return out
+}
+
+// StorageLocations parses VHW_STORAGE_PATHS into id/name/path triples.
+//
+// Format is "name=/abs/path", comma-separated; the first entry is the default
+// download target. A bare path is accepted and named after its last element, so
+// the common single-volume case needs no ceremony.
+func (c *Config) StorageLocations() ([]struct {
+	ID, Name, Path string
+	Default        bool
+}, error) {
+	type loc = struct {
+		ID, Name, Path string
+		Default        bool
+	}
+	var out []loc
+	seen := map[string]bool{}
+	for i, raw := range c.StoragePaths {
+		name, p, ok := strings.Cut(raw, "=")
+		if !ok {
+			p = name
+			name = filepath.Base(strings.TrimRight(p, "/"))
+		}
+		name = strings.TrimSpace(name)
+		p = strings.TrimSpace(p)
+		if name == "" || p == "" {
+			return nil, fmt.Errorf("VHW_STORAGE_PATHS entry %q: want name=/abs/path", raw)
+		}
+		if !filepath.IsAbs(p) {
+			return nil, fmt.Errorf("VHW_STORAGE_PATHS entry %q: path must be absolute", raw)
+		}
+		id := "cfg-" + strings.ToLower(name)
+		if seen[id] {
+			return nil, fmt.Errorf("VHW_STORAGE_PATHS declares %q twice", name)
+		}
+		seen[id] = true
+		out = append(out, loc{ID: id, Name: name, Path: p, Default: i == 0})
+	}
+	return out, nil
 }

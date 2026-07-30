@@ -340,7 +340,30 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `GET` | `/api/v1/admin/registries/{id}/datasets` | **implemented** — live listing |
 | `GET` | `/api/v1/admin/registries/{id}/fetch?ref=` | **implemented** — returns a manifest for review |
 | `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | not implemented |
+| `GET` | `/api/v1/admin/storage` | **implemented** — storage locations |
+| `POST` | `/api/v1/admin/storage` | **implemented** — add an S3 bucket (paths come from config) |
+| `DELETE` | `/api/v1/admin/storage/{id}` | **implemented** (not config-managed ones) |
+| `GET` | `/api/v1/admin/files` | **implemented** — downloaded files and sizes |
+| `POST` | `/api/v1/admin/downloads` | **implemented** — queues a provisioning job |
 | `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
+
+### Provisioning
+
+`POST /admin/downloads` queues a job that runs `varhub download` for a snapshot's
+sources into a storage location. It rides the same queue as annotation rather
+than running inline — a download can take hours and move gigabytes — so it gets
+the same persistence, scheduling and error reporting, and shows up in
+`GET /jobs` with `kind: "download"`.
+
+The worker takes the file inventory after the download, because only the worker
+is guaranteed to have the storage volume mounted. Files are attributed to a
+source by varhub's cache layout, `<root>/<name>/<version>/…`.
+
+Filesystem locations are declared by the deployment (`VHW_STORAGE_PATHS`) and
+reconciled at startup; the API refuses to add one, since a path is meaningless
+unless the worker mounts it. S3 locations can be added at runtime but are not yet
+usable as targets — `usable: false` with a reason, rather than accepting a
+download that would fail at job time.
 
 **Authorization is not role-based yet.** There are no accounts, so every valid
 token can administer. The routes sit under `/admin` so the eventual role gate has

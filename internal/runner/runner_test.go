@@ -307,3 +307,76 @@ func TestCLIMessageTruncates(t *testing.T) {
 		t.Errorf("truncated message should be marked, got %q", got[len(got)-10:])
 	}
 }
+
+func TestInventory(t *testing.T) {
+	root := t.TempDir()
+	write := func(rel string, size int) {
+		p := filepath.Join(root, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, make([]byte, size), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// varhub's cache layout: <cache>/<name>/<version>/...
+	write("clinvar/2026-06/clinvar.vcf.gz", 100)
+	write("clinvar/2026-06/clinvar.vcf.gz.tbi", 20)
+	write("gencode/48/gencode.gtf.gz", 300)
+
+	files, err := inventory(root)
+	if err != nil {
+		t.Fatalf("inventory: %v", err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("got %d files, want 3: %+v", len(files), files)
+	}
+	byPath := map[string]int64{}
+	for _, f := range files {
+		byPath[f.Path] = f.SizeBytes
+		if f.ModifiedAt == 0 {
+			t.Errorf("%s has no mtime", f.Path)
+		}
+		if filepath.IsAbs(f.Path) {
+			t.Errorf("path %q should be relative to the storage root", f.Path)
+		}
+	}
+	if byPath[filepath.Join("clinvar", "2026-06", "clinvar.vcf.gz")] != 100 {
+		t.Errorf("sizes wrong: %+v", byPath)
+	}
+
+	// A location nothing has been downloaded into yet is empty, not an error —
+	// the storage volume exists before the first download.
+	missing, err := inventory(filepath.Join(root, "nope"))
+	if err != nil || len(missing) != 0 {
+		t.Errorf("missing root = %v, %v; want empty and no error", missing, err)
+	}
+}
+
+func TestRewriteCacheDir(t *testing.T) {
+	home := t.TempDir()
+	cfg := `data_dir         = "/old/data"
+cache_dir        = "/old/cache"
+annotations_dir  = "./annotations"
+default_snapshot = "dev"
+`
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := rewriteCacheDir(home, "/mnt/sources", "/mnt/data"); err != nil {
+		t.Fatalf("rewriteCacheDir: %v", err)
+	}
+	out, _ := os.ReadFile(filepath.Join(home, "config.toml"))
+	got := string(out)
+	if !strings.Contains(got, `cache_dir        = "/mnt/sources"`) {
+		t.Errorf("cache_dir not repointed:\n%s", got)
+	}
+	if !strings.Contains(got, `data_dir         = "/mnt/data"`) {
+		t.Errorf("data_dir not repointed:\n%s", got)
+	}
+	// Untouched lines survive: the snapshot must still resolve.
+	if !strings.Contains(got, `default_snapshot = "dev"`) ||
+		!strings.Contains(got, `annotations_dir  = "./annotations"`) {
+		t.Errorf("rewrite damaged the config:\n%s", got)
+	}
+}

@@ -98,6 +98,9 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		log.Printf("serve: catalog unavailable, /api/v1/snapshots and /sources will 503: %v", err)
 	} else {
 		defer cat.Close()
+		if err := syncStorage(ctx, cfg, cat); err != nil {
+			log.Printf("serve: storage config: %v", err)
+		}
 	}
 
 	if !cfg.RequireToken {
@@ -140,8 +143,15 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		Timeout: cfg.JobTimeout,
 	}
 
+	// The download path records what it fetched, so it needs the catalog too.
+	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
-	q.StartWorkers(ctx, cfg.Workers, adapt(exec))
+	q.StartWorkers(ctx, cfg.Workers, adapt(exec, cat))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -173,6 +183,24 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 	}, nil
 }
 
+// syncStorage reconciles the deployment's declared filesystem locations into the
+// catalog, so the config file stays authoritative for them and a path the
+// deployment no longer mounts stops being offered.
+func syncStorage(ctx context.Context, cfg *config.Config, cat *catalog.Store) error {
+	decl, err := cfg.StorageLocations()
+	if err != nil {
+		return err
+	}
+	locs := make([]catalog.StorageLocation, 0, len(decl))
+	for _, d := range decl {
+		locs = append(locs, catalog.StorageLocation{
+			ID: d.ID, Name: d.Name, Kind: catalog.StoragePath,
+			URI: d.Path, FromConfig: true, IsDefault: d.Default,
+		})
+	}
+	return cat.SyncConfigStorage(ctx, locs)
+}
+
 // seed populates an empty catalog with a starter snapshot.
 func seed(ctx context.Context, cfg *config.Config) error {
 	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
@@ -180,14 +208,20 @@ func seed(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 	defer cat.Close()
+	if err := syncStorage(ctx, cfg, cat); err != nil {
+		return err
+	}
 	return cat.Seed(ctx)
 }
 
 // adapt bridges runner.Runner to queue.Runner. The two are deliberately separate
 // types: the queue knows nothing about how annotation happens, and the runner
 // knows nothing about job persistence.
-func adapt(r runner.Runner) queue.Runner {
+func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
+		if job.Kind == queue.KindDownload {
+			return runDownload(ctx, r, cat, job, input)
+		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
 			Snapshot:  job.Snapshot,
@@ -211,8 +245,74 @@ func adapt(r runner.Runner) queue.Runner {
 				log.Printf("worker: job %s: encode columns: %v", job.ID, mErr)
 			}
 		}
-		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols}, nil
+		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}, nil
 	}
+}
+
+// runDownload provisions a snapshot's sources and records what landed.
+//
+// The inventory is written here, in the worker, because only the worker is
+// guaranteed to have the storage volume mounted — the API server may not.
+func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
+	job queue.Job, input []byte) (queue.Outcome, error) {
+
+	exec, ok := r.(*runner.ExecRunner)
+	if !ok {
+		return queue.Outcome{}, errors.New("download requires the exec runner")
+	}
+	var req struct {
+		StorageID string `json:"storage_id"`
+		CacheDir  string `json:"cache_dir"`
+		Force     bool   `json:"force"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
+	}
+
+	res, err := exec.Download(ctx, runner.DownloadRequest{
+		Snapshot: job.Snapshot,
+		CacheDir: req.CacheDir,
+		Force:    req.Force,
+	})
+	if err != nil {
+		var ee *runner.ExitError
+		if errors.As(err, &ee) {
+			log.Printf("worker: download job %s: %s", job.ID, ee.Detail())
+		}
+		return queue.Outcome{}, err
+	}
+
+	// Attribute files to their source by the directory varhub lays out per
+	// source: <cache>/<name>/<version>/... A file outside that shape belongs to no
+	// source we can name, so it is inventoried but not attributed.
+	snap, err := cat.GetSnapshot(ctx, job.Snapshot)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	for _, src := range snap.Sources {
+		prefix := src.Name + string(os.PathSeparator) + src.Version + string(os.PathSeparator)
+		var mine []catalog.SourceFile
+		for _, f := range res.Files {
+			if !strings.HasPrefix(f.Path, prefix) {
+				continue
+			}
+			mine = append(mine, catalog.SourceFile{
+				Path: f.Path, SizeBytes: f.SizeBytes, ModifiedAt: f.ModifiedAt,
+			})
+		}
+		if err := cat.ReplaceSourceFiles(ctx, src.ID, req.StorageID, mine); err != nil {
+			return queue.Outcome{}, fmt.Errorf("record files for %s: %w", src.Ref(), err)
+		}
+		log.Printf("worker: download job %s: %s → %d file(s)", job.ID, src.Ref(), len(mine))
+	}
+
+	// The job's "result" is the manifest of what landed, so the UI can show it
+	// without a second call.
+	body, err := json.Marshal(res.Files)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	return queue.Outcome{Result: body, N: len(res.Files)}, nil
 }
 
 // sweepInterval scales GC frequency to the TTL, clamped to a sane band: often

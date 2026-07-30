@@ -27,8 +27,9 @@ spec:
             - configMapRef: {name: varianthub-web}
             - secretRef:    {name: varianthub-web}
           volumeMounts:
-            - {name: varhub-data, mountPath: /var/lib/varianthub}
-            - {name: scratch,     mountPath: /tmp}
+            - {name: varhub-data,    mountPath: /var/lib/varianthub}
+            - {name: varhub-sources, mountPath: /var/lib/varianthub/sources}
+            - {name: scratch,        mountPath: /tmp}
           resources:
             requests: {cpu: 500m, memory: 512Mi}
             limits:   {memory: 4Gi}
@@ -48,6 +49,12 @@ spec:
         - name: varhub-data
           persistentVolumeClaim:
             claimName: varianthub-data
+        # Downloaded source data. Separate from working data because it is the
+        # large, slow-to-rebuild part, and because every VHW_STORAGE_PATHS entry
+        # has to be mounted here or a download fails at job time.
+        - name: varhub-sources
+          persistentVolumeClaim:
+            claimName: varianthub-sources
         - name: scratch
           emptyDir: {sizeLimit: 20Gi}
 ---
@@ -60,4 +67,20 @@ spec:
   accessModes: [ReadWriteMany]
   resources:
     requests:
-      storage: 100Gi
+      storage: 50Gi
+---
+# Downloaded source data. Sized for the sources you actually provision: dbSNP
+# alone is ~24 GB, phyloP ~6 GB.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: varianthub-sources
+  namespace: varianthub
+spec:
+  # ReadWriteMany so several workers share one copy. If your storage class only
+  # offers RWO, run a single worker replica — or wait for S3-backed sources,
+  # which removes the volume entirely.
+  accessModes: [ReadWriteMany]
+  resources:
+    requests:
+      storage: 500Gi

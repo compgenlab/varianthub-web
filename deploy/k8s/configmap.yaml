@@ -21,3 +21,8 @@ data:
   # catalog. Setting it would bypass the catalog and pin every job to one tree.
   VHW_DATA_DIR: "/var/lib/varianthub/data"
   VHW_CACHE_DIR: "/var/lib/varianthub/cache"
+  # Filesystem download targets, "name=/abs/path", comma-separated; the first is
+  # the default. Each must be mounted into the worker — a path the worker cannot
+  # see is a download that fails at job time. S3 targets are added through the
+  # admin UI instead, since they need no mount.
+  VHW_STORAGE_PATHS: "default=/var/lib/varianthub/sources"

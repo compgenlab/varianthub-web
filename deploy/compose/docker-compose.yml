@@ -71,7 +71,11 @@ services:
   seed:
     <<: *web
     command: ["seed"]
-    environment: *db-env
+    environment:
+      <<: *db-env
+      # seed reconciles the declared storage locations into the catalog, so it
+      # needs the same view of them as the worker.
+      VHW_STORAGE_PATHS: ${VHW_STORAGE_PATHS:-default=/var/lib/varianthub/sources}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -110,11 +114,17 @@ services:
       # catalog. Set it to bypass the catalog and use a fixed tree instead.
       VHW_DATA_DIR: /var/lib/varianthub/data
       VHW_CACHE_DIR: /var/lib/varianthub/cache
+      # Filesystem download targets, "name=/abs/path", first is the default.
+      # A path only means something if the worker mounts it, so these are
+      # declared here rather than added through the UI.
+      VHW_STORAGE_PATHS: ${VHW_STORAGE_PATHS:-default=/var/lib/varianthub/sources}
     volumes:
-      # Downloaded source files and built indexes, shared across jobs. Only the
-      # per-job config tree is ephemeral; re-fetching this every job would cost
-      # gigabytes. Chunk 4b replaces it with S3 range reads.
+      # Working data: tool images, reference files, the annotation cache.
       - varhub-data:/var/lib/varianthub
+      # Downloaded source data, kept in its own volume because it is the large,
+      # slow-to-rebuild part — a `down -v` that resets the database should not
+      # also throw away gigabytes of downloads.
+      - varhub-sources:/var/lib/varianthub/sources
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -123,3 +133,4 @@ services:
 volumes:
   pgdata:
   varhub-data:
+  varhub-sources:

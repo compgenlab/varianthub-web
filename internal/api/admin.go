@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/catalog"
+	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // Catalog administration: register sources, build snapshots.
@@ -439,4 +440,167 @@ func (s *Server) handleDeleteSnapshot(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// --- storage locations and downloads ---
+
+func (s *Server) handleListStorage(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	locs, err := s.catalog.ListStorage(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	type item struct {
+		catalog.StorageLocation
+		Usable bool   `json:"usable"`
+		Reason string `json:"unusable_reason,omitempty"`
+	}
+	out := make([]item, 0, len(locs))
+	for _, l := range locs {
+		out = append(out, item{StorageLocation: l, Usable: l.Usable(), Reason: l.UnusableReason()})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"storage": out})
+}
+
+func (s *Server) handleCreateStorage(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		URI  string `json:"uri"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if req.ID == "" {
+		req.ID = slug(req.Name)
+	}
+	// Filesystem locations are deliberately not addable here: a path only means
+	// something if the worker has it mounted, which is a deployment decision. The
+	// config file declares those; the API takes S3 buckets, which need no mount.
+	if req.Kind != catalog.StorageS3 {
+		writeError(w, http.StatusBadRequest,
+			"only S3 locations can be added here — filesystem paths must be declared "+
+				"in the deployment config (VHW_STORAGE_PATHS), since the worker has to mount them")
+		return
+	}
+	if err := s.catalog.PutStorage(r.Context(), catalog.StorageLocation{
+		ID: req.ID, Name: req.Name, Kind: req.Kind, URI: req.URI,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"id": req.ID, "name": req.Name, "uri": req.URI})
+}
+
+func (s *Server) handleDeleteStorage(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.DeleteStorage(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleFiles lists downloaded files, optionally for one source.
+func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	files, err := s.catalog.SourceFiles(r.Context(), r.URL.Query().Get("source"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var total int64
+	for _, f := range files {
+		total += f.SizeBytes
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"files": files, "total_bytes": total, "count": len(files),
+	})
+}
+
+// handleDownload queues a provisioning job for a snapshot's sources.
+//
+// It goes through the same queue as annotation rather than running inline: a
+// download can take hours and move gigabytes, which is not something to hold an
+// HTTP request open for, and reusing the queue means it gets the same
+// persistence, progress and error reporting.
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		Snapshot  string   `json:"snapshot"`
+		Sources   []string `json:"sources"`
+		Build     string   `json:"build"`
+		StorageID string   `json:"storage_id"`
+		Force     bool     `json:"force"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+
+	var loc catalog.StorageLocation
+	var err error
+	if req.StorageID != "" {
+		loc, err = s.catalog.GetStorage(r.Context(), req.StorageID)
+	} else {
+		loc, err = s.catalog.DefaultStorage(r.Context())
+	}
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !loc.Usable() {
+		writeError(w, http.StatusBadRequest, loc.UnusableReason())
+		return
+	}
+
+	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(req.Snapshot), req.Sources,
+		req.Build, nil)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// The job body carries the target, so the worker does not have to re-resolve
+	// it — and a job stays reproducible even if the location is edited later.
+	body, err := json.Marshal(map[string]any{
+		"storage_id": loc.ID, "cache_dir": loc.URI, "force": req.Force,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+		Kind:     queue.KindDownload,
+		Snapshot: snapshot,
+		Session:  sessionOf(r),
+		Label:    "download " + snapshot + " → " + loc.Name,
+		Body:     body,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": id, "snapshot": snapshot, "storage": loc,
+	})
 }

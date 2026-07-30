@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"os"
 	"os/exec"
@@ -443,4 +444,191 @@ func cliMessage(stderr, home string) string {
 		found = found[:400] + "\u2026"
 	}
 	return found
+}
+
+// KindDownload is a job that provisions a snapshot's source data rather than
+// annotating. It rides the same queue so it gets persistence, fair scheduling,
+// progress and the same error surfacing as an annotation.
+const KindDownload = "download"
+
+// DownloadRequest provisions one snapshot's sources into a storage location.
+type DownloadRequest struct {
+	Snapshot string // snapshot whose sources to fetch
+	CacheDir string // where the files land — the storage location's path
+	DataDir  string // varhub's data dir (tool images, reference files)
+	Source   string // optional: just this "name:version"
+	Force    bool
+}
+
+// DownloadResult reports what a download produced.
+type DownloadResult struct {
+	Files []DownloadedFile `json:"files"`
+	Log   string           `json:"-"`
+}
+
+// DownloadedFile is one file found under the source's cache directory.
+type DownloadedFile struct {
+	Path       string `json:"path"` // relative to CacheDir
+	SizeBytes  int64  `json:"size_bytes"`
+	ModifiedAt int64  `json:"modified_at"`
+}
+
+// Download runs `varhub download` for a snapshot, then inventories what landed.
+//
+// The inventory is taken here rather than by the API server because only the
+// worker is guaranteed to have the storage volume mounted.
+func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (DownloadResult, error) {
+	bin := r.Bin
+	if bin == "" {
+		bin = "varhub"
+	}
+	if r.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		defer cancel()
+	}
+	if req.CacheDir == "" {
+		return DownloadResult{}, errors.New("no storage location for the download")
+	}
+	for _, a := range []string{req.Snapshot, req.Source, req.CacheDir, req.DataDir} {
+		if err := safeArg(a); err != nil {
+			return DownloadResult{}, err
+		}
+	}
+
+	home, cleanup, err := r.Home.Home(ctx, req.Snapshot)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("prepare annotation home: %w", err)
+	}
+	defer cleanup()
+
+	// Point the materialized config at the chosen storage rather than the worker's
+	// default cache, so the operator's choice of location is what actually
+	// receives the files.
+	if err := rewriteCacheDir(home, req.CacheDir, req.DataDir); err != nil {
+		return DownloadResult{}, err
+	}
+
+	args := []string{"-home", home, "-snapshot", req.Snapshot, "download"}
+	if req.Source != "" {
+		args = append(args, "--source", req.Source)
+	}
+	if req.Force {
+		args = append(args, "--force")
+	}
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Env = append(os.Environ(), "VARHUB_HOME="+home)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return DownloadResult{}, err
+	}
+	if err := cmd.Start(); err != nil {
+		return DownloadResult{}, fmt.Errorf("start %s: %w", bin, err)
+	}
+
+	var (
+		wg    sync.WaitGroup
+		mu    sync.Mutex
+		lines []string
+	)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sc := bufio.NewScanner(stderrPipe)
+		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for sc.Scan() {
+			line := sc.Text()
+			if r.OnProgress != nil {
+				r.OnProgress(line)
+			}
+			mu.Lock()
+			lines = append(lines, line)
+			if len(lines) > 40 {
+				lines = lines[len(lines)-40:]
+			}
+			mu.Unlock()
+		}
+		_, _ = io.Copy(io.Discard, stderrPipe)
+	}()
+
+	runErr := cmd.Wait()
+	wg.Wait()
+	mu.Lock()
+	tail := strings.Join(lines, "\n")
+	mu.Unlock()
+
+	if runErr != nil {
+		if ctx.Err() != nil {
+			return DownloadResult{}, fmt.Errorf("download cancelled: %w", ctx.Err())
+		}
+		return DownloadResult{}, &ExitError{Err: runErr, Stderr: tail, Home: home}
+	}
+
+	files, err := inventory(req.CacheDir)
+	if err != nil {
+		return DownloadResult{}, fmt.Errorf("inventory %s: %w", req.CacheDir, err)
+	}
+	return DownloadResult{Files: files, Log: tail}, nil
+}
+
+// rewriteCacheDir repoints a materialized config's cache_dir and data_dir.
+//
+// Rewriting the generated file is deliberate: the materializer produces the
+// config from the catalog, and the download target is a per-job choice that does
+// not belong in the catalog.
+func rewriteCacheDir(home, cacheDir, dataDir string) error {
+	p := filepath.Join(home, "config.toml")
+	body, err := os.ReadFile(p)
+	if err != nil {
+		return fmt.Errorf("read generated config: %w", err)
+	}
+	var out []string
+	for _, line := range strings.Split(string(body), "\n") {
+		switch {
+		case strings.HasPrefix(strings.TrimSpace(line), "cache_dir"):
+			out = append(out, fmt.Sprintf("cache_dir        = %q", cacheDir))
+		case strings.HasPrefix(strings.TrimSpace(line), "data_dir") && dataDir != "":
+			out = append(out, fmt.Sprintf("data_dir         = %q", dataDir))
+		default:
+			out = append(out, line)
+		}
+	}
+	return os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600)
+}
+
+// inventory walks a directory and reports every regular file, relative to root.
+func inventory(root string) ([]DownloadedFile, error) {
+	var out []DownloadedFile
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// A download can leave a directory the worker cannot read; report the
+			// rest rather than failing the whole job over one entry.
+			if errors.Is(err, fs.ErrPermission) {
+				return nil
+			}
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil {
+			return nil
+		}
+		out = append(out, DownloadedFile{
+			Path: rel, SizeBytes: info.Size(), ModifiedAt: info.ModTime().Unix(),
+		})
+		return nil
+	})
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil // nothing downloaded yet is not an error
+	}
+	return out, err
 }

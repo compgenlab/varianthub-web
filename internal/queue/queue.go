@@ -43,6 +43,10 @@ const (
 const (
 	KindLocus = "locus"
 	KindVCF   = "vcf"
+	// KindDownload provisions a snapshot's source data instead of annotating. It
+	// shares the queue so it gets the same persistence, scheduling and error
+	// reporting; the worker dispatches on this.
+	KindDownload = "download"
 )
 
 // Postgres NOTIFY channels.
@@ -105,6 +109,9 @@ type Outcome struct {
 	// Columns is the JSON column model for these results (may be nil). Stored on
 	// the job so its results stay renderable even if the snapshot is re-pinned.
 	Columns []byte
+	// Variants says whether Result is an annotated-variant array that should be
+	// projected into job_variant. A download's result is a file manifest.
+	Variants bool
 }
 
 // Runner annotates one job's input. An error marks the job failed (its message
@@ -501,9 +508,15 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		}
 		// Rows for querying. Same transaction as the blob and the status change, so
 		// a job is never observably "done" with results that are not yet queryable.
-		if err := insertVariants(wctx, tx, id, out.Result); err != nil {
-			log.Printf("queue: store job %s variants: %v", id, err)
-			return
+		//
+		// Skipped for a download: its result is a file manifest, not variants, and
+		// forcing it through the variant projection would fail on a shape that was
+		// never meant to fit.
+		if out.Variants {
+			if err := insertVariants(wctx, tx, id, out.Result); err != nil {
+				log.Printf("queue: store job %s variants: %v", id, err)
+				return
+			}
 		}
 	}
 	var errArg any
