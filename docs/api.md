@@ -365,9 +365,13 @@ Carried from the handoff and from implementation review:
    variants that a per-key index matters.
 2. **HGVS resolution** needs an authoritative transcript set when input is
    ambiguous.
-3. **Failed-job detail** — what the error view shows (stage, stderr, per-variant
-   failures). Note the worker deliberately does not put CLI stderr in the job's
-   stored error; exposing it needs an explicit, admin-gated channel.
+3. **Failed-job detail** — partly settled. A job's `error` now carries the CLI's
+   own `error:` line, which is written for humans ("genelist X: needs gtf = …")
+   and is what a user needs to fix a misconfigured source. The ephemeral config
+   path is redacted, and a message still carrying an absolute path — or stderr
+   with no recognizable error line — stays the opaque "annotation failed" rather
+   than risk describing server layout. Full stderr remains logs-only; per-variant
+   failures and stage attribution are still open.
 4. **Filter panel** — which fields are filterable, and whether presets are saved.
 5. **Column manager** — persisted per user, per job, or per snapshot?
 6. **Large VCF upload** — size ceiling and whether resumable upload is required.

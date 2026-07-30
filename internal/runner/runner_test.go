@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -239,5 +240,70 @@ func TestSafeArgLength(t *testing.T) {
 	}
 	if err := safeArg(strings.Repeat("a", maxArgLen)); err != nil {
 		t.Errorf("argument at the limit should be accepted: %v", err)
+	}
+}
+
+// A failing job must tell the user what to fix. The CLI writes its errors for
+// humans; hiding them behind "annotation failed" leaves a misconfigured source
+// undiagnosable. But server paths must not leak.
+func TestCLIMessageSurfacedAndRedacted(t *testing.T) {
+	for _, tc := range []struct {
+		name, stderr, home, want string
+	}{
+		{
+			name:   "cli error is surfaced",
+			stderr: "varhub: starting\nerror: genelist \"x:1\": needs gtf = \"name[:version]\"",
+			want:   `genelist "x:1": needs gtf = "name[:version]"`,
+		},
+		{
+			name:   "last error wins",
+			stderr: "error: first\nerror: second",
+			want:   "second",
+		},
+		{
+			name:   "home is redacted",
+			stderr: "error: config file /home/x/varhub-home-123/config.toml not found",
+			home:   "/home/x/varhub-home-123",
+			want:   "config file <config>/config.toml not found",
+		},
+		{
+			// A path we cannot attribute to the home describes server layout.
+			name:   "unattributable path withheld",
+			stderr: "error: cannot read /var/lib/varianthub/data/clinvar.vcf.gz",
+			want:   "",
+		},
+		{
+			name:   "no error line stays opaque",
+			stderr: "panic: runtime error\ngoroutine 1 [running]:",
+			want:   "",
+		},
+		{name: "empty stderr", stderr: "", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := cliMessage(tc.stderr, tc.home); got != tc.want {
+				t.Errorf("cliMessage = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExitErrorFallsBackToOpaque(t *testing.T) {
+	e := &ExitError{Err: errors.New("exit status 1"), Stderr: "panic: boom"}
+	if e.Error() != "annotation failed" {
+		t.Errorf("Error() = %q, want the opaque fallback", e.Error())
+	}
+	if !strings.Contains(e.Detail(), "panic: boom") {
+		t.Errorf("Detail() should carry the full diagnostic, got %q", e.Detail())
+	}
+}
+
+func TestCLIMessageTruncates(t *testing.T) {
+	long := "error: " + strings.Repeat("x", 900)
+	got := cliMessage(long, "")
+	if len(got) > 420 {
+		t.Errorf("message not truncated: %d chars", len(got))
+	}
+	if !strings.HasSuffix(got, "…") {
+		t.Errorf("truncated message should be marked, got %q", got[len(got)-10:])
 	}
 }

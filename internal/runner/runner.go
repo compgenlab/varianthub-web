@@ -246,12 +246,12 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		if ctx.Err() != nil {
 			return Result{}, fmt.Errorf("annotation cancelled: %w", ctx.Err())
 		}
-		return Result{}, &ExitError{Err: runErr, Stderr: tail}
+		return Result{}, &ExitError{Err: runErr, Stderr: tail, Home: home}
 	}
 
 	out := bytes.TrimSpace(stdout.Bytes())
 	if len(out) == 0 {
-		return Result{}, &ExitError{Err: errors.New("no output"), Stderr: tail}
+		return Result{}, &ExitError{Err: errors.New("no output"), Stderr: tail, Home: home}
 	}
 	// Decode just enough to count rows and learn which annotation keys the engine
 	// actually emitted. The blob itself is stored verbatim.
@@ -259,7 +259,7 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		Annotations map[string]json.RawMessage `json:"annotations"`
 	}
 	if err := json.Unmarshal(out, &probe); err != nil {
-		return Result{}, &ExitError{Err: fmt.Errorf("parse annotation output: %w", err), Stderr: tail}
+		return Result{}, &ExitError{Err: fmt.Errorf("parse annotation output: %w", err), Stderr: tail, Home: home}
 	}
 
 	present := map[string]bool{}
@@ -380,15 +380,32 @@ func truncate(s string, n int) string {
 }
 
 // ExitError is a failed CLI invocation. It separates the operator-facing detail
-// (the CLI's stderr) from the caller-facing message, so a job's stored error does
-// not leak internal paths and command lines to API clients — a gap the previous
-// server had, where raw Go error strings went straight into the response.
+// (the CLI's full stderr) from the caller-facing message, so a job's stored error
+// does not leak internal paths and command lines to API clients — a gap the
+// previous server had, where raw Go error strings went straight into the response.
 type ExitError struct {
 	Err    error
 	Stderr string
+	// Home is the annotation home this job ran in, redacted out of the
+	// caller-facing message. It is a per-job temp path that means nothing to a
+	// client and reveals server layout.
+	Home string
 }
 
-func (e *ExitError) Error() string { return "annotation failed" }
+// Error is the caller-facing message, stored on the job and served to clients.
+//
+// The CLI writes its failures as "error: <message>", and those messages are
+// written for humans — "genelist X: needs gtf = ..." tells a user exactly what to
+// fix. Hiding them behind a blanket "annotation failed" leaves someone with a
+// misconfigured source no way to diagnose it. So the CLI's own message is
+// surfaced, with the ephemeral home path redacted; anything unrecognized stays
+// opaque.
+func (e *ExitError) Error() string {
+	if msg := cliMessage(e.Stderr, e.Home); msg != "" {
+		return msg
+	}
+	return "annotation failed"
+}
 
 func (e *ExitError) Unwrap() error { return e.Err }
 
@@ -398,4 +415,32 @@ func (e *ExitError) Detail() string {
 		return e.Err.Error()
 	}
 	return e.Err.Error() + ": " + e.Stderr
+}
+
+// cliMessage extracts the last "error: ..." line the CLI wrote, with home
+// redacted. Returns "" when stderr carries no such line, so an unexpected
+// failure mode cannot leak whatever it happened to print.
+func cliMessage(stderr, home string) string {
+	var found string
+	for _, line := range strings.Split(stderr, "\n") {
+		line = strings.TrimSpace(line)
+		if after, ok := strings.CutPrefix(line, "error: "); ok {
+			found = strings.TrimSpace(after)
+		}
+	}
+	if found == "" {
+		return ""
+	}
+	if home != "" {
+		found = strings.ReplaceAll(found, home, "<config>")
+	}
+	// A message still carrying an absolute path is describing server layout, not
+	// the user's input. Withhold it rather than guess at redaction.
+	if strings.Contains(found, "/tmp/") || strings.Contains(found, "/var/") {
+		return ""
+	}
+	if len(found) > 400 {
+		found = found[:400] + "\u2026"
+	}
+	return found
 }

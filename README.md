@@ -58,9 +58,9 @@ postgres (healthy) ─► migrate ─► seed ─┬─► api
 | `make dev-down` | stop, **keep** data |
 | `make dev-reset` | stop, **delete** volumes for a clean start |
 | `make dev-psql` | psql shell on the dev database |
-| `make ui` | build the React app |
+| `make build` | build the React app **and** the binary that embeds it |
+| `make build-api` | Go-only binary, no web UI (needs no node) |
 | `make ui-dev` | Vite dev server on :5173, proxying to the API |
-| `make all-build` | UI + binary, for running outside Docker |
 
 The image contains both `varianthub-web` and `varhub`; the CLI is compiled from
 your local checkout, so the stack exercises the CLI you actually have. Point
@@ -84,6 +84,38 @@ clean checkout and is what self-hosters should use.
 `deploy/k8s` holds reference manifests. Our own production deployment is managed
 in a separate k8s deploy repo, so those files are examples and seed material, not
 the live configuration — see that directory's README.
+
+## Adding sources and snapshots
+
+There is no admin UI yet, so the catalog is managed from the command line. A
+source is a **varhub source fragment** — exactly the TOML `varhub source add`
+writes under `annotations/sources/`:
+
+```sh
+varianthub-web source add clinvar.toml          # derives name/version/kind
+varianthub-web source add --private cosmic.toml
+varianthub-web source list
+
+varianthub-web snapshot add clinical-v4 \
+  --build GRCh38 --title "GRCh38 Clinical v4" \
+  --source clinvar-2026-06 --source gnomad-4.1 \
+  --default clinvar_sig,gnomad_af --publish
+
+varianthub-web snapshot list
+```
+
+The fragment text is stored verbatim and handed to `varhub` unchanged; the
+columns beside it are a projection derived at write time for listing and
+filtering. A snapshot stays a **draft** until `--publish`.
+
+`snapshot add` reads the snapshot back after writing it, so a bad set of pins
+fails there rather than at job time. Note that some source kinds have their own
+requirements — a `genelist`, for instance, needs a `gtf = "name:version"` pointing
+at a GTF source in the same snapshot, since flagging variants by gene membership
+needs a gene model.
+
+There is no `source remove` yet; detach a source from its snapshots and delete the
+row directly if you need to.
 
 ## Configuration
 

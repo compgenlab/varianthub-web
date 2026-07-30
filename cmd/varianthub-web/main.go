@@ -64,6 +64,10 @@ func run(args []string) error {
 		return store.Migrate(ctx, cfg.DatabaseURL)
 	case "seed":
 		return seed(ctx, cfg)
+	case "source":
+		return cmdSource(ctx, cfg, args[1:])
+	case "snapshot":
+		return cmdSnapshot(ctx, cfg, args[1:])
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -240,6 +244,13 @@ commands:
   worker    run the annotation job pool (execs the varhub CLI)
   migrate   apply pending SQL migrations, then exit
   seed      populate an empty catalog with a starter snapshot, then exit
+
+catalog administration:
+  source add [flags] <source.toml>   register a source from a varhub fragment
+  source list                        list registered sources
+  snapshot add <name> --build B --source S [--publish]
+                                     create/update a snapshot pinning sources
+  snapshot list                      list snapshots
   version   print the version
 
 Configuration is read from the environment; see README.md. VHW_DATABASE_URL is

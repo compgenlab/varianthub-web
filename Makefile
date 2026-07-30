@@ -14,26 +14,43 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 TEST_DB_PORT ?= 55440
 TEST_DB_URL  ?= postgres://postgres:test@localhost:$(TEST_DB_PORT)/varianthub?sslmode=disable
 
-.DEFAULT_GOAL := build
-.PHONY: build test test-unit test-integration vet fmt tidy clean run-api run-worker \
-        migrate dev dev-down dev-reset dev-logs dev-psql image test-db test-db-stop \
-        ui ui-dev all-build help
+# The React app is part of the build: `make build` produces a binary that serves
+# both the API and the web UI. Node is therefore a build dependency — use
+# `build-api` for a Go-only binary (CI checks, API-only deployments).
+UI_DIST      := web/embed/dist/index.html
+UI_DEPS      := web/node_modules/.package-lock.json
+UI_SOURCES   := $(shell find web/src web/public -type f 2>/dev/null) \
+                web/index.html web/vite.config.ts web/package.json
 
-## build: compile for the host platform into bin/ (embeds web/ if it is built)
-build:
+.DEFAULT_GOAL := build
+.PHONY: build build-api test test-unit test-integration vet fmt tidy clean \
+        run-api run-worker migrate dev dev-down dev-reset dev-logs dev-psql \
+        image test-db test-db-stop ui ui-dev help
+
+## build: build the web UI and the binary that embeds it (the normal build)
+build: $(UI_DIST)
 	$(GO) build -ldflags '$(LDFLAGS)' -o bin/$(BIN) $(PKG)
 
-## ui: install deps and build the React app into web/embed/dist
-ui:
-	npm --prefix web ci
+## build-api: build the binary only, without the web UI (Go-only; API is complete)
+build-api:
+	$(GO) build -ldflags '$(LDFLAGS)' -o bin/$(BIN) $(PKG)
+
+## ui: build the React app into web/embed/dist
+ui: $(UI_DIST)
+
+# Rebuilds only when a UI source actually changed, so `make build` stays fast.
+$(UI_DIST): $(UI_DEPS) $(UI_SOURCES)
 	npm --prefix web run build
 
-## ui-dev: run the Vite dev server (proxies /api to a local API on 18080)
-ui-dev:
-	npm --prefix web run dev
+# npm ci only when the lockfile moves. Its own output file is the stamp, so this
+# does not re-run on every build.
+$(UI_DEPS): web/package-lock.json
+	npm --prefix web ci
+	@touch $@
 
-## all-build: build the UI then the binary, so the binary serves the web app
-all-build: ui build
+## ui-dev: run the Vite dev server (proxies /api to a local API on 18080)
+ui-dev: $(UI_DEPS)
+	npm --prefix web run dev
 
 ## test: run every test (integration tests skip unless their env vars are set)
 test:
@@ -117,9 +134,10 @@ run-worker: build
 image:
 	docker build -f deploy/compose/Dockerfile -t varianthub-web:$(VERSION) .
 
-## clean: remove build artifacts
+## clean: remove build artifacts (keeps node_modules)
 clean:
-	rm -rf bin dist
+	rm -rf bin dist web/embed/dist/assets web/embed/dist/index.html \
+	       web/embed/dist/favicon.svg
 
 ## help: list targets
 help:

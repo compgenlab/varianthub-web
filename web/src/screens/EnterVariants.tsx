@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useNavigate } from "react-router-dom";
+import { Navigate, useNavigate, useSearchParams } from "react-router-dom";
 import { Play, Plus, Upload, X, FileText } from "lucide-react";
 
 import { api } from "../api";
@@ -12,16 +12,23 @@ const PLACEHOLDER = "chr17-7676154-C-T · chr17:7676154:C:T";
 export default function EnterVariants() {
   const nav = useNavigate();
   const flow = useFlow();
+  const [params] = useSearchParams();
   const [mode, setMode] = useState<Mode>("batch");
   const [draft, setDraft] = useState("");
   const [batch, setBatch] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  if (!flow.snapshot) {
-    nav("/annotate/sources", { replace: true });
-    return null;
-  }
+  // The chosen snapshot comes from the URL, not context. Context does not survive
+  // a reload or a back-navigation into this step from a fresh page load, so a
+  // context-only guard bounced the user to step 1 — which is what "the back
+  // button doesn't work" looked like. With it in the URL the step is a real,
+  // reloadable location and browser history behaves.
+  const snapshot = params.get("snapshot") ?? "";
+
+  // Declarative redirect: calling navigate() during render is not supported and
+  // fights the history stack.
+  if (!snapshot) return <Navigate to="/annotate/sources" replace />;
 
   const chips = flow.variants;
   const batchLines = batch.split("\n").map((l) => l.trim()).filter(Boolean);
@@ -41,11 +48,11 @@ export default function EnterVariants() {
       let job: { job_id: string };
       if (mode === "vcf") {
         if (!flow.file) throw new Error("Choose a VCF file first.");
-        job = await api.annotateVCF(flow.file, { snapshot: flow.snapshot });
+        job = await api.annotateVCF(flow.file, { snapshot });
       } else {
         const variants = mode === "single" ? chips : batchLines;
         if (variants.length === 0) throw new Error("Enter at least one variant.");
-        job = await api.annotate({ snapshot: flow.snapshot, variants });
+        job = await api.annotate({ snapshot, variants });
       }
       nav(`/annotate/running/${job.job_id}`);
     } catch (e) {

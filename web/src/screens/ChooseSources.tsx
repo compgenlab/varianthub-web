@@ -114,7 +114,7 @@ export default function ChooseSources() {
         <button
           className="btn"
           disabled={!flow.snapshot}
-          onClick={() => nav("/annotate/variants")}
+          onClick={() => nav(`/annotate/variants?snapshot=${encodeURIComponent(flow.snapshot)}`)}
         >
           Continue to variants <ArrowRight size={16} />
         </button>
