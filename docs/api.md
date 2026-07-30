@@ -310,18 +310,32 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 
 ---
 
-## Admin — *Chunk 5/6, role-gated*
+## Admin — **partly implemented**
 
-| Method | Path | Purpose |
+| Method | Path | Status |
 |---|---|---|
-| `POST` | `/api/v1/admin/sources` | Validate and register a source from a TOML manifest |
-| `PATCH` | `/api/v1/admin/sources/{id}` | Edit a source |
-| `GET` | `/api/v1/admin/registries` | List configured public registries |
-| `GET` | `/api/v1/admin/registries/{id}/datasets` | Available datasets in a registry |
-| `POST` | `/api/v1/admin/snapshots` | Create a draft snapshot with pinned versions |
-| `POST` | `/api/v1/admin/snapshots/{id}/publish` | Publish (making it immutable) |
-| `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | Copy to a new draft |
-| `GET`/`PUT` | `/api/v1/admin/grants` | Read/write the team × private-source matrix |
+| `POST` | `/api/v1/admin/sources/validate` | **implemented** — parses a manifest, writes nothing |
+| `POST` | `/api/v1/admin/sources` | **implemented** — register/update from a manifest |
+| `POST` | `/api/v1/admin/snapshots` | **implemented** — create/update with pinned sources |
+| `POST` | `/api/v1/admin/snapshots/{id}/publish` | **implemented** |
+| `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
+| `DELETE` | `/api/v1/admin/sources/{id}` | not implemented |
+| `GET` | `/api/v1/admin/registries[/{id}/datasets]` | not implemented |
+| `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | not implemented |
+| `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
+
+**Authorization is not role-based yet.** There are no accounts, so every valid
+token can administer. The routes sit under `/admin` so the eventual role gate has
+one place to attach. Note a registered manifest is executed by `varhub` and can
+name build recipes and container images — anyone who can register a source can
+run code on a worker, so treat the token as an administrative credential.
+
+`POST /admin/snapshots` creates a **draft** unless `"publish": true`. Drafts are
+excluded from `GET /snapshots` so the annotation flow cannot select something
+still being edited; the admin view passes `?state=all` to see them.
+
+The response is the snapshot re-read from the database, which is what proves the
+pins resolved — a bad set would otherwise look accepted and fail at job time.
 
 The TOML manifest is the primary configuration mechanism; direct upload is
 secondary because the files are large. Registration validates the TOML, checks

@@ -124,7 +124,10 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export const api = {
-  snapshots: () => req<{ snapshots: Snapshot[] }>("/snapshots"),
+  // includeDrafts is for the admin view only: the annotation flow must not offer
+  // a snapshot that can still be re-pinned.
+  snapshots: (includeDrafts = false) =>
+    req<{ snapshots: Snapshot[] }>(`/snapshots${includeDrafts ? "?state=all" : ""}`),
   snapshot: (id: string) => req<Snapshot>(`/snapshots/${encodeURIComponent(id)}`),
   sources: () => req<{ sources: Source[] }>("/sources"),
 
@@ -224,6 +227,57 @@ export const api = {
     a.remove();
     URL.revokeObjectURL(url);
   },
+
+  // --- admin ---
+  //
+  // Any valid token can administer today: there are no roles yet. See
+  // internal/api/admin.go — a registered manifest is executed by varhub, so the
+  // token is effectively an administrative credential.
+
+  validateSource: (toml: string) =>
+    req<{ valid: boolean; error?: string; id?: string; name?: string; version?: string; kind?: string }>(
+      "/admin/sources/validate",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ toml }),
+      },
+    ),
+
+  createSource: (body: {
+    toml: string;
+    id?: string;
+    title?: string;
+    detail?: string;
+    visibility?: "public" | "private";
+    origin?: string;
+  }) =>
+    req<{ id: string; ref: string; kind: string; visibility: string }>("/admin/sources", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  createSnapshot: (body: {
+    id: string;
+    title?: string;
+    description?: string;
+    build: string;
+    defaults?: string[];
+    tags?: string[];
+    sources: string[];
+    publish?: boolean;
+  }) =>
+    req<Snapshot>("/admin/snapshots", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  publishSnapshot: (id: string) =>
+    req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
+      method: "POST",
+    }),
 
   health: () => fetch(`${BASE}/healthz`).then((r) => r.json()),
   version: () => fetch(`${BASE}/version`).then((r) => r.json()),

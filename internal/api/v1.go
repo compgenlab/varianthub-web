@@ -108,6 +108,18 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Drafts are hidden by default: a snapshot is a promise of reproducibility,
+	// and an unpublished one can still be re-pinned. The admin view asks for them
+	// explicitly with ?state=all, since it is where they get published.
+	if r.URL.Query().Get("state") != "all" {
+		published := snaps[:0]
+		for _, sn := range snaps {
+			if sn.State == catalog.StatePublished {
+				published = append(published, sn)
+			}
+		}
+		snaps = published
+	}
 	type item struct {
 		catalog.Snapshot
 		SourceCount     int  `json:"source_count"`

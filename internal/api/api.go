@@ -64,6 +64,13 @@ func (s *Server) Routes() http.Handler {
 	v1.Handle("POST /api/v1/annotate", s.throttle(http.HandlerFunc(s.handleAnnotate)))
 	v1.Handle("POST /api/v1/annotate/vcf", s.throttle(http.HandlerFunc(s.handleAnnotateVCF)))
 
+	// Catalog administration. Under /admin so the eventual role gate has one
+	// place to attach; today any valid token can administer (see admin.go).
+	v1.HandleFunc("POST /api/v1/admin/sources/validate", s.handleValidateSource)
+	v1.HandleFunc("POST /api/v1/admin/sources", s.handleCreateSource)
+	v1.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
+	v1.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
+
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
 	v1.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)

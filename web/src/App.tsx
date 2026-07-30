@@ -7,7 +7,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { FilePlus2, Table2, KeyRound } from "lucide-react";
+import { FilePlus2, Table2, KeyRound, ShieldCheck } from "lucide-react";
 
 import { api, getToken, setToken } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -17,6 +17,7 @@ import Running from "./screens/Running";
 import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
 import TokenGate from "./screens/TokenGate";
+import Admin from "./screens/Admin";
 
 /** Steps are shown only during the annotation flow, per the handoff. */
 function StepHeader() {
@@ -74,6 +75,38 @@ function Shell({ children }: { children: React.ReactNode }) {
           <NavLink to="/jobs">
             <Table2 /> Results
           </NavLink>
+
+          {/* The design role-gates this section. There are no roles yet, so it is
+              always shown — with the badge, so it is obvious what it is. */}
+          <div style={{ padding: "14px 12px 5px" }}>
+            <span
+              className="row gap-8"
+              style={{
+                fontSize: 10,
+                letterSpacing: ".09em",
+                textTransform: "uppercase",
+                color: "rgba(22,24,29,.35)",
+              }}
+            >
+              Administration
+              <span
+                className="mono"
+                style={{
+                  fontSize: 9,
+                  padding: "1px 6px",
+                  borderRadius: 4,
+                  background: "#f6eaea",
+                  color: "#8f2f2f",
+                  letterSpacing: 0,
+                }}
+              >
+                ADMIN
+              </span>
+            </span>
+          </div>
+          <NavLink to="/admin">
+            <ShieldCheck /> Sources &amp; snapshots
+          </NavLink>
         </nav>
         <div
           style={{ marginTop: "auto", padding: 14, borderTop: "1px solid var(--border)" }}
@@ -126,6 +159,7 @@ export default function App() {
             <Route path="/annotate/running/:jobId" element={<Running />} />
             <Route path="/jobs" element={<JobsList />} />
             <Route path="/jobs/:jobId" element={<JobResults />} />
+            <Route path="/admin" element={<Admin />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>
         </Shell>

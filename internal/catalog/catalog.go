@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -294,6 +295,12 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO snapshot_source (snapshot_id,source_id,position) VALUES ($1,$2,$3)`,
 			snap.ID, id, i); err != nil {
+			// A foreign-key violation means the source id does not exist. Say that,
+			// rather than passing a raw constraint error up to an API client.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23503" {
+				return fmt.Errorf("%w: unknown source %q", ErrNotFound, id)
+			}
 			return fmt.Errorf("pin source %q to snapshot %q: %w", id, snap.ID, err)
 		}
 	}
