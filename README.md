@@ -96,10 +96,10 @@ Two ways to do it:
 - **Sources & snapshots → Sources.** An unprovisioned source shows a storage
   dropdown and a Download button on its own row; a provisioned one shows its
   footprint instead. The gap and the fix are in the same place.
-- **Storage & files.** Tick several sources at once, choose a location, and
-  review what is already on disk.
+- **Storage & files** lists the configured locations and what each holds; **View**
+  opens a tree of that location's contents.
 
-Either way it runs as a queued job — watch it under **System jobs**.
+Provisioning runs as a queued job — watch it under **System jobs**.
 
 Provisioning is per **source**, not per snapshot — a source is the unit of data,
 and a newly registered one has to be downloadable before anyone bundles it.

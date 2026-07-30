@@ -346,7 +346,7 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `GET` | `/api/v1/admin/storage` | **implemented** — storage locations |
 | `POST` | `/api/v1/admin/storage` | **implemented** — add an S3 bucket (paths come from config) |
 | `DELETE` | `/api/v1/admin/storage/{id}` | **implemented** (not config-managed ones) |
-| `GET` | `/api/v1/admin/files` | **implemented** — downloaded files and sizes |
+| `GET` | `/api/v1/admin/files` | **implemented** — downloaded files and sizes; `?source=` / `?storage=` narrow it |
 | `POST` | `/api/v1/admin/downloads` | **implemented** — queues a provisioning job |
 | `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
 

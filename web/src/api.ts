@@ -371,10 +371,15 @@ export const api = {
   deleteStorage: (id: string) =>
     req<void>(`/admin/storage/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-  files: (source?: string) =>
-    req<{ files: SourceFile[]; total_bytes: number; count: number }>(
-      `/admin/files${source ? `?source=${encodeURIComponent(source)}` : ""}`,
-    ),
+  files: (p: { source?: string; storage?: string } = {}) => {
+    const q = new URLSearchParams();
+    if (p.source) q.set("source", p.source);
+    if (p.storage) q.set("storage", p.storage);
+    const qs = q.toString();
+    return req<{ files: SourceFile[]; total_bytes: number; count: number }>(
+      `/admin/files${qs ? `?${qs}` : ""}`,
+    );
+  },
 
   // Provisioning is per source: a source is the unit of data, and a newly
   // registered one must be downloadable before anyone bundles it in a snapshot.

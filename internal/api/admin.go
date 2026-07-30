@@ -522,7 +522,8 @@ func (s *Server) handleFiles(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
 		return
 	}
-	files, err := s.catalog.SourceFiles(r.Context(), r.URL.Query().Get("source"))
+	q := r.URL.Query()
+	files, err := s.catalog.SourceFiles(r.Context(), q.Get("source"), q.Get("storage"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

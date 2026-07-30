@@ -217,16 +217,25 @@ func (s *Store) ReplaceSourceFiles(ctx context.Context, sourceID, storageID stri
 	return tx.Commit(ctx)
 }
 
-// SourceFiles lists recorded files, optionally narrowed to one source.
-func (s *Store) SourceFiles(ctx context.Context, sourceID string) ([]SourceFile, error) {
+// SourceFiles lists recorded files, optionally narrowed to one source and/or one
+// storage location.
+func (s *Store) SourceFiles(ctx context.Context, sourceID, storageID string) ([]SourceFile, error) {
 	q := `SELECT source_id,storage_id,path,size_bytes,modified_at,recorded_at
 	        FROM source_file`
+	var where []string
 	args := []any{}
 	if sourceID != "" {
-		q += ` WHERE source_id=$1`
 		args = append(args, sourceID)
+		where = append(where, fmt.Sprintf("source_id=$%d", len(args)))
 	}
-	q += ` ORDER BY source_id, path`
+	if storageID != "" {
+		args = append(args, storageID)
+		where = append(where, fmt.Sprintf("storage_id=$%d", len(args)))
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += ` ORDER BY path`
 
 	rows, err := s.pool.Query(ctx, q, args...)
 	if err != nil {

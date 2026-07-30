@@ -525,7 +525,7 @@ func TestStorageAndFiles(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if f, _ := s.SourceFiles(ctx, "builtins"); len(f) != 2 {
+	if f, _ := s.SourceFiles(ctx, "builtins", ""); len(f) != 2 {
 		t.Fatalf("got %d files, want 2", len(f))
 	}
 	if err := s.ReplaceSourceFiles(ctx, "builtins", "cfg-a", []SourceFile{
@@ -533,7 +533,7 @@ func TestStorageAndFiles(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	f, _ := s.SourceFiles(ctx, "builtins")
+	f, _ := s.SourceFiles(ctx, "builtins", "")
 	if len(f) != 1 || f[0].SizeBytes != 11 {
 		t.Errorf("replace did not clear stale rows: %+v", f)
 	}

@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
-import { Download, HardDrive, Trash2, TriangleAlert } from "lucide-react";
+import { useNavigate } from "react-router-dom";
+import { HardDrive, Trash2, TriangleAlert } from "lucide-react";
 
-import { api, type Source, type SourceFile, type StorageLocation } from "../api";
+import { api, type SourceFile, type StorageLocation } from "../api";
 
 export function humanSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -16,26 +17,18 @@ export function humanSize(n: number): string {
 }
 
 export default function Files() {
-  const [sources, setSources] = useState<Source[]>([]);
+  const nav = useNavigate();
   const [storage, setStorage] = useState<StorageLocation[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
-  const [total, setTotal] = useState(0);
-  const [picked, setPicked] = useState<Record<string, boolean>>({});
-  const [storageID, setStorageID] = useState("");
-  const [msg, setMsg] = useState("");
+
   const [err, setErr] = useState("");
-  const [busy, setBusy] = useState(false);
   const [addingS3, setAddingS3] = useState(false);
 
   async function load() {
     try {
-      const [s, f, src] = await Promise.all([api.storage(), api.files(), api.sources()]);
+      const [s, f] = await Promise.all([api.storage(), api.files()]);
       setStorage(s.storage ?? []);
-      setSources(src.sources ?? []);
       setFiles(f.files ?? []);
-      setTotal(f.total_bytes ?? 0);
-      const usable = (s.storage ?? []).find((l) => l.usable);
-      setStorageID((cur) => cur || usable?.id || "");
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -48,120 +41,28 @@ export default function Files() {
     return () => window.clearInterval(t);
   }, []);
 
-  async function startDownload() {
-    setBusy(true);
-    setErr("");
-    setMsg("");
-    try {
-      const r = await api.download({ sources: chosen, storage_id: storageID });
-      setMsg(
-        `Queued as job ${r.job_id.slice(0, 8)} → ${r.storage.name}. ` +
-          `Watch it under Results; files appear here when it finishes.`,
-      );
-      setPicked({});
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  // Group by source so a source's footprint is legible at a glance.
-  const bySource = new Map<string, SourceFile[]>();
+  // Per-location totals for the rows; the file listing itself lives in the
+  // browser behind View.
+  const byStorage = new Map<string, { bytes: number; count: number }>();
   for (const f of files) {
-    const list = bySource.get(f.source_id) ?? [];
-    list.push(f);
-    bySource.set(f.source_id, list);
+    const cur = byStorage.get(f.storage_id) ?? { bytes: 0, count: 0 };
+    cur.bytes += f.size_bytes;
+    cur.count += 1;
+    byStorage.set(f.storage_id, cur);
   }
-  const provisioned = new Set(bySource.keys());
-  const chosen = Object.entries(picked).filter(([, v]) => v).map(([k]) => k);
 
   return (
     <div className="page page-wide" style={{ paddingTop: 30 }}>
       <h1 className="title">Storage &amp; files</h1>
       <div className="between" style={{ margin: "6px 0 18px" }}>
         <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
-          Source data has to be downloaded before it can annotate. Provisioning is
-          per source; the same source can be downloaded into more than one location.
+          Where downloaded source data lives, and what is on disk. Provision a
+          source from <strong>Sources &amp; snapshots → Sources</strong>; each
+          unprovisioned source has a download control on its row.
         </p>
       </div>
 
-      <div className="card" style={{ padding: 16, marginBottom: 18 }}>
-        <label className="label">Sources to provision</label>
-        <div
-          style={{
-            maxHeight: 220,
-            overflow: "auto",
-            border: "1px solid var(--border-card)",
-            borderRadius: 8,
-            marginBottom: 14,
-          }}
-        >
-          {sources.length === 0 && <div className="empty">No sources registered.</div>}
-          {sources.map((s) => {
-            const on = !!picked[s.id];
-            const have = provisioned.has(s.id);
-            return (
-              <button
-                key={s.id}
-                className="trow row gap-10"
-                aria-pressed={on}
-                style={{ cursor: "pointer", padding: "9px 14px" }}
-                onClick={() => setPicked({ ...picked, [s.id]: !on })}
-              >
-                <span className={`check sm ${on ? "on" : ""}`}>
-                  {on && <span style={{ fontSize: 11, color: "#fff" }}>✓</span>}
-                </span>
-                <span style={{ flex: 1 }}>
-                  <span style={{ fontWeight: 500 }}>{s.title || s.name}</span>{" "}
-                  <span className="mono" style={{ fontSize: 11.5, color: "var(--accent-text)" }}>
-                    {s.version}
-                  </span>
-                  {s.build && <span className="tag" style={{ marginLeft: 6 }}>{s.build}</span>}
-                </span>
-                <span className="tag">{s.kind}</span>
-                <span
-                  style={{
-                    fontSize: 11.5,
-                    color: have ? "var(--benign-fg)" : "var(--text-4)",
-                    minWidth: 90,
-                    textAlign: "right",
-                  }}
-                >
-                  {have ? "downloaded" : "not downloaded"}
-                </span>
-              </button>
-            );
-          })}
-        </div>
-        <div className="row gap-14" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
-          <div style={{ minWidth: 220, flex: 1 }}>
-            <label className="label">Download to</label>
-            <select
-              className="select"
-              value={storageID}
-              onChange={(e) => setStorageID(e.target.value)}
-            >
-              {storage.map((l) => (
-                <option key={l.id} value={l.id} disabled={!l.usable}>
-                  {l.name} — {l.uri}
-                  {l.usable ? "" : " (not yet supported)"}
-                </option>
-              ))}
-            </select>
-          </div>
-          <button
-            className="btn"
-            disabled={busy || chosen.length === 0 || !storageID}
-            onClick={startDownload}
-          >
-            <Download size={15} />{" "}
-            {busy ? "Queueing…" : `Download ${chosen.length || ""}`.trim()}
-          </button>
-        </div>
-        {msg && <p style={{ fontSize: 13, color: "var(--accent-text)", marginTop: 12 }}>{msg}</p>}
-        {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
-      </div>
+      {err && <p className="err" style={{ fontSize: 13 }}>{err}</p>}
 
       <div className="between" style={{ marginBottom: 10 }}>
         <span className="label" style={{ margin: 0 }}>
@@ -195,7 +96,19 @@ export default function Files() {
                   <TriangleAlert size={11} /> {l.unusable_reason}
                 </div>
               )}
+              {byStorage.has(l.id) && (
+                <div style={{ fontSize: 11.5, color: "var(--text-2)", marginTop: 2 }}>
+                  {byStorage.get(l.id)!.count} files ·{" "}
+                  {humanSize(byStorage.get(l.id)!.bytes)}
+                </div>
+              )}
             </div>
+            <button
+              className="btn secondary sm"
+              onClick={() => nav(`/admin/storage/${encodeURIComponent(l.id)}`)}
+            >
+              View
+            </button>
             {!l.from_config && (
               <button
                 className="icon-btn"
@@ -214,52 +127,6 @@ export default function Files() {
         ))}
       </div>
 
-      <div className="between" style={{ marginBottom: 10 }}>
-        <span className="label" style={{ margin: 0 }}>
-          Downloaded files
-        </span>
-        <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>
-          {files.length} files · {humanSize(total)}
-        </span>
-      </div>
-      <div className="card">
-        {files.length === 0 && (
-          <div className="empty">
-            Nothing downloaded yet. Provision a snapshot above — until then,
-            annotating with a source that needs data fails with{" "}
-            <span className="mono">sources not downloaded</span>.
-          </div>
-        )}
-        {[...bySource.entries()].map(([sourceID, list]) => {
-          const sum = list.reduce((a, f) => a + f.size_bytes, 0);
-          return (
-            <div key={sourceID} style={{ borderBottom: "1px solid var(--hairline)" }}>
-              <div className="between" style={{ padding: "10px 18px", background: "var(--bg)" }}>
-                <span className="mono" style={{ fontSize: 12.5, fontWeight: 500 }}>
-                  {sourceID}
-                </span>
-                <span style={{ fontSize: 12, color: "var(--text-2)" }}>
-                  {list.length} files · {humanSize(sum)}
-                </span>
-              </div>
-              {list.map((f) => (
-                <div
-                  key={f.path}
-                  className="between"
-                  style={{ padding: "7px 18px 7px 34px", fontSize: 12.5 }}
-                >
-                  <span className="mono" style={{ color: "var(--text-2)" }}>
-                    {f.path}
-                  </span>
-                  <span className="mono" style={{ color: "var(--text-3)" }}>
-                    {humanSize(f.size_bytes)}
-                  </span>
-                </div>
-              ))}
-            </div>
-          );
-        })}
-      </div>
       <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 10 }}>
         Files are not individually deletable: each belongs to a source, and removing
         it would break that source. Delete the source instead.
