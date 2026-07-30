@@ -387,10 +387,11 @@ func truncate(s string, n int) string {
 type ExitError struct {
 	Err    error
 	Stderr string
-	// Home is the annotation home this job ran in, redacted out of the
-	// caller-facing message. It is a per-job temp path that means nothing to a
-	// client and reveals server layout.
+	// Home is the ephemeral per-job config directory, redacted out of the
+	// caller-facing message: it is a temp path that means nothing to a client.
 	Home string
+	// Op names what failed, for the fallback message ("annotation", "download").
+	Op string
 }
 
 // Error is the caller-facing message, stored on the job and served to clients.
@@ -402,10 +403,14 @@ type ExitError struct {
 // surfaced, with the ephemeral home path redacted; anything unrecognized stays
 // opaque.
 func (e *ExitError) Error() string {
+	op := e.Op
+	if op == "" {
+		op = "annotation"
+	}
 	if msg := cliMessage(e.Stderr, e.Home); msg != "" {
 		return msg
 	}
-	return "annotation failed"
+	return op + " failed"
 }
 
 func (e *ExitError) Unwrap() error { return e.Err }
@@ -435,11 +440,12 @@ func cliMessage(stderr, home string) string {
 	if home != "" {
 		found = strings.ReplaceAll(found, home, "<config>")
 	}
-	// A message still carrying an absolute path is describing server layout, not
-	// the user's input. Withhold it rather than guess at redaction.
-	if strings.Contains(found, "/tmp/") || strings.Contains(found, "/var/") {
-		return ""
-	}
+	// Earlier this withheld any message still containing an absolute path, on the
+	// theory that it described server layout. That threw away the most useful
+	// errors — "mkdir /path/to/storage: permission denied" is precisely what an
+	// operator needs, and the path is one they configured and can already see in
+	// the UI. Only the ephemeral home is genuinely opaque, and it is redacted
+	// above.
 	if len(found) > 400 {
 		found = found[:400] + "\u2026"
 	}
@@ -578,7 +584,7 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		if ctx.Err() != nil {
 			return DownloadResult{}, fmt.Errorf("download cancelled: %w", ctx.Err())
 		}
-		return DownloadResult{}, &ExitError{Err: runErr, Stderr: tail, Home: home}
+		return DownloadResult{}, &ExitError{Err: runErr, Stderr: tail, Home: home, Op: "download"}
 	}
 
 	files, err := inventory(req.CacheDir)

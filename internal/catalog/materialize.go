@@ -48,13 +48,34 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 		return "", nil, err
 	}
 
+	// Read from wherever these sources were actually downloaded. The storage
+	// location is the source cache; pointing a job at a different directory is
+	// how you get "sources not downloaded" for data that is on disk.
+	ids := make([]string, 0, len(snap.Sources))
+	for _, src := range snap.Sources {
+		ids = append(ids, src.ID)
+	}
+	cacheDir, err := m.Store.StorageForSources(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
+	if cacheDir == "" {
+		// Nothing downloaded yet. Use the default location so varhub looks where
+		// a download would have put it, and reports the absence itself.
+		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
+			cacheDir = def.URI
+		} else {
+			cacheDir = m.CacheDir
+		}
+	}
+
 	dir, err := os.MkdirTemp(m.Root, "varhub-home-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create annotation home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.write(dir, snap); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -62,6 +83,10 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
+	return m.writeWithCache(dir, snap, m.CacheDir)
+}
+
+func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string) error {
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -77,7 +102,7 @@ data_dir         = %s
 cache_dir        = %s
 annotations_dir  = "./annotations"
 default_snapshot = %s
-`, tomlString(m.DataDir), tomlString(m.CacheDir), tomlString(snap.ID))
+`, tomlString(m.DataDir), tomlString(cacheDir), tomlString(snap.ID))
 	if err := writeFile("config.toml", cfg); err != nil {
 		return fmt.Errorf("write config.toml: %w", err)
 	}
@@ -182,12 +207,28 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		snap.Build = "GRCh38"
 	}
 
+	// Resolve the cache the same way annotation does, so a home built for these
+	// sources reads the directory a download wrote to. The download path
+	// overrides this with the chosen target anyway; this matters for any other
+	// caller of HomeForSources.
+	cacheDir, err := m.Store.StorageForSources(ctx, sourceIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	if cacheDir == "" {
+		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
+			cacheDir = def.URI
+		} else {
+			cacheDir = m.CacheDir
+		}
+	}
+
 	dir, err := os.MkdirTemp(m.Root, "varhub-provision-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.write(dir, snap); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir); err != nil {
 		cleanup()
 		return "", nil, err
 	}

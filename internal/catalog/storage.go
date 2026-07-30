@@ -244,3 +244,53 @@ func (s *Store) SourceFiles(ctx context.Context, sourceID string) ([]SourceFile,
 	}
 	return out, rows.Err()
 }
+
+// StorageForSources reports which location holds the given sources' files.
+//
+// Annotation and provisioning have to agree on a directory: varhub reads one
+// cache root, so a source downloaded into location A is invisible to a job
+// pointed at location B. Rather than assume, look up where the files actually
+// are.
+//
+// Returns "" when nothing has been downloaded yet, so the caller can fall back
+// to the default and let varhub report "sources not downloaded" itself.
+func (s *Store) StorageForSources(ctx context.Context, sourceIDs []string) (string, error) {
+	if len(sourceIDs) == 0 {
+		return "", nil
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT sf.storage_id, sl.uri
+		  FROM source_file sf
+		  JOIN storage_location sl ON sl.id = sf.storage_id
+		 WHERE sf.source_id = ANY($1)`, sourceIDs)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+
+	var ids, uris []string
+	for rows.Next() {
+		var id, uri string
+		if err := rows.Scan(&id, &uri); err != nil {
+			return "", err
+		}
+		ids = append(ids, id)
+		uris = append(uris, uri)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	switch len(uris) {
+	case 0:
+		return "", nil
+	case 1:
+		return uris[0], nil
+	default:
+		// varhub reads a single cache root, so a job cannot span two. Say so
+		// plainly — the fix is to provision them into one location.
+		return "", fmt.Errorf(
+			"these sources are split across storage locations (%s); "+
+				"a job reads one location at a time — download them all into one",
+			strings.Join(ids, ", "))
+	}
+}

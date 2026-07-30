@@ -99,6 +99,17 @@ grouped by source.
 Provisioning is per **source**, not per snapshot — a source is the unit of data,
 and a newly registered one has to be downloadable before anyone bundles it.
 
+**Put the storage somewhere with room.** Reference data is large — GENCODE is
+~130 MB, dbSNP ~24 GB — and the default is a docker volume on the root
+filesystem. Point it at a real disk with `VHW_HOST_STORAGE` in
+`deploy/compose/.env` (see `.env.example`); it is bind-mounted at `/mnt/storage`,
+so nothing else has to change. The directory must be writable by the container
+user (uid 10001) — `chmod 777` on a dev box, or chown it in production.
+
+A source is annotated from wherever it was downloaded: the storage location *is*
+the source cache. A job reads one location at a time, so sources split across two
+locations is an error rather than a confusing "sources not downloaded".
+
 **Storage locations** come from two places, deliberately:
 
 - **Filesystem paths** are declared by the deployment in `VHW_STORAGE_PATHS`. A
@@ -158,7 +169,8 @@ row directly if you need to.
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
 | `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |
 | `VHW_DATA_DIR` | `/var/lib/varianthub/data` | Shared, persistent: tool images and reference files |
-| `VHW_STORAGE_PATHS` | `default=/var/lib/varianthub/sources` | Filesystem download targets, `name=/abs/path`, comma-separated; first is the default |
+| `VHW_STORAGE_PATHS` | `default=/mnt/storage` | Filesystem download targets, `name=/abs/path`, comma-separated; first is the default. Must be set on **both** `api` and `worker` — `serve` reconciles them into the catalog |
+| `VHW_HOST_STORAGE` | *(named volume)* | Compose only: absolute host path to bind-mount at `/mnt/storage` |
 | `VHW_CACHE_DIR` | `/var/lib/varianthub/cache` | Shared, persistent: built indexes and cache |
 | `VHW_JOB_TTL` | `24h` | Terminal jobs GC'd after this |
 | `VHW_RATE_PER_MIN` | `30` | Per-IP submit rate |

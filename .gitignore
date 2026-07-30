@@ -21,3 +21,6 @@ go.work.sum
 
 # design handoff bundle (kept, but not the zip)
 *.zip
+
+# local compose overrides (real paths, real secrets)
+deploy/compose/.env

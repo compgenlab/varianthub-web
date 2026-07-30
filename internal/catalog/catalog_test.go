@@ -556,3 +556,51 @@ func TestValidateStorage(t *testing.T) {
 		t.Errorf("valid location rejected: %v", err)
 	}
 }
+
+// Annotation and provisioning must agree on a directory: varhub reads one cache
+// root, so a source downloaded into location A is invisible to a job pointed at
+// location B. That mismatch produced "sources not downloaded" for data sitting
+// on disk.
+func TestStorageForSources(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.SyncConfigStorage(ctx, []StorageLocation{
+		{ID: "a", Name: "a", Kind: StoragePath, URI: "/mnt/a", IsDefault: true},
+		{ID: "b", Name: "b", Kind: StoragePath, URI: "/mnt/b"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSource(ctx, Source{
+		ID: "other", Name: "other", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing downloaded: no location, so the caller falls back to the default
+	// and lets varhub report the absence itself.
+	if uri, err := s.StorageForSources(ctx, []string{"builtins"}); err != nil || uri != "" {
+		t.Errorf("undownloaded = %q, %v; want empty", uri, err)
+	}
+
+	if err := s.ReplaceSourceFiles(ctx, "builtins", "a", []SourceFile{
+		{Path: "builtins/1/x", SizeBytes: 1, ModifiedAt: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	uri, err := s.StorageForSources(ctx, []string{"builtins"})
+	if err != nil || uri != "/mnt/a" {
+		t.Errorf("StorageForSources = %q, %v; want /mnt/a", uri, err)
+	}
+
+	// Split across locations: a job cannot span two cache roots, so say so rather
+	// than silently reading one and reporting the other's sources missing.
+	if err := s.ReplaceSourceFiles(ctx, "other", "b", []SourceFile{
+		{Path: "other/1/y", SizeBytes: 1, ModifiedAt: 1},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = s.StorageForSources(ctx, []string{"builtins", "other"})
+	if err == nil || !strings.Contains(err.Error(), "split across storage locations") {
+		t.Errorf("err = %v, want a split-locations error", err)
+	}
+}

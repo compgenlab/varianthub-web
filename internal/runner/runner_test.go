@@ -267,10 +267,13 @@ func TestCLIMessageSurfacedAndRedacted(t *testing.T) {
 			want:   "config file <config>/config.toml not found",
 		},
 		{
-			// A path we cannot attribute to the home describes server layout.
-			name:   "unattributable path withheld",
-			stderr: "error: cannot read /var/lib/varianthub/data/clinvar.vcf.gz",
-			want:   "",
+			// A configured storage path is exactly what an operator needs to see —
+			// it is a path they set and can already read off the admin screen.
+			// Withholding it (as an earlier version did) made a permission error
+			// undiagnosable.
+			name:   "configured path is kept",
+			stderr: "error: gencode:48: mkdir /var/lib/varianthub/sources/gencode: permission denied",
+			want:   "gencode:48: mkdir /var/lib/varianthub/sources/gencode: permission denied",
 		},
 		{
 			name:   "no error line stays opaque",
@@ -291,6 +294,12 @@ func TestExitErrorFallsBackToOpaque(t *testing.T) {
 	e := &ExitError{Err: errors.New("exit status 1"), Stderr: "panic: boom"}
 	if e.Error() != "annotation failed" {
 		t.Errorf("Error() = %q, want the opaque fallback", e.Error())
+	}
+	// The fallback names the operation: "annotation failed" on a provisioning job
+	// sends the reader looking in the wrong place.
+	d := &ExitError{Err: errors.New("exit status 1"), Stderr: "panic", Op: "download"}
+	if d.Error() != "download failed" {
+		t.Errorf("Error() = %q, want %q", d.Error(), "download failed")
 	}
 	if !strings.Contains(e.Detail(), "panic: boom") {
 		t.Errorf("Detail() should carry the full diagnostic, got %q", e.Detail())
