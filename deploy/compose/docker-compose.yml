@@ -76,6 +76,13 @@ services:
       # seed reconciles the declared storage locations into the catalog, so it
       # needs the same view of them as the worker.
       VHW_STORAGE_PATHS: ${VHW_STORAGE_PATHS:-default=/mnt/storage}
+      # Object-store target and credentials. Empty unless the s3 profile is in
+      # use — an endpoint with no gateway behind it is worse than none.
+      VHW_STORAGE_S3: ${VHW_STORAGE_S3:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-varhubdev}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -91,11 +98,23 @@ services:
       # needs the same view of them as the worker. Leaving it out here means the
       # catalog keeps a stale path and downloads go somewhere nobody mounted.
       VHW_STORAGE_PATHS: ${VHW_STORAGE_PATHS:-default=/mnt/storage}
+      # Object-store target and credentials. Empty unless the s3 profile is in
+      # use — an endpoint with no gateway behind it is worse than none.
+      VHW_STORAGE_S3: ${VHW_STORAGE_S3:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-varhubdev}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
       # The Vite dev server's origin, so a locally-run front-end can call the API.
       VHW_CORS_ORIGINS: ${VHW_CORS_ORIGINS:-http://localhost:5173}
     ports:
       # Not 8080: like postgres above, a dev machine usually already has one.
       - "${API_PORT:-18080}:8080"
+    # Lets a container reach a service on the host, which is how a streamed
+    # source pointed at a locally-served file resolves. Docker Desktop provides
+    # this name; on Linux it has to be mapped explicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -122,6 +141,13 @@ services:
       # A path only means something if the worker mounts it, so these are
       # declared here rather than added through the UI.
       VHW_STORAGE_PATHS: ${VHW_STORAGE_PATHS:-default=/mnt/storage}
+      # Object-store target and credentials. Empty unless the s3 profile is in
+      # use — an endpoint with no gateway behind it is worse than none.
+      VHW_STORAGE_S3: ${VHW_STORAGE_S3:-}
+      AWS_ENDPOINT_URL: ${AWS_ENDPOINT_URL:-}
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-varhubdev}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
     volumes:
       # Working data: tool images, reference files, the annotation cache.
       - varhub-data:/var/lib/varianthub
@@ -134,10 +160,51 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+    # Lets a container reach a service on the host, which is how a streamed
+    # source pointed at a locally-served file resolves. Docker Desktop provides
+    # this name; on Linux it has to be mapped explicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       seed:
         condition: service_completed_successfully
     restart: unless-stopped
+
+  # Optional S3-compatible object store for exercising the bucket path locally.
+  #
+  # Off by default: it only starts with `--profile s3` (or COMPOSE_PROFILES=s3),
+  # because the stack is perfectly usable with a filesystem volume alone and
+  # most dev work does not need a bucket. Production does not use this at all —
+  # deploy/k8s points at a real object store.
+  #
+  # versitygw's posix backend treats each top-level directory under its root as
+  # a bucket, so the bucket is created by making a directory.
+  s3:
+    image: versity/versitygw:latest
+    profiles: ["s3"]
+    environment:
+      ROOT_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-varhubdev}
+      ROOT_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
+    # The posix backend treats each top-level directory under its root as a
+    # bucket, so creating one is mkdir. Done here rather than by hand so a fresh
+    # checkout comes up with a usable bucket.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - mkdir -p /data/${S3_BUCKET:-varhub-dev} && exec versitygw --port :7070 posix /data
+    ports:
+      - "${S3_PORT:-17070}:7070"
+    volumes:
+      # Host-backed so the bucket survives `make dev-reset` and can be inspected
+      # with ordinary tools — it is just a directory tree.
+      - ${S3_HOST_DIR:-/mnt/data1/working/varhub-web-versitygw}:/data
+    healthcheck:
+      # An unauthenticated request gets a signed-request error, which is proof
+      # the S3 endpoint is answering. Only a connection failure means not-ready.
+      test: ["CMD-SHELL", "wget -q -O- http://localhost:7070/ >/dev/null 2>&1 || wget -S -O- http://localhost:7070/ 2>&1 | grep -q HTTP"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
 
 volumes:
   pgdata:

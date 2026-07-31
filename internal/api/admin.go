@@ -558,6 +558,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		Sources   []string `json:"sources"`
 		StorageID string   `json:"storage_id"`
 		Force     bool     `json:"force"`
+
+		// IncludeStreamed downloads sources that ask to be streamed. Off by
+		// default so the common case does not accidentally pull tens of
+		// gigabytes, but available because `stream` is the publisher's
+		// suggestion and not a policy.
+		IncludeStreamed bool `json:"include_streamed"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -604,10 +610,14 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown source "+strconv.Quote(id))
 			return
 		}
-		// Builtins compute from the variant and have nothing on disk. Silently
+		// Some sources have nothing to provision: a builtin computes from the
+		// variant, and a streamed source is read from its url. Silently
 		// including one would queue a job that downloads nothing and reports
 		// success, which looks like it did something.
-		if !src.NeedsData() {
+		//
+		// A streamed source is the exception the caller can ask for: it does
+		// have data, it just is not normally copied.
+		if !src.NeedsData() && !(src.Stream && req.IncludeStreamed) {
 			skipped = append(skipped, src.Ref())
 			continue
 		}
@@ -616,7 +626,9 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(wanted) == 0 {
 		writeError(w, http.StatusBadRequest, "nothing to download: "+
-			strings.Join(skipped, ", ")+" compute from the variant and need no data")
+			strings.Join(skipped, ", ")+" have no data to fetch — a builtin computes "+
+			"from the variant, and a streamed source is read from its url "+
+			"(pass include_streamed to download a streamed source anyway)")
 		return
 	}
 	req.Sources = wanted
@@ -624,6 +636,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	body, err := json.Marshal(map[string]any{
 		"storage_id": loc.ID, "cache_dir": loc.URI,
 		"sources": req.Sources, "force": req.Force,
+		"no_stream": req.IncludeStreamed,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -707,5 +720,58 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": id, "ref": src.Ref(), "cleanup_jobs": jobs,
+	})
+}
+
+// handleSourceConfig returns a source's stored manifest.
+//
+// The manifest is the source of truth — the columns beside it are a derived
+// projection — so being able to read it back is how an admin checks what a
+// source actually declares, rather than inferring it from the listing.
+func (s *Server) handleSourceConfig(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	src, err := s.catalog.GetSource(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": src.ID, "ref": src.Ref(), "format": "toml", "config": src.TOML,
+	})
+}
+
+// handleSetSnapshotSources replaces a draft snapshot's source set.
+func (s *Server) handleSetSnapshotSources(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		Sources []string `json:"sources"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	snap, err := s.catalog.SetSnapshotSources(r.Context(), r.PathValue("id"), req.Sources)
+	switch {
+	case errors.Is(err, catalog.ErrNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	case errors.Is(err, catalog.ErrPinsFrozen):
+		// 409 rather than 403: the request is well-formed and the caller is
+		// permitted; the snapshot's state is what refuses it.
+		writeError(w, http.StatusConflict,
+			"a published snapshot's sources are fixed — duplicate it to change them")
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"snapshot": snap, "annotations": snapshotAnnotations(snap),
 	})
 }

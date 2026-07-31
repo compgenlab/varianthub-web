@@ -55,13 +55,18 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	for _, src := range snap.Sources {
 		ids = append(ids, src.ID)
 	}
-	cacheDir, err := m.Store.StorageForSources(ctx, ids)
+	// Where each source's files actually are. Sources in different locations are
+	// normal, not an error: cache_dir carries the majority and the rest get a
+	// location overlay beside their manifest.
+	roots, err := m.Store.StorageRootsForSources(ctx, ids)
 	if err != nil {
 		return "", nil, err
 	}
+	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
-		// Nothing downloaded yet. Use the default location so varhub looks where
-		// a download would have put it, and reports the absence itself.
+		// Nothing downloaded yet, or no clear majority. Use the default location
+		// so varhub looks where a download would have put it, and reports the
+		// absence itself.
 		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
 			cacheDir = def.URI
 		} else {
@@ -75,7 +80,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -83,10 +88,10 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir)
+	return m.writeWithCache(dir, snap, m.CacheDir, nil)
 }
 
-func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string) error {
+func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string, roots map[string]string) error {
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -131,10 +136,21 @@ default_snapshot = %s
 	// Source fragments, verbatim. varhub resolves a "name:version" ref to
 	// sources/<name>/<version>/<name>-<version>.toml, so the layout is fixed.
 	for _, src := range snap.Sources {
-		rel := filepath.Join("annotations", "sources", src.Name, src.Version,
-			src.Name+"-"+src.Version+".toml")
-		if err := writeFile(rel, src.TOML); err != nil {
+		dir := filepath.Join("annotations", "sources", src.Name, src.Version)
+		if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".toml"), src.TOML); err != nil {
 			return fmt.Errorf("write source %s: %w", src.Ref(), err)
+		}
+		// A location overlay beside the manifest, when this source lives
+		// somewhere other than the job's cache_dir. That is what lets one job
+		// read sources from different places — cache_dir names only one.
+		if root := roots[src.ID]; root != "" && root != cacheDir {
+			overlay := fmt.Sprintf(`# Generated per job from the VariantHub catalog. Do not edit.
+root = %s
+`, tomlString(root))
+			if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".locations.toml"),
+				overlay); err != nil {
+				return fmt.Errorf("write locations for %s: %w", src.Ref(), err)
+			}
 		}
 	}
 	return nil
@@ -211,10 +227,11 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 	// sources reads the directory a download wrote to. The download path
 	// overrides this with the chosen target anyway; this matters for any other
 	// caller of HomeForSources.
-	cacheDir, err := m.Store.StorageForSources(ctx, sourceIDs)
+	roots, err := m.Store.StorageRootsForSources(ctx, sourceIDs)
 	if err != nil {
 		return "", nil, err
 	}
+	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
 			cacheDir = def.URI
@@ -228,9 +245,36 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
 		cleanup()
 		return "", nil, err
 	}
 	return dir, cleanup, nil
+}
+
+// commonRoot picks the location holding the most sources, which becomes the
+// job's cache_dir. The rest get an overlay.
+//
+// Choosing the majority rather than the first keeps the overlay count down, and
+// the choice is otherwise arbitrary — correctness does not depend on it, only
+// the number of small files written into the job home.
+func commonRoot(roots map[string]string) string {
+	if len(roots) == 0 {
+		return ""
+	}
+	count := map[string]int{}
+	for _, r := range roots {
+		if r != "" {
+			count[r]++
+		}
+	}
+	best, bestN := "", 0
+	for r, n := range count {
+		// Ties broken by name so a given catalog always materializes the same
+		// way; a job home that differs run to run is needlessly hard to debug.
+		if n > bestN || (n == bestN && r < best) {
+			best, bestN = r, n
+		}
+	}
+	return best
 }

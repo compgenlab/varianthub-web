@@ -499,13 +499,25 @@ func TestStorageAndFiles(t *testing.T) {
 		t.Error("sync removed a user-added location")
 	}
 
-	// The default is the first usable one; S3 is not usable as a target yet.
+	// Both kinds are usable targets now that varhub provisions to a bucket and
+	// reads back from one; the default is simply the first declared.
 	def, err := s.DefaultStorage(ctx)
 	if err != nil || def.ID != "cfg-a" {
 		t.Errorf("DefaultStorage = %+v, %v", def, err)
 	}
-	if (StorageLocation{Kind: StorageS3}).Usable() {
-		t.Error("S3 should not be a usable download target yet")
+	if !(StorageLocation{Kind: StorageS3}).Usable() {
+		t.Error("S3 should be a usable download target")
+	}
+	if !(StorageLocation{Kind: StoragePath}).Usable() {
+		t.Error("a filesystem path should be a usable download target")
+	}
+	// An unknown kind still is not, and says why.
+	unknown := StorageLocation{Kind: "gopher"}
+	if unknown.Usable() {
+		t.Error("an unknown storage kind should not be usable")
+	}
+	if !strings.Contains(unknown.UnusableReason(), "gopher") {
+		t.Errorf("UnusableReason does not name the kind: %q", unknown.UnusableReason())
 	}
 
 	// Config-managed locations cannot be deleted through the API path: they come
@@ -576,10 +588,11 @@ func TestStorageForSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Nothing downloaded: no location, so the caller falls back to the default
-	// and lets varhub report the absence itself.
-	if uri, err := s.StorageForSources(ctx, []string{"builtins"}); err != nil || uri != "" {
-		t.Errorf("undownloaded = %q, %v; want empty", uri, err)
+	// Nothing downloaded: the source is simply absent from the map, and the
+	// caller falls back to the default so varhub reports the absence itself.
+	roots, err := s.StorageRootsForSources(ctx, []string{"builtins"})
+	if err != nil || len(roots) != 0 {
+		t.Errorf("undownloaded = %v, %v; want empty", roots, err)
 	}
 
 	if err := s.ReplaceSourceFiles(ctx, "builtins", "a", []SourceFile{
@@ -587,21 +600,24 @@ func TestStorageForSources(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	uri, err := s.StorageForSources(ctx, []string{"builtins"})
-	if err != nil || uri != "/mnt/a" {
-		t.Errorf("StorageForSources = %q, %v; want /mnt/a", uri, err)
+	roots, err = s.StorageRootsForSources(ctx, []string{"builtins"})
+	if err != nil || roots["builtins"] != "/mnt/a" {
+		t.Errorf("roots = %v, %v; want builtins at /mnt/a", roots, err)
 	}
 
-	// Split across locations: a job cannot span two cache roots, so say so rather
-	// than silently reading one and reporting the other's sources missing.
+	// Split across locations is normal, not an error: each source is read where
+	// it is, via a location overlay for whichever ones are not at cache_dir.
 	if err := s.ReplaceSourceFiles(ctx, "other", "b", []SourceFile{
 		{Path: "other/1/y", SizeBytes: 1, ModifiedAt: 1},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.StorageForSources(ctx, []string{"builtins", "other"})
-	if err == nil || !strings.Contains(err.Error(), "split across storage locations") {
-		t.Errorf("err = %v, want a split-locations error", err)
+	roots, err = s.StorageRootsForSources(ctx, []string{"builtins", "other"})
+	if err != nil {
+		t.Fatalf("split locations should not be an error: %v", err)
+	}
+	if roots["builtins"] != "/mnt/a" || roots["other"] != "/mnt/b" {
+		t.Errorf("roots = %v; want builtins at /mnt/a and other at /mnt/b", roots)
 	}
 }
 
@@ -701,5 +717,50 @@ func TestAdhocSnapshotDoesNotBlockSourceDeletion(t *testing.T) {
 	// The ad-hoc snapshot goes with it rather than dangling.
 	if _, err := s.GetSnapshot(ctx, adhoc); !errors.Is(err, ErrNotFound) {
 		t.Errorf("ad-hoc snapshot survived: %v", err)
+	}
+}
+
+// A wrong assembly does not error at annotate time — it returns plausible
+// answers at coordinates that mean something else. So it has to be refused
+// where snapshots are built, and that means every path: creating one, editing
+// one, and the ad-hoc snapshot an individual-source selection mints. Checking
+// it in a single handler left the other two accepting a mix.
+func TestAssemblyInvariantOnEveryPath(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	for _, src := range []Source{
+		{ID: "h38", Name: "h38", Version: "1", Kind: "vcf", Build: "GRCh38", TOML: "[[sources]]\n"},
+		{ID: "h37", Name: "h37", Version: "1", Kind: "vcf", Build: "GRCh37", TOML: "[[sources]]\n"},
+		{ID: "agnostic", Name: "agnostic", Version: "1", Kind: "builtin", TOML: "[[sources]]\n"},
+	} {
+		if err := s.PutSource(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Creating one.
+	err := s.PutSnapshot(ctx, Snapshot{ID: "mixed", Build: "GRCh38"}, []string{"h38", "h37"})
+	if err == nil {
+		t.Error("PutSnapshot accepted a mixed-assembly snapshot")
+	} else if !strings.Contains(err.Error(), "h37") {
+		t.Errorf("error does not name the offender: %v", err)
+	}
+
+	// The ad-hoc snapshot an individual-source selection mints.
+	if _, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"h38", "h37"}, nil); err == nil {
+		t.Error("EnsureAdhocSnapshot accepted a mixed-assembly selection")
+	}
+
+	// Editing one.
+	if err := s.PutSnapshot(ctx, Snapshot{ID: "ok", Build: "GRCh38"}, []string{"h38"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetSnapshotSources(ctx, "ok", []string{"h38", "h37"}); err == nil {
+		t.Error("SetSnapshotSources accepted a mixed-assembly edit")
+	}
+
+	// A source with no declared assembly is agnostic and belongs anywhere.
+	if _, err := s.SetSnapshotSources(ctx, "ok", []string{"h38", "agnostic"}); err != nil {
+		t.Errorf("an assembly-agnostic source was refused: %v", err)
 	}
 }

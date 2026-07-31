@@ -28,18 +28,20 @@ type StorageLocation struct {
 
 // Usable reports whether downloads can currently target this location.
 //
-// S3 locations can be configured, but `varhub download` cannot yet write to a
-// bucket — that is the CLI-side work tracked as chunk 4a. Saying so here means
-// the UI can show an S3 target and explain why it is not selectable, rather than
-// offering it and failing at job time.
-func (l StorageLocation) Usable() bool { return l.Kind == StoragePath }
+// Both kinds are usable now: `varhub download` writes to a bucket as readily as
+// to a directory, and `varhub annotate` reads back from one with range requests.
+// The method stays because a location can still be unusable for other reasons —
+// an unknown kind — and because the UI wants a single question to ask.
+func (l StorageLocation) Usable() bool {
+	return l.Kind == StoragePath || l.Kind == StorageS3
+}
 
 // UnusableReason explains Usable() == false.
 func (l StorageLocation) UnusableReason() string {
-	if l.Kind == StorageS3 {
-		return "varhub cannot download to S3 yet; use a filesystem location for now"
+	if l.Usable() {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("unknown storage kind %q", l.Kind)
 }
 
 // SourceFile is one downloaded file.
@@ -254,52 +256,37 @@ func (s *Store) SourceFiles(ctx context.Context, sourceID, storageID string) ([]
 	return out, rows.Err()
 }
 
-// StorageForSources reports which location holds the given sources' files.
+// StorageRootsForSources reports where each source's files live, keyed by
+// source id. A source with nothing downloaded is absent from the map.
 //
-// Annotation and provisioning have to agree on a directory: varhub reads one
-// cache root, so a source downloaded into location A is invisible to a job
-// pointed at location B. Rather than assume, look up where the files actually
-// are.
-//
-// Returns "" when nothing has been downloaded yet, so the caller can fall back
-// to the default and let varhub report "sources not downloaded" itself.
-func (s *Store) StorageForSources(ctx context.Context, sourceIDs []string) (string, error) {
+// This replaces the older question — "which single location holds all of
+// these?" — which had to fail when the answer was "several". Several is normal:
+// a source streamed from its origin, one in a bucket and one on a local volume
+// is a perfectly good snapshot, and the job reads each where it is.
+func (s *Store) StorageRootsForSources(ctx context.Context, sourceIDs []string) (map[string]string, error) {
+	out := map[string]string{}
 	if len(sourceIDs) == 0 {
-		return "", nil
+		return out, nil
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT DISTINCT sf.storage_id, sl.uri
+		SELECT DISTINCT sf.source_id, sl.uri
 		  FROM source_file sf
 		  JOIN storage_location sl ON sl.id = sf.storage_id
 		 WHERE sf.source_id = ANY($1)`, sourceIDs)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer rows.Close()
-
-	var ids, uris []string
 	for rows.Next() {
 		var id, uri string
 		if err := rows.Scan(&id, &uri); err != nil {
-			return "", err
+			return nil, err
 		}
-		ids = append(ids, id)
-		uris = append(uris, uri)
+		// A source provisioned to two locations resolves to one of them; the
+		// files are identical by construction, so either answers correctly.
+		if _, seen := out[id]; !seen {
+			out[id] = uri
+		}
 	}
-	if err := rows.Err(); err != nil {
-		return "", err
-	}
-	switch len(uris) {
-	case 0:
-		return "", nil
-	case 1:
-		return uris[0], nil
-	default:
-		// varhub reads a single cache root, so a job cannot span two. Say so
-		// plainly — the fix is to provision them into one location.
-		return "", fmt.Errorf(
-			"these sources are split across storage locations (%s); "+
-				"a job reads one location at a time — download them all into one",
-			strings.Join(ids, ", "))
-	}
+	return out, rows.Err()
 }

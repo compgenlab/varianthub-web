@@ -307,9 +307,11 @@ func TestExitErrorFallsBackToOpaque(t *testing.T) {
 }
 
 func TestCLIMessageTruncates(t *testing.T) {
-	long := "error: " + strings.Repeat("x", 900)
+	// The cap is generous because the useful part of a multi-line error is
+	// often the list rather than the first line — but it is still a cap.
+	long := "error: " + strings.Repeat("x", 2000)
 	got := cliMessage(long, "")
-	if len(got) > 420 {
+	if len(got) > 950 {
 		t.Errorf("message not truncated: %d chars", len(got))
 	}
 	if !strings.HasSuffix(got, "…") {
@@ -458,5 +460,90 @@ func TestCleanupRefusesEscapes(t *testing.T) {
 	}
 	if _, err := os.Stat(outside); err != nil {
 		t.Fatal("cleanup escaped the storage root")
+	}
+}
+
+// The report is how a download's result reaches the catalog. Walking the cache
+// used to do this job and silently returned nothing for an object store, which
+// is exactly the failure this parsing replaces.
+func TestParseDownloadReport(t *testing.T) {
+	out := []byte(`{
+	  "cache": "s3://varhub-dev",
+	  "snapshot": "provision",
+	  "results": [
+	    {"Source":"gencode:48","Data":"downloaded","Index":"built","files":[
+	      {"path":"gencode/48/gencode.gtf.gz","size_bytes":79000000},
+	      {"path":"gencode/48/gencode.gtf.gz.tbi","size_bytes":1650000}]},
+	    {"Source":"builtins:1","Data":"-","Index":"-"}
+	  ]}`)
+	files, err := parseDownloadReport(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("got %d files, want 2: %+v", len(files), files)
+	}
+	if files[0].Path != "gencode/48/gencode.gtf.gz" || files[0].SizeBytes != 79000000 {
+		t.Errorf("first file = %+v", files[0])
+	}
+	// Paths must stay relative to the cache root, not become locators.
+	for _, f := range files {
+		if strings.Contains(f.Path, "://") {
+			t.Errorf("path %q is a locator, not relative to the cache root", f.Path)
+		}
+	}
+}
+
+func TestParseDownloadReportRejectsGarbage(t *testing.T) {
+	if _, err := parseDownloadReport([]byte("varhub: downloading...\n")); err == nil {
+		t.Error("non-JSON output was accepted as a report")
+	}
+}
+
+// Cleanup cannot remove objects, and must say so rather than reporting success
+// after reclaiming nothing.
+func TestCleanupRefusesObjectStore(t *testing.T) {
+	_, err := Cleanup(CleanupRequest{Root: "s3://bucket/prefix", Name: "gencode", Version: "48"})
+	if err == nil {
+		t.Fatal("cleanup accepted an object-store root")
+	}
+	if !strings.Contains(err.Error(), "s3") {
+		t.Errorf("error does not name the storage kind: %v", err)
+	}
+}
+
+// varhub reports a problem on one line and its subjects on the next, indented.
+// Keeping only the "error: " line left a message that named a failure and no
+// cause — "sources not downloaded:" with nothing after the colon.
+func TestCLIMessageKeepsContinuationLines(t *testing.T) {
+	stderr := "varhub: loading snapshot\n" +
+		"error: sources not downloaded — run `varhub download`:\n" +
+		"  gencode:48 (missing /mnt/storage/gencode/48/gencode.gtf.gz)\n" +
+		"  clinvar:1 (missing /mnt/storage/clinvar/1/clinvar.vcf.gz)\n"
+	got := cliMessage(stderr, "")
+	for _, want := range []string{"sources not downloaded", "gencode:48", "clinvar:1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message lost %q:\n%s", want, got)
+		}
+	}
+}
+
+// Unrelated flush-left output after an error is not part of it.
+func TestCLIMessageStopsAtUnindentedOutput(t *testing.T) {
+	got := cliMessage("error: something failed\n  because of this\nvarhub: unrelated progress line\n", "")
+	if !strings.Contains(got, "because of this") {
+		t.Errorf("dropped the continuation: %q", got)
+	}
+	if strings.Contains(got, "unrelated progress") {
+		t.Errorf("swallowed unrelated output: %q", got)
+	}
+}
+
+// The ephemeral home is still redacted — it is a path the operator never chose
+// and cannot act on.
+func TestCLIMessageRedactsHome(t *testing.T) {
+	got := cliMessage("error: open /tmp/varhub-home-123/x: no such file\n", "/tmp/varhub-home-123")
+	if strings.Contains(got, "varhub-home-123") {
+		t.Errorf("home not redacted: %q", got)
 	}
 }

@@ -23,6 +23,7 @@ type fragment struct {
 		Format   string `toml:"format"`
 		Desc     string `toml:"description"`
 		Assembly string `toml:"assembly"`
+		Stream   bool   `toml:"stream"`
 	} `toml:"sources"`
 }
 
@@ -60,7 +61,12 @@ func SourceFromTOML(text string) (Source, error) {
 		// The assembly a source declares. A synthesized manifest has to state one
 		// that matches, or varhub rejects the snapshot as inconsistent.
 		Build: s.Assembly,
-		TOML:  text,
+		// A streamed source is read from its url, so it has nothing to
+		// provision. Projected here so the listing and the download endpoint
+		// can treat it like a builtin: present and usable, with no data of its
+		// own.
+		Stream: s.Stream,
+		TOML:   text,
 	}, nil
 }
 
@@ -148,4 +154,15 @@ func (s Source) DisplayName() string {
 		return s.Title
 	}
 	return s.Name
+}
+
+// streamFromTOML reports whether a manifest asks to be read from its url rather
+// than downloaded. Derived on read for the same reason the annotation list is:
+// it is a projection of toml_text, so nothing needs backfilling.
+func streamFromTOML(text string) bool {
+	var f fragment
+	if _, err := toml.Decode(text, &f); err != nil || len(f.Sources) == 0 {
+		return false
+	}
+	return f.Sources[0].Stream
 }

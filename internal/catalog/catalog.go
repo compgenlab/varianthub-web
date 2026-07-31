@@ -45,13 +45,19 @@ const (
 
 // Source is one registered annotation source.
 type Source struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Title       string `json:"title,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-	Kind        string `json:"kind"`
-	Build       string `json:"build,omitempty"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Title   string `json:"title,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	Kind    string `json:"kind"`
+	Build   string `json:"build,omitempty"`
+
+	// Stream is derived from the manifest on read rather than stored, like the
+	// annotation list: it is a projection of toml_text, and deriving it means a
+	// source registered before this existed needs no backfill.
+	Stream bool `json:"stream,omitempty"`
+
 	Visibility  string `json:"visibility"`
 	IndexStatus string `json:"index_status"`
 	Origin      string `json:"origin,omitempty"`
@@ -70,7 +76,12 @@ func (s Source) Ref() string { return s.Name + ":" + s.Version }
 // registered. Offering to provision one is offering to fetch nothing: the job
 // runs, downloads zero files, and reports success, which reads as though
 // something happened.
-func (s Source) NeedsData() bool { return s.Kind != "builtin" }
+func (s Source) NeedsData() bool {
+	// A builtin computes from the variant; a streamed source is read from its
+	// url. Neither has files, so offering to download them provisions nothing
+	// and then reports success.
+	return s.Kind != "builtin" && !s.Stream
+}
 
 // Snapshot is a versioned bundle of pinned sources.
 type Snapshot struct {
@@ -134,6 +145,9 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	err := row.Scan(&s.ID, &s.Name, &s.Version, &s.Title, &s.Detail, &s.Kind,
 		&s.Build, &s.Visibility, &s.IndexStatus, &s.Origin, &s.TOML,
 		&s.CreatedAt, &s.UpdatedAt)
+	if err == nil {
+		s.Stream = streamFromTOML(s.TOML)
+	}
 	return s, err
 }
 
@@ -348,6 +362,15 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 	if snap.State == "" {
 		snap.State = StateDraft
 	}
+	// Enforced here rather than in the handlers because this is the single point
+	// every path to a snapshot's membership goes through — creating one, editing
+	// one, and the ad-hoc snapshot an individual-source selection mints.
+	// Checking it in one caller left the other two accepting a mix, and a wrong
+	// assembly does not error at annotate time: it returns plausible answers at
+	// coordinates that mean something else.
+	if err := s.checkBuilds(ctx, snap.Build, sourceIDs); err != nil {
+		return err
+	}
 	// A nil Go slice binds as SQL NULL, and a column DEFAULT does not apply when
 	// NULL is passed explicitly — so nil would violate the NOT NULL constraint
 	// rather than fall back to '{}'.
@@ -558,4 +581,76 @@ func (s *Store) DeleteSource(ctx context.Context, id string) (src Source, locati
 		return Source{}, nil, err
 	}
 	return src, locations, nil
+}
+
+// SetSnapshotSources replaces a draft snapshot's source set.
+//
+// Published snapshots are refused: a published snapshot is a reproducibility
+// claim, and changing which sources it contains would silently change what
+// every past result meant. Editing its metadata stays allowed — that is what
+// ErrPinsFrozen distinguishes.
+//
+// The build invariant is enforced here rather than in the handler because this
+// is the choke point every path to a snapshot's membership goes through.
+func (s *Store) SetSnapshotSources(ctx context.Context, id string, sourceIDs []string) (Snapshot, error) {
+	snap, err := s.GetSnapshot(ctx, id)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if snap.State == StatePublished {
+		return Snapshot{}, fmt.Errorf("%w (snapshot %q)", ErrPinsFrozen, id)
+	}
+	if len(sourceIDs) == 0 {
+		return Snapshot{}, errors.New("a snapshot needs at least one source")
+	}
+	// Sources are carried separately; PutSnapshot takes the ids, and enforces
+	// the assembly invariant for every path including this one.
+	snap.Sources = nil
+	if err := s.PutSnapshot(ctx, snap, sourceIDs); err != nil {
+		return Snapshot{}, err
+	}
+	return s.GetSnapshot(ctx, id)
+}
+
+// checkBuilds refuses a source whose declared assembly differs from the
+// snapshot's.
+//
+// A wrong assembly does not error at annotate time — it returns plausible wrong
+// answers at coordinates that mean something else, which is the one failure
+// mode invisible in the output. Sources with no declared build are
+// assembly-agnostic (a builtin computes from the variant) and belong anywhere.
+func (s *Store) checkBuilds(ctx context.Context, build string, sourceIDs []string) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, build FROM source WHERE id = ANY($1) AND build <> '' AND build <> $2`,
+		sourceIDs, build)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var bad []string
+	for rows.Next() {
+		var id, b string
+		if err := rows.Scan(&id, &b); err != nil {
+			return err
+		}
+		bad = append(bad, fmt.Sprintf("%s is %s", id, b))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("snapshot build is %s but %s — a snapshot cannot mix assemblies",
+			build, strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+// GetSource returns one source, manifest included.
+func (s *Store) GetSource(ctx context.Context, id string) (Source, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM source WHERE id=$1`, id)
+	src, err := scanSource(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Source{}, fmt.Errorf("source %q: %w", id, ErrNotFound)
+	}
+	return src, err
 }

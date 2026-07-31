@@ -183,9 +183,9 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 	}, nil
 }
 
-// syncStorage reconciles the deployment's declared filesystem locations into the
-// catalog, so the config file stays authoritative for them and a path the
-// deployment no longer mounts stops being offered.
+// syncStorage reconciles the deployment's declared locations into the catalog,
+// so the config file stays authoritative for them and a target the deployment
+// no longer provides stops being offered.
 func syncStorage(ctx context.Context, cfg *config.Config, cat *catalog.Store) error {
 	decl, err := cfg.StorageLocations()
 	if err != nil {
@@ -193,8 +193,12 @@ func syncStorage(ctx context.Context, cfg *config.Config, cat *catalog.Store) er
 	}
 	locs := make([]catalog.StorageLocation, 0, len(decl))
 	for _, d := range decl {
+		kind := catalog.StoragePath
+		if d.Kind == "s3" {
+			kind = catalog.StorageS3
+		}
 		locs = append(locs, catalog.StorageLocation{
-			ID: d.ID, Name: d.Name, Kind: catalog.StoragePath,
+			ID: d.ID, Name: d.Name, Kind: kind,
 			URI: d.Path, FromConfig: true, IsDefault: d.Default,
 		})
 	}
@@ -268,6 +272,7 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		CacheDir  string   `json:"cache_dir"`
 		Sources   []string `json:"sources"`
 		Force     bool     `json:"force"`
+		NoStream  bool     `json:"no_stream"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
@@ -277,6 +282,7 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
 		Force:    req.Force,
+		NoStream: req.NoStream,
 	})
 	if err != nil {
 		var ee *runner.ExitError

@@ -56,8 +56,13 @@ type Result struct {
 // each column with its source, so a reader can tell which dataset a value came
 // from.
 type Column struct {
-	Key       string `json:"key"`
-	Label     string `json:"label"`
+	Key   string `json:"key"`
+	Label string `json:"label"`
+
+	// Description is the annotation's prose, kept apart from Label so a
+	// described field does not lose its name in the header.
+	Description string `json:"description,omitempty"`
+
 	Type      string `json:"type,omitempty"`   // categorical|text|numeric|flag
 	Source    string `json:"source,omitempty"` // producing source name
 	SourceRef string `json:"source_ref,omitempty"`
@@ -312,16 +317,12 @@ func (r *ExecRunner) columns(ctx context.Context, bin, home, snapshot string, pr
 			continue
 		}
 		seen[a.Name] = true
-		label := a.Name
-		if a.Description != "" {
-			label = a.Description
-		}
 		source := a.Source
 		if a.SourceTitle != "" {
 			source = a.SourceTitle
 		}
 		cols = append(cols, Column{
-			Key: a.Name, Label: label, Type: a.Type,
+			Key: a.Name, Label: a.Name, Description: a.Description, Type: a.Type,
 			Source: source, SourceRef: a.SourceRef, Default: a.Default,
 		})
 	}
@@ -427,18 +428,35 @@ func (e *ExitError) Detail() string {
 // redacted. Returns "" when stderr carries no such line, so an unexpected
 // failure mode cannot leak whatever it happened to print.
 func cliMessage(stderr, home string) string {
-	var found string
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSpace(line)
-		if after, ok := strings.CutPrefix(line, "error: "); ok {
-			found = strings.TrimSpace(after)
+	// An error may run to several lines: varhub reports "sources not downloaded"
+	// and then lists which ones, indented. Keeping only the "error: " line threw
+	// away the entire useful half — the message named a problem and no subject.
+	var found []string
+	collecting := false
+	for _, raw := range strings.Split(stderr, "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "error: "); ok {
+			found = []string{strings.TrimSpace(after)} // a later error supersedes
+			collecting = true
+			continue
+		}
+		// Continuation lines are indented under the error. A flush-left line is
+		// unrelated output and ends the message.
+		if collecting {
+			if strings.TrimSpace(line) != "" && (strings.HasPrefix(raw, " ") || strings.HasPrefix(raw, "\t")) {
+				found = append(found, strings.TrimSpace(line))
+				continue
+			}
+			collecting = false
 		}
 	}
-	if found == "" {
+	if len(found) == 0 {
 		return ""
 	}
+
+	msg := strings.Join(found, "\n  ")
 	if home != "" {
-		found = strings.ReplaceAll(found, home, "<config>")
+		msg = strings.ReplaceAll(msg, home, "<config>")
 	}
 	// Earlier this withheld any message still containing an absolute path, on the
 	// theory that it described server layout. That threw away the most useful
@@ -446,10 +464,12 @@ func cliMessage(stderr, home string) string {
 	// operator needs, and the path is one they configured and can already see in
 	// the UI. Only the ephemeral home is genuinely opaque, and it is redacted
 	// above.
-	if len(found) > 400 {
-		found = found[:400] + "\u2026"
+	if len(msg) > 900 {
+		// Generous, because the useful part is often the list rather than the
+		// first line.
+		msg = msg[:900] + "\u2026"
 	}
-	return found
+	return msg
 }
 
 // KindDownload is a job that provisions a snapshot's source data rather than
@@ -471,6 +491,12 @@ type DownloadRequest struct {
 	CacheDir string   // where the files land — the storage location's path
 	DataDir  string   // varhub's data dir (tool images, reference files)
 	Force    bool
+
+	// NoStream provisions sources that declare `stream = true` anyway. The flag
+	// in a manifest is the publisher saying a copy is unnecessary; whether one
+	// is wanted — for whole-genome runs, or to pin results to bytes that cannot
+	// change upstream — is the operator's call.
+	NoStream bool
 }
 
 // DownloadResult reports what a download produced.
@@ -532,9 +558,16 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 
 	// The synthesized manifest contains exactly the selected sources, so a plain
 	// `download` fetches those and nothing else — no --source filtering needed.
-	args := []string{"-home", home, "-snapshot", "provision", "download"}
+	// --format json makes varhub report what each source now occupies. Asking it
+	// is the only way to know for an object-store cache: there is no directory
+	// tree to walk, and reimplementing the cache layout here would duplicate the
+	// thing varhub already decides.
+	args := []string{"-home", home, "-snapshot", "provision", "download", "--format", "json"}
 	if req.Force {
 		args = append(args, "--force")
+	}
+	if req.NoStream {
+		args = append(args, "--no-stream")
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -587,11 +620,39 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		return DownloadResult{}, &ExitError{Err: runErr, Stderr: tail, Home: home, Op: "download"}
 	}
 
-	files, err := inventory(req.CacheDir)
+	files, err := parseDownloadReport(stdout.Bytes())
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("inventory %s: %w", req.CacheDir, err)
+		return DownloadResult{}, fmt.Errorf("reading the download report: %w (stderr: %s)", err, tail)
 	}
 	return DownloadResult{Files: files, Log: tail}, nil
+}
+
+// parseDownloadReport reads `varhub download --format json`.
+//
+// Paths come back relative to the cache root, which is what this package
+// records — so a file reads the same whether the location is a directory or a
+// bucket prefix.
+func parseDownloadReport(out []byte) ([]DownloadedFile, error) {
+	var report struct {
+		Cache   string `json:"cache"`
+		Results []struct {
+			Source string `json:"Source"`
+			Files  []struct {
+				Path      string `json:"path"`
+				SizeBytes int64  `json:"size_bytes"`
+			} `json:"files"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(out, &report); err != nil {
+		return nil, err
+	}
+	var files []DownloadedFile
+	for _, r := range report.Results {
+		for _, f := range r.Files {
+			files = append(files, DownloadedFile{Path: f.Path, SizeBytes: f.SizeBytes})
+		}
+	}
+	return files, nil
 }
 
 // rewriteCacheDir repoints a materialized config's cache_dir and data_dir.
@@ -672,6 +733,12 @@ type CleanupRequest struct {
 func Cleanup(req CleanupRequest) (freed int64, err error) {
 	if req.Root == "" || req.Name == "" || req.Version == "" {
 		return 0, errors.New("cleanup needs a root, name and version")
+	}
+	// An object store has no directory to remove. Refusing is better than the
+	// filesystem path quietly reclaiming nothing and reporting success.
+	if i := strings.Index(req.Root, "://"); i > 1 {
+		return 0, fmt.Errorf("cannot clean up %s: removing objects from %s storage is not supported yet, "+
+			"so its files must be removed out of band", req.Name, req.Root[:i])
 	}
 	for _, part := range []string{req.Name, req.Version} {
 		if part == "." || part == ".." || strings.ContainsAny(part, `/\`) {

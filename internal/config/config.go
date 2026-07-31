@@ -31,7 +31,13 @@ type Config struct {
 	// StoragePaths are filesystem download targets declared by the deployment, as
 	// "name=/abs/path" entries. The first is the default. They are reconciled into
 	// the catalog at startup so the config file stays authoritative for them.
-	StoragePaths   []string
+	StoragePaths []string
+
+	// StorageS3 are object-store download targets declared by the deployment,
+	// as "name=s3://bucket/prefix". Separate from StoragePaths because the two
+	// are validated differently and because a deployment usually has one of
+	// each, not a mixed list.
+	StorageS3      []string
 	JobTimeout     time.Duration // per-job wall clock
 	JobTTL         time.Duration // terminal jobs GC'd after this
 	SubmitWaitCap  time.Duration // ceiling on ?wait=
@@ -57,6 +63,7 @@ func Load() (*Config, error) {
 		VarhubHome:   os.Getenv("VHW_VARHUB_HOME"),
 		DataDir:      env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
 		CacheDir:     env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		StorageS3:    envList("VHW_STORAGE_S3", nil),
 		StoragePaths: envList("VHW_STORAGE_PATHS",
 			[]string{"default=/var/lib/varianthub/sources"}),
 		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),
@@ -129,22 +136,28 @@ func envList(k string, def []string) []string {
 	return out
 }
 
-// StorageLocations parses VHW_STORAGE_PATHS into id/name/path triples.
+// StorageLocations parses the deployment's declared download targets.
 //
-// Format is "name=/abs/path", comma-separated; the first entry is the default
-// download target. A bare path is accepted and named after its last element, so
-// the common single-volume case needs no ceremony.
+// VHW_STORAGE_PATHS holds filesystem targets as "name=/abs/path"; a bare path
+// is accepted and named after its last element, so the common single-volume
+// case needs no ceremony. VHW_STORAGE_S3 holds object-store targets as
+// "name=s3://bucket/prefix". Both are comma-separated.
+//
+// Filesystem entries come first and the first of those is the default download
+// target, because a deployment that has both usually wants the local volume as
+// the default and the bucket as an explicit choice.
 func (c *Config) StorageLocations() ([]struct {
-	ID, Name, Path string
-	Default        bool
+	ID, Name, Path, Kind string
+	Default              bool
 }, error) {
 	type loc = struct {
-		ID, Name, Path string
-		Default        bool
+		ID, Name, Path, Kind string
+		Default              bool
 	}
 	var out []loc
 	seen := map[string]bool{}
-	for i, raw := range c.StoragePaths {
+
+	add := func(raw, envName, kind string, isDefault bool, check func(string) error) error {
 		name, p, ok := strings.Cut(raw, "=")
 		if !ok {
 			p = name
@@ -153,17 +166,39 @@ func (c *Config) StorageLocations() ([]struct {
 		name = strings.TrimSpace(name)
 		p = strings.TrimSpace(p)
 		if name == "" || p == "" {
-			return nil, fmt.Errorf("VHW_STORAGE_PATHS entry %q: want name=/abs/path", raw)
+			return fmt.Errorf("%s entry %q: want name=<target>", envName, raw)
 		}
-		if !filepath.IsAbs(p) {
-			return nil, fmt.Errorf("VHW_STORAGE_PATHS entry %q: path must be absolute", raw)
+		if err := check(p); err != nil {
+			return fmt.Errorf("%s entry %q: %w", envName, raw, err)
 		}
 		id := "cfg-" + strings.ToLower(name)
 		if seen[id] {
-			return nil, fmt.Errorf("VHW_STORAGE_PATHS declares %q twice", name)
+			return fmt.Errorf("%s declares %q twice", envName, name)
 		}
 		seen[id] = true
-		out = append(out, loc{ID: id, Name: name, Path: p, Default: i == 0})
+		out = append(out, loc{ID: id, Name: name, Path: p, Kind: kind, Default: isDefault})
+		return nil
+	}
+
+	for i, raw := range c.StoragePaths {
+		if err := add(raw, "VHW_STORAGE_PATHS", "path", i == 0, func(p string) error {
+			if !filepath.IsAbs(p) {
+				return fmt.Errorf("path must be absolute")
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
+	for i, raw := range c.StorageS3 {
+		if err := add(raw, "VHW_STORAGE_S3", "s3", len(c.StoragePaths) == 0 && i == 0, func(p string) error {
+			if !strings.HasPrefix(p, "s3://") {
+				return fmt.Errorf("target must be an s3:// URI")
+			}
+			return nil
+		}); err != nil {
+			return nil, err
+		}
 	}
 	return out, nil
 }

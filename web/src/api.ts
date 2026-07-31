@@ -28,6 +28,7 @@ export interface Source {
   visibility: string;
   index_status: string;
   origin?: string;
+  stream?: boolean;
 }
 
 export interface Registry {
@@ -96,6 +97,7 @@ export interface Job {
 export interface Column {
   key: string;
   label: string;
+  description?: string;
   type?: string;
   source?: string;
   source_ref?: string;
@@ -353,6 +355,17 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  sourceConfig: (id: string) =>
+    req<{ id: string; ref: string; format: string; config: string }>(
+      `/admin/sources/${encodeURIComponent(id)}/config`,
+    ),
+
+  setSnapshotSources: (id: string, sources: string[]) =>
+    req<{ snapshot: Snapshot }>(`/admin/snapshots/${encodeURIComponent(id)}/sources`, {
+      method: "PUT",
+      body: JSON.stringify({ sources }),
+    }),
+
   deleteSource: (id: string) =>
     req<{ id: string; ref: string; cleanup_jobs: string[] }>(
       `/admin/sources/${encodeURIComponent(id)}`,
@@ -391,7 +404,12 @@ export const api = {
 
   // Provisioning is per source: a source is the unit of data, and a newly
   // registered one must be downloadable before anyone bundles it in a snapshot.
-  download: (body: { sources: string[]; storage_id?: string; force?: boolean }) =>
+  download: (body: {
+    sources: string[];
+    storage_id?: string;
+    force?: boolean;
+    include_streamed?: boolean;
+  }) =>
     req<{ job_id: string; sources: string[]; storage: StorageLocation }>("/admin/downloads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
