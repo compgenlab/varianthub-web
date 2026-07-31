@@ -76,8 +76,16 @@ type ResultPage struct {
 
 // Column mirrors the stored column model.
 type Column struct {
-	Key       string `json:"key"`
-	Label     string `json:"label"`
+	Key   string `json:"key"`
+	Label string `json:"label"`
+
+	// Description is the annotation's prose, kept apart from Label. The two
+	// were conflated: a described field lost its name in the header, so a table
+	// of "PHRED scaled CADD scores" and "ClinVar Aggregate germline
+	// classification for this single variant" no longer matched the names the
+	// manifest declares, the export writes, or a filter refers to.
+	Description string `json:"description,omitempty"`
+
 	Type      string `json:"type,omitempty"`
 	Source    string `json:"source,omitempty"`
 	SourceRef string `json:"source_ref,omitempty"`

@@ -56,8 +56,13 @@ type Result struct {
 // each column with its source, so a reader can tell which dataset a value came
 // from.
 type Column struct {
-	Key       string `json:"key"`
-	Label     string `json:"label"`
+	Key   string `json:"key"`
+	Label string `json:"label"`
+
+	// Description is the annotation's prose, kept apart from Label so a
+	// described field does not lose its name in the header.
+	Description string `json:"description,omitempty"`
+
 	Type      string `json:"type,omitempty"`   // categorical|text|numeric|flag
 	Source    string `json:"source,omitempty"` // producing source name
 	SourceRef string `json:"source_ref,omitempty"`
@@ -312,16 +317,12 @@ func (r *ExecRunner) columns(ctx context.Context, bin, home, snapshot string, pr
 			continue
 		}
 		seen[a.Name] = true
-		label := a.Name
-		if a.Description != "" {
-			label = a.Description
-		}
 		source := a.Source
 		if a.SourceTitle != "" {
 			source = a.SourceTitle
 		}
 		cols = append(cols, Column{
-			Key: a.Name, Label: label, Type: a.Type,
+			Key: a.Name, Label: a.Name, Description: a.Description, Type: a.Type,
 			Source: source, SourceRef: a.SourceRef, Default: a.Default,
 		})
 	}

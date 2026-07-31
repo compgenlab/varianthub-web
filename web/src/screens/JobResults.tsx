@@ -198,9 +198,12 @@ export default function JobResults() {
                 </button>
               </th>
               {cols.map((c) => (
-                <th key={c.key}>
+                // The header is the field name — it is what the manifest
+                // declares, what the export writes, and what a filter refers
+                // to. The description is prose and belongs on hover.
+                <th key={c.key} title={c.description || undefined}>
                   <button onClick={() => toggleSort(c.key)}>
-                    {c.label || c.key}
+                    <span className="mono">{c.label || c.key}</span>
                     {c.source && <span className="src-tag">{c.source}</span>}
                     {sortIcon(c.key)}
                   </button>

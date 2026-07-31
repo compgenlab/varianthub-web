@@ -97,6 +97,7 @@ export interface Job {
 export interface Column {
   key: string;
   label: string;
+  description?: string;
   type?: string;
   source?: string;
   source_ref?: string;
