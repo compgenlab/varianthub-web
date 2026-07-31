@@ -307,9 +307,11 @@ func TestExitErrorFallsBackToOpaque(t *testing.T) {
 }
 
 func TestCLIMessageTruncates(t *testing.T) {
-	long := "error: " + strings.Repeat("x", 900)
+	// The cap is generous because the useful part of a multi-line error is
+	// often the list rather than the first line — but it is still a cap.
+	long := "error: " + strings.Repeat("x", 2000)
 	got := cliMessage(long, "")
-	if len(got) > 420 {
+	if len(got) > 950 {
 		t.Errorf("message not truncated: %d chars", len(got))
 	}
 	if !strings.HasSuffix(got, "…") {
@@ -507,5 +509,41 @@ func TestCleanupRefusesObjectStore(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "s3") {
 		t.Errorf("error does not name the storage kind: %v", err)
+	}
+}
+
+// varhub reports a problem on one line and its subjects on the next, indented.
+// Keeping only the "error: " line left a message that named a failure and no
+// cause — "sources not downloaded:" with nothing after the colon.
+func TestCLIMessageKeepsContinuationLines(t *testing.T) {
+	stderr := "varhub: loading snapshot\n" +
+		"error: sources not downloaded — run `varhub download`:\n" +
+		"  gencode:48 (missing /mnt/storage/gencode/48/gencode.gtf.gz)\n" +
+		"  clinvar:1 (missing /mnt/storage/clinvar/1/clinvar.vcf.gz)\n"
+	got := cliMessage(stderr, "")
+	for _, want := range []string{"sources not downloaded", "gencode:48", "clinvar:1"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("message lost %q:\n%s", want, got)
+		}
+	}
+}
+
+// Unrelated flush-left output after an error is not part of it.
+func TestCLIMessageStopsAtUnindentedOutput(t *testing.T) {
+	got := cliMessage("error: something failed\n  because of this\nvarhub: unrelated progress line\n", "")
+	if !strings.Contains(got, "because of this") {
+		t.Errorf("dropped the continuation: %q", got)
+	}
+	if strings.Contains(got, "unrelated progress") {
+		t.Errorf("swallowed unrelated output: %q", got)
+	}
+}
+
+// The ephemeral home is still redacted — it is a path the operator never chose
+// and cannot act on.
+func TestCLIMessageRedactsHome(t *testing.T) {
+	got := cliMessage("error: open /tmp/varhub-home-123/x: no such file\n", "/tmp/varhub-home-123")
+	if strings.Contains(got, "varhub-home-123") {
+		t.Errorf("home not redacted: %q", got)
 	}
 }

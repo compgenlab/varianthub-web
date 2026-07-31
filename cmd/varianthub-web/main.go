@@ -272,6 +272,7 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		CacheDir  string   `json:"cache_dir"`
 		Sources   []string `json:"sources"`
 		Force     bool     `json:"force"`
+		NoStream  bool     `json:"no_stream"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
@@ -281,6 +282,7 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
 		Force:    req.Force,
+		NoStream: req.NoStream,
 	})
 	if err != nil {
 		var ee *runner.ExitError

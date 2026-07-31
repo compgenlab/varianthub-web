@@ -387,13 +387,16 @@ function ProvisionCell({
   // Nothing to fetch: a builtin computes from the variant, a streamed source is
   // read from its url. Both are usable the moment they are registered, so say
   // which rather than offering a control that would provision nothing.
-  if (source.needs_data === false) {
+  if (source.needs_data === false && !source.stream) {
     return (
-      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
-        {source.stream ? "streamed from source" : "no data required"}
-      </span>
+      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>
     );
   }
+
+  // A streamed source reads from its url, so it needs nothing — but a copy is
+  // worth having for whole-genome runs, or to pin results to bytes that cannot
+  // change upstream. Offered, not pressed: the default stays "no copy".
+  const streamed = source.needs_data === false && source.stream;
 
   if (have) {
     return (
@@ -432,6 +435,7 @@ function ProvisionCell({
       const r = await api.download({
         sources: [source.id],
         storage_id: target || targets[0].id,
+        include_streamed: streamed,
       });
       setMsg(`queued #${r.job_id.slice(0, 8)}`);
       onChange();
@@ -464,6 +468,11 @@ function ProvisionCell({
           style={{ height: 30, padding: "0 11px", fontSize: 12 }}
           disabled={busy}
           onClick={provision}
+          title={
+            streamed
+              ? "This source is read from its url. Download a copy anyway — useful for whole-genome runs, or to pin results to bytes that cannot change upstream."
+              : undefined
+          }
         >
           {busy ? "…" : "Download"}
         </button>

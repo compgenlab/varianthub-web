@@ -403,7 +403,12 @@ export const api = {
 
   // Provisioning is per source: a source is the unit of data, and a newly
   // registered one must be downloadable before anyone bundles it in a snapshot.
-  download: (body: { sources: string[]; storage_id?: string; force?: boolean }) =>
+  download: (body: {
+    sources: string[];
+    storage_id?: string;
+    force?: boolean;
+    include_streamed?: boolean;
+  }) =>
     req<{ job_id: string; sources: string[]; storage: StorageLocation }>("/admin/downloads", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

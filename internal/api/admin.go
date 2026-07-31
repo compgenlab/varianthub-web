@@ -558,6 +558,12 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		Sources   []string `json:"sources"`
 		StorageID string   `json:"storage_id"`
 		Force     bool     `json:"force"`
+
+		// IncludeStreamed downloads sources that ask to be streamed. Off by
+		// default so the common case does not accidentally pull tens of
+		// gigabytes, but available because `stream` is the publisher's
+		// suggestion and not a policy.
+		IncludeStreamed bool `json:"include_streamed"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -608,7 +614,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		// variant, and a streamed source is read from its url. Silently
 		// including one would queue a job that downloads nothing and reports
 		// success, which looks like it did something.
-		if !src.NeedsData() {
+		//
+		// A streamed source is the exception the caller can ask for: it does
+		// have data, it just is not normally copied.
+		if !src.NeedsData() && !(src.Stream && req.IncludeStreamed) {
 			skipped = append(skipped, src.Ref())
 			continue
 		}
@@ -618,7 +627,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if len(wanted) == 0 {
 		writeError(w, http.StatusBadRequest, "nothing to download: "+
 			strings.Join(skipped, ", ")+" have no data to fetch — a builtin computes "+
-			"from the variant, and a streamed source is read from its url")
+			"from the variant, and a streamed source is read from its url "+
+			"(pass include_streamed to download a streamed source anyway)")
 		return
 	}
 	req.Sources = wanted
@@ -626,6 +636,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	body, err := json.Marshal(map[string]any{
 		"storage_id": loc.ID, "cache_dir": loc.URI,
 		"sources": req.Sources, "force": req.Force,
+		"no_stream": req.IncludeStreamed,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

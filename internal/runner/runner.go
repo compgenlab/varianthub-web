@@ -427,18 +427,35 @@ func (e *ExitError) Detail() string {
 // redacted. Returns "" when stderr carries no such line, so an unexpected
 // failure mode cannot leak whatever it happened to print.
 func cliMessage(stderr, home string) string {
-	var found string
-	for _, line := range strings.Split(stderr, "\n") {
-		line = strings.TrimSpace(line)
-		if after, ok := strings.CutPrefix(line, "error: "); ok {
-			found = strings.TrimSpace(after)
+	// An error may run to several lines: varhub reports "sources not downloaded"
+	// and then lists which ones, indented. Keeping only the "error: " line threw
+	// away the entire useful half — the message named a problem and no subject.
+	var found []string
+	collecting := false
+	for _, raw := range strings.Split(stderr, "\n") {
+		line := strings.TrimRight(raw, "\r")
+		if after, ok := strings.CutPrefix(strings.TrimSpace(line), "error: "); ok {
+			found = []string{strings.TrimSpace(after)} // a later error supersedes
+			collecting = true
+			continue
+		}
+		// Continuation lines are indented under the error. A flush-left line is
+		// unrelated output and ends the message.
+		if collecting {
+			if strings.TrimSpace(line) != "" && (strings.HasPrefix(raw, " ") || strings.HasPrefix(raw, "\t")) {
+				found = append(found, strings.TrimSpace(line))
+				continue
+			}
+			collecting = false
 		}
 	}
-	if found == "" {
+	if len(found) == 0 {
 		return ""
 	}
+
+	msg := strings.Join(found, "\n  ")
 	if home != "" {
-		found = strings.ReplaceAll(found, home, "<config>")
+		msg = strings.ReplaceAll(msg, home, "<config>")
 	}
 	// Earlier this withheld any message still containing an absolute path, on the
 	// theory that it described server layout. That threw away the most useful
@@ -446,10 +463,12 @@ func cliMessage(stderr, home string) string {
 	// operator needs, and the path is one they configured and can already see in
 	// the UI. Only the ephemeral home is genuinely opaque, and it is redacted
 	// above.
-	if len(found) > 400 {
-		found = found[:400] + "\u2026"
+	if len(msg) > 900 {
+		// Generous, because the useful part is often the list rather than the
+		// first line.
+		msg = msg[:900] + "\u2026"
 	}
-	return found
+	return msg
 }
 
 // KindDownload is a job that provisions a snapshot's source data rather than
@@ -471,6 +490,12 @@ type DownloadRequest struct {
 	CacheDir string   // where the files land — the storage location's path
 	DataDir  string   // varhub's data dir (tool images, reference files)
 	Force    bool
+
+	// NoStream provisions sources that declare `stream = true` anyway. The flag
+	// in a manifest is the publisher saying a copy is unnecessary; whether one
+	// is wanted — for whole-genome runs, or to pin results to bytes that cannot
+	// change upstream — is the operator's call.
+	NoStream bool
 }
 
 // DownloadResult reports what a download produced.
@@ -539,6 +564,9 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	args := []string{"-home", home, "-snapshot", "provision", "download", "--format", "json"}
 	if req.Force {
 		args = append(args, "--force")
+	}
+	if req.NoStream {
+		args = append(args, "--no-stream")
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
