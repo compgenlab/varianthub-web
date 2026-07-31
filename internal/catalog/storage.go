@@ -28,18 +28,20 @@ type StorageLocation struct {
 
 // Usable reports whether downloads can currently target this location.
 //
-// S3 locations can be configured, but `varhub download` cannot yet write to a
-// bucket — that is the CLI-side work tracked as chunk 4a. Saying so here means
-// the UI can show an S3 target and explain why it is not selectable, rather than
-// offering it and failing at job time.
-func (l StorageLocation) Usable() bool { return l.Kind == StoragePath }
+// Both kinds are usable now: `varhub download` writes to a bucket as readily as
+// to a directory, and `varhub annotate` reads back from one with range requests.
+// The method stays because a location can still be unusable for other reasons —
+// an unknown kind — and because the UI wants a single question to ask.
+func (l StorageLocation) Usable() bool {
+	return l.Kind == StoragePath || l.Kind == StorageS3
+}
 
 // UnusableReason explains Usable() == false.
 func (l StorageLocation) UnusableReason() string {
-	if l.Kind == StorageS3 {
-		return "varhub cannot download to S3 yet; use a filesystem location for now"
+	if l.Usable() {
+		return ""
 	}
-	return ""
+	return fmt.Sprintf("unknown storage kind %q", l.Kind)
 }
 
 // SourceFile is one downloaded file.

@@ -499,13 +499,25 @@ func TestStorageAndFiles(t *testing.T) {
 		t.Error("sync removed a user-added location")
 	}
 
-	// The default is the first usable one; S3 is not usable as a target yet.
+	// Both kinds are usable targets now that varhub provisions to a bucket and
+	// reads back from one; the default is simply the first declared.
 	def, err := s.DefaultStorage(ctx)
 	if err != nil || def.ID != "cfg-a" {
 		t.Errorf("DefaultStorage = %+v, %v", def, err)
 	}
-	if (StorageLocation{Kind: StorageS3}).Usable() {
-		t.Error("S3 should not be a usable download target yet")
+	if !(StorageLocation{Kind: StorageS3}).Usable() {
+		t.Error("S3 should be a usable download target")
+	}
+	if !(StorageLocation{Kind: StoragePath}).Usable() {
+		t.Error("a filesystem path should be a usable download target")
+	}
+	// An unknown kind still is not, and says why.
+	unknown := StorageLocation{Kind: "gopher"}
+	if unknown.Usable() {
+		t.Error("an unknown storage kind should not be usable")
+	}
+	if !strings.Contains(unknown.UnusableReason(), "gopher") {
+		t.Errorf("UnusableReason does not name the kind: %q", unknown.UnusableReason())
 	}
 
 	// Config-managed locations cannot be deleted through the API path: they come

@@ -390,9 +390,18 @@ deleted along with the source rather than blocking it.
 
 Filesystem locations are declared by the deployment (`VHW_STORAGE_PATHS`) and
 reconciled at startup; the API refuses to add one, since a path is meaningless
-unless the worker mounts it. S3 locations can be added at runtime but are not yet
-usable as targets — `usable: false` with a reason, rather than accepting a
-download that would fail at job time.
+unless the worker mounts it. Object-store locations may be declared the same way
+(`VHW_STORAGE_S3`, as `name=s3://bucket/prefix`) or added at runtime through the
+API.
+
+Both kinds are usable targets: `varhub download` writes to a bucket as readily
+as to a directory, and annotation reads back from one with range requests, so no
+local copy of the data is needed. `usable: false` now means only that the kind is
+unrecognised.
+
+The dev compose stack can run a local S3-compatible gateway for exercising this
+— see `deploy/compose/.env.example`. It is behind a profile and off by default,
+because most work does not need a bucket and production points at a real one.
 
 **Authorization is not role-based yet.** There are no accounts, so every valid
 token can administer. The routes sit under `/admin` so the eventual role gate has
