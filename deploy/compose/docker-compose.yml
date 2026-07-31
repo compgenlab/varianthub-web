@@ -110,6 +110,11 @@ services:
     ports:
       # Not 8080: like postgres above, a dev machine usually already has one.
       - "${API_PORT:-18080}:8080"
+    # Lets a container reach a service on the host, which is how a streamed
+    # source pointed at a locally-served file resolves. Docker Desktop provides
+    # this name; on Linux it has to be mapped explicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -155,6 +160,11 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+    # Lets a container reach a service on the host, which is how a streamed
+    # source pointed at a locally-served file resolves. Docker Desktop provides
+    # this name; on Linux it has to be mapped explicitly.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       seed:
         condition: service_completed_successfully

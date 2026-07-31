@@ -28,6 +28,7 @@ export interface Source {
   visibility: string;
   index_status: string;
   origin?: string;
+  stream?: boolean;
 }
 
 export interface Registry {

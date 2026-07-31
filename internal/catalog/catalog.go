@@ -45,13 +45,19 @@ const (
 
 // Source is one registered annotation source.
 type Source struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Version     string `json:"version"`
-	Title       string `json:"title,omitempty"`
-	Detail      string `json:"detail,omitempty"`
-	Kind        string `json:"kind"`
-	Build       string `json:"build,omitempty"`
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Title   string `json:"title,omitempty"`
+	Detail  string `json:"detail,omitempty"`
+	Kind    string `json:"kind"`
+	Build   string `json:"build,omitempty"`
+
+	// Stream is derived from the manifest on read rather than stored, like the
+	// annotation list: it is a projection of toml_text, and deriving it means a
+	// source registered before this existed needs no backfill.
+	Stream bool `json:"stream,omitempty"`
+
 	Visibility  string `json:"visibility"`
 	IndexStatus string `json:"index_status"`
 	Origin      string `json:"origin,omitempty"`
@@ -70,7 +76,12 @@ func (s Source) Ref() string { return s.Name + ":" + s.Version }
 // registered. Offering to provision one is offering to fetch nothing: the job
 // runs, downloads zero files, and reports success, which reads as though
 // something happened.
-func (s Source) NeedsData() bool { return s.Kind != "builtin" }
+func (s Source) NeedsData() bool {
+	// A builtin computes from the variant; a streamed source is read from its
+	// url. Neither has files, so offering to download them provisions nothing
+	// and then reports success.
+	return s.Kind != "builtin" && !s.Stream
+}
 
 // Snapshot is a versioned bundle of pinned sources.
 type Snapshot struct {
@@ -134,6 +145,9 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	err := row.Scan(&s.ID, &s.Name, &s.Version, &s.Title, &s.Detail, &s.Kind,
 		&s.Build, &s.Visibility, &s.IndexStatus, &s.Origin, &s.TOML,
 		&s.CreatedAt, &s.UpdatedAt)
+	if err == nil {
+		s.Stream = streamFromTOML(s.TOML)
+	}
 	return s, err
 }
 

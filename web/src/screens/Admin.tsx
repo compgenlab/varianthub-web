@@ -384,12 +384,13 @@ function ProvisionCell({
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
-  // A builtin computes from the variant; there is nothing to fetch, and it is
-  // usable the moment it is registered.
+  // Nothing to fetch: a builtin computes from the variant, a streamed source is
+  // read from its url. Both are usable the moment they are registered, so say
+  // which rather than offering a control that would provision nothing.
   if (source.needs_data === false) {
     return (
       <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
-        no data required
+        {source.stream ? "streamed from source" : "no data required"}
       </span>
     );
   }

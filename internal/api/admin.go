@@ -604,7 +604,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, "unknown source "+strconv.Quote(id))
 			return
 		}
-		// Builtins compute from the variant and have nothing on disk. Silently
+		// Some sources have nothing to provision: a builtin computes from the
+		// variant, and a streamed source is read from its url. Silently
 		// including one would queue a job that downloads nothing and reports
 		// success, which looks like it did something.
 		if !src.NeedsData() {
@@ -616,7 +617,8 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(wanted) == 0 {
 		writeError(w, http.StatusBadRequest, "nothing to download: "+
-			strings.Join(skipped, ", ")+" compute from the variant and need no data")
+			strings.Join(skipped, ", ")+" have no data to fetch — a builtin computes "+
+			"from the variant, and a streamed source is read from its url")
 		return
 	}
 	req.Sources = wanted
