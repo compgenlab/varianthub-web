@@ -460,3 +460,52 @@ func TestCleanupRefusesEscapes(t *testing.T) {
 		t.Fatal("cleanup escaped the storage root")
 	}
 }
+
+// The report is how a download's result reaches the catalog. Walking the cache
+// used to do this job and silently returned nothing for an object store, which
+// is exactly the failure this parsing replaces.
+func TestParseDownloadReport(t *testing.T) {
+	out := []byte(`{
+	  "cache": "s3://varhub-dev",
+	  "snapshot": "provision",
+	  "results": [
+	    {"Source":"gencode:48","Data":"downloaded","Index":"built","files":[
+	      {"path":"gencode/48/gencode.gtf.gz","size_bytes":79000000},
+	      {"path":"gencode/48/gencode.gtf.gz.tbi","size_bytes":1650000}]},
+	    {"Source":"builtins:1","Data":"-","Index":"-"}
+	  ]}`)
+	files, err := parseDownloadReport(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("got %d files, want 2: %+v", len(files), files)
+	}
+	if files[0].Path != "gencode/48/gencode.gtf.gz" || files[0].SizeBytes != 79000000 {
+		t.Errorf("first file = %+v", files[0])
+	}
+	// Paths must stay relative to the cache root, not become locators.
+	for _, f := range files {
+		if strings.Contains(f.Path, "://") {
+			t.Errorf("path %q is a locator, not relative to the cache root", f.Path)
+		}
+	}
+}
+
+func TestParseDownloadReportRejectsGarbage(t *testing.T) {
+	if _, err := parseDownloadReport([]byte("varhub: downloading...\n")); err == nil {
+		t.Error("non-JSON output was accepted as a report")
+	}
+}
+
+// Cleanup cannot remove objects, and must say so rather than reporting success
+// after reclaiming nothing.
+func TestCleanupRefusesObjectStore(t *testing.T) {
+	_, err := Cleanup(CleanupRequest{Root: "s3://bucket/prefix", Name: "gencode", Version: "48"})
+	if err == nil {
+		t.Fatal("cleanup accepted an object-store root")
+	}
+	if !strings.Contains(err.Error(), "s3") {
+		t.Errorf("error does not name the storage kind: %v", err)
+	}
+}

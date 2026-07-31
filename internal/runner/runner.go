@@ -532,7 +532,11 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 
 	// The synthesized manifest contains exactly the selected sources, so a plain
 	// `download` fetches those and nothing else — no --source filtering needed.
-	args := []string{"-home", home, "-snapshot", "provision", "download"}
+	// --format json makes varhub report what each source now occupies. Asking it
+	// is the only way to know for an object-store cache: there is no directory
+	// tree to walk, and reimplementing the cache layout here would duplicate the
+	// thing varhub already decides.
+	args := []string{"-home", home, "-snapshot", "provision", "download", "--format", "json"}
 	if req.Force {
 		args = append(args, "--force")
 	}
@@ -587,11 +591,39 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		return DownloadResult{}, &ExitError{Err: runErr, Stderr: tail, Home: home, Op: "download"}
 	}
 
-	files, err := inventory(req.CacheDir)
+	files, err := parseDownloadReport(stdout.Bytes())
 	if err != nil {
-		return DownloadResult{}, fmt.Errorf("inventory %s: %w", req.CacheDir, err)
+		return DownloadResult{}, fmt.Errorf("reading the download report: %w (stderr: %s)", err, tail)
 	}
 	return DownloadResult{Files: files, Log: tail}, nil
+}
+
+// parseDownloadReport reads `varhub download --format json`.
+//
+// Paths come back relative to the cache root, which is what this package
+// records — so a file reads the same whether the location is a directory or a
+// bucket prefix.
+func parseDownloadReport(out []byte) ([]DownloadedFile, error) {
+	var report struct {
+		Cache   string `json:"cache"`
+		Results []struct {
+			Source string `json:"Source"`
+			Files  []struct {
+				Path      string `json:"path"`
+				SizeBytes int64  `json:"size_bytes"`
+			} `json:"files"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(out, &report); err != nil {
+		return nil, err
+	}
+	var files []DownloadedFile
+	for _, r := range report.Results {
+		for _, f := range r.Files {
+			files = append(files, DownloadedFile{Path: f.Path, SizeBytes: f.SizeBytes})
+		}
+	}
+	return files, nil
 }
 
 // rewriteCacheDir repoints a materialized config's cache_dir and data_dir.
@@ -672,6 +704,12 @@ type CleanupRequest struct {
 func Cleanup(req CleanupRequest) (freed int64, err error) {
 	if req.Root == "" || req.Name == "" || req.Version == "" {
 		return 0, errors.New("cleanup needs a root, name and version")
+	}
+	// An object store has no directory to remove. Refusing is better than the
+	// filesystem path quietly reclaiming nothing and reporting success.
+	if i := strings.Index(req.Root, "://"); i > 1 {
+		return 0, fmt.Errorf("cannot clean up %s: removing objects from %s storage is not supported yet, "+
+			"so its files must be removed out of band", req.Name, req.Root[:i])
 	}
 	for _, part := range []string{req.Name, req.Version} {
 		if part == "." || part == ".." || strings.ContainsAny(part, `/\`) {
