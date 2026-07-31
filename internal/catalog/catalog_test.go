@@ -719,3 +719,48 @@ func TestAdhocSnapshotDoesNotBlockSourceDeletion(t *testing.T) {
 		t.Errorf("ad-hoc snapshot survived: %v", err)
 	}
 }
+
+// A wrong assembly does not error at annotate time — it returns plausible
+// answers at coordinates that mean something else. So it has to be refused
+// where snapshots are built, and that means every path: creating one, editing
+// one, and the ad-hoc snapshot an individual-source selection mints. Checking
+// it in a single handler left the other two accepting a mix.
+func TestAssemblyInvariantOnEveryPath(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	for _, src := range []Source{
+		{ID: "h38", Name: "h38", Version: "1", Kind: "vcf", Build: "GRCh38", TOML: "[[sources]]\n"},
+		{ID: "h37", Name: "h37", Version: "1", Kind: "vcf", Build: "GRCh37", TOML: "[[sources]]\n"},
+		{ID: "agnostic", Name: "agnostic", Version: "1", Kind: "builtin", TOML: "[[sources]]\n"},
+	} {
+		if err := s.PutSource(ctx, src); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Creating one.
+	err := s.PutSnapshot(ctx, Snapshot{ID: "mixed", Build: "GRCh38"}, []string{"h38", "h37"})
+	if err == nil {
+		t.Error("PutSnapshot accepted a mixed-assembly snapshot")
+	} else if !strings.Contains(err.Error(), "h37") {
+		t.Errorf("error does not name the offender: %v", err)
+	}
+
+	// The ad-hoc snapshot an individual-source selection mints.
+	if _, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"h38", "h37"}, nil); err == nil {
+		t.Error("EnsureAdhocSnapshot accepted a mixed-assembly selection")
+	}
+
+	// Editing one.
+	if err := s.PutSnapshot(ctx, Snapshot{ID: "ok", Build: "GRCh38"}, []string{"h38"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.SetSnapshotSources(ctx, "ok", []string{"h38", "h37"}); err == nil {
+		t.Error("SetSnapshotSources accepted a mixed-assembly edit")
+	}
+
+	// A source with no declared assembly is agnostic and belongs anywhere.
+	if _, err := s.SetSnapshotSources(ctx, "ok", []string{"h38", "agnostic"}); err != nil {
+		t.Errorf("an assembly-agnostic source was refused: %v", err)
+	}
+}

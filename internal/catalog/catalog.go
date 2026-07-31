@@ -362,6 +362,15 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 	if snap.State == "" {
 		snap.State = StateDraft
 	}
+	// Enforced here rather than in the handlers because this is the single point
+	// every path to a snapshot's membership goes through — creating one, editing
+	// one, and the ad-hoc snapshot an individual-source selection mints.
+	// Checking it in one caller left the other two accepting a mix, and a wrong
+	// assembly does not error at annotate time: it returns plausible answers at
+	// coordinates that mean something else.
+	if err := s.checkBuilds(ctx, snap.Build, sourceIDs); err != nil {
+		return err
+	}
 	// A nil Go slice binds as SQL NULL, and a column DEFAULT does not apply when
 	// NULL is passed explicitly — so nil would violate the NOT NULL constraint
 	// rather than fall back to '{}'.
@@ -594,10 +603,8 @@ func (s *Store) SetSnapshotSources(ctx context.Context, id string, sourceIDs []s
 	if len(sourceIDs) == 0 {
 		return Snapshot{}, errors.New("a snapshot needs at least one source")
 	}
-	if err := s.checkBuilds(ctx, snap.Build, sourceIDs); err != nil {
-		return Snapshot{}, err
-	}
-	// Sources are carried separately; PutSnapshot takes the ids.
+	// Sources are carried separately; PutSnapshot takes the ids, and enforces
+	// the assembly invariant for every path including this one.
 	snap.Sources = nil
 	if err := s.PutSnapshot(ctx, snap, sourceIDs); err != nil {
 		return Snapshot{}, err
