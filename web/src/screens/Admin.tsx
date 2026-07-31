@@ -167,7 +167,7 @@ export default function Admin() {
               <Plus size={15} /> New snapshot
             </button>
           </div>
-          <SnapshotList snapshots={snapshots} onChange={load} />
+          <SnapshotList snapshots={snapshots} allSources={sources} onChange={load} />
         </>
       )}
     </div>
@@ -186,6 +186,8 @@ function SourceTable({
   onChange: () => void;
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
+  // Which source's manifest is expanded, if any.
+  const [showConfig, setShowConfig] = useState("");
 
   // A source is "provisioned" when files are recorded for it. Summarize per
   // source so the row can show a footprint instead of a bare yes/no.
@@ -220,7 +222,22 @@ function SourceTable({
           }}
         >
           <span>
-            <span style={{ fontSize: 14, fontWeight: 500 }}>{s.title || s.name}</span>
+            <button
+              onClick={() => setShowConfig(showConfig === s.id ? "" : s.id)}
+              title="Show this source's manifest"
+              style={{
+                background: "none",
+                border: "none",
+                padding: 0,
+                cursor: "pointer",
+                textAlign: "left",
+                fontSize: 14,
+                fontWeight: 500,
+                color: "var(--accent-text)",
+              }}
+            >
+              {s.title || s.name}
+            </button>
             <br />
             <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
               {s.origin || s.id}
@@ -245,9 +262,54 @@ function SourceTable({
             onChange={onChange}
           />
           <DeleteSource source={s} onChange={onChange} />
+          {showConfig === s.id && <SourceConfig id={s.id} />}
         </div>
       ))}
     </div>
+  );
+}
+
+/**
+ * Shows a source's stored manifest.
+ *
+ * The manifest is the source of truth — the listed columns are a projection of
+ * it — so this is how an admin checks what a source actually declares instead
+ * of inferring it from the row.
+ */
+function SourceConfig({ id }: { id: string }) {
+  const [toml, setToml] = useState("");
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let live = true;
+    api
+      .sourceConfig(id)
+      .then((r) => live && setToml(r.config))
+      .catch((e) => live && setErr(String(e.message ?? e)));
+    return () => {
+      live = false;
+    };
+  }, [id]);
+
+  return (
+    <pre
+      className="mono"
+      style={{
+        gridColumn: "1 / -1",
+        margin: "10px 0 0",
+        padding: 12,
+        fontSize: 12,
+        lineHeight: 1.5,
+        background: "var(--surface-2)",
+        border: "1px solid var(--hairline)",
+        borderRadius: 6,
+        overflowX: "auto",
+        whiteSpace: "pre",
+        color: err ? "var(--danger)" : "var(--text-1)",
+      }}
+    >
+      {err || toml || "Loading…"}
+    </pre>
   );
 }
 
@@ -416,9 +478,11 @@ function ProvisionCell({
 
 function SnapshotList({
   snapshots,
+  allSources,
   onChange,
 }: {
   snapshots: Snapshot[];
+  allSources: Source[];
   onChange: () => void;
 }) {
   const [busy, setBusy] = useState("");
@@ -502,13 +566,16 @@ function SnapshotList({
           </div>
 
           {editing === s.id && (
-            <EditSnapshot
-              snapshot={s}
-              onDone={() => {
-                setEditing("");
-                onChange();
-              }}
-            />
+            <>
+              <EditSnapshot
+                snapshot={s}
+                onDone={() => {
+                  setEditing("");
+                  onChange();
+                }}
+              />
+              <EditSnapshotSources snapshot={s} sources={allSources} onChange={onChange} />
+            </>
           )}
         </div>
       ))}
@@ -1068,6 +1135,109 @@ function BuildSnapshot({
             {busy ? "Saving…" : "Publish snapshot"}
           </button>
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Adds and removes a snapshot's sources.
+ *
+ * Refused server-side once published: a published snapshot is a reproducibility
+ * claim, so changing which sources it contains would silently change what every
+ * past result meant. The checkboxes are disabled rather than the request being
+ * allowed to fail, since there is nothing the user could do to make it succeed.
+ *
+ * Sources whose assembly differs from the snapshot's are also disabled, with the
+ * mismatch named. A wrong assembly does not error at annotate time — it returns
+ * plausible answers at coordinates that mean something else — so it is worth
+ * refusing at the point of choosing rather than explaining afterwards.
+ */
+function EditSnapshotSources({
+  snapshot,
+  sources,
+  onChange,
+}: {
+  snapshot: Snapshot;
+  sources: Source[];
+  onChange: () => void;
+}) {
+  const pinned = new Set((snapshot.sources ?? []).map((s) => s.id));
+  const [picked, setPicked] = useState<Set<string>>(new Set(pinned));
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+  const frozen = snapshot.state === "published";
+
+  const dirty =
+    picked.size !== pinned.size || [...picked].some((id) => !pinned.has(id));
+
+  function toggle(id: string) {
+    const next = new Set(picked);
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    setPicked(next);
+  }
+
+  async function save() {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.setSnapshotSources(snapshot.id, [...picked]);
+      onChange();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--hairline)" }}>
+      <div className="between" style={{ marginBottom: 8 }}>
+        <span style={{ fontSize: 13, fontWeight: 600 }}>Sources</span>
+        {!frozen && dirty && (
+          <button className="btn sm" disabled={busy || picked.size === 0} onClick={save}>
+            {busy ? "Saving…" : "Save sources"}
+          </button>
+        )}
+      </div>
+      {frozen && (
+        <p style={{ fontSize: 12, color: "var(--text-3)", margin: "0 0 8px" }}>
+          Published — its sources are fixed. Duplicate it to change them.
+        </p>
+      )}
+      {err && <p className="err">{err}</p>}
+      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        {sources.map((src) => {
+          const clash = !!src.build && !!snapshot.build && src.build !== snapshot.build;
+          return (
+            <label
+              key={src.id}
+              className="row gap-8"
+              style={{
+                fontSize: 13,
+                opacity: frozen || clash ? 0.55 : 1,
+                cursor: frozen || clash ? "not-allowed" : "pointer",
+              }}
+            >
+              <input
+                type="checkbox"
+                checked={picked.has(src.id)}
+                disabled={frozen || clash}
+                onChange={() => toggle(src.id)}
+              />
+              <span>{src.title || src.name}</span>
+              <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
+                {src.id}
+              </span>
+              {clash && (
+                <span style={{ fontSize: 11, color: "var(--path-fg)" }}>
+                  {src.build}, not {snapshot.build}
+                </span>
+              )}
+            </label>
+          );
+        })}
       </div>
     </div>
   );

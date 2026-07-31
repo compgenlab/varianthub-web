@@ -709,3 +709,56 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		"id": id, "ref": src.Ref(), "cleanup_jobs": jobs,
 	})
 }
+
+// handleSourceConfig returns a source's stored manifest.
+//
+// The manifest is the source of truth — the columns beside it are a derived
+// projection — so being able to read it back is how an admin checks what a
+// source actually declares, rather than inferring it from the listing.
+func (s *Server) handleSourceConfig(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	src, err := s.catalog.GetSource(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": src.ID, "ref": src.Ref(), "format": "toml", "config": src.TOML,
+	})
+}
+
+// handleSetSnapshotSources replaces a draft snapshot's source set.
+func (s *Server) handleSetSnapshotSources(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		Sources []string `json:"sources"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	snap, err := s.catalog.SetSnapshotSources(r.Context(), r.PathValue("id"), req.Sources)
+	switch {
+	case errors.Is(err, catalog.ErrNotFound):
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	case errors.Is(err, catalog.ErrPinsFrozen):
+		// 409 rather than 403: the request is well-formed and the caller is
+		// permitted; the snapshot's state is what refuses it.
+		writeError(w, http.StatusConflict,
+			"a published snapshot's sources are fixed — duplicate it to change them")
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"snapshot": snap, "annotations": snapshotAnnotations(snap),
+	})
+}

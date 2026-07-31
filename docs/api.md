@@ -337,6 +337,7 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `POST` | `/api/v1/admin/snapshots/{id}/publish` | **implemented** |
 | `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
 | `DELETE` | `/api/v1/admin/sources/{id}` | **implemented** — refused with 409 while a snapshot pins it |
+| `GET` | `/api/v1/admin/sources/{id}/config` | **implemented** — the stored TOML manifest |
 | `GET` | `/api/v1/admin/registries` | **implemented** |
 | `POST` | `/api/v1/admin/registries` | **implemented** — validates by fetching once |
 | `DELETE` | `/api/v1/admin/registries/{id}` | **implemented** (not the builtin default) |

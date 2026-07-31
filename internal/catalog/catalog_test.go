@@ -588,10 +588,11 @@ func TestStorageForSources(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Nothing downloaded: no location, so the caller falls back to the default
-	// and lets varhub report the absence itself.
-	if uri, err := s.StorageForSources(ctx, []string{"builtins"}); err != nil || uri != "" {
-		t.Errorf("undownloaded = %q, %v; want empty", uri, err)
+	// Nothing downloaded: the source is simply absent from the map, and the
+	// caller falls back to the default so varhub reports the absence itself.
+	roots, err := s.StorageRootsForSources(ctx, []string{"builtins"})
+	if err != nil || len(roots) != 0 {
+		t.Errorf("undownloaded = %v, %v; want empty", roots, err)
 	}
 
 	if err := s.ReplaceSourceFiles(ctx, "builtins", "a", []SourceFile{
@@ -599,21 +600,24 @@ func TestStorageForSources(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	uri, err := s.StorageForSources(ctx, []string{"builtins"})
-	if err != nil || uri != "/mnt/a" {
-		t.Errorf("StorageForSources = %q, %v; want /mnt/a", uri, err)
+	roots, err = s.StorageRootsForSources(ctx, []string{"builtins"})
+	if err != nil || roots["builtins"] != "/mnt/a" {
+		t.Errorf("roots = %v, %v; want builtins at /mnt/a", roots, err)
 	}
 
-	// Split across locations: a job cannot span two cache roots, so say so rather
-	// than silently reading one and reporting the other's sources missing.
+	// Split across locations is normal, not an error: each source is read where
+	// it is, via a location overlay for whichever ones are not at cache_dir.
 	if err := s.ReplaceSourceFiles(ctx, "other", "b", []SourceFile{
 		{Path: "other/1/y", SizeBytes: 1, ModifiedAt: 1},
 	}); err != nil {
 		t.Fatal(err)
 	}
-	_, err = s.StorageForSources(ctx, []string{"builtins", "other"})
-	if err == nil || !strings.Contains(err.Error(), "split across storage locations") {
-		t.Errorf("err = %v, want a split-locations error", err)
+	roots, err = s.StorageRootsForSources(ctx, []string{"builtins", "other"})
+	if err != nil {
+		t.Fatalf("split locations should not be an error: %v", err)
+	}
+	if roots["builtins"] != "/mnt/a" || roots["other"] != "/mnt/b" {
+		t.Errorf("roots = %v; want builtins at /mnt/a and other at /mnt/b", roots)
 	}
 }
 

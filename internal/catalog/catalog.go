@@ -559,3 +559,77 @@ func (s *Store) DeleteSource(ctx context.Context, id string) (src Source, locati
 	}
 	return src, locations, nil
 }
+
+// SetSnapshotSources replaces a draft snapshot's source set.
+//
+// Published snapshots are refused: a published snapshot is a reproducibility
+// claim, and changing which sources it contains would silently change what
+// every past result meant. Editing its metadata stays allowed — that is what
+// ErrPinsFrozen distinguishes.
+//
+// The build invariant is enforced here rather than in the handler because this
+// is the choke point every path to a snapshot's membership goes through.
+func (s *Store) SetSnapshotSources(ctx context.Context, id string, sourceIDs []string) (Snapshot, error) {
+	snap, err := s.GetSnapshot(ctx, id)
+	if err != nil {
+		return Snapshot{}, err
+	}
+	if snap.State == StatePublished {
+		return Snapshot{}, fmt.Errorf("%w (snapshot %q)", ErrPinsFrozen, id)
+	}
+	if len(sourceIDs) == 0 {
+		return Snapshot{}, errors.New("a snapshot needs at least one source")
+	}
+	if err := s.checkBuilds(ctx, snap.Build, sourceIDs); err != nil {
+		return Snapshot{}, err
+	}
+	// Sources are carried separately; PutSnapshot takes the ids.
+	snap.Sources = nil
+	if err := s.PutSnapshot(ctx, snap, sourceIDs); err != nil {
+		return Snapshot{}, err
+	}
+	return s.GetSnapshot(ctx, id)
+}
+
+// checkBuilds refuses a source whose declared assembly differs from the
+// snapshot's.
+//
+// A wrong assembly does not error at annotate time — it returns plausible wrong
+// answers at coordinates that mean something else, which is the one failure
+// mode invisible in the output. Sources with no declared build are
+// assembly-agnostic (a builtin computes from the variant) and belong anywhere.
+func (s *Store) checkBuilds(ctx context.Context, build string, sourceIDs []string) error {
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, build FROM source WHERE id = ANY($1) AND build <> '' AND build <> $2`,
+		sourceIDs, build)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	var bad []string
+	for rows.Next() {
+		var id, b string
+		if err := rows.Scan(&id, &b); err != nil {
+			return err
+		}
+		bad = append(bad, fmt.Sprintf("%s is %s", id, b))
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(bad) > 0 {
+		return fmt.Errorf("snapshot build is %s but %s — a snapshot cannot mix assemblies",
+			build, strings.Join(bad, ", "))
+	}
+	return nil
+}
+
+// GetSource returns one source, manifest included.
+func (s *Store) GetSource(ctx context.Context, id string) (Source, error) {
+	row := s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM source WHERE id=$1`, id)
+	src, err := scanSource(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Source{}, fmt.Errorf("source %q: %w", id, ErrNotFound)
+	}
+	return src, err
+}

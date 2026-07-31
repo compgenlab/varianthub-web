@@ -353,6 +353,17 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  sourceConfig: (id: string) =>
+    req<{ id: string; ref: string; format: string; config: string }>(
+      `/admin/sources/${encodeURIComponent(id)}/config`,
+    ),
+
+  setSnapshotSources: (id: string, sources: string[]) =>
+    req<{ snapshot: Snapshot }>(`/admin/snapshots/${encodeURIComponent(id)}/sources`, {
+      method: "PUT",
+      body: JSON.stringify({ sources }),
+    }),
+
   deleteSource: (id: string) =>
     req<{ id: string; ref: string; cleanup_jobs: string[] }>(
       `/admin/sources/${encodeURIComponent(id)}`,
