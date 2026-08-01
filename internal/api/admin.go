@@ -651,6 +651,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
 		Kind:    queue.KindDownload,
 		Session: sessionOf(r),
+		UserID:  callerOf(r).UserID(),
 		Label:   "download " + label + " → " + loc.Name,
 		Body:    body,
 	})
@@ -708,6 +709,7 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		jobID, qErr := s.queue.Enqueue(r.Context(), queue.NewJob{
 			Kind:    queue.KindCleanup,
 			Session: sessionOf(r),
+			UserID:  callerOf(r).UserID(),
 			Label:   "remove " + src.Ref() + " from " + loc.Name,
 			Body:    body,
 		})

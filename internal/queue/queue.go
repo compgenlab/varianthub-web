@@ -60,16 +60,20 @@ const (
 
 // Job is one row of the job table (its metadata, without the input/result blobs).
 type Job struct {
-	ID         string `json:"job_id"`
-	Kind       string `json:"kind"`
-	Snapshot   string `json:"snapshot"`
-	Selection  string `json:"selection"`
-	Status     string `json:"status"`
-	Error      string `json:"error,omitempty"`
-	NVariants  int64  `json:"n_variants"`
-	ClientIP   string `json:"client_ip,omitempty"`
-	Session    string `json:"session,omitempty"` // submitter's session id, for scoping history
-	Label      string `json:"label,omitempty"`   // short human label (the locus, or the VCF filename)
+	ID        string `json:"job_id"`
+	Kind      string `json:"kind"`
+	Snapshot  string `json:"snapshot"`
+	Selection string `json:"selection"`
+	Status    string `json:"status"`
+	Error     string `json:"error,omitempty"`
+	NVariants int64  `json:"n_variants"`
+	ClientIP  string `json:"client_ip,omitempty"`
+	Session   string `json:"session,omitempty"` // submitter's session id, for scoping history
+	// UserID is the owning account, when the submitter had one. Authoritative
+	// where Session is not: a session id is asserted by the client, while this
+	// is written from the credential the server verified.
+	UserID     string `json:"user_id,omitempty"`
+	Label      string `json:"label,omitempty"` // short human label (the locus, or the VCF filename)
 	CreatedAt  int64  `json:"created_at"`
 	StartedAt  int64  `json:"started_at,omitempty"`
 	FinishedAt int64  `json:"finished_at,omitempty"`
@@ -85,6 +89,7 @@ type NewJob struct {
 	Selection string
 	ClientIP  string
 	Session   string
+	UserID    string
 	Label     string
 	Body      []byte
 }
@@ -94,12 +99,12 @@ type NewJob struct {
 // and then threw the validity flag away, which amounts to the same thing with
 // more ceremony.
 const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
-	`COALESCE(n_variants,0), client_ip, session_id, label, created_at, ` +
+	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
-	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, j.label, j.created_at, ` +
+	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // Outcome is what a Runner produces for a completed job.
@@ -195,10 +200,10 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,label,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
-		j.ClientIP, j.Session, j.Label, q.nowFn()); err != nil {
+		j.ClientIP, j.Session, j.UserID, j.Label, q.nowFn()); err != nil {
 		return "", err
 	}
 	if _, err := tx.Exec(ctx,
@@ -258,7 +263,7 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
-		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.Label,
+		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label,
 		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Job{}, err
 	}
@@ -269,6 +274,7 @@ func scanJob(row rowScanner) (Job, error) {
 type JobFilter struct {
 	Status   string   // queued|running|done|error
 	Session  string   // scope to one submitter's session id
+	UserID   string   // scope to one account
 	ClientIP string   // scope to one client IP
 	Kinds    []string // restrict to these job kinds
 }
@@ -292,6 +298,9 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 	}
 	if f.Session != "" {
 		add("session_id=$%d", f.Session)
+	}
+	if f.UserID != "" {
+		add("user_id=$%d", f.UserID)
 	}
 	if f.ClientIP != "" {
 		add("client_ip=$%d", f.ClientIP)

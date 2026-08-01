@@ -18,6 +18,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/api"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/identity"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
@@ -103,8 +104,22 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Accounts share the catalog's pool, so they are available exactly when it
+	// is. Without them the server still runs: it just has no way to identify
+	// anyone, which the middleware treats as everybody being anonymous.
+	var ids *identity.Store
+	if cat != nil {
+		ids = identity.NewStore(cat.Pool())
+		if err := announceBootstrap(ctx, ids); err != nil {
+			log.Printf("serve: bootstrap: %v", err)
+		}
+	}
+
 	if !cfg.RequireToken {
 		log.Printf("serve: /api/v1 is OPEN (VHW_REQUIRE_TOKEN=false)")
+	}
+	if cfg.AllowAnonymous {
+		log.Printf("serve: anonymous annotation is ENABLED (VHW_ALLOW_ANONYMOUS=true)")
 	}
 
 	// The web UI is embedded at build time. A binary built without running the
@@ -118,7 +133,34 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		log.Printf("serve: no web UI embedded (run `npm --prefix web run build`)")
 	}
 
-	return api.New(cfg, q, cat, spa).Run(ctx)
+	return api.New(cfg, q, cat, ids, spa).Run(ctx)
+}
+
+// announceBootstrap issues and logs the first-administrator credential when the
+// installation has no administrator yet.
+//
+// Printed to the log rather than written to a file or an env var because the log
+// is the one place an operator is already looking on first start, and because it
+// is the shortest-lived: the token stops working the moment the first
+// administrator account exists.
+func announceBootstrap(ctx context.Context, ids *identity.Store) error {
+	needs, err := ids.NeedsBootstrap(ctx)
+	if err != nil || !needs {
+		return err
+	}
+	secret, err := ids.IssueBootstrap(ctx)
+	if err != nil {
+		return err
+	}
+	log.Printf("serve: this installation has no administrator yet.")
+	log.Printf("serve: create the first one with the bootstrap token below — it stops")
+	log.Printf("serve: working as soon as that account exists, and is reissued on restart.")
+	log.Printf("serve:")
+	log.Printf("serve:     %s", secret)
+	log.Printf("serve:")
+	log.Printf("serve: POST /api/v1/admin/users {\"email\":..., \"password\":..., \"role\":\"admin\"}")
+	log.Printf("serve: with `Authorization: Bearer <token>`, or open the web UI and follow the prompt.")
+	return nil
 }
 
 // worker runs the job pool. It serves no HTTP.

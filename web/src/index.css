@@ -345,3 +345,8 @@ table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline)
 
 .metric-storage-row { grid-template-columns: 2.4fr 1fr .7fr .7fr .9fr; }
 .metric-remote-row  { grid-template-columns: 2fr 1.6fr 1.2fr .9fr; }
+
+/* --- accounts --- */
+
+.token-row  { grid-template-columns: 1.6fr 1.2fr 1.4fr 1.4fr .4fr; }
+.people-row { grid-template-columns: 2fr 1.4fr .9fr .8fr .9fr; }

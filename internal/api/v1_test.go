@@ -51,7 +51,7 @@ func TestSelectionNormalization(t *testing.T) {
 }
 
 func TestWaitForClamping(t *testing.T) {
-	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil)
+	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil, nil)
 	cases := []struct {
 		raw  string
 		want time.Duration
@@ -98,7 +98,7 @@ func openServer(t *testing.T) http.Handler {
 	return New(&config.Config{
 		MasterKey: "test-key", RequireToken: false, Version: "test",
 		RatePerMin: 1000, RateBurst: 1000, SubmitWaitCap: time.Second,
-	}, nil, nil, nil).Routes()
+	}, nil, nil, nil, nil).Routes()
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
@@ -245,7 +245,7 @@ func TestV1RoutesAreTokenGated(t *testing.T) {
 	h := New(&config.Config{
 		MasterKey: "test-key", RequireToken: true, Version: "test",
 		RatePerMin: 1000, RateBurst: 1000,
-	}, nil, nil, nil).Routes()
+	}, nil, nil, nil, nil).Routes()
 
 	paths := []struct{ method, path string }{
 		{"GET", "/api/v1/snapshots"},
@@ -267,16 +267,26 @@ func TestV1RoutesAreTokenGated(t *testing.T) {
 	}
 }
 
-func TestTrustedCallerNeedsValidToken(t *testing.T) {
-	s := New(&config.Config{MasterKey: "k"}, nil, nil, nil)
+// resolved runs a request through the identity middleware, which is the only
+// thing that populates the caller — calling trustedCaller on a bare request
+// would test nothing but the zero value.
+func resolved(s *Server, r *http.Request) (trusted, admin bool) {
+	s.withCaller(http.HandlerFunc(func(_ http.ResponseWriter, rr *http.Request) {
+		trusted, admin = s.trustedCaller(rr), callerOf(rr).IsAdmin()
+	})).ServeHTTP(httptest.NewRecorder(), r)
+	return
+}
+
+func TestMasterKeyIsAServiceAccountNotAnAdmin(t *testing.T) {
+	s := New(&config.Config{MasterKey: "k"}, nil, nil, nil, nil)
 
 	r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
-	if s.trustedCaller(r) {
+	if trusted, _ := resolved(s, r); trusted {
 		t.Fatal("no Authorization header must not be trusted")
 	}
 
 	r.Header.Set("Authorization", "Bearer garbage")
-	if s.trustedCaller(r) {
+	if trusted, _ := resolved(s, r); trusted {
 		t.Fatal("an unsigned token must not be trusted")
 	}
 
@@ -285,13 +295,19 @@ func TestTrustedCallerNeedsValidToken(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.Header.Set("Authorization", "Bearer "+tok)
-	if !s.trustedCaller(r) {
-		t.Fatal("a validly signed token must be trusted")
+	trusted, admin := resolved(s, r)
+	if !trusted {
+		t.Error("a validly signed master-key token must still be trusted for bulk submission")
+	}
+	// The point of the change: a shared secret in a compose file submits jobs,
+	// it does not publish snapshots.
+	if admin {
+		t.Error("the master key must not confer administrator rights")
 	}
 
 	// With no master key configured nothing can be verified, so nothing is trusted.
-	noKey := New(&config.Config{}, nil, nil, nil)
-	if noKey.trustedCaller(r) {
+	noKey := New(&config.Config{}, nil, nil, nil, nil)
+	if trusted, _ := resolved(noKey, r); trusted {
 		t.Fatal("an empty master key must not trust anything")
 	}
 }

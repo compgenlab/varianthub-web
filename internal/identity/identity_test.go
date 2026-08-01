@@ -71,6 +71,7 @@ func TestCallerAuthority(t *testing.T) {
 	admin := Caller{User: &User{ID: "u1", Email: "a@x", Role: RoleAdmin}}
 	member := Caller{User: &User{ID: "u2", Email: "m@x", Role: RoleMember}, TeamIDs: []string{"t1"}}
 	svc := Caller{Service: true}
+	boot := Caller{Bootstrap: true}
 	anon := Caller{}
 
 	for _, tc := range []struct {
@@ -81,9 +82,15 @@ func TestCallerAuthority(t *testing.T) {
 	}{
 		{"admin user", admin, true, false},
 		{"member", member, false, false},
-		// The service account holds the deployment's own key. Demoting it would
-		// lock an operator out of the API they installed.
-		{"service", svc, true, false},
+		// The master key is a machine credential for bulk submission, not a
+		// person. It is identified — so not anonymous — but administering is a
+		// property of an account, and a shared secret in a compose file is not
+		// one.
+		{"service", svc, false, false},
+		// The bootstrap credential administers, because creating the first
+		// administrator is administration. It stops resolving at all once that
+		// account exists, so this is a narrow and self-closing exception.
+		{"bootstrap", boot, true, false},
 		{"anonymous", anon, false, true},
 	} {
 		if got := tc.c.IsAdmin(); got != tc.admin {
@@ -100,8 +107,8 @@ func TestCallerAuthority(t *testing.T) {
 	if anon.UserID() != "" || member.UserID() != "u2" {
 		t.Error("UserID is wrong")
 	}
-	if svc.Label() != "service" || member.Label() != "m@x" {
-		t.Errorf("labels: %q %q", svc.Label(), member.Label())
+	if svc.Label() != "service" || member.Label() != "m@x" || boot.Label() != "bootstrap" {
+		t.Errorf("labels: %q %q %q", svc.Label(), member.Label(), boot.Label())
 	}
 }
 

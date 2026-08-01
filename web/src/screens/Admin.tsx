@@ -9,6 +9,7 @@ import {
   type Source,
   type SourceFile,
   type StorageLocation,
+  type Team,
 } from "../api";
 import { humanSize } from "./Files";
 
@@ -188,6 +189,7 @@ function SourceTable({
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
   const [showConfig, setShowConfig] = useState("");
+  const [showGrants, setShowGrants] = useState("");
 
   // A source is "provisioned" when files are recorded for it. Summarize per
   // source so the row can show a footprint instead of a bare yes/no.
@@ -253,7 +255,19 @@ function SourceTable({
               color: s.visibility === "private" ? "var(--private)" : "var(--text-2)",
             }}
           >
-            {s.visibility === "private" ? "Private" : "Public"}
+            {s.visibility === "private" ? (
+              // Private is the default, so most sources land here; the button
+              // is what decides who can actually see them.
+              <button
+                className="btn link"
+                style={{ fontSize: 12.5, padding: 0, color: "var(--private)" }}
+                onClick={() => setShowGrants(showGrants === s.id ? "" : s.id)}
+              >
+                Private ▾
+              </button>
+            ) : (
+              "Public"
+            )}
           </span>
           <ProvisionCell
             source={s}
@@ -263,6 +277,7 @@ function SourceTable({
           />
           <DeleteSource source={s} onChange={onChange} />
           {showConfig === s.id && <SourceConfig id={s.id} />}
+          {showGrants === s.id && <SourceGrants id={s.id} />}
         </div>
       ))}
     </div>
@@ -1249,6 +1264,100 @@ function EditSnapshotSources({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Which teams may see a private source.
+ *
+ * Grants attach to teams rather than to people so that access survives
+ * membership changes: adding someone to the team is one action, not one per
+ * source they need.
+ */
+function SourceGrants({ id }: { id: string }) {
+  const [granted, setGranted] = useState<Team[]>([]);
+  const [teams, setTeams] = useState<Team[]>([]);
+  const [err, setErr] = useState("");
+
+  async function load() {
+    try {
+      const [g, all] = await Promise.all([api.grants(id), api.teams()]);
+      setGranted(g.teams ?? []);
+      setTeams(all.teams ?? []);
+      setErr("");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+  useEffect(() => {
+    load();
+  }, [id]);
+
+  async function act<T>(fn: () => Promise<T>) {
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div
+      style={{
+        gridColumn: "1 / -1",
+        padding: "12px 4px 4px",
+        borderTop: "1px solid var(--hairline)",
+        marginTop: 10,
+      }}
+    >
+      <div className="label" style={{ marginBottom: 8 }}>
+        Teams with access
+      </div>
+      {err && <p className="err" style={{ fontSize: 12.5 }}>{err}</p>}
+      <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+        {granted.map((t) => (
+          <span key={t.id} className="tag" style={{ display: "inline-flex", gap: 6 }}>
+            {t.name}
+            <button
+              className="btn link"
+              style={{ padding: 0, fontSize: 11 }}
+              onClick={() => act(() => api.revokeGrant(id, t.id))}
+              title="Revoke access"
+            >
+              ×
+            </button>
+          </span>
+        ))}
+        {granted.length === 0 && (
+          <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
+            No teams — only administrators can see this source.
+          </span>
+        )}
+      </div>
+      <select
+        className="select"
+        style={{ fontSize: 12.5, padding: "4px 8px", marginTop: 10, maxWidth: 260 }}
+        value=""
+        onChange={(e) => {
+          if (e.target.value) act(() => api.grant(id, e.target.value));
+        }}
+      >
+        <option value="">Grant to a team…</option>
+        {teams
+          .filter((t) => !granted.some((g) => g.id === t.id))
+          .map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+      </select>
+      {teams.length === 0 && (
+        <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
+          No teams exist yet — create one under <strong>People &amp; teams</strong>.
+        </p>
+      )}
     </div>
   );
 }

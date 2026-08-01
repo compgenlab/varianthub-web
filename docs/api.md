@@ -562,3 +562,123 @@ defined another way:
   no length; the per-source `unmeasured` count says how many files are missing
   from the figure rather than quietly under-reporting.
 - **`?remote=0`** skips the origin probes and returns the local figures alone.
+
+## Authentication
+
+Three credentials, in the order the middleware tries them. Whichever resolves
+becomes the request's caller; nothing downstream authenticates separately.
+
+| Credential | Header / cookie | Who it is |
+| --- | --- | --- |
+| Personal API token | `Authorization: Bearer cgl_vh_…` | the account that owns it |
+| Session | `vh_auth` cookie, set by `POST /auth/login` | the account that signed in |
+| Bootstrap token | `Authorization: Bearer cgl_vhb_…` | nobody — the first-administrator path |
+| Master key | `Authorization: Bearer <HMAC token>` | the deployment, as a service account |
+
+An unrecognised credential is anonymous, not an error: a stale token gets the
+same treatment as no token, so a client that kept one past its revocation sees a
+sign-in prompt rather than a hard failure it cannot interpret.
+
+### Administration is a property of the account
+
+`/api/v1/admin/*` requires `role = admin`. A token administers only because the
+person who owns it does — the role is read from the account on every request, so
+promoting takes effect on tokens already issued and demoting revokes them all at
+once, with nothing to reissue or clean up.
+
+**The master key is deliberately not an administrator.** It is a shared secret
+that lives in a compose file, a CI variable and several shell histories; it can
+submit in bulk and read its own jobs, which is what a machine credential is for,
+but publishing a snapshot takes an account. This changed with accounts: a
+deployment that used the master key from a browser now signs in instead.
+
+### Bootstrap: the first administrator
+
+An installation with no accounts cannot be administered, and an administrator
+cannot be created without administering. The service breaks that circle by
+minting one bootstrap token at startup whenever no enabled administrator exists,
+and logging it:
+
+```
+serve: this installation has no administrator yet.
+serve:     cgl_vhb_ravjR2Fl5TP8abeRd7Onhz4_vAcqJHI8i1vjALxH0TI
+```
+
+It passes `requireAdmin` and nothing else, and it dies three ways: it is consumed
+when it creates an administrator, it stops resolving the moment any enabled
+administrator exists (so an unspent one is not a standing back door), and a
+restart replaces it (so a token printed into a log and never used stops working).
+`GET /auth/me` reports `needs_bootstrap` so the sign-in screen can ask for it.
+
+After that, people sign in with an email and password.
+
+### Personal API tokens
+
+`POST /auth/tokens` returns `{"token": {...}, "secret": "cgl_vh_…"}`. The secret
+is shown once and stored only as a SHA-256 hash, so a database leak yields no
+working credentials. The `cgl_vh_` marker exists so a leaked token is greppable
+by secret scanners, and the stored prefix locates the row without the hash being
+reversible — presenting the prefix alone never authenticates.
+
+One account holds as many tokens as it likes. Each is revoked on its own and
+carries `last_used_at`, so a machine that is decommissioned costs one revocation
+rather than a rotation of everything, and a token nobody has used is visibly safe
+to remove. Revoked tokens stay listed: the row is the record that the token
+existed and when it stopped working, which is what an audit of a leak needs.
+
+### Visibility
+
+A source is **private by default** and visible to administrators plus any team it
+has been granted to. Grants attach to teams rather than to people so access
+survives membership changes.
+
+A snapshot pinning a source the caller cannot see is **hidden entirely** — absent
+from the listing, `404` (not `403`) when fetched by name, and refused by
+`POST /annotate`. All-or-nothing is deliberate: a snapshot is a claim about which
+annotations a result carries, and returning it with a source quietly dropped
+would answer a different question than the one asked, with nothing in the
+response to say so. The `404` matters for the same reason a `403` would not — a
+snapshot's name and existence are themselves information about what an
+installation holds.
+
+Selecting sources individually is checked the same way, so the ad-hoc path is not
+a way around the snapshot rule.
+
+### Job ownership
+
+Jobs carry `user_id`, written from the verified credential. A job with an owner is
+readable only by that account, by an administrator, or by the service account.
+Jobs submitted anonymously still scope by the client-asserted `X-Varhub-Session`,
+which is all an anonymous visitor has — but that header is never honoured for a
+job that has an owner, or anyone who learned the string could read a signed-in
+user's results.
+
+### Configuration
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VHW_ALLOW_ANONYMOUS` | `false` | let callers with no credential use the annotation flow |
+| `VHW_REQUIRE_TOKEN` | `true` | `false` opens `/api/v1` entirely, which implies anonymous access |
+| `VHW_MASTER_KEY` | — | the service-account HMAC key |
+
+### Endpoints
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/api/v1/auth/login` | email + password → `vh_auth` cookie |
+| `POST` | `/api/v1/auth/logout` | ends the session server-side |
+| `GET` | `/api/v1/auth/me` | caller, role, teams, `needs_bootstrap` |
+| `GET` | `/api/v1/auth/tokens` | the caller's own tokens |
+| `POST` | `/api/v1/auth/tokens` | mint one; the secret is in this response only |
+| `DELETE` | `/api/v1/auth/tokens/{id}` | revoke one |
+| `GET` | `/api/v1/admin/users` | accounts |
+| `POST` | `/api/v1/admin/users` | create — also the bootstrap path |
+| `PATCH` | `/api/v1/admin/users/{id}` | role, disabled, password |
+| `GET` | `/api/v1/admin/teams` | teams with their members |
+| `POST` | `/api/v1/admin/teams` | create |
+| `DELETE` | `/api/v1/admin/teams/{id}` | delete; its grants go with it |
+| `POST` | `/api/v1/admin/teams/{id}/members` | add a member |
+| `DELETE` | `/api/v1/admin/teams/{id}/members/{user}` | remove one |
+| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a private source |
+| `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
+| `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |

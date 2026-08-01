@@ -23,7 +23,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -82,19 +81,17 @@ func sessionOf(r *http.Request) string {
 	return ""
 }
 
-// trusted reports whether the request carries a valid bearer token.
+// trustedCaller reports whether the caller may read any job and skip the submit
+// throttle.
 //
-// A token holder is a service account rather than a browser session: it may read
-// any job, and it bypasses the per-IP submit throttle. Those limits exist to stop
-// an anonymous browser flooding the queue, and applying them to a bulk ingest
-// would make it throttle itself — a 3,000-site catalog submitted in chunks would
-// stall on a 30-per-minute cap.
+// That is the machine credential and an administrator, not any signed-in user:
+// the throttle exists to stop a browser flooding the queue, and applying it to a
+// bulk ingest would make that ingest throttle itself — a 3,000-site catalog
+// submitted in chunks would stall on a 30-per-minute cap. Reading *other
+// people's* jobs is a separate power, and an ordinary account has neither.
 func (s *Server) trustedCaller(r *http.Request) bool {
-	tok, ok := auth.Bearer(r)
-	if !ok || s.cfg.MasterKey == "" {
-		return false
-	}
-	return auth.VerifyToken(s.cfg.MasterKey, tok)
+	c := callerOf(r)
+	return c.Service || c.IsAdmin()
 }
 
 // --- catalog ---
@@ -122,6 +119,12 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		}
 		snaps = kept
 	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	type item struct {
 		catalog.Snapshot
 		SourceCount     int  `json:"source_count"`
@@ -135,7 +138,12 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		// stops being true.
 		full, err := s.catalog.GetSnapshot(r.Context(), sn.ID)
 		if err != nil {
-			out = append(out, item{Snapshot: sn})
+			// The sources could not be read, so whether it is visible cannot be
+			// decided. Omit it: listing a snapshot that might pin something
+			// private is the one outcome with no way back.
+			continue
+		}
+		if !vis.canSeeSnapshot(full) {
 			continue
 		}
 		out = append(out, item{
@@ -159,6 +167,18 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	snap, err := s.catalog.GetSnapshot(r.Context(), r.PathValue("id"))
 	if err != nil {
+		writeError(w, http.StatusNotFound, "no such snapshot")
+		return
+	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !vis.canSeeSnapshot(snap) {
+		// 404, not 403. A snapshot's name and the fact that it exists are
+		// themselves information about what this installation holds, and a 403
+		// would confirm both to someone who guessed.
 		writeError(w, http.StatusNotFound, "no such snapshot")
 		return
 	}
@@ -212,6 +232,13 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	srcs = vis.filterSources(srcs)
+
 	type item struct {
 		catalog.Source
 		Ref string `json:"ref"` // "name:version", how a snapshot manifest pins it
@@ -259,6 +286,9 @@ func (s *Server) resolveSnapshot(r *http.Request, snapshot string, sources []str
 		return "", errors.New(`give either "snapshot" or "sources", not both`)
 	}
 	if snapshot != "" {
+		if err := s.checkSnapshotVisible(r, snapshot); err != nil {
+			return "", err
+		}
 		return snapshot, nil
 	}
 	if len(sources) == 0 {
@@ -270,7 +300,57 @@ func (s *Server) resolveSnapshot(r *http.Request, snapshot string, sources []str
 	if strings.TrimSpace(build) == "" {
 		return "", errors.New(`"build" is required when selecting individual sources`)
 	}
+	if err := s.checkSourcesVisible(r, sources); err != nil {
+		return "", err
+	}
 	return s.catalog.EnsureAdhocSnapshot(r.Context(), build, sources, defaults)
+}
+
+// checkSnapshotVisible refuses to annotate against a snapshot the caller cannot
+// see. Without this, a snapshot hidden from the listing is still annotatable by
+// name — and the results would carry exactly the private annotations the hiding
+// was meant to withhold.
+func (s *Server) checkSnapshotVisible(r *http.Request, id string) error {
+	if s.catalog == nil {
+		return nil // no catalog to check against; the runner will fail loudly
+	}
+	snap, err := s.catalog.GetSnapshot(r.Context(), id)
+	if err != nil {
+		return nil // unknown snapshot: let the existing not-found path report it
+	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		return err
+	}
+	if !vis.canSeeSnapshot(snap) {
+		return fmt.Errorf("no such snapshot: %q", id)
+	}
+	return nil
+}
+
+// checkSourcesVisible refuses a selection containing a source the caller cannot
+// see, naming the ones at fault so a mistaken ref is distinguishable from a
+// missing grant.
+func (s *Server) checkSourcesVisible(r *http.Request, ids []string) error {
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		return err
+	}
+	if vis.admin {
+		return nil
+	}
+	var srcs []catalog.Source
+	for _, id := range ids {
+		src, err := s.catalog.GetSource(r.Context(), id)
+		if err != nil {
+			continue // unknown source: PutSnapshot reports it with better context
+		}
+		srcs = append(srcs, src)
+	}
+	if hidden := vis.hiddenSources(srcs); len(hidden) > 0 {
+		return fmt.Errorf("no such source: %s", strings.Join(hidden, ", "))
+	}
+	return nil
 }
 
 // selection normalizes the `annotations` field to the runner's Selection string:
@@ -354,6 +434,7 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
 		Label:     label,
 		Body:      []byte(strings.Join(loci, "\n")),
 	})
@@ -421,6 +502,7 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
 		Label:     hdr.Filename,
 		Body:      body,
 	})
@@ -516,17 +598,24 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 
 	scoped := !s.trustedCaller(r)
 	if scoped {
-		// An untrusted caller sees only their own submissions. With no session at
-		// all there is nothing to scope to, so return nothing rather than
-		// everything -- the failure mode of a leak is worse than an empty list.
-		sess := sessionOf(r)
-		if sess == "" {
+		// An untrusted caller sees only their own submissions. An account scopes
+		// by user id, which the server wrote from a verified credential; an
+		// anonymous visitor falls back to the session id they assert, which
+		// scopes their own browser history and nothing more.
+		//
+		// With neither there is nothing to scope to, so return nothing rather
+		// than everything — the failure mode of a leak is worse than an empty
+		// list.
+		if uid := callerOf(r).UserID(); uid != "" {
+			f.UserID = uid
+		} else if sess := sessionOf(r); sess != "" {
+			f.Session = sess
+		} else {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"jobs": []any{}, "limit": limit, "offset": offset, "scoped": true,
 			})
 			return
 		}
-		f.Session = sess
 	}
 	jobs, err := s.queue.List(r.Context(), f, limit, offset)
 	if err != nil {
@@ -544,8 +633,8 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 // job loads a job and enforces ownership, writing the error response itself.
 //
 // Knowing a job id is not authorization: ids are handed out to whoever submitted
-// and could be logged or shared. An untrusted caller must match the session that
-// created it.
+// and could be logged or shared. An untrusted caller must own the job — by
+// account where it has one, and only otherwise by the session that created it.
 func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	id := r.PathValue("id")
 	job, ok, err := s.queue.Get(r.Context(), id)
@@ -557,14 +646,25 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 		writeError(w, http.StatusNotFound, "no such job")
 		return queue.Job{}, false
 	}
-	if !s.trustedCaller(r) {
-		if sess := sessionOf(r); sess == "" || sess != job.Session {
-			// 404 rather than 403: confirming a job exists is itself a small leak.
-			writeError(w, http.StatusNotFound, "no such job")
-			return queue.Job{}, false
-		}
+	if !s.trustedCaller(r) && !s.owns(r, job) {
+		// 404 rather than 403: confirming a job exists is itself a small leak.
+		writeError(w, http.StatusNotFound, "no such job")
+		return queue.Job{}, false
 	}
 	return job, true
+}
+
+// owns reports whether the caller submitted this job.
+//
+// A job with an owning account is readable only by that account: the session id
+// on it is client-asserted, so honouring it as well would let anyone who learned
+// the string read a signed-in user's results.
+func (s *Server) owns(r *http.Request, job queue.Job) bool {
+	if job.UserID != "" {
+		return callerOf(r).UserID() == job.UserID
+	}
+	sess := sessionOf(r)
+	return sess != "" && sess == job.Session
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {

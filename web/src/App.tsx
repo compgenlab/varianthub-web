@@ -7,16 +7,28 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { FilePlus2, Table2, KeyRound, ShieldCheck, ServerCog, HardDrive, ChartColumn } from "lucide-react";
+import {
+  FilePlus2,
+  Table2,
+  ShieldCheck,
+  ServerCog,
+  HardDrive,
+  ChartColumn,
+  LogOut,
+  UserRound,
+  UsersRound,
+} from "lucide-react";
 
-import { api, getToken, setToken } from "./api";
+import { api, setToken, type Me } from "./api";
 import { AnnotateProvider } from "./flow";
 import ChooseSources from "./screens/ChooseSources";
 import EnterVariants from "./screens/EnterVariants";
 import Running from "./screens/Running";
 import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
-import TokenGate from "./screens/TokenGate";
+import SignIn from "./screens/SignIn";
+import Account from "./screens/Account";
+import People from "./screens/People";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
 import SystemJobs from "./screens/SystemJobs";
@@ -53,7 +65,7 @@ function StepHeader() {
   );
 }
 
-function Shell({ children }: { children: React.ReactNode }) {
+function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
   const [version, setVersion] = useState("");
   const [snapshots, setSnapshots] = useState<number | null>(null);
 
@@ -80,8 +92,15 @@ function Shell({ children }: { children: React.ReactNode }) {
             <Table2 /> Results
           </NavLink>
 
-          {/* The design role-gates this section. There are no roles yet, so it is
-              always shown — with the badge, so it is obvious what it is. */}
+          <NavLink to="/account">
+            <UserRound /> Account
+          </NavLink>
+
+          {/* Role-gated. Hidden rather than disabled for a non-admin: the server
+              refuses these routes anyway, and showing them would only advertise
+              actions the person cannot take. */}
+          {me.admin && (
+          <>
           <div style={{ padding: "14px 12px 5px" }}>
             <span
               className="row gap-8"
@@ -120,19 +139,34 @@ function Shell({ children }: { children: React.ReactNode }) {
           <NavLink to="/admin/metrics">
             <ChartColumn /> Metrics
           </NavLink>
+          <NavLink to="/admin/people">
+            <UsersRound /> People &amp; teams
+          </NavLink>
+          </>
+          )}
         </nav>
         <div
           style={{ marginTop: "auto", padding: 14, borderTop: "1px solid var(--border)" }}
         >
+          <div style={{ fontSize: 12, color: "var(--text-3)", marginBottom: 8 }}>
+            {me.user?.email ?? me.label}
+          </div>
           <button
             className="btn link"
             style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
-            onClick={() => {
+            onClick={async () => {
+              // Ends the session server-side too; clearing the cookie alone
+              // would leave a credential that still works if it is replayed.
+              try {
+                await api.logout();
+              } catch {
+                /* signing out locally matters more than the round trip */
+              }
               setToken("");
               location.reload();
             }}
           >
-            <KeyRound size={14} /> Change API token
+            <LogOut size={14} /> Sign out
           </button>
         </div>
       </aside>
@@ -155,16 +189,34 @@ function Shell({ children }: { children: React.ReactNode }) {
 }
 
 export default function App() {
-  // Auth is a single shared bearer token today. Rather than fake a login screen
-  // against an endpoint that does not exist, ask for the token once and keep it
-  // for the session — replaced by real sign-in when accounts land.
-  const [authed, setAuthed] = useState(!!getToken());
-  if (!authed) return <TokenGate onDone={() => setAuthed(true)} />;
+  // Who the caller is comes from the server, not from whether a token happens to
+  // be in storage: a stale token, an expired session and a signed-in cookie are
+  // indistinguishable here, and only the server can tell them apart.
+  const [me, setMe] = useState<Me | null>(null);
+  const [ready, setReady] = useState(false);
+
+  useEffect(() => {
+    api
+      .me()
+      .then(setMe)
+      .catch(() => setMe(null))
+      .finally(() => setReady(true));
+  }, []);
+
+  if (!ready) return null;
+  if (!me || me.anonymous) {
+    return (
+      <SignIn
+        me={me ?? { anonymous: true, admin: false, label: "anonymous", service: false, bootstrap: false }}
+        onDone={() => location.reload()}
+      />
+    );
+  }
 
   return (
     <BrowserRouter>
       <AnnotateProvider>
-        <Shell>
+        <Shell me={me}>
           <Routes>
             <Route path="/" element={<Navigate to="/annotate/sources" replace />} />
             <Route path="/annotate/sources" element={<ChooseSources />} />
@@ -177,6 +229,8 @@ export default function App() {
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="/admin/metrics" element={<Metrics />} />
+            <Route path="/admin/people" element={<People me={me} />} />
+            <Route path="/account" element={<Account me={me} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>
         </Shell>

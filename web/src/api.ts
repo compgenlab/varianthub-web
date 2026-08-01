@@ -86,6 +86,44 @@ export interface Metrics {
   generated_at: number;
 }
 
+export interface User {
+  id: string;
+  email: string;
+  name?: string;
+  role: string;
+  disabled?: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface Me {
+  anonymous: boolean;
+  admin: boolean;
+  label: string;
+  service: boolean;
+  bootstrap: boolean;
+  teams?: string[];
+  user?: User;
+  /** True while the installation has no administrator and the bootstrap token works. */
+  needs_bootstrap?: boolean;
+}
+
+export interface ApiToken {
+  id: string;
+  name?: string;
+  prefix: string;
+  created_at: number;
+  last_used_at?: number;
+  revoked_at?: number;
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  created_at: number;
+  members?: { user: User; role: string }[];
+}
+
 export interface Registry {
   id: string;
   name: string;
@@ -188,9 +226,11 @@ export class ApiError extends Error {
 // VITE_API_BASE when the dev server runs separately from the API.
 const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
-// The token is held in sessionStorage rather than localStorage so it does not
-// outlive the browser session. Auth is a single shared token until per-user
-// tokens land; see docs/api.md.
+// A bearer token is held in sessionStorage rather than localStorage so it does
+// not outlive the browser tab. It is the *secondary* path: signing in with a
+// password sets an HttpOnly cookie the browser sends automatically, which is
+// what a session should be. This exists for the bootstrap credential and for
+// pasting a personal token, neither of which has a cookie.
 const TOKEN_KEY = "vh_token";
 
 export function getToken(): string {
@@ -212,6 +252,9 @@ function headers(extra: Record<string, string> = {}): Record<string, string> {
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, {
     ...init,
+    // Send the session cookie. Without this a cross-origin dev server would
+    // authenticate every request as anonymous with no visible reason why.
+    credentials: "include",
     headers: headers(init.headers as Record<string, string>),
   });
   if (!res.ok) {
@@ -434,6 +477,86 @@ export const api = {
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
       method: "POST",
     }),
+
+  me: () => req<Me>("/auth/me"),
+
+  login: (email: string, password: string) =>
+    req<{ user: User }>("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    }),
+
+  logout: () => req<void>("/auth/logout", { method: "POST" }),
+
+  tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
+
+  createToken: (name: string) =>
+    req<{ token: ApiToken; secret: string }>("/auth/tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+
+  revokeToken: (id: string) =>
+    req<void>(`/auth/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  users: () => req<{ users: User[] }>("/admin/users"),
+
+  createUser: (body: { email: string; name?: string; role: string; password: string }) =>
+    req<{ user: User }>("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  updateUser: (id: string, body: { role?: string; disabled?: boolean; password?: string }) =>
+    req<{ user: User }>(`/admin/users/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  teams: () => req<{ teams: Team[] }>("/admin/teams"),
+
+  createTeam: (name: string) =>
+    req<{ team: Team }>("/admin/teams", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+
+  deleteTeam: (id: string) =>
+    req<void>(`/admin/teams/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  addMember: (teamId: string, userId: string, role = "member") =>
+    req<void>(`/admin/teams/${encodeURIComponent(teamId)}/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, role }),
+    }),
+
+  removeMember: (teamId: string, userId: string) =>
+    req<void>(
+      `/admin/teams/${encodeURIComponent(teamId)}/members/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    ),
+
+  grants: (sourceId: string) =>
+    req<{ teams: Team[] }>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`),
+
+  grant: (sourceId: string, teamId: string) =>
+    req<void>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ team_id: teamId }),
+    }),
+
+  revokeGrant: (sourceId: string, teamId: string) =>
+    req<void>(
+      `/admin/sources/${encodeURIComponent(sourceId)}/grants/${encodeURIComponent(teamId)}`,
+      { method: "DELETE" },
+    ),
 
   metrics: () => req<Metrics>("/admin/metrics"),
 

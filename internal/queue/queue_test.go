@@ -25,6 +25,7 @@ import (
 var migrationFiles = []string{
 	"../../migrations/0001_job_queue.sql",
 	"../../migrations/0003_job_variant.sql",
+	"../../migrations/0010_job_user.sql",
 }
 
 func testQueue(t *testing.T) *Queue {

@@ -76,9 +76,3 @@ CREATE TABLE IF NOT EXISTS source_grant (
   PRIMARY KEY (source_id, team_id)
 );
 CREATE INDEX IF NOT EXISTS source_grant_by_team ON source_grant (team_id);
-
--- Jobs gain a real owner. The existing session column stays: it still scopes an
--- anonymous caller's own history, and back-filling it with a user is not
--- possible for jobs submitted before accounts existed.
-ALTER TABLE job ADD COLUMN IF NOT EXISTS user_id TEXT;
-CREATE INDEX IF NOT EXISTS job_by_user ON job (user_id, created_at DESC);

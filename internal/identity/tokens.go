@@ -163,6 +163,19 @@ func (s *Store) PurgeExpiredSessions(ctx context.Context) (int64, error) {
 // Order matters only in that a personal token is checked before a session: a
 // request carrying both is a script acting as itself, not a browser.
 func (s *Store) Resolve(ctx context.Context, bearer, sessionID string) (Caller, error) {
+	// The bootstrap credential is checked first and separately: it belongs to no
+	// account, so it can never be resolved through the token or session tables.
+	if strings.HasPrefix(bearer, BootstrapPrefix) {
+		ok, err := s.CheckBootstrap(ctx, bearer)
+		if err != nil {
+			return Caller{}, err
+		}
+		if !ok {
+			return Caller{}, nil
+		}
+		return Caller{Bootstrap: true}, nil
+	}
+
 	var u User
 	var err error
 	switch {

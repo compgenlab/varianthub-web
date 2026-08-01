@@ -70,19 +70,27 @@ type Team struct {
 type Caller struct {
 	User    *User    // nil when not a user
 	TeamIDs []string // teams the user belongs to
-	Service bool     // authenticated with the deployment's master key
+	// Service means the deployment's shared master key. It is a machine
+	// credential for bulk submission, not a person, and deliberately not an
+	// administrator: a shared secret in a compose file, a CI variable and three
+	// shell histories is exactly what should not be able to publish a snapshot.
+	Service bool
+	// Bootstrap means the one-time credential that exists only until the first
+	// administrator account does. It administers, because creating that account
+	// is administration; it stops working the moment the account exists.
+	Bootstrap bool
 }
 
 // Anonymous reports whether the request carried no credential at all.
-func (c Caller) Anonymous() bool { return c.User == nil && !c.Service }
+func (c Caller) Anonymous() bool { return c.User == nil && !c.Service && !c.Bootstrap }
 
 // IsAdmin reports whether the caller may administer the catalog.
 //
-// The service account is an administrator: it is the deployment's own key, held
-// by whoever configured the deployment, and demoting it would lock an operator
-// out of the API they installed.
+// Administration is a property of an account, so a token administers only
+// because the person who owns it does — demote them and every token they hold
+// stops administering, with nothing to revoke separately.
 func (c Caller) IsAdmin() bool {
-	if c.Service {
+	if c.Bootstrap {
 		return true
 	}
 	return c.User != nil && c.User.IsAdmin()
@@ -93,6 +101,8 @@ func (c Caller) Label() string {
 	switch {
 	case c.User != nil:
 		return c.User.Email
+	case c.Bootstrap:
+		return "bootstrap"
 	case c.Service:
 		return "service"
 	default:
@@ -146,14 +156,22 @@ func CheckPassword(hash, plain string) bool {
 // The secret is never recoverable afterwards. That is the point: a database
 // leak yields hashes, and a hash cannot be presented as a credential.
 func NewToken() (secret, prefix, hash string, err error) {
+	return newSecret(TokenPrefix)
+}
+
+// newSecret mints a random credential under a given marker prefix. The markers
+// are disjoint, so which kind of credential was presented is decidable from the
+// string alone — a personal token is never tried against the bootstrap table or
+// the other way round.
+func newSecret(marker string) (secret, prefix, hash string, err error) {
 	var b [32]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", "", "", err
 	}
 	body := base64.RawURLEncoding.EncodeToString(b[:])
-	secret = TokenPrefix + body
+	secret = marker + body
 	// Enough of the body to be unique without being enough to guess the rest.
-	prefix = TokenPrefix + body[:8]
+	prefix = marker + body[:8]
 	return secret, prefix, HashToken(secret), nil
 }
 
@@ -168,17 +186,32 @@ func HashToken(secret string) string {
 }
 
 // PrefixOf extracts the stored prefix from a presented token, so it can be
-// looked up before the hash is compared.
+// looked up before the hash is compared. It accepts either credential marker;
+// the marker is part of the prefix, so the lookup cannot cross between them.
 func PrefixOf(secret string) (string, bool) {
-	if !strings.HasPrefix(secret, TokenPrefix) {
-		return "", false
+	// Longest marker first: the markers are disjoint, but testing the shorter
+	// one first would still be a trap waiting for the next marker added.
+	for _, marker := range []string{BootstrapPrefix, TokenPrefix} {
+		if !strings.HasPrefix(secret, marker) {
+			continue
+		}
+		body := secret[len(marker):]
+		if len(body) < 8 {
+			return "", false
+		}
+		return marker + body[:8], true
 	}
-	body := secret[len(TokenPrefix):]
-	if len(body) < 8 {
-		return "", false
-	}
-	return TokenPrefix + body[:8], true
+	return "", false
 }
+
+// IsCredential reports whether a bearer value is one of ours at all, so an
+// unrelated Authorization scheme is treated as anonymous rather than as a failed
+// login attempt.
+func IsCredential(s string) bool {
+	return strings.HasPrefix(s, TokenPrefix) || strings.HasPrefix(s, BootstrapPrefix)
+}
+
+func hasPrefix(s, prefix string) bool { return strings.HasPrefix(s, prefix) }
 
 // TokenMatches compares a presented token against a stored hash in constant
 // time, so a caller cannot learn the hash by timing repeated attempts.

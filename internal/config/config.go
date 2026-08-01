@@ -22,6 +22,11 @@ type Config struct {
 	MasterKey   string // HMAC key signing API tokens
 
 	RequireToken bool // bearer auth on /api/v1
+	// AllowAnonymous lets a caller with no credential use the annotation flow.
+	// A public instance wants this on; a private one wants every request to
+	// carry an identity. Off by default: opening an instance up should be a
+	// decision someone made, not one they inherited.
+	AllowAnonymous bool
 
 	Workers    int    // worker pool size
 	VarhubBin  string // path to the varhub CLI
@@ -54,16 +59,17 @@ type Config struct {
 // Load reads the configuration from the environment, applying defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:         env("VHW_ADDR", ":8080"),
-		DatabaseURL:  os.Getenv("VHW_DATABASE_URL"),
-		MasterKey:    os.Getenv("VHW_MASTER_KEY"),
-		RequireToken: envBool("VHW_REQUIRE_TOKEN", true),
-		Workers:      envInt("VHW_WORKERS", 2),
-		VarhubBin:    env("VHW_VARHUB_BIN", "varhub"),
-		VarhubHome:   os.Getenv("VHW_VARHUB_HOME"),
-		DataDir:      env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
-		CacheDir:     env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
-		StorageS3:    envList("VHW_STORAGE_S3", nil),
+		Addr:           env("VHW_ADDR", ":8080"),
+		DatabaseURL:    os.Getenv("VHW_DATABASE_URL"),
+		MasterKey:      os.Getenv("VHW_MASTER_KEY"),
+		RequireToken:   envBool("VHW_REQUIRE_TOKEN", true),
+		AllowAnonymous: envBool("VHW_ALLOW_ANONYMOUS", false),
+		Workers:        envInt("VHW_WORKERS", 2),
+		VarhubBin:      env("VHW_VARHUB_BIN", "varhub"),
+		VarhubHome:     os.Getenv("VHW_VARHUB_HOME"),
+		DataDir:        env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
+		CacheDir:       env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		StorageS3:      envList("VHW_STORAGE_S3", nil),
 		StoragePaths: envList("VHW_STORAGE_PATHS",
 			[]string{"default=/var/lib/varianthub/sources"}),
 		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),

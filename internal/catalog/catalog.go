@@ -137,6 +137,11 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// Pool exposes the connection pool so the identity store can share it. These
+// are the same database; a second pool would double the connection budget for
+// no benefit, and the two stores would then hold inconsistent views under load.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
 const sourceCols = `id, name, version, title, detail, kind, build, visibility,
 	index_status, origin, toml_text, created_at, updated_at`
 
