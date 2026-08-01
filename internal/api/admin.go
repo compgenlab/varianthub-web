@@ -65,7 +65,9 @@ func (req sourceRequest) derive() (catalog.Source, error) {
 		src.Origin = req.Origin
 	}
 	switch req.Visibility {
-	case "", catalog.VisibilityPublic:
+	case "":
+		src.Visibility = catalog.VisibilityPrivate // default closed
+	case catalog.VisibilityPublic:
 		src.Visibility = catalog.VisibilityPublic
 	case catalog.VisibilityPrivate:
 		src.Visibility = catalog.VisibilityPrivate

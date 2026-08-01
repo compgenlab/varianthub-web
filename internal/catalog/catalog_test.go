@@ -764,3 +764,38 @@ func TestAssemblyInvariantOnEveryPath(t *testing.T) {
 		t.Errorf("an assembly-agnostic source was refused: %v", err)
 	}
 }
+
+// A source registered without a stated visibility is private. The two mistakes
+// are not symmetric: publishing something private is a disclosure that cannot
+// be undone, while a private source nobody can see is a support request.
+func TestSourceDefaultsToPrivate(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.PutSource(ctx, Source{
+		ID: "unstated", Name: "unstated", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSource(ctx, "unstated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Visibility != VisibilityPrivate {
+		t.Errorf("visibility = %q, want private", got.Visibility)
+	}
+	// A stated visibility is honoured.
+	if err := s.PutSource(ctx, Source{
+		ID: "stated", Name: "stated", Version: "1", Kind: "vcf",
+		Visibility: VisibilityPublic, TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetSource(ctx, "stated"); got.Visibility != VisibilityPublic {
+		t.Errorf("a stated public visibility was overridden: %q", got.Visibility)
+	}
+	// The starter catalog must remain usable: its only source is a builtin that
+	// computes from the variant and discloses nothing.
+	if b, err := s.GetSource(ctx, "builtins"); err != nil || b.Visibility != VisibilityPublic {
+		t.Errorf("seeded builtins = %q, %v; want public", b.Visibility, err)
+	}
+}

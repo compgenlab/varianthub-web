@@ -27,11 +27,12 @@ func TestSourceRequestDerive(t *testing.T) {
 	if src.Title != "Lab panel" {
 		t.Errorf("title = %q", src.Title)
 	}
-	// Public unless asked otherwise: a source must not become private by accident,
-	// but it must not become *visible* by accident either — so the default is the
-	// one that grants no extra access.
-	if src.Visibility != catalog.VisibilityPublic {
-		t.Errorf("visibility = %q, want public", src.Visibility)
+	// Private unless asked otherwise. The two mistakes are not symmetric: a
+	// source that should have been public is one request away from being fixed,
+	// while one that should have been private has already been readable by
+	// everyone who could reach the server.
+	if src.Visibility != catalog.VisibilityPrivate {
+		t.Errorf("visibility = %q, want private", src.Visibility)
 	}
 	// The manifest is stored byte-for-byte; varhub reads it, not our projection.
 	if src.TOML != fragment {

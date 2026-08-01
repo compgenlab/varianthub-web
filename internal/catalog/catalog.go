@@ -249,7 +249,10 @@ func (s *Store) PutSource(ctx context.Context, src Source) error {
 		return fmt.Errorf("source %q has no TOML manifest", src.ID)
 	}
 	if src.Visibility == "" {
-		src.Visibility = VisibilityPublic
+		// Default closed. Publishing something private is a disclosure that
+		// cannot be undone; a private source nobody can see is a support
+		// request. The costs are not symmetric.
+		src.Visibility = VisibilityPrivate
 	}
 	if src.IndexStatus == "" {
 		src.IndexStatus = "indexed"
