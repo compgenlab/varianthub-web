@@ -166,3 +166,67 @@ func streamFromTOML(text string) bool {
 	}
 	return f.Sources[0].Stream
 }
+
+// urlFragment is the file-location half of a source manifest.
+type urlFragment struct {
+	Sources []struct {
+		URL      string   `toml:"url"`
+		URLIndex string   `toml:"url_index"`
+		Chroms   []string `toml:"chroms"`
+		Alts     []string `toml:"alts"`
+		Files    []struct {
+			URL      string `toml:"url"`
+			URLIndex string `toml:"url_index"`
+		} `toml:"files"`
+	} `toml:"sources"`
+}
+
+// SourceURLs lists the data URLs a source reads, with {chrom} and {alt}
+// templates expanded.
+//
+// Index URLs are deliberately excluded: an index is small and is fetched whole
+// regardless, so counting it would add noise to a figure whose point is how much
+// data sits behind a network hop rather than on our own storage.
+func SourceURLs(text string) []string {
+	var f urlFragment
+	if _, err := toml.Decode(text, &f); err != nil || len(f.Sources) == 0 {
+		return nil
+	}
+	s := f.Sources[0]
+	var raw []string
+	if s.URL != "" {
+		raw = append(raw, s.URL)
+	}
+	for _, file := range s.Files {
+		if file.URL != "" {
+			raw = append(raw, file.URL)
+		}
+	}
+
+	alts := s.Alts
+	if len(alts) == 0 {
+		alts = []string{"a", "c", "g", "t"} // varhub's default per-alt set
+	}
+	var out []string
+	for _, u := range raw {
+		expanded := []string{u}
+		if strings.Contains(u, "{chrom}") {
+			expanded = expand(expanded, "{chrom}", s.Chroms)
+		}
+		if strings.Contains(u, "{alt}") {
+			expanded = expand(expanded, "{alt}", alts)
+		}
+		out = append(out, expanded...)
+	}
+	return out
+}
+
+func expand(in []string, placeholder string, values []string) []string {
+	var out []string
+	for _, u := range in {
+		for _, v := range values {
+			out = append(out, strings.ReplaceAll(u, placeholder, v))
+		}
+	}
+	return out
+}

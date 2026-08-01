@@ -27,6 +27,7 @@ type Server struct {
 	spa     *SPA           // nil serves no web UI (API-only)
 	trusted []*net.IPNet
 	limiter *limit.Limiter
+	remote  *remoteSizer
 }
 
 // New builds the server. cat may be nil, in which case the catalog endpoints
@@ -40,6 +41,7 @@ func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, spa *SPA) *Serv
 		spa:     spa,
 		trusted: limit.ParseCIDRs(cfg.TrustedProxy),
 		limiter: limit.New(cfg.RatePerMin, cfg.RateBurst),
+		remote:  newRemoteSizer(),
 	}
 }
 
@@ -75,6 +77,7 @@ func (s *Server) Routes() http.Handler {
 	v1.HandleFunc("PATCH /api/v1/admin/snapshots/{id}", s.handleUpdateSnapshotMeta)
 	v1.HandleFunc("PUT /api/v1/admin/snapshots/{id}/sources", s.handleSetSnapshotSources)
 	v1.HandleFunc("DELETE /api/v1/admin/snapshots/{id}", s.handleDeleteSnapshot)
+	v1.HandleFunc("GET /api/v1/admin/metrics", s.handleMetrics)
 	v1.HandleFunc("GET /api/v1/admin/storage", s.handleListStorage)
 	v1.HandleFunc("POST /api/v1/admin/storage", s.handleCreateStorage)
 	v1.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)

@@ -344,6 +344,7 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `GET` | `/api/v1/admin/registries/{id}/datasets` | **implemented** — live listing |
 | `GET` | `/api/v1/admin/registries/{id}/fetch?ref=` | **implemented** — returns a manifest for review |
 | `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | not implemented |
+| `GET` | `/api/v1/admin/metrics` | **implemented** — throughput, queue state, storage usage |
 | `GET` | `/api/v1/admin/storage` | **implemented** — storage locations |
 | `POST` | `/api/v1/admin/storage` | **implemented** — add an S3 bucket (paths come from config) |
 | `DELETE` | `/api/v1/admin/storage/{id}` | **implemented** (not config-managed ones) |
@@ -506,3 +507,58 @@ Carried from the handoff and from implementation review:
 5. **Column manager** — persisted per user, per job, or per snapshot?
 6. **Large VCF upload** — size ceiling and whether resumable upload is required.
    The current 64 MiB limit is inherited, not chosen.
+
+## `GET /api/v1/admin/metrics`
+
+Counters for the admin dashboard, in one response so the figures agree with each
+other: reading them separately lets a job finish between two requests and produce
+totals that do not add up.
+
+```json
+{
+  "jobs": {
+    "total": 412, "succeeded": 398, "failed": 14,
+    "queued": 2, "running": 1, "oldest_queued_at": 1785600000,
+    "variants": 91422, "last_24h": 37, "last_7d": 210
+  },
+  "sources": {"total": 5, "provisioned": 1, "streamed": 3, "builtin": 1, "pending": 0},
+  "storage": [
+    {"storage_id": "cfg-default", "name": "default", "kind": "path",
+     "uri": "/mnt/storage", "bytes": 0, "files": 0, "sources": 0, "is_default": true},
+    {"storage_id": "cfg-versitygw", "name": "versitygw", "kind": "s3",
+     "uri": "s3://varhub-dev", "bucket": "varhub-dev",
+     "bytes": 78704219, "files": 2, "sources": 1, "is_default": false}
+  ],
+  "storage_bytes": 78704219,
+  "remote": [
+    {"source_id": "gnomad-4.1.0", "name": "gnomAD", "host": "storage.googleapis.com",
+     "files": 24, "bytes": 563049556499}
+  ],
+  "remote_bytes": 563049556499,
+  "remote_measured": true,
+  "generated_at": 1785605894
+}
+```
+
+Notes on what the numbers mean, because several of them could reasonably be
+defined another way:
+
+- **`jobs.variants` counts successful jobs only.** A failed job's variant count is
+  what was *submitted*, not what was annotated, so including it would inflate the
+  total exactly when something is going wrong.
+- **`oldest_queued_at` is absent when nothing is waiting.** A queue depth alone
+  does not distinguish a queue that is moving from one that is stuck.
+- **Every storage location appears, including empty ones.** "This bucket is
+  configured and holds nothing" is usually the answer being looked for, and
+  omitting the row makes it indistinguishable from a location that does not exist.
+- **Locations are never merged.** Two locations in one bucket stay two rows, each
+  carrying `bucket`, so usage can be read per location or summed per bucket.
+- **`remote` is measured, not stored.** Streamed sources are read from their
+  origin with range requests and occupy nothing here, so their bytes are reported
+  separately and are *not* part of `storage_bytes`. Sizes come from a `HEAD` per
+  file, falling back to a one-byte ranged `GET` for origins that refuse `HEAD`,
+  cached for six hours.
+- **`remote_measured: false` makes `remote_bytes` a floor.** Some origins report
+  no length; the per-source `unmeasured` count says how many files are missing
+  from the figure rather than quietly under-reporting.
+- **`?remote=0`** skips the origin probes and returns the local figures alone.

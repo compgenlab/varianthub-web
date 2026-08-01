@@ -7,7 +7,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { FilePlus2, Table2, KeyRound, ShieldCheck, ServerCog, HardDrive } from "lucide-react";
+import { FilePlus2, Table2, KeyRound, ShieldCheck, ServerCog, HardDrive, ChartColumn } from "lucide-react";
 
 import { api, getToken, setToken } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -18,6 +18,7 @@ import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
 import TokenGate from "./screens/TokenGate";
 import Admin from "./screens/Admin";
+import Metrics from "./screens/Metrics";
 import SystemJobs from "./screens/SystemJobs";
 import Files from "./screens/Files";
 import StorageBrowser from "./screens/StorageBrowser";
@@ -116,6 +117,9 @@ function Shell({ children }: { children: React.ReactNode }) {
           <NavLink to="/admin/jobs">
             <ServerCog /> System jobs
           </NavLink>
+          <NavLink to="/admin/metrics">
+            <ChartColumn /> Metrics
+          </NavLink>
         </nav>
         <div
           style={{ marginTop: "auto", padding: 14, borderTop: "1px solid var(--border)" }}
@@ -172,6 +176,7 @@ export default function App() {
             <Route path="/admin/storage" element={<Files />} />
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
+            <Route path="/admin/metrics" element={<Metrics />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>
         </Shell>

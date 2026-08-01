@@ -31,6 +31,61 @@ export interface Source {
   stream?: boolean;
 }
 
+export interface JobStats {
+  total: number;
+  succeeded: number;
+  failed: number;
+  queued: number;
+  running: number;
+  /** Creation time of the longest-waiting queued job; absent when none wait. */
+  oldest_queued_at?: number;
+  /** Variants across successful jobs only. */
+  variants: number;
+  last_24h: number;
+  last_7d: number;
+}
+
+export interface StorageUsage {
+  storage_id: string;
+  name: string;
+  kind: string;
+  uri: string;
+  /** Set for S3 locations, so usage reads per bucket. */
+  bucket?: string;
+  bytes: number;
+  files: number;
+  sources: number;
+  is_default: boolean;
+}
+
+export interface RemoteUsage {
+  source_id: string;
+  name: string;
+  host: string;
+  files: number;
+  bytes: number;
+  /** Files whose origin reported no length, making bytes a floor. */
+  unmeasured?: number;
+}
+
+export interface Metrics {
+  jobs: JobStats;
+  sources: {
+    total: number;
+    provisioned: number;
+    streamed: number;
+    builtin: number;
+    pending: number;
+  };
+  storage: StorageUsage[];
+  /** Only what this deployment stores; remote bytes are counted separately. */
+  storage_bytes: number;
+  remote: RemoteUsage[];
+  remote_bytes: number;
+  remote_measured: boolean;
+  generated_at: number;
+}
+
 export interface Registry {
   id: string;
   name: string;
@@ -379,6 +434,8 @@ export const api = {
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
       method: "POST",
     }),
+
+  metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
 
