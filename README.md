@@ -171,9 +171,34 @@ row directly if you need to.
 
 ## Configuration
 
+Settings resolve in three layers, each overriding the one before:
+
+1. **Defaults** — compiled in; a deployment that sets nothing still runs.
+2. **A TOML file** — `varianthub-web.toml` in the working directory, or
+   `/etc/varianthub-web/config.toml`, or whatever `VHW_CONFIG` names.
+3. **Environment variables** — every setting has one, so a container can change
+   a single value without templating a file.
+
+```sh
+varianthub-web config init       # write a documented varianthub-web.toml
+varianthub-web config            # print what this deployment resolved to
+```
+
+`config` prints the *resolved* configuration with the database password and any
+client secret masked, which is the only way to answer "what is this actually
+running with" once the environment has had its say. A misspelled key stops
+startup with the offending name rather than being silently ignored — that is the
+failure a config file exists to prevent.
+
+The file is optional. An env-only deployment keeps working with no file at all,
+and the two can be mixed: the compose stack keeps the database DSN in the
+environment (it is assembled from `POSTGRES_PASSWORD`) and everything else in a
+mounted file.
+
 | Env var | Default | Purpose |
 |---|---|---|
-| `VHW_ADDR` | `:8080` | Listen address (inside the container) |
+| `VHW_CONFIG` | *(searched)* | Path to the TOML config file; naming one that does not exist is an error |
+| `VHW_ADDR` | `:8080` | Listen address (inside the container) — `server.addr` |
 | `VHW_DATABASE_URL` | — | Postgres DSN (required) |
 | `VHW_ALLOW_ANONYMOUS` | `false` | Let callers with no account use the annotation flow |
 | `VHW_CILOGON_CLIENT_ID` | — | CILogon OIDC client id (all three required to enable institutional sign-in) |

@@ -50,6 +50,11 @@ func run(args []string) error {
 		usage()
 		return nil
 	}
+	// `config init` writes an example file, so it must run before Load — the
+	// whole point is that there is nothing to load yet.
+	if cmd == "config" && len(args) > 1 && args[1] == "init" {
+		return configInit(args[2:])
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -69,6 +74,8 @@ func run(args []string) error {
 		return cmdSource(ctx, cfg, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, cfg, args[1:])
+	case "config":
+		return configShow(cfg)
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -430,6 +437,42 @@ func sweepInterval(ttl time.Duration) time.Duration {
 	}
 }
 
+// configShow prints the resolved configuration, secrets masked.
+//
+// "What is this deployment actually running with" is a question the file alone
+// cannot answer, because the environment overrides it. This answers it.
+func configShow(cfg *config.Config) error {
+	if p := config.AbsConfigPath(); p != "" {
+		fmt.Printf("# resolved from %s, then the environment\n\n", p)
+	} else {
+		fmt.Printf("# no config file found (looked for %s)\n"+
+			"# resolved from defaults and the environment\n\n",
+			strings.Join(config.SearchPaths, ", "))
+	}
+	fmt.Print(cfg.Redacted())
+	return nil
+}
+
+// configInit writes a documented starting file.
+func configInit(args []string) error {
+	path := config.SearchPaths[0]
+	if len(args) > 0 && args[0] != "" {
+		path = args[0]
+	}
+	// Never clobber: a config file is the one thing whose loss is not
+	// recoverable from the repository.
+	if _, err := os.Stat(path); err == nil {
+		return fmt.Errorf("%s already exists", path)
+	}
+	// 0600 from the start — it is about to hold a DSN and a client secret, and
+	// tightening permissions after the fact is a step people skip.
+	if err := os.WriteFile(path, []byte(config.ExampleFile()), 0o600); err != nil {
+		return err
+	}
+	fmt.Printf("wrote %s — edit database.url, then run 'varianthub-web config' to check it\n", path)
+	return nil
+}
+
 func usage() {
 	fmt.Fprint(os.Stderr, strings.TrimLeft(`
 varianthub-web — VariantHub API server
@@ -442,6 +485,10 @@ commands:
   migrate   apply pending SQL migrations, then exit
   seed      populate an empty catalog with a starter snapshot, then exit
 
+configuration:
+  config             print the resolved configuration, secrets masked
+  config init [path] write a documented varianthub-web.toml
+
 catalog administration:
   source add [flags] <source.toml>   register a source from a varhub fragment
   source list                        list registered sources
@@ -450,7 +497,8 @@ catalog administration:
   snapshot list                      list snapshots
   version   print the version
 
-Configuration is read from the environment; see README.md. VHW_DATABASE_URL is
-always required.
+Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
+/etc/varianthub-web/config.toml), with environment variables overriding it.
+Start with "config init"; see README.md. A database URL is always required.
 `, "\n"))
 }

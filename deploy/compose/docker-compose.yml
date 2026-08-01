@@ -20,6 +20,12 @@ name: varianthub-web
 # services run it with different arguments.
 x-web: &web
   image: varianthub-web:dev
+  # An optional config file. Point VHW_CONFIG_FILE at a varianthub-web.toml to
+  # mount it; with nothing set this mounts the in-repo example, which is
+  # harmless because every value in it matches the built-in defaults.
+  #   VHW_CONFIG_FILE=./my-config.toml make dev
+  volumes:
+    - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
   build:
     context: ../..
     dockerfile: deploy/compose/Dockerfile
@@ -31,8 +37,13 @@ x-web: &web
     args:
       VERSION: ${VERSION:-dev}
 
+# The DSN stays an environment variable here because compose assembles it from
+# POSTGRES_PASSWORD. Everything else can live in a mounted varianthub-web.toml —
+# see VHW_CONFIG_FILE below — and the environment still wins over the file, so
+# either style works and they can be mixed.
 x-db-env: &db-env
   VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
+  VHW_CONFIG: ${VHW_CONFIG:-/etc/varianthub-web/config.toml}
 
 services:
   postgres:

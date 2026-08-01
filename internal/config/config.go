@@ -1,9 +1,15 @@
-// Package config is the service's environment-driven configuration.
+// Package config is the service's configuration: defaults, then an optional
+// TOML file, then the environment, each overriding the one before.
 //
-// Everything is read from the environment rather than a file: this runs in
-// containers, where env vars and mounted secrets are the native mechanism. Note
-// this is the *service's* config — the annotation catalog (sources, snapshots)
-// is a separate concern that Chunk 2 moves into Postgres.
+// The file is the readable record of how a deployment is set up — one place to
+// look rather than a dozen variables spread across a compose file and a shell
+// profile. The environment stays authoritative on top of it so a container can
+// override a single value without templating a whole file, and so a deployment
+// that has no file keeps working exactly as before.
+//
+// Note this is the *service's* config. The annotation catalog — sources,
+// snapshots, and the varhub config.toml the worker materializes per job — is a
+// separate concern living in Postgres.
 package config
 
 import (
@@ -67,37 +73,55 @@ type Config struct {
 	Version      string   // build stamp, surfaced at /version
 }
 
-// Load reads the configuration from the environment, applying defaults.
-func Load() (*Config, error) {
-	c := &Config{
-		Addr:                 env("VHW_ADDR", ":8080"),
-		DatabaseURL:          os.Getenv("VHW_DATABASE_URL"),
-		AllowAnonymous:       envBool("VHW_ALLOW_ANONYMOUS", false),
-		CILogonClientID:      os.Getenv("VHW_CILOGON_CLIENT_ID"),
-		CILogonClientSecret:  os.Getenv("VHW_CILOGON_CLIENT_SECRET"),
-		CILogonRedirectURL:   os.Getenv("VHW_CILOGON_REDIRECT_URL"),
-		CILogonAutoProvision: envList("VHW_CILOGON_AUTO_PROVISION_DOMAINS", nil),
-		Workers:              envInt("VHW_WORKERS", 2),
-		VarhubBin:            env("VHW_VARHUB_BIN", "varhub"),
-		VarhubHome:           os.Getenv("VHW_VARHUB_HOME"),
-		DataDir:              env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
-		CacheDir:             env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
-		StorageS3:            envList("VHW_STORAGE_S3", nil),
-		StoragePaths: envList("VHW_STORAGE_PATHS",
-			[]string{"default=/var/lib/varianthub/sources"}),
-		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),
-		JobTTL:         envDur("VHW_JOB_TTL", 24*time.Hour),
-		SubmitWaitCap:  envDur("VHW_SUBMIT_WAIT_CAP", 10*time.Second),
-		MaxUploadBytes: int64(envInt("VHW_MAX_UPLOAD_BYTES", 64<<20)),
-		RatePerMin:     envInt("VHW_RATE_PER_MIN", 30),
-		RateBurst:      envInt("VHW_RATE_BURST", 10),
-		MaxJobsPerIP:   envInt("VHW_MAX_JOBS_PER_IP", 2),
-		TrustedProxy: envList("VHW_TRUSTED_PROXIES",
-			[]string{"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"}),
-		CORSOrigins: envList("VHW_CORS_ORIGINS", nil),
+// Defaults returns the configuration with nothing configured.
+//
+// Kept as its own function so the defaults are stated once and are what both
+// Load and the example file describe — the previous shape buried them as the
+// second argument of twenty env lookups, where they could drift from the docs
+// without anything noticing.
+func Defaults() *Config {
+	return &Config{
+		Addr:           ":8080",
+		Workers:        2,
+		VarhubBin:      "varhub",
+		DataDir:        "/var/lib/varianthub/data",
+		CacheDir:       "/var/lib/varianthub/cache",
+		StoragePaths:   []string{"default=/var/lib/varianthub/sources"},
+		JobTimeout:     time.Hour,
+		JobTTL:         24 * time.Hour,
+		SubmitWaitCap:  10 * time.Second,
+		MaxUploadBytes: 64 << 20,
+		RatePerMin:     30,
+		RateBurst:      10,
+		MaxJobsPerIP:   2,
+		TrustedProxy: []string{
+			"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
+		},
 	}
+}
+
+// Load resolves the configuration: defaults, then the file, then the
+// environment.
+func Load() (*Config, error) {
+	c := Defaults()
+
+	path, err := findConfigFile()
+	if err != nil {
+		return nil, err
+	}
+	if path != "" {
+		fileHasSecret, err := applyFile(c, path)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("config: loaded %s", path)
+		warnIfWorldReadable(path, fileHasSecret, log.Printf)
+	}
+	applyEnv(c)
+
 	if c.DatabaseURL == "" {
-		return nil, fmt.Errorf("VHW_DATABASE_URL is required")
+		return nil, fmt.Errorf("no database configured: set database.url in %s, or VHW_DATABASE_URL",
+			configHint(path))
 	}
 	// Removed in favour of accounts. Warned about rather than ignored: a
 	// deployment still setting these believes they do something, and the shape
@@ -111,44 +135,100 @@ func Load() (*Config, error) {
 	return c, nil
 }
 
-func env(k, def string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+// configHint names the file in an error, or suggests where one would go.
+func configHint(path string) string {
+	if path != "" {
+		return path
 	}
-	return def
+	return "a config file (" + SearchPaths[0] + ")"
 }
 
-func envInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
+// applyEnv overlays environment variables, which win over the file.
+//
+// Every setting is overridable, without exception: a value that could only be
+// set in the file would be one a container could not change, and finding that
+// out during an incident is not the moment.
+func applyEnv(c *Config) {
+	envStr("VHW_ADDR", &c.Addr)
+	envStr("VHW_DATABASE_URL", &c.DatabaseURL)
+	envBoolInto("VHW_ALLOW_ANONYMOUS", &c.AllowAnonymous)
+
+	envStr("VHW_CILOGON_CLIENT_ID", &c.CILogonClientID)
+	envStr("VHW_CILOGON_CLIENT_SECRET", &c.CILogonClientSecret)
+	envStr("VHW_CILOGON_REDIRECT_URL", &c.CILogonRedirectURL)
+	envListInto("VHW_CILOGON_AUTO_PROVISION_DOMAINS", &c.CILogonAutoProvision)
+
+	envIntInto("VHW_WORKERS", &c.Workers)
+	envStr("VHW_VARHUB_BIN", &c.VarhubBin)
+	envStr("VHW_VARHUB_HOME", &c.VarhubHome)
+	envStr("VHW_DATA_DIR", &c.DataDir)
+	envStr("VHW_CACHE_DIR", &c.CacheDir)
+	envDurInto("VHW_JOB_TIMEOUT", &c.JobTimeout)
+	envDurInto("VHW_JOB_TTL", &c.JobTTL)
+
+	envListInto("VHW_STORAGE_PATHS", &c.StoragePaths)
+	envListInto("VHW_STORAGE_S3", &c.StorageS3)
+
+	envIntInto("VHW_RATE_PER_MIN", &c.RatePerMin)
+	envIntInto("VHW_RATE_BURST", &c.RateBurst)
+	envIntInto("VHW_MAX_JOBS_PER_IP", &c.MaxJobsPerIP)
+	envDurInto("VHW_SUBMIT_WAIT_CAP", &c.SubmitWaitCap)
+	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			c.MaxUploadBytes = n
+		}
+	}
+	envListInto("VHW_TRUSTED_PROXIES", &c.TrustedProxy)
+	envListInto("VHW_CORS_ORIGINS", &c.CORSOrigins)
+}
+
+// lookup reads an environment variable, treating empty as unset. An empty
+// string cannot mean "override the file with nothing" — that is what the file
+// itself is for, and the ambiguity would make an accidentally-blank variable
+// silently erase a configured value.
+func lookup(k string) (string, bool) {
+	v, ok := os.LookupEnv(k)
+	if !ok {
+		return "", false
+	}
+	v = strings.TrimSpace(v)
+	return v, v != ""
+}
+
+func envStr(k string, dst *string) {
+	if v, ok := lookup(k); ok {
+		*dst = v
+	}
+}
+
+func envIntInto(k string, dst *int) {
+	if v, ok := lookup(k); ok {
 		if n, err := strconv.Atoi(v); err == nil {
-			return n
+			*dst = n
 		}
 	}
-	return def
 }
 
-func envBool(k string, def bool) bool {
-	if v := os.Getenv(k); v != "" {
+func envBoolInto(k string, dst *bool) {
+	if v, ok := lookup(k); ok {
 		if b, err := strconv.ParseBool(v); err == nil {
-			return b
+			*dst = b
 		}
 	}
-	return def
 }
 
-func envDur(k string, def time.Duration) time.Duration {
-	if v := os.Getenv(k); v != "" {
+func envDurInto(k string, dst *time.Duration) {
+	if v, ok := lookup(k); ok {
 		if d, err := time.ParseDuration(v); err == nil {
-			return d
+			*dst = d
 		}
 	}
-	return def
 }
 
-func envList(k string, def []string) []string {
-	v := os.Getenv(k)
-	if v == "" {
-		return def
+func envListInto(k string, dst *[]string) {
+	v, ok := lookup(k)
+	if !ok {
+		return
 	}
 	var out []string
 	for _, p := range strings.Split(v, ",") {
@@ -156,15 +236,15 @@ func envList(k string, def []string) []string {
 			out = append(out, p)
 		}
 	}
-	return out
+	*dst = out
 }
 
 // StorageLocations parses the deployment's declared download targets.
 //
-// VHW_STORAGE_PATHS holds filesystem targets as "name=/abs/path"; a bare path
-// is accepted and named after its last element, so the common single-volume
-// case needs no ceremony. VHW_STORAGE_S3 holds object-store targets as
-// "name=s3://bucket/prefix". Both are comma-separated.
+// storage.paths (VHW_STORAGE_PATHS) holds filesystem targets as
+// "name=/abs/path"; a bare path is accepted and named after its last element,
+// so the common single-volume case needs no ceremony. storage.s3
+// (VHW_STORAGE_S3) holds object-store targets as "name=s3://bucket/prefix".
 //
 // Filesystem entries come first and the first of those is the default download
 // target, because a deployment that has both usually wants the local volume as
@@ -204,7 +284,7 @@ func (c *Config) StorageLocations() ([]struct {
 	}
 
 	for i, raw := range c.StoragePaths {
-		if err := add(raw, "VHW_STORAGE_PATHS", "path", i == 0, func(p string) error {
+		if err := add(raw, "storage.paths", "path", i == 0, func(p string) error {
 			if !filepath.IsAbs(p) {
 				return fmt.Errorf("path must be absolute")
 			}
@@ -214,7 +294,7 @@ func (c *Config) StorageLocations() ([]struct {
 		}
 	}
 	for i, raw := range c.StorageS3 {
-		if err := add(raw, "VHW_STORAGE_S3", "s3", len(c.StoragePaths) == 0 && i == 0, func(p string) error {
+		if err := add(raw, "storage.s3", "s3", len(c.StoragePaths) == 0 && i == 0, func(p string) error {
 			if !strings.HasPrefix(p, "s3://") {
 				return fmt.Errorf("target must be an s3:// URI")
 			}
