@@ -2,7 +2,7 @@
 //
 // Ops endpoints (/healthz, /version) are open. Everything under /api/v1 resolves
 // an identity once in withCaller; /api/v1/admin then requires an administrator
-// account, and the rest requires any identity unless anonymous access is on.
+// account, and the rest requires any identity unless VHW_ALLOW_ANONYMOUS is set.
 // The v1 handlers live in v1.go, identity in identity.go.
 package api
 
@@ -69,6 +69,7 @@ func (s *Server) Routes() http.Handler {
 	v1.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
 	v1.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
 	v1.HandleFunc("GET /api/v1/auth/me", s.handleMe)
+	v1.Handle("POST /api/v1/auth/password", s.requireAuth(http.HandlerFunc(s.handleChangePassword)))
 
 	// A caller's own API tokens. Gated on being someone, not on being an admin:
 	// every account issues its own, and each carries that account's role.
@@ -217,12 +218,10 @@ func (s *Server) limiterGC(ctx context.Context) {
 
 // throttle rate-limits by resolved client IP. Wraps submit routes only.
 //
-// A token-bearing service account is exempt: the limit exists to stop an
-// anonymous browser flooding the queue, and applying it to a bulk ingest would
-// make that ingest throttle itself.
+// See throttled: identified callers are exempt, anonymous ones are not.
 func (s *Server) throttle(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.trustedCaller(r) {
+		if !s.throttled(r) {
 			h.ServeHTTP(w, r)
 			return
 		}

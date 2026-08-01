@@ -58,7 +58,7 @@ test:
 
 ## test-unit: run only tests that need no external services
 test-unit:
-	go test -race ./internal/auth/... ./internal/limit/... ./internal/api/...
+	go test -race ./internal/limit/... ./internal/api/...
 
 ## test-integration: run the full suite against a local Postgres + varhub
 # VHW_TEST_VARHUB defaults to a varhub built from a sibling varianthub-cli checkout.

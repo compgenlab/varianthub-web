@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/identity"
 )
 
@@ -46,7 +45,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 	// Creating the first administrator is what the bootstrap credential exists
 	// for, so it is spent here rather than lingering as a second way in.
 	if c := callerOf(r); c.Bootstrap && u.IsAdmin() {
-		if tok, ok := auth.Bearer(r); ok {
+		if tok := bearerOf(r); tok != "" {
 			if err := s.identity.ConsumeBootstrap(r.Context(), tok); err != nil {
 				// The account exists either way, and an administrator now does
 				// too — which is itself enough to stop the bootstrap working.

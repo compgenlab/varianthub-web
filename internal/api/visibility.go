@@ -24,9 +24,7 @@ type visibility struct {
 // visibilityFor resolves the caller's grants once per request.
 func (s *Server) visibilityFor(r *http.Request) (visibility, error) {
 	c := callerOf(r)
-	if c.IsAdmin() || c.Service {
-		// The service account provisions and annotates on the deployment's
-		// behalf, so it reads every source; it still cannot administer.
+	if c.IsAdmin() {
 		return visibility{admin: true}, nil
 	}
 	if s.identity == nil || len(c.TeamIDs) == 0 {

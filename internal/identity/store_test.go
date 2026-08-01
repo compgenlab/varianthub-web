@@ -432,3 +432,126 @@ func TestResolve(t *testing.T) {
 		})
 	}
 }
+
+// Changing a password takes the current one, and an SSO account has none to
+// change — the two rules that make the feature safe rather than a takeover path.
+func TestChangePassword(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUser(ctx, "local@example.com", "Local", RoleMember, "old-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u.SSO {
+		t.Fatal("an account created with a password reports as SSO")
+	}
+	if !u.CanChangePassword() {
+		t.Error("an account with a password cannot change it")
+	}
+
+	// A wrong current password is refused: otherwise a stolen session cookie
+	// would be enough to lock the owner out of their own account.
+	if err := s.ChangePassword(ctx, u.ID, "not-the-password", "new-password"); err == nil {
+		t.Error("changed the password without knowing the current one")
+	}
+	if _, err := s.Authenticate(ctx, u.Email, "old-password"); err != nil {
+		t.Error("the failed attempt changed the password anyway")
+	}
+
+	// Too short is refused by the same rule that governs every password.
+	if err := s.ChangePassword(ctx, u.ID, "old-password", "short"); err == nil {
+		t.Error("accepted a password below the minimum length")
+	}
+	// Reusing the current one is a no-op dressed as a change.
+	if err := s.ChangePassword(ctx, u.ID, "old-password", "old-password"); err == nil {
+		t.Error("accepted the current password as the new one")
+	}
+
+	if err := s.ChangePassword(ctx, u.ID, "old-password", "new-password"); err != nil {
+		t.Fatalf("ChangePassword: %v", err)
+	}
+	if _, err := s.Authenticate(ctx, u.Email, "new-password"); err != nil {
+		t.Errorf("the new password does not work: %v", err)
+	}
+	if _, err := s.Authenticate(ctx, u.Email, "old-password"); err == nil {
+		t.Error("the old password still works")
+	}
+}
+
+// An account whose password lives with an identity provider has none here. It
+// must be refused rather than quietly given a local one, which would be a second
+// way in that bypasses the provider.
+func TestSSOAccountHasNoPasswordToChange(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	u, err := s.CreateUser(ctx, "sso@example.com", "Federated", RoleMember, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !u.SSO {
+		t.Error("an account created with no password does not report as SSO")
+	}
+	if u.CanChangePassword() {
+		t.Error("an SSO account reports that it can change its password")
+	}
+
+	err = s.ChangePassword(ctx, u.ID, "anything", "new-password")
+	if !errors.Is(err, ErrNoLocalPassword) {
+		t.Errorf("ChangePassword on an SSO account = %v, want ErrNoLocalPassword", err)
+	}
+	// And it still cannot sign in with a password, empty or otherwise.
+	for _, pw := range []string{"", "anything", "new-password"} {
+		if _, err := s.Authenticate(ctx, u.Email, pw); err == nil {
+			t.Errorf("an SSO account authenticated with password %q", pw)
+		}
+	}
+
+	// Reading it back through the store keeps the flag, so a listing shows it.
+	back, err := s.User(ctx, u.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !back.SSO {
+		t.Error("the SSO flag is lost when the account is read back")
+	}
+}
+
+// Changing a password ends other sessions but leaves API tokens alone: someone
+// changing it because it leaked expects the leak's sessions gone, and does not
+// expect their CI to stop working.
+func TestChangePasswordEndsOtherSessions(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	u, err := s.CreateUser(ctx, "sessions@example.com", "S", RoleMember, "old-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	keep, _, _ := s.CreateSession(ctx, u.ID)
+	other, _, _ := s.CreateSession(ctx, u.ID)
+	_, tokenSecret, err := s.CreateToken(ctx, u.ID, "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := s.ChangePassword(ctx, u.ID, "old-password", "new-password"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := s.EndOtherSessions(ctx, u.ID, keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 1 {
+		t.Errorf("ended %d sessions, want 1", n)
+	}
+	if _, err := s.UserBySession(ctx, keep); err != nil {
+		t.Error("the session that made the change was ended too")
+	}
+	if _, err := s.UserBySession(ctx, other); err == nil {
+		t.Error("another session survived the password change")
+	}
+	if _, err := s.UserByToken(ctx, tokenSecret); err != nil {
+		t.Error("an API token was invalidated by a password change")
+	}
+}

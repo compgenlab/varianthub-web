@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Copy, KeyRound, Trash2 } from "lucide-react";
+import { Copy, KeyRound, Lock, Trash2 } from "lucide-react";
 
 import { api, type ApiToken, type Me } from "../api";
 
@@ -68,7 +68,9 @@ export default function Account({ me }: { me: Me }) {
         </p>
       )}
 
-      <h2 className="label" style={{ marginBottom: 8 }}>
+      <ChangePassword me={me} />
+
+      <h2 className="label" style={{ margin: "26px 0 8px" }}>
         API tokens
       </h2>
       <p className="lede" style={{ fontSize: 12.5, margin: "0 0 14px" }}>
@@ -189,5 +191,118 @@ export default function Account({ me }: { me: Me }) {
         </>
       )}
     </div>
+  );
+}
+
+/**
+ * Change your own password.
+ *
+ * Absent entirely for an account that signs in through an identity provider —
+ * there is no password here to change, and a form that always failed would be
+ * worse than none. The server refuses those accounts too; hiding the form is
+ * courtesy, not the control.
+ */
+function ChangePassword({ me }: { me: Me }) {
+  const [current, setCurrent] = useState("");
+  const [next, setNext] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState(false);
+  const [busy, setBusy] = useState(false);
+
+  if (me.can_change_password === false || me.user?.sso) {
+    return (
+      <>
+        <h2 className="label" style={{ marginBottom: 8 }}>
+          Password
+        </h2>
+        <div className="card" style={{ padding: 16 }}>
+          <p className="row gap-8" style={{ fontSize: 13, color: "var(--text-2)", margin: 0 }}>
+            <Lock size={14} />
+            This account signs in through your identity provider, so its password
+            is managed there.
+          </p>
+        </div>
+      </>
+    );
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault();
+    if (next !== confirm) {
+      setErr("The new passwords do not match.");
+      return;
+    }
+    setErr("");
+    setBusy(true);
+    try {
+      await api.changePassword(current, next);
+      setCurrent("");
+      setNext("");
+      setConfirm("");
+      setDone(true);
+    } catch (e) {
+      setDone(false);
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <h2 className="label" style={{ marginBottom: 8 }}>
+        Password
+      </h2>
+      <form className="card" style={{ padding: 16 }} onSubmit={submit}>
+        <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+          <input
+            className="input"
+            style={{ flex: "1 1 180px" }}
+            type="password"
+            autoComplete="current-password"
+            placeholder="Current password"
+            value={current}
+            onChange={(e) => setCurrent(e.target.value)}
+          />
+          <input
+            className="input"
+            style={{ flex: "1 1 180px" }}
+            type="password"
+            autoComplete="new-password"
+            placeholder="New password"
+            value={next}
+            onChange={(e) => setNext(e.target.value)}
+          />
+          <input
+            className="input"
+            style={{ flex: "1 1 180px" }}
+            type="password"
+            autoComplete="new-password"
+            placeholder="Confirm new password"
+            value={confirm}
+            onChange={(e) => setConfirm(e.target.value)}
+          />
+          <button className="btn" disabled={busy || !current || next.length < 8}>
+            {busy ? "Changing…" : "Change"}
+          </button>
+        </div>
+        {err && (
+          <p className="err" style={{ fontSize: 12.5, margin: "10px 0 0" }}>
+            {err}
+          </p>
+        )}
+        {done && (
+          <p style={{ fontSize: 12.5, color: "var(--benign-fg)", margin: "10px 0 0" }}>
+            Password changed. Other sessions have been signed out; your API tokens
+            still work.
+          </p>
+        )}
+        <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "10px 0 0" }}>
+          At least 8 characters. The current password is required even though you
+          are signed in — otherwise a stolen session could lock you out.
+        </p>
+      </form>
+    </>
   );
 }

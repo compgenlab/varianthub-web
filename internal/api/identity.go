@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/identity"
 )
 
@@ -47,16 +46,21 @@ func (s *Server) withCaller(h http.Handler) http.Handler {
 	})
 }
 
-func (s *Server) resolveCaller(r *http.Request) (identity.Caller, error) {
-	bearer, _ := auth.Bearer(r)
+// bearerOf extracts the token from an "Authorization: Bearer <token>" header.
+func bearerOf(r *http.Request) string {
+	tok, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if !ok {
+		return ""
+	}
+	return strings.TrimSpace(tok)
+}
 
-	// The master key stays a machine credential: it submits in bulk and reads
-	// its own jobs, and it is not an administrator. A shared secret that lives
-	// in a compose file is the wrong thing to hang catalog writes off.
+func (s *Server) resolveCaller(r *http.Request) (identity.Caller, error) {
+	bearer := bearerOf(r)
+	// An Authorization header in some other scheme is not ours to interpret, so
+	// the caller is anonymous rather than rejected — a client sending a Basic
+	// header to an anonymous-allowed instance should still be served.
 	if bearer != "" && !identity.IsCredential(bearer) {
-		if s.cfg.MasterKey != "" && auth.VerifyToken(s.cfg.MasterKey, bearer) {
-			return identity.Caller{Service: true}, nil
-		}
 		return identity.Caller{}, nil
 	}
 	if s.identity == nil {
@@ -70,14 +74,10 @@ func (s *Server) resolveCaller(r *http.Request) (identity.Caller, error) {
 }
 
 // requireAuth rejects an unidentified caller unless the deployment opted into
-// anonymous access.
-//
-// VHW_REQUIRE_TOKEN=false already declares an open API, so it implies anonymous
-// access rather than contradicting it — otherwise turning authentication off
-// would make the service less reachable instead of more.
+// anonymous access with VHW_ALLOW_ANONYMOUS.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AllowAnonymous || !s.cfg.RequireToken || !callerOf(r).Anonymous() {
+		if s.cfg.AllowAnonymous || !callerOf(r).Anonymous() {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -176,9 +176,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"anonymous": c.Anonymous(),
 		"admin":     c.IsAdmin(),
 		"label":     c.Label(),
-		"service":   c.Service,
 		"bootstrap": c.Bootstrap,
 		"teams":     c.TeamIDs,
+		// Whether a password can be changed here at all. An SSO account has no
+		// password of ours, so the UI shows no form rather than one that fails.
+		"can_change_password": c.User != nil && c.User.CanChangePassword(),
 	}
 	if c.User != nil {
 		out["user"] = c.User
@@ -192,6 +194,56 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// handleChangePassword lets a caller change their own password.
+func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
+	c := callerOf(r)
+	if c.User == nil {
+		writeError(w, http.StatusForbidden, "a password belongs to an account; sign in first")
+		return
+	}
+	// Checked here as well as in the store so the UI gets the same answer from
+	// /auth/me that it would get from submitting: the form is hidden for an SSO
+	// account, and hiding it must not be the only thing stopping it.
+	if c.User.SSO {
+		writeError(w, http.StatusConflict, identity.ErrNoLocalPassword.Error())
+		return
+	}
+	var req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "malformed JSON body")
+		return
+	}
+	err := s.identity.ChangePassword(r.Context(), c.User.ID, req.CurrentPassword, req.NewPassword)
+	switch {
+	case errors.Is(err, identity.ErrNoLocalPassword):
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	case errors.Is(err, identity.ErrNotFound):
+		writeError(w, http.StatusNotFound, "no such account")
+		return
+	case err != nil:
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// Keep this session alive and end the rest: changing a password should end
+	// whatever a leaked one was being used for, without signing the person out
+	// of the browser they just did it from.
+	var keep string
+	if ck, err := r.Cookie(SessionCookie); err == nil {
+		keep = ck.Value
+	}
+	if n, err := s.identity.EndOtherSessions(r.Context(), c.User.ID, keep); err != nil {
+		log.Printf("api: ending other sessions for %s: %v", c.User.ID, err)
+	} else if n > 0 {
+		log.Printf("api: password changed for %s; ended %d other session(s)", c.User.Email, n)
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // --- personal API tokens ---

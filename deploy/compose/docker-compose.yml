@@ -33,7 +33,6 @@ x-web: &web
 
 x-db-env: &db-env
   VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
-  VHW_MASTER_KEY: ${VHW_MASTER_KEY:-dev-master-key-change-me}
 
 services:
   postgres:

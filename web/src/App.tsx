@@ -207,7 +207,7 @@ export default function App() {
   if (!me || me.anonymous) {
     return (
       <SignIn
-        me={me ?? { anonymous: true, admin: false, label: "anonymous", service: false, bootstrap: false }}
+        me={me ?? { anonymous: true, admin: false, label: "anonymous", bootstrap: false }}
         onDone={() => location.reload()}
       />
     );

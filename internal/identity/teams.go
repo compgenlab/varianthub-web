@@ -98,7 +98,8 @@ type Member struct {
 // Members lists a team's people.
 func (s *Store) Members(ctx context.Context, teamID string) ([]Member, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT u.id,u.email,u.name,u.role,u.disabled,u.created_at,u.updated_at, m.role
+		SELECT u.id,u.email,u.name,u.role,u.disabled,u.password_hash = '',
+		       u.created_at,u.updated_at, m.role
 		  FROM team_member m JOIN app_user u ON u.id = m.user_id
 		 WHERE m.team_id=$1 ORDER BY lower(u.email)`, teamID)
 	if err != nil {
@@ -109,7 +110,8 @@ func (s *Store) Members(ctx context.Context, teamID string) ([]Member, error) {
 	for rows.Next() {
 		var m Member
 		if err := rows.Scan(&m.User.ID, &m.User.Email, &m.User.Name, &m.User.Role,
-			&m.User.Disabled, &m.User.CreatedAt, &m.User.UpdatedAt, &m.Role); err != nil {
+			&m.User.Disabled, &m.User.SSO, &m.User.CreatedAt, &m.User.UpdatedAt,
+			&m.Role); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

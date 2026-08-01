@@ -22,7 +22,7 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 | `internal/queue/` | Postgres-backed job queue |
 | `internal/catalog/` | Sources and snapshots in Postgres; materializes config per job |
 | `internal/runner/` | The annotation seam — `Runner` interface + `ExecRunner` |
-| `internal/auth/` | HMAC bearer tokens |
+| `internal/identity/` | Accounts, teams, tokens, sessions, grants |
 | `internal/limit/` | Per-IP rate limiting and client-IP resolution |
 | `migrations/` | Numbered SQL, applied by `migrate` |
 | `web/` | React app (embedded into the binary at build time) |
@@ -39,8 +39,15 @@ open http://localhost:18080           # the web app
 ```
 
 The stack builds the React app into the Go binary, so one container serves both
-the UI and the API. On first load the app asks for an API token — mint one with
-the deployment's `VHW_MASTER_KEY`; the dev default is `dev-master-key-change-me`.
+the UI and the API. On first load the app asks you to create an administrator
+account, using the **bootstrap token** the server printed to its log at startup:
+
+```
+docker compose -f deploy/compose/docker-compose.yml logs api | grep cgl_vhb_
+```
+
+That token stops working the moment the account exists. Everything after that is
+an email and password, or a personal API token for scripts.
 
 That brings up Postgres, applies migrations, seeds a starter snapshot into the
 catalog, and starts the API and a worker. Ordering is enforced by the compose
@@ -168,8 +175,7 @@ row directly if you need to.
 |---|---|---|
 | `VHW_ADDR` | `:8080` | Listen address (inside the container) |
 | `VHW_DATABASE_URL` | — | Postgres DSN (required) |
-| `VHW_MASTER_KEY` | — | HMAC key signing API tokens |
-| `VHW_REQUIRE_TOKEN` | `true` | Bearer auth on `/api/v1` |
+| `VHW_ALLOW_ANONYMOUS` | `false` | Let callers with no account use the annotation flow |
 | `VHW_WORKERS` | `2` | Worker pool size |
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
 | `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |

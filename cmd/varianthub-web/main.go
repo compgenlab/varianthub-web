@@ -115,9 +115,6 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	if !cfg.RequireToken {
-		log.Printf("serve: /api/v1 is OPEN (VHW_REQUIRE_TOKEN=false)")
-	}
 	if cfg.AllowAnonymous {
 		log.Printf("serve: anonymous annotation is ENABLED (VHW_ALLOW_ANONYMOUS=true)")
 	}

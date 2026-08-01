@@ -98,11 +98,12 @@ func (s *Store) UserByToken(ctx context.Context, secret string) (User, error) {
 	)
 	row := s.pool.QueryRow(ctx, `
 		SELECT t.id, t.hash, t.revoked_at,
-		       u.id,u.email,u.name,u.role,u.disabled,u.created_at,u.updated_at
+		       u.id,u.email,u.name,u.role,u.disabled,u.password_hash = '',
+		       u.created_at,u.updated_at
 		  FROM api_token t JOIN app_user u ON u.id = t.user_id
 		 WHERE t.prefix=$1`, prefix)
 	if err := row.Scan(&tokenID, &hash, &revoked, &u.ID, &u.Email, &u.Name,
-		&u.Role, &u.Disabled, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		&u.Role, &u.Disabled, &u.SSO, &u.CreatedAt, &u.UpdatedAt); err != nil {
 		return User{}, ErrNotFound
 	}
 	if revoked != 0 || u.Disabled || !TokenMatches(hash, secret) {
@@ -130,10 +131,11 @@ func (s *Store) CreateSession(ctx context.Context, userID string) (string, int64
 func (s *Store) UserBySession(ctx context.Context, id string) (User, error) {
 	var u User
 	row := s.pool.QueryRow(ctx, `
-		SELECT u.id,u.email,u.name,u.role,u.disabled,u.created_at,u.updated_at
+		SELECT u.id,u.email,u.name,u.role,u.disabled,u.password_hash = '',
+		       u.created_at,u.updated_at
 		  FROM user_session s JOIN app_user u ON u.id = s.user_id
 		 WHERE s.id=$1 AND s.expires_at > $2`, id, s.nowFn())
-	if err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled,
+	if err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.SSO,
 		&u.CreatedAt, &u.UpdatedAt); err != nil {
 		return User{}, ErrNotFound
 	}

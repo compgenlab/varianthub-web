@@ -36,7 +36,8 @@ here as a change to a shared contract.
 
 `Authorization: Bearer <token>`.
 
-Chunk 1 issues a single HMAC token signed with `VHW_MASTER_KEY`. Chunk 6 replaces
+*Superseded — see **Authentication** at the end of this document.* Chunk 1 issued
+a single HMAC token signed with `VHW_MASTER_KEY`; that key is gone. Chunk 6 replaced
 this with per-user tokens: `cgl_vh_` prefix + random secret, shown once at
 creation, stored only as a hash, and carrying the owner's private-source grants.
 A token must never grant more than its owner has.
@@ -573,7 +574,14 @@ becomes the request's caller; nothing downstream authenticates separately.
 | Personal API token | `Authorization: Bearer cgl_vh_…` | the account that owns it |
 | Session | `vh_auth` cookie, set by `POST /auth/login` | the account that signed in |
 | Bootstrap token | `Authorization: Bearer cgl_vhb_…` | nobody — the first-administrator path |
-| Master key | `Authorization: Bearer <HMAC token>` | the deployment, as a service account |
+
+There is no deployment-wide shared key. `VHW_MASTER_KEY` was removed: a shared
+secret cannot be attributed to anyone, cannot be revoked without rotating it for
+every holder at once, and is indistinguishable from a copy of itself. Scripts and
+bulk loaders now hold a personal API token belonging to an account — often an
+account created for that purpose — which is individually revocable and shows when
+it was last used. Setting the variable is warned about at startup rather than
+silently ignored.
 
 An unrecognised credential is anonymous, not an error: a stale token gets the
 same treatment as no token, so a client that kept one past its revocation sees a
@@ -586,11 +594,13 @@ person who owns it does — the role is read from the account on every request, 
 promoting takes effect on tokens already issued and demoting revokes them all at
 once, with nothing to reissue or clean up.
 
-**The master key is deliberately not an administrator.** It is a shared secret
-that lives in a compose file, a CI variable and several shell histories; it can
-submit in bulk and read its own jobs, which is what a machine credential is for,
-but publishing a snapshot takes an account. This changed with accounts: a
-deployment that used the master key from a browser now signs in instead.
+Reading *anyone's* jobs is likewise administrator-only.
+
+**The submit rate limit applies to anonymous callers only.** It exists to stop an
+unaccountable browser flooding the queue; an account is accountable — it can be
+disabled and its jobs are attributable — and throttling a signed-in bulk load
+would make that load throttle itself. The per-IP *concurrency* cap still applies
+to everyone, so no one caller monopolises the workers.
 
 ### Bootstrap: the first administrator
 
@@ -611,6 +621,24 @@ restart replaces it (so a token printed into a log and never used stops working)
 `GET /auth/me` reports `needs_bootstrap` so the sign-in screen can ask for it.
 
 After that, people sign in with an email and password.
+
+### Changing a password
+
+`POST /auth/password` takes `current_password` and `new_password`. The current
+one is required even though the caller is already authenticated: a session cookie
+and an API token are both bearer credentials, and if one is stolen, setting a new
+password without knowing the old one would turn a read of the account into a
+takeover. Re-proving knowledge of the password is what prevents that.
+
+Succeeding ends the account's **other** sessions — someone changing a password
+because they think it leaked expects that — while leaving API tokens alone, since
+those are separate credentials with their own revocation and silently breaking a
+CI job is not what the request asked for.
+
+An account with no password stored here is refused with `409`. `GET /auth/me`
+reports `can_change_password`, and a user carries `sso: true`, so the UI shows no
+form rather than one that always fails. Hiding the form is courtesy; the server
+check is the control.
 
 ### Personal API tokens
 
@@ -657,9 +685,10 @@ user's results.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `VHW_ALLOW_ANONYMOUS` | `false` | let callers with no credential use the annotation flow |
-| `VHW_REQUIRE_TOKEN` | `true` | `false` opens `/api/v1` entirely, which implies anonymous access |
-| `VHW_MASTER_KEY` | — | the service-account HMAC key |
+| `VHW_ALLOW_ANONYMOUS` | `false` | let callers with no account use the annotation flow |
+
+`VHW_MASTER_KEY` and `VHW_REQUIRE_TOKEN` were removed; both are warned about at
+startup if still set.
 
 ### Endpoints
 
@@ -667,6 +696,7 @@ user's results.
 | --- | --- | --- |
 | `POST` | `/api/v1/auth/login` | email + password → `vh_auth` cookie |
 | `POST` | `/api/v1/auth/logout` | ends the session server-side |
+| `POST` | `/api/v1/auth/password` | change your own password; `409` for an SSO account |
 | `GET` | `/api/v1/auth/me` | caller, role, teams, `needs_bootstrap` |
 | `GET` | `/api/v1/auth/tokens` | the caller's own tokens |
 | `POST` | `/api/v1/auth/tokens` | mint one; the secret is in this response only |

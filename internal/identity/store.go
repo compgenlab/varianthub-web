@@ -33,11 +33,15 @@ func NewStore(pool *pgxpool.Pool) *Store {
 // SetNow overrides the clock, for tests.
 func (s *Store) SetNow(fn func() int64) { s.nowFn = fn }
 
-const userCols = `id, email, name, role, disabled, created_at, updated_at`
+// The projection carries whether a password exists, never the hash itself: no
+// caller of scanUser needs it, and a hash that is never selected cannot be
+// logged, serialized or compared by accident.
+const userCols = `id, email, name, role, disabled, password_hash = '', created_at, updated_at`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.CreatedAt, &u.UpdatedAt)
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.SSO,
+		&u.CreatedAt, &u.UpdatedAt)
 	return u, err
 }
 
@@ -64,7 +68,13 @@ func (s *Store) CreateUser(ctx context.Context, email, name, role, password stri
 		hash = h
 	}
 	now := s.nowFn()
-	u := User{ID: NewID(), Email: email, Name: name, Role: role, CreatedAt: now, UpdatedAt: now}
+	u := User{
+		ID: NewID(), Email: email, Name: name, Role: role,
+		// The row is not read back, so the derived flag is set here too. An
+		// account created with no password authenticates elsewhere.
+		SSO:       hash == "",
+		CreatedAt: now, UpdatedAt: now,
+	}
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO app_user (id,email,name,role,password_hash,disabled,created_at,updated_at)
 		VALUES ($1,$2,$3,$4,$5,false,$6,$6)`,
@@ -136,7 +146,7 @@ func (s *Store) Authenticate(ctx context.Context, email, password string) (User,
 	row := s.pool.QueryRow(ctx,
 		`SELECT `+userCols+`, password_hash FROM app_user WHERE lower(email)=lower($1)`,
 		NormalizeEmail(email))
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled,
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.SSO,
 		&u.CreatedAt, &u.UpdatedAt, &hash)
 	if err != nil || u.Disabled || !CheckPassword(hash, password) {
 		return User{}, errors.New("invalid email or password")
@@ -144,7 +154,60 @@ func (s *Store) Authenticate(ctx context.Context, email, password string) (User,
 	return u, nil
 }
 
-// SetPassword replaces an account's password.
+// ErrNoLocalPassword is returned when an account has no password here to change.
+var ErrNoLocalPassword = errors.New("this account signs in through an identity provider, so it has no password here")
+
+// ChangePassword replaces an account's own password, given the current one.
+//
+// The current password is required even though the caller is already
+// authenticated. A session cookie or an API token is a bearer credential: if one
+// is stolen, being able to set a new password without knowing the old one would
+// let the thief lock the owner out of their own account. Re-proving knowledge of
+// the password is what makes that a read of the account rather than a takeover.
+//
+// An SSO account is refused rather than quietly given a local password, which
+// would create a second way in that bypasses the identity provider entirely.
+func (s *Store) ChangePassword(ctx context.Context, userID, current, next string) error {
+	var hash string
+	err := s.pool.QueryRow(ctx,
+		`SELECT password_hash FROM app_user WHERE id=$1`, userID).Scan(&hash)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("user %q: %w", userID, ErrNotFound)
+	}
+	if err != nil {
+		return err
+	}
+	if hash == "" {
+		return ErrNoLocalPassword
+	}
+	if !CheckPassword(hash, current) {
+		return errors.New("the current password is incorrect")
+	}
+	if CheckPassword(hash, next) {
+		return errors.New("the new password is the same as the current one")
+	}
+	return s.SetPassword(ctx, userID, next)
+}
+
+// EndOtherSessions logs out every session for an account except one.
+//
+// Called after a password change: someone changing their password because they
+// think it leaked expects that to end whatever the leak was being used for. API
+// tokens deliberately survive — they are separate credentials with their own
+// revocation, and silently breaking a CI job is not what "change my password"
+// asked for.
+func (s *Store) EndOtherSessions(ctx context.Context, userID, keepID string) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM user_session WHERE user_id=$1 AND id <> $2`, userID, keepID)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// SetPassword replaces an account's password, with no check on the current one.
+// This is the administrator's reset path; a user changing their own goes through
+// ChangePassword.
 func (s *Store) SetPassword(ctx context.Context, userID, password string) error {
 	hash, err := HashPassword(password)
 	if err != nil {

@@ -6,23 +6,23 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/config"
 )
 
-func testServer(t *testing.T, requireToken bool) *Server {
+// testServer has no identity store, so no credential can resolve: every caller
+// is anonymous, which is exactly the state these tests are about.
+func testServer(t *testing.T, allowAnonymous bool) *Server {
 	t.Helper()
 	return New(&config.Config{
-		MasterKey:    "test-key",
-		RequireToken: requireToken,
-		Version:      "test",
-		RatePerMin:   1000,
-		RateBurst:    1000,
+		AllowAnonymous: allowAnonymous,
+		Version:        "test",
+		RatePerMin:     1000,
+		RateBurst:      1000,
 	}, nil, nil, nil, nil)
 }
 
 func TestVersionIsOpen(t *testing.T) {
-	h := testServer(t, true).Routes()
+	h := testServer(t, false).Routes()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/version", nil))
 	if w.Code != http.StatusOK {
@@ -37,30 +37,17 @@ func TestVersionIsOpen(t *testing.T) {
 	}
 }
 
-func TestV1RequiresToken(t *testing.T) {
-	h := testServer(t, true).Routes()
-
+func TestV1RequiresAnIdentity(t *testing.T) {
+	h := testServer(t, false).Routes()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/ping", nil))
 	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("tokenless /api/v1/ping = %d, want 401", w.Code)
-	}
-
-	tok, err := auth.MintToken("test-key", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest("GET", "/api/v1/ping", nil)
-	r.Header.Set("Authorization", "Bearer "+tok)
-	w = httptest.NewRecorder()
-	h.ServeHTTP(w, r)
-	if w.Code != http.StatusOK {
-		t.Fatalf("authenticated /api/v1/ping = %d, want 200", w.Code)
+		t.Fatalf("anonymous /api/v1/ping = %d, want 401", w.Code)
 	}
 }
 
-func TestRequireTokenFalseOpensV1(t *testing.T) {
-	h := testServer(t, false).Routes()
+func TestAllowAnonymousOpensV1(t *testing.T) {
+	h := testServer(t, true).Routes()
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, httptest.NewRequest("GET", "/api/v1/ping", nil))
 	if w.Code != http.StatusOK {
@@ -68,18 +55,22 @@ func TestRequireTokenFalseOpensV1(t *testing.T) {
 	}
 }
 
-// A wrong key must not authenticate, even though the token is well-formed.
-func TestWrongKeyRejected(t *testing.T) {
-	tok, err := auth.MintToken("other-key", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest("GET", "/api/v1/ping", nil)
-	r.Header.Set("Authorization", "Bearer "+tok)
-	w := httptest.NewRecorder()
-	testServer(t, true).Routes().ServeHTTP(w, r)
-	if w.Code != http.StatusUnauthorized {
-		t.Fatalf("foreign-key token = %d, want 401", w.Code)
+// There is no deployment-wide key any more. A well-formed-looking bearer value
+// that is not one of our credentials resolves to anonymous — it must not be
+// mistaken for a shared secret that once worked here.
+func TestUnknownBearerIsAnonymous(t *testing.T) {
+	for _, bearer := range []string{
+		"eyJzdWIiOiJ2YXJodWIiLCJpYXQiOjB9.c2ln", // the shape the old master key had
+		"cgl_vh_notarealtoken",
+		"Basic dXNlcjpwdw==",
+	} {
+		r := httptest.NewRequest("GET", "/api/v1/ping", nil)
+		r.Header.Set("Authorization", "Bearer "+bearer)
+		w := httptest.NewRecorder()
+		testServer(t, false).Routes().ServeHTTP(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Errorf("bearer %q = %d, want 401", bearer, w.Code)
+		}
 	}
 }
 
@@ -97,7 +88,7 @@ func TestCORSOffByDefault(t *testing.T) {
 
 func TestCORSAllowsConfiguredOrigin(t *testing.T) {
 	s := New(&config.Config{
-		MasterKey: "k", RequireToken: true, Version: "test",
+		Version:     "test",
 		CORSOrigins: []string{"https://app.example"},
 	}, nil, nil, nil, nil)
 	h := s.Routes()

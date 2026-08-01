@@ -1,11 +1,12 @@
 // Package identity models who is making a request: accounts, the teams they
 // belong to, personal API tokens, and browser sessions.
 //
-// It exists apart from internal/auth, which verifies the deployment's shared
-// master key and knows nothing about people. That key remains a valid
-// credential — the CLI and any existing script authenticate with it — but it
-// identifies a service rather than a user, so the two live side by side rather
-// than one replacing the other.
+// This is the whole of authentication. There was a deployment-wide HMAC master
+// key; it is gone. A shared secret cannot be attributed, revoked individually, or
+// told apart from a copy of itself, so scripts now hold personal API tokens
+// belonging to an account like everyone else. The one credential that is not a
+// person is the bootstrap token, which exists only until the first administrator
+// account does — see bootstrap.go.
 package identity
 
 import (
@@ -46,10 +47,19 @@ type User struct {
 	Name     string `json:"name,omitempty"`
 	Role     string `json:"role"`
 	Disabled bool   `json:"disabled,omitempty"`
+	// SSO means no password is stored here: the account authenticates through
+	// an identity provider. Such an account has no password to change, and
+	// saying so is the difference between a form that is absent and one that
+	// fails when submitted.
+	SSO bool `json:"sso,omitempty"`
 
 	CreatedAt int64 `json:"created_at"`
 	UpdatedAt int64 `json:"updated_at"`
 }
+
+// CanChangePassword reports whether this account holds a password we could
+// change. False for an SSO account, where the password lives elsewhere.
+func (u User) CanChangePassword() bool { return !u.SSO }
 
 // IsAdmin reports whether the user administers the catalog.
 func (u User) IsAdmin() bool { return u.Role == RoleAdmin }
@@ -63,18 +73,13 @@ type Team struct {
 
 // Caller is the resolved identity of one request.
 //
-// A request may be authenticated as a user, as the deployment's service account,
-// or not at all. Kept as one type rather than three so every handler asks the
-// same questions of it — Anonymous, IsAdmin, CanSee — instead of branching on
-// which credential happened to be presented.
+// A request is authenticated as a user, as the one-time bootstrap credential, or
+// not at all. Kept as one type so every handler asks it the same questions —
+// Anonymous, IsAdmin, UserID — instead of branching on which credential happened
+// to be presented.
 type Caller struct {
 	User    *User    // nil when not a user
 	TeamIDs []string // teams the user belongs to
-	// Service means the deployment's shared master key. It is a machine
-	// credential for bulk submission, not a person, and deliberately not an
-	// administrator: a shared secret in a compose file, a CI variable and three
-	// shell histories is exactly what should not be able to publish a snapshot.
-	Service bool
 	// Bootstrap means the one-time credential that exists only until the first
 	// administrator account does. It administers, because creating that account
 	// is administration; it stops working the moment the account exists.
@@ -82,7 +87,7 @@ type Caller struct {
 }
 
 // Anonymous reports whether the request carried no credential at all.
-func (c Caller) Anonymous() bool { return c.User == nil && !c.Service && !c.Bootstrap }
+func (c Caller) Anonymous() bool { return c.User == nil && !c.Bootstrap }
 
 // IsAdmin reports whether the caller may administer the catalog.
 //
@@ -103,8 +108,6 @@ func (c Caller) Label() string {
 		return c.User.Email
 	case c.Bootstrap:
 		return "bootstrap"
-	case c.Service:
-		return "service"
 	default:
 		return "anonymous"
 	}

@@ -14,7 +14,6 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -89,8 +88,7 @@ func newHarness(t *testing.T) *harness {
 	cat := catalog.New(pool)
 	ids := identity.NewStore(pool)
 	srv := New(&config.Config{
-		MasterKey: "test-key", RequireToken: true, Version: "test",
-		RatePerMin: 1000, RateBurst: 1000,
+		Version: "test", RatePerMin: 1000, RateBurst: 1000,
 	}, nil, cat, ids, nil)
 	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat}
 }
@@ -148,11 +146,6 @@ func TestAdminRoutesRequireAnAdminAccount(t *testing.T) {
 	_, adminTok := h.admin(t)
 	member, memberTok := h.member(t, "member@example.com")
 
-	masterKey, err := auth.MintToken("test-key", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	for _, tc := range []struct {
 		name   string
 		bearer string
@@ -160,7 +153,6 @@ func TestAdminRoutesRequireAnAdminAccount(t *testing.T) {
 	}{
 		{"administrator", adminTok, http.StatusOK},
 		{"ordinary member", memberTok, http.StatusForbidden},
-		{"master key", masterKey, http.StatusForbidden},
 		{"nobody", "", http.StatusUnauthorized},
 		{"garbage", identity.TokenPrefix + "notreal", http.StatusUnauthorized},
 	} {
@@ -497,5 +489,74 @@ func TestLogoutEndsTheSession(t *testing.T) {
 	}
 	if w := withCookie("GET", "/api/v1/admin/users"); w.Code != http.StatusUnauthorized {
 		t.Errorf("after logout = %d, want 401", w.Code)
+	}
+}
+
+// The change-password endpoint over the wire, including the SSO refusal.
+func TestChangePasswordEndpoint(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	u, err := h.ids.CreateUser(ctx, "local@example.com", "Local", identity.RoleMember, "old-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, secret, err := h.ids.CreateToken(ctx, u.ID, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// /auth/me tells the UI whether to render the form at all.
+	var me struct {
+		CanChangePassword bool `json:"can_change_password"`
+		User              struct {
+			SSO bool `json:"sso"`
+		} `json:"user"`
+	}
+	w := h.do("GET", "/api/v1/auth/me", secret, nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if !me.CanChangePassword || me.User.SSO {
+		t.Errorf("a local account reports can_change_password=%v sso=%v",
+			me.CanChangePassword, me.User.SSO)
+	}
+
+	if w := h.do("POST", "/api/v1/auth/password", secret, map[string]string{
+		"current_password": "wrong", "new_password": "new-password",
+	}); w.Code != http.StatusBadRequest {
+		t.Errorf("wrong current password = %d, want 400", w.Code)
+	}
+	if w := h.do("POST", "/api/v1/auth/password", secret, map[string]string{
+		"current_password": "old-password", "new_password": "new-password",
+	}); w.Code != http.StatusNoContent {
+		t.Fatalf("change = %d, want 204 (%s)", w.Code, w.Body.String())
+	}
+	if _, err := h.ids.Authenticate(ctx, u.Email, "new-password"); err != nil {
+		t.Errorf("the new password does not work: %v", err)
+	}
+
+	// An SSO account is refused by the endpoint, not only hidden in the UI.
+	sso, err := h.ids.CreateUser(ctx, "sso@example.com", "Federated", identity.RoleMember, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, ssoTok, err := h.ids.CreateToken(ctx, sso.ID, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	w = h.do("GET", "/api/v1/auth/me", ssoTok, nil)
+	me.CanChangePassword = true
+	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if me.CanChangePassword || !me.User.SSO {
+		t.Errorf("an SSO account reports can_change_password=%v sso=%v",
+			me.CanChangePassword, me.User.SSO)
+	}
+	if w := h.do("POST", "/api/v1/auth/password", ssoTok, map[string]string{
+		"current_password": "x", "new_password": "new-password",
+	}); w.Code != http.StatusConflict {
+		t.Errorf("SSO change = %d, want 409 (%s)", w.Code, w.Body.String())
 	}
 }

@@ -81,17 +81,24 @@ func sessionOf(r *http.Request) string {
 	return ""
 }
 
-// trustedCaller reports whether the caller may read any job and skip the submit
-// throttle.
+// trustedCaller reports whether the caller may read *anyone's* jobs.
 //
-// That is the machine credential and an administrator, not any signed-in user:
-// the throttle exists to stop a browser flooding the queue, and applying it to a
-// bulk ingest would make that ingest throttle itself — a 3,000-site catalog
-// submitted in chunks would stall on a 30-per-minute cap. Reading *other
-// people's* jobs is a separate power, and an ordinary account has neither.
+// Administrators only. Reading other people's results is an operator power, and
+// an ordinary account has no business with it however it authenticated.
 func (s *Server) trustedCaller(r *http.Request) bool {
-	c := callerOf(r)
-	return c.Service || c.IsAdmin()
+	return callerOf(r).IsAdmin()
+}
+
+// throttled reports whether this caller is subject to the per-IP submit rate.
+//
+// Anonymous callers are; identified ones are not. The rate limit exists to stop
+// an unaccountable browser flooding the queue, and an account is accountable —
+// it can be disabled, and its jobs are attributable. Applying it to a signed-in
+// bulk load would make that load throttle itself: a 3,000-site catalog submitted
+// in chunks would stall on a 30-per-minute cap. The per-IP *concurrency* cap
+// still applies to everyone, so one caller cannot monopolise the workers.
+func (s *Server) throttled(r *http.Request) bool {
+	return callerOf(r).Anonymous()
 }
 
 // --- catalog ---

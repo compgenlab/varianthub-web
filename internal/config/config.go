@@ -8,6 +8,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -19,9 +20,7 @@ import (
 type Config struct {
 	Addr        string // listen address
 	DatabaseURL string // Postgres DSN
-	MasterKey   string // HMAC key signing API tokens
 
-	RequireToken bool // bearer auth on /api/v1
 	// AllowAnonymous lets a caller with no credential use the annotation flow.
 	// A public instance wants this on; a private one wants every request to
 	// carry an identity. Off by default: opening an instance up should be a
@@ -61,8 +60,6 @@ func Load() (*Config, error) {
 	c := &Config{
 		Addr:           env("VHW_ADDR", ":8080"),
 		DatabaseURL:    os.Getenv("VHW_DATABASE_URL"),
-		MasterKey:      os.Getenv("VHW_MASTER_KEY"),
-		RequireToken:   envBool("VHW_REQUIRE_TOKEN", true),
 		AllowAnonymous: envBool("VHW_ALLOW_ANONYMOUS", false),
 		Workers:        envInt("VHW_WORKERS", 2),
 		VarhubBin:      env("VHW_VARHUB_BIN", "varhub"),
@@ -86,10 +83,14 @@ func Load() (*Config, error) {
 	if c.DatabaseURL == "" {
 		return nil, fmt.Errorf("VHW_DATABASE_URL is required")
 	}
-	// An empty master key with auth on means HMAC over an empty key, which anyone
-	// can forge. Refuse rather than appear secured.
-	if c.RequireToken && c.MasterKey == "" {
-		return nil, fmt.Errorf("VHW_MASTER_KEY is required (or set VHW_REQUIRE_TOKEN=false for an open API)")
+	// Removed in favour of accounts. Warned about rather than ignored: a
+	// deployment still setting these believes they do something, and the shape
+	// of "the API is protected" has changed under it.
+	for _, k := range []string{"VHW_MASTER_KEY", "VHW_REQUIRE_TOKEN"} {
+		if os.Getenv(k) != "" {
+			log.Printf("config: %s is set but no longer used — /api/v1 now requires "+
+				"an account, and VHW_ALLOW_ANONYMOUS is the only opt-out", k)
+		}
 	}
 	return c, nil
 }

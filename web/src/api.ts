@@ -92,6 +92,8 @@ export interface User {
   name?: string;
   role: string;
   disabled?: boolean;
+  /** No password is stored here — the account signs in through an identity provider. */
+  sso?: boolean;
   created_at: number;
   updated_at: number;
 }
@@ -100,12 +102,13 @@ export interface Me {
   anonymous: boolean;
   admin: boolean;
   label: string;
-  service: boolean;
   bootstrap: boolean;
   teams?: string[];
   user?: User;
   /** True while the installation has no administrator and the bootstrap token works. */
   needs_bootstrap?: boolean;
+  /** False for an SSO account, which has no password here to change. */
+  can_change_password?: boolean;
 }
 
 export interface ApiToken {
@@ -488,6 +491,13 @@ export const api = {
     }),
 
   logout: () => req<void>("/auth/logout", { method: "POST" }),
+
+  changePassword: (current: string, next: string) =>
+    req<void>("/auth/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: current, new_password: next }),
+    }),
 
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
 
