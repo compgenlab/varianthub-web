@@ -654,6 +654,58 @@ rather than a rotation of everything, and a token nobody has used is visibly saf
 to remove. Revoked tokens stay listed: the row is the record that the token
 existed and when it stopped working, which is what an audit of a leak needs.
 
+### CILogon (institutional sign-in)
+
+Configured with three variables; an incomplete set leaves sign-in
+password-only rather than half-enabled.
+
+| Variable | Purpose |
+| --- | --- |
+| `VHW_CILOGON_CLIENT_ID` | OIDC client id |
+| `VHW_CILOGON_CLIENT_SECRET` | OIDC client secret |
+| `VHW_CILOGON_REDIRECT_URL` | e.g. `https://varianthub.example/auth/cilogon/callback` |
+| `VHW_CILOGON_AUTO_PROVISION_DOMAINS` | email domains that get an account on first sign-in; empty = invite-only |
+
+Two browser routes, deliberately outside `/api/v1` so no JSON error wrapper
+intercepts a redirect the provider has to follow:
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/auth/cilogon` | redirects to CILogon; `?next=/path` survives the round trip |
+| `GET` | `/auth/cilogon/callback` | exchanges the code, issues `vh_auth`, redirects to `next` |
+
+**Accounts are not created just because CILogon vouched for someone.** CILogon
+federates several thousand institutional providers, so a successful login proves
+only that *an* institution recognises the person — not that they belong on this
+deployment. Resolution runs in three steps:
+
+1. **By subject.** The provider's `sub` claim is the join key, not the email, so
+   someone whose institutional address changes returns to the same account
+   instead of acquiring a second one.
+2. **By verified email.** An account an administrator already created is linked
+   on first sign-in. This is the invitation: create the account with an empty
+   password (it is then an SSO account with nothing to leak) and the first
+   sign-in claims it.
+3. **By allow-listed domain.** Only if `VHW_CILOGON_AUTO_PROVISION_DOMAINS`
+   covers the verified address. A configured `iu.edu` also matches
+   `umail.iu.edu`, because institutions routinely issue mail on a subdomain —
+   but not `notiu.edu`. Auto-provisioned accounts are always **members**;
+   administration is granted deliberately, never by having the right email.
+
+Anything else is refused with `?error=sso_no_account`, which the sign-in screen
+renders as "ask an administrator to add you". A disabled account is refused too:
+SSO is not a way back in.
+
+The `state` parameter is held in a short-lived, path-scoped, `HttpOnly` cookie
+and compared on return, so another site's callback cannot be replayed into a
+browser as a login. `?next=` is restricted to same-origin absolute paths —
+`//host` is rejected because a browser reads it as protocol-relative and leaves
+the site.
+
+An account may hold a password *and* an identity, either alone. Unlinking the
+last one is refused when there is no password, since that would leave an account
+nobody can sign in to.
+
 ### Visibility
 
 A source is **private by default** and visible to administrators plus any team it

@@ -181,6 +181,8 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		// Whether a password can be changed here at all. An SSO account has no
 		// password of ours, so the UI shows no form rather than one that fails.
 		"can_change_password": c.User != nil && c.User.CanChangePassword(),
+		// Whether to offer the institutional sign-in button at all.
+		"sso_enabled": s.oidc != nil,
 	}
 	if c.User != nil {
 		out["user"] = c.User
@@ -244,6 +246,22 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request) {
 		log.Printf("api: password changed for %s; ended %d other session(s)", c.User.Email, n)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleListIdentities shows the external logins linked to the caller's
+// account, so someone can see how they are actually signing in.
+func (s *Server) handleListIdentities(w http.ResponseWriter, r *http.Request) {
+	c := callerOf(r)
+	if c.User == nil {
+		writeError(w, http.StatusForbidden, "sign in first")
+		return
+	}
+	ids, err := s.identity.Identities(r.Context(), c.User.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"identities": ids})
 }
 
 // --- personal API tokens ---

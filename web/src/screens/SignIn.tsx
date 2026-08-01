@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Building2 } from "lucide-react";
 
 import { api, setToken, type Me } from "../api";
 
@@ -12,9 +13,25 @@ import { api, setToken, type Me } from "../api";
  * to create, because the token's only purpose is to make that account.
  */
 export default function SignIn({ me, onDone }: { me: Me; onDone: () => void }) {
-  const bootstrapping = !!me.needs_bootstrap;
-  return bootstrapping ? <Bootstrap onDone={onDone} /> : <Password onDone={onDone} />;
+  // Bootstrapping wins: an installation with no administrator has no account to
+  // sign in to, however you would otherwise authenticate.
+  if (me.needs_bootstrap) return <Bootstrap onDone={onDone} />;
+  return <Password onDone={onDone} sso={!!me.sso_enabled} />;
 }
+
+/** The error codes the CILogon callback redirects back with. */
+const SSO_ERRORS: Record<string, string> = {
+  sso_no_account:
+    "That login worked, but there is no VariantHub account for it. Ask an administrator to add you.",
+  sso_disabled: "That account has been disabled.",
+  sso_denied: "The sign-in was cancelled at your institution.",
+  sso_state: "The sign-in took too long or was interrupted. Please try again.",
+  sso_not_configured: "Institutional sign-in is not configured on this server.",
+  sso_no_code: "Your institution did not complete the sign-in. Please try again.",
+  sso_exchange: "Could not complete sign-in with your institution.",
+  sso_session: "Signed in, but the session could not be started.",
+  sso_internal: "Something went wrong completing sign-in.",
+};
 
 function Card({ children }: { children: React.ReactNode }) {
   return (
@@ -39,10 +56,15 @@ function Card({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Password({ onDone }: { onDone: () => void }) {
+function Password({ onDone, sso }: { onDone: () => void; sso: boolean }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [err, setErr] = useState("");
+  // The callback redirects back to "/?error=..." rather than rendering its own
+  // page, so the message it wants shown arrives in the query string.
+  const [err, setErr] = useState(() => {
+    const code = new URLSearchParams(location.search).get("error");
+    return code ? (SSO_ERRORS[code] ?? "Sign-in failed.") : "";
+  });
   const [busy, setBusy] = useState(false);
 
   async function submit(e: React.FormEvent) {
@@ -70,6 +92,28 @@ function Password({ onDone }: { onDone: () => void }) {
         <p style={{ fontSize: 13, color: "var(--text-2)", margin: "0 0 22px" }}>
           Use your VariantHub account.
         </p>
+
+        {sso && (
+          <>
+            {/* A plain link, not fetch: the whole point is to leave the SPA for
+                the provider and come back with a cookie set. */}
+            <a
+              className="btn"
+              style={{ width: "100%", justifyContent: "center", textDecoration: "none" }}
+              href="/auth/cilogon"
+            >
+              <Building2 size={15} /> Sign in with your institution
+            </a>
+            <div
+              className="row"
+              style={{ gap: 10, margin: "18px 0", color: "var(--text-3)", fontSize: 11.5 }}
+            >
+              <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
+              OR
+              <span style={{ flex: 1, height: 1, background: "var(--border)" }} />
+            </div>
+          </>
+        )}
 
         <label className="label" htmlFor="email">
           Email

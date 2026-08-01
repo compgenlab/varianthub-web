@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
-import { Copy, KeyRound, Lock, Trash2 } from "lucide-react";
+import { Building2, Copy, KeyRound, Lock, Trash2 } from "lucide-react";
 
-import { api, type ApiToken, type Me } from "../api";
+import { api, type ApiToken, type ExternalIdentity, type Me } from "../api";
 
 function when(ts?: number): string {
   if (!ts) return "—";
@@ -10,6 +10,7 @@ function when(ts?: number): string {
 
 export default function Account({ me }: { me: Me }) {
   const [tokens, setTokens] = useState<ApiToken[]>([]);
+  const [identities, setIdentities] = useState<ExternalIdentity[]>([]);
   const [name, setName] = useState("");
   const [fresh, setFresh] = useState<{ secret: string; name?: string } | null>(null);
   const [err, setErr] = useState("");
@@ -17,7 +18,9 @@ export default function Account({ me }: { me: Me }) {
 
   async function load() {
     try {
-      setTokens((await api.tokens()).tokens ?? []);
+      const [t, i] = await Promise.all([api.tokens(), api.identities()]);
+      setTokens(t.tokens ?? []);
+      setIdentities(i.identities ?? []);
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -66,6 +69,29 @@ export default function Account({ me }: { me: Me }) {
         <p className="err" style={{ fontSize: 13, marginBottom: 12 }}>
           {err}
         </p>
+      )}
+
+      {identities.length > 0 && (
+        <>
+          <h2 className="label" style={{ marginBottom: 8 }}>
+            Institutional sign-in
+          </h2>
+          <div className="card" style={{ padding: 16, marginBottom: 26 }}>
+            {identities.map((i) => (
+              <div key={i.provider + i.subject} className="between" style={{ fontSize: 13 }}>
+                <span className="row gap-8">
+                  <Building2 size={14} />
+                  {/* The provider's own address, which can differ from the
+                      account's — the account's stays authoritative. */}
+                  {i.email || i.provider}
+                </span>
+                <span style={{ fontSize: 12, color: "var(--text-3)" }}>
+                  {i.provider} · {i.last_seen_at ? `last used ${when(i.last_seen_at)}` : "linked"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
       )}
 
       <ChangePassword me={me} />

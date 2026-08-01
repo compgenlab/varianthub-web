@@ -176,6 +176,10 @@ row directly if you need to.
 | `VHW_ADDR` | `:8080` | Listen address (inside the container) |
 | `VHW_DATABASE_URL` | — | Postgres DSN (required) |
 | `VHW_ALLOW_ANONYMOUS` | `false` | Let callers with no account use the annotation flow |
+| `VHW_CILOGON_CLIENT_ID` | — | CILogon OIDC client id (all three required to enable institutional sign-in) |
+| `VHW_CILOGON_CLIENT_SECRET` | — | CILogon OIDC client secret |
+| `VHW_CILOGON_REDIRECT_URL` | — | e.g. `https://varianthub.example/auth/cilogon/callback` |
+| `VHW_CILOGON_AUTO_PROVISION_DOMAINS` | — | Email domains auto-provisioned on first sign-in; empty means invite-only |
 | `VHW_WORKERS` | `2` | Worker pool size |
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
 | `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |

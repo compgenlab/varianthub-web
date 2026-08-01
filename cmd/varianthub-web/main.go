@@ -118,6 +118,15 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	if cfg.AllowAnonymous {
 		log.Printf("serve: anonymous annotation is ENABLED (VHW_ALLOW_ANONYMOUS=true)")
 	}
+	if cfg.CILogonClientID != "" {
+		if len(cfg.CILogonAutoProvision) > 0 {
+			log.Printf("serve: CILogon sign-in enabled; accounts auto-created for %v",
+				cfg.CILogonAutoProvision)
+		} else {
+			log.Printf("serve: CILogon sign-in enabled (invite-only — an administrator " +
+				"creates the account, the first sign-in claims it)")
+		}
+	}
 
 	// The web UI is embedded at build time. A binary built without running the
 	// frontend build still serves the API, which is what CI and API-only

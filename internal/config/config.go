@@ -27,6 +27,18 @@ type Config struct {
 	// decision someone made, not one they inherited.
 	AllowAnonymous bool
 
+	// CILogon (OIDC). All three are required to enable it; an incomplete set
+	// leaves sign-in password-only rather than half-configured.
+	CILogonClientID     string
+	CILogonClientSecret string
+	CILogonRedirectURL  string
+	// CILogonAutoProvision are email domains whose verified holders get an
+	// account on first sign-in. Empty — the default — means invite-only: an
+	// administrator creates the account and the first sign-in claims it.
+	// CILogon federates thousands of institutions, so authenticating there is
+	// not by itself a reason to have an account here.
+	CILogonAutoProvision []string
+
 	Workers    int    // worker pool size
 	VarhubBin  string // path to the varhub CLI
 	VarhubHome string // fixed VARHUB_HOME; empty = materialize per job from the catalog
@@ -58,15 +70,19 @@ type Config struct {
 // Load reads the configuration from the environment, applying defaults.
 func Load() (*Config, error) {
 	c := &Config{
-		Addr:           env("VHW_ADDR", ":8080"),
-		DatabaseURL:    os.Getenv("VHW_DATABASE_URL"),
-		AllowAnonymous: envBool("VHW_ALLOW_ANONYMOUS", false),
-		Workers:        envInt("VHW_WORKERS", 2),
-		VarhubBin:      env("VHW_VARHUB_BIN", "varhub"),
-		VarhubHome:     os.Getenv("VHW_VARHUB_HOME"),
-		DataDir:        env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
-		CacheDir:       env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
-		StorageS3:      envList("VHW_STORAGE_S3", nil),
+		Addr:                 env("VHW_ADDR", ":8080"),
+		DatabaseURL:          os.Getenv("VHW_DATABASE_URL"),
+		AllowAnonymous:       envBool("VHW_ALLOW_ANONYMOUS", false),
+		CILogonClientID:      os.Getenv("VHW_CILOGON_CLIENT_ID"),
+		CILogonClientSecret:  os.Getenv("VHW_CILOGON_CLIENT_SECRET"),
+		CILogonRedirectURL:   os.Getenv("VHW_CILOGON_REDIRECT_URL"),
+		CILogonAutoProvision: envList("VHW_CILOGON_AUTO_PROVISION_DOMAINS", nil),
+		Workers:              envInt("VHW_WORKERS", 2),
+		VarhubBin:            env("VHW_VARHUB_BIN", "varhub"),
+		VarhubHome:           os.Getenv("VHW_VARHUB_HOME"),
+		DataDir:              env("VHW_DATA_DIR", "/var/lib/varianthub/data"),
+		CacheDir:             env("VHW_CACHE_DIR", "/var/lib/varianthub/cache"),
+		StorageS3:            envList("VHW_STORAGE_S3", nil),
 		StoragePaths: envList("VHW_STORAGE_PATHS",
 			[]string{"default=/var/lib/varianthub/sources"}),
 		JobTimeout:     envDur("VHW_JOB_TIMEOUT", time.Hour),

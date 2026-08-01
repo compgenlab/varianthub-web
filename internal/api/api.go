@@ -32,6 +32,7 @@ type Server struct {
 	trusted  []*net.IPNet
 	limiter  *limit.Limiter
 	remote   *remoteSizer
+	oidc     *oidcProvider // nil when no external sign-in is configured
 }
 
 // New builds the server. cat may be nil, in which case the catalog endpoints
@@ -47,6 +48,7 @@ func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, ids *identity.S
 		trusted:  limit.ParseCIDRs(cfg.TrustedProxy),
 		limiter:  limit.New(cfg.RatePerMin, cfg.RateBurst),
 		remote:   newRemoteSizer(),
+		oidc:     newCILogon(cfg),
 	}
 }
 
@@ -57,6 +59,14 @@ func (s *Server) Routes() http.Handler {
 	// Ops endpoints are never token-gated: a readiness probe cannot hold a secret.
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /version", s.handleVersion)
+
+	// External sign-in is a browser redirect flow, not an API call: it lands
+	// here rather than under /api/v1 so a JSON error wrapper never intercepts a
+	// 302 the provider needs to follow.
+	if s.oidc != nil {
+		mux.HandleFunc("GET /auth/cilogon", s.handleOIDCLogin)
+		mux.HandleFunc("GET /auth/cilogon/callback", s.handleOIDCCallback)
+	}
 
 	v1 := http.NewServeMux()
 	// Gated: ping is how a client checks that its credential works, which it
@@ -73,6 +83,7 @@ func (s *Server) Routes() http.Handler {
 
 	// A caller's own API tokens. Gated on being someone, not on being an admin:
 	// every account issues its own, and each carries that account's role.
+	v1.Handle("GET /api/v1/auth/identities", s.requireAuth(http.HandlerFunc(s.handleListIdentities)))
 	v1.Handle("GET /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleListTokens)))
 	v1.Handle("POST /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleCreateToken)))
 	v1.Handle("DELETE /api/v1/auth/tokens/{id}", s.requireAuth(http.HandlerFunc(s.handleRevokeToken)))

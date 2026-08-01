@@ -109,6 +109,16 @@ export interface Me {
   needs_bootstrap?: boolean;
   /** False for an SSO account, which has no password here to change. */
   can_change_password?: boolean;
+  /** True when institutional (CILogon) sign-in is configured. */
+  sso_enabled?: boolean;
+}
+
+export interface ExternalIdentity {
+  provider: string;
+  subject: string;
+  email?: string;
+  created_at: number;
+  last_seen_at?: number;
 }
 
 export interface ApiToken {
@@ -498,6 +508,8 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ current_password: current, new_password: next }),
     }),
+
+  identities: () => req<{ identities: ExternalIdentity[] }>("/auth/identities"),
 
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
 
