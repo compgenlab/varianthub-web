@@ -3,7 +3,6 @@ package config
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -218,78 +217,16 @@ func warnIfWorldReadable(path string, fileHasSecret bool, logf func(string, ...a
 	}
 }
 
-// Redacted renders the resolved configuration as TOML, with secrets masked.
+// redactDSN removes the password from a DSN.
 //
-// The point of a config file is being able to see how a deployment is set up.
-// That is only true if you can see what it *resolved to* after the environment
-// has had its say, which is what this prints.
-func (c *Config) Redacted() string {
-	var b strings.Builder
-	p := func(format string, args ...any) { fmt.Fprintf(&b, format+"\n", args...) }
-
-	p("[server]")
-	p("  addr = %q", c.Addr)
-	p("  cors_origins = %s", tomlList(c.CORSOrigins))
-	p("  trusted_proxies = %s", tomlList(c.TrustedProxy))
-	p("")
-	p("[database]")
-	p("  url = %q", redactDSN(c.DatabaseURL))
-	p("")
-	p("[auth]")
-	p("  allow_anonymous = %v", c.AllowAnonymous)
-	p("")
-	p("[auth.cilogon]")
-	p("  client_id = %q", c.CILogonClientID)
-	p("  client_secret = %q", mask(c.CILogonClientSecret))
-	p("  redirect_url = %q", c.CILogonRedirectURL)
-	p("  auto_provision_domains = %s", tomlList(c.CILogonAutoProvision))
-	p("")
-	p("[worker]")
-	p("  count = %d", c.Workers)
-	p("  varhub_bin = %q", c.VarhubBin)
-	p("  varhub_home = %q", c.VarhubHome)
-	p("  data_dir = %q", c.DataDir)
-	p("  cache_dir = %q", c.CacheDir)
-	p("  job_timeout = %q", c.JobTimeout.String())
-	p("  job_ttl = %q", c.JobTTL.String())
-	p("")
-	p("[storage]")
-	p("  paths = %s", tomlList(c.StoragePaths))
-	p("  s3 = %s", tomlList(c.StorageS3))
-	p("")
-	p("[limits]")
-	p("  rate_per_min = %d", c.RatePerMin)
-	p("  rate_burst = %d", c.RateBurst)
-	p("  max_jobs_per_ip = %d", c.MaxJobsPerIP)
-	p("  max_upload_bytes = %d", c.MaxUploadBytes)
-	p("  submit_wait_cap = %q", c.SubmitWaitCap.String())
-	return b.String()
-}
-
-func tomlList(v []string) string {
-	if len(v) == 0 {
-		return "[]"
-	}
-	parts := make([]string, len(v))
-	for i, s := range v {
-		parts[i] = fmt.Sprintf("%q", s)
-	}
-	return "[" + strings.Join(parts, ", ") + "]"
-}
-
-func mask(s string) string {
-	if s == "" {
-		return ""
-	}
-	return "***"
-}
-
-// redactDSN keeps a DSN legible while removing the password, which is the part
-// that matters and the part someone reading the output does not need.
+// Used to decide whether a config file carries a secret — a DSN counts only
+// when it has a password in it, since one relying on a peer or IAM credential
+// has nothing to protect. Comparing the redacted form against the original is
+// the whole test.
 //
-// The search is bounded to the authority section. A "@" in a query parameter is
+// The search is bounded to the authority section: a "@" in a query parameter is
 // not a credential separator, and taking the last one in the whole string would
-// mangle the DSN into something unrecognisable — the opposite of legible.
+// find a separator that is not there.
 func redactDSN(dsn string) string {
 	scheme := strings.Index(dsn, "://")
 	if scheme < 0 {
@@ -313,26 +250,4 @@ func redactDSN(dsn string) string {
 		return dsn // a user with no password: nothing to hide
 	}
 	return dsn[:scheme+3] + creds[:colon] + ":***" + rest[at:]
-}
-
-// ConfigPath reports which file Load() would read, for diagnostics.
-func ConfigPath() string {
-	p, err := findConfigFile()
-	if err != nil {
-		return ""
-	}
-	return p
-}
-
-// AbsConfigPath is ConfigPath made absolute where possible, so a relative
-// search-path hit is unambiguous in a log line.
-func AbsConfigPath() string {
-	p := ConfigPath()
-	if p == "" {
-		return ""
-	}
-	if abs, err := filepath.Abs(p); err == nil {
-		return abs
-	}
-	return p
 }

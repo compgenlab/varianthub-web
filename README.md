@@ -181,14 +181,11 @@ Settings resolve in three layers, each overriding the one before:
 
 ```sh
 cp varianthub-web.example.toml varianthub-web.toml   # then edit database.url
-varianthub-web config                                # print what resolved
 ```
 
 `varianthub-web.example.toml` documents every setting and states the built-in
 defaults, so a copy with only `database.url` filled in behaves exactly like no
-file at all. `config` prints the *resolved* configuration with the database
-password and any client secret masked — the only way to answer "what is this
-actually running with" once the environment has had its say. A misspelled key
+file at all. The file that was loaded is logged at startup. A misspelled key
 stops startup with the offending name rather than being silently ignored, which
 is the failure a config file exists to prevent.
 

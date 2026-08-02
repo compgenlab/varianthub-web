@@ -69,8 +69,6 @@ func run(args []string) error {
 		return cmdSource(ctx, cfg, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, cfg, args[1:])
-	case "config":
-		return configShow(cfg)
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -432,22 +430,6 @@ func sweepInterval(ttl time.Duration) time.Duration {
 	}
 }
 
-// configShow prints the resolved configuration, secrets masked.
-//
-// "What is this deployment actually running with" is a question the file alone
-// cannot answer, because the environment overrides it. This answers it.
-func configShow(cfg *config.Config) error {
-	if p := config.AbsConfigPath(); p != "" {
-		fmt.Printf("# resolved from %s, then the environment\n\n", p)
-	} else {
-		fmt.Printf("# no config file found (looked for %s)\n"+
-			"# resolved from defaults and the environment\n\n",
-			strings.Join(config.SearchPaths, ", "))
-	}
-	fmt.Print(cfg.Redacted())
-	return nil
-}
-
 func usage() {
 	fmt.Fprint(os.Stderr, strings.TrimLeft(`
 varianthub-web — VariantHub API server
@@ -459,9 +441,6 @@ commands:
   worker    run the annotation job pool (execs the varhub CLI)
   migrate   apply pending SQL migrations, then exit
   seed      populate an empty catalog with a starter snapshot, then exit
-
-configuration:
-  config    print the resolved configuration, secrets masked
 
 catalog administration:
   source add [flags] <source.toml>   register a source from a varhub fragment

@@ -247,27 +247,8 @@ func TestExampleFileIsValid(t *testing.T) {
 	}
 }
 
-// Printing the config must not print the secrets in it.
-func TestRedactedHidesSecrets(t *testing.T) {
-	c := Defaults()
-	c.DatabaseURL = "postgres://varianthub:hunter2@db.internal:5432/varianthub?sslmode=require"
-	c.CILogonClientSecret = "super-secret-value"
-	c.CILogonClientID = "client-id-is-not-secret"
-
-	out := c.Redacted()
-	for _, secret := range []string{"hunter2", "super-secret-value"} {
-		if strings.Contains(out, secret) {
-			t.Errorf("Redacted() leaked %q:\n%s", secret, out)
-		}
-	}
-	// Still legible: the host and user are what someone is checking.
-	for _, want := range []string{"db.internal:5432", "varianthub:***", "client-id-is-not-secret"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("Redacted() dropped %q:\n%s", want, out)
-		}
-	}
-}
-
+// redactDSN decides whether a file holds a secret, so getting it wrong either
+// warns about every file or about none.
 func TestRedactDSN(t *testing.T) {
 	for in, want := range map[string]string{
 		"postgres://u:p@h:5432/db":  "postgres://u:***@h:5432/db",
