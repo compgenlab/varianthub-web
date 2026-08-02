@@ -50,11 +50,6 @@ func run(args []string) error {
 		usage()
 		return nil
 	}
-	// `config init` writes an example file, so it must run before Load — the
-	// whole point is that there is nothing to load yet.
-	if cmd == "config" && len(args) > 1 && args[1] == "init" {
-		return configInit(args[2:])
-	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -453,26 +448,6 @@ func configShow(cfg *config.Config) error {
 	return nil
 }
 
-// configInit writes a documented starting file.
-func configInit(args []string) error {
-	path := config.SearchPaths[0]
-	if len(args) > 0 && args[0] != "" {
-		path = args[0]
-	}
-	// Never clobber: a config file is the one thing whose loss is not
-	// recoverable from the repository.
-	if _, err := os.Stat(path); err == nil {
-		return fmt.Errorf("%s already exists", path)
-	}
-	// 0600 from the start — it is about to hold a DSN and a client secret, and
-	// tightening permissions after the fact is a step people skip.
-	if err := os.WriteFile(path, []byte(config.ExampleFile()), 0o600); err != nil {
-		return err
-	}
-	fmt.Printf("wrote %s — edit database.url, then run 'varianthub-web config' to check it\n", path)
-	return nil
-}
-
 func usage() {
 	fmt.Fprint(os.Stderr, strings.TrimLeft(`
 varianthub-web — VariantHub API server
@@ -486,8 +461,7 @@ commands:
   seed      populate an empty catalog with a starter snapshot, then exit
 
 configuration:
-  config             print the resolved configuration, secrets masked
-  config init [path] write a documented varianthub-web.toml
+  config    print the resolved configuration, secrets masked
 
 catalog administration:
   source add [flags] <source.toml>   register a source from a varhub fragment
@@ -499,6 +473,7 @@ catalog administration:
 
 Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
 /etc/varianthub-web/config.toml), with environment variables overriding it.
-Start with "config init"; see README.md. A database URL is always required.
+Copy varianthub-web.example.toml to start; see README.md. A database URL is
+always required.
 `, "\n"))
 }

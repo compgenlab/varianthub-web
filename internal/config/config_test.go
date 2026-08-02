@@ -223,10 +223,15 @@ func TestDatabaseIsRequired(t *testing.T) {
 	}
 }
 
-// The example file must actually load — it is what `config init` writes, and a
-// starting point that fails to parse is worse than none.
+// The shipped example must load, and must agree with the defaults it claims to
+// document. Without this the file drifts silently and becomes advice that is
+// quietly wrong — the failure mode of every example config ever written.
 func TestExampleFileIsValid(t *testing.T) {
-	withFile(t, ExampleFile())
+	body, err := os.ReadFile("../../varianthub-web.example.toml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	withFile(t, string(body))
 	c, err := Load()
 	if err != nil {
 		t.Fatalf("the shipped example does not load: %v", err)
