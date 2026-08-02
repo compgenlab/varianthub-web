@@ -183,6 +183,11 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		"can_change_password": c.User != nil && c.User.CanChangePassword(),
 		// Whether to offer the institutional sign-in button at all.
 		"sso_enabled": s.oidc != nil,
+		// Whether an unidentified caller may use the annotation flow. The UI
+		// needs this to decide between showing the app and showing a login
+		// wall — without it the two disagree, and a server that permits
+		// anonymous use still looks closed from the browser.
+		"allow_anonymous": s.cfg.AllowAnonymous,
 	}
 	if c.User != nil {
 		out["user"] = c.User

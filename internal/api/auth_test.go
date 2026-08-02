@@ -17,6 +17,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
+	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // The authorization rules are the point of this file, and they are enforced
@@ -40,6 +41,7 @@ type harness struct {
 	http   http.Handler
 	ids    *identity.Store
 	cat    *catalog.Store
+	dsn    string // schema-scoped, for tests that need a real queue
 }
 
 func newHarness(t *testing.T) *harness {
@@ -91,7 +93,22 @@ func newHarness(t *testing.T) *harness {
 	srv := New(&config.Config{
 		Version: "test", RatePerMin: 1000, RateBurst: 1000,
 	}, nil, cat, ids, nil)
-	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat}
+	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat,
+		dsn: dsn + "&search_path=" + schema}
+}
+
+// withQueue gives the harness a real queue. Most tests do not need one — the
+// handler rejects them before it is reached — but job ownership is decided
+// after a job exists, so those tests need somewhere to put one.
+func (h *harness) withQueue(t *testing.T) {
+	t.Helper()
+	q, err := queue.Open(context.Background(), h.dsn)
+	if err != nil {
+		t.Fatalf("open queue: %v", err)
+	}
+	t.Cleanup(q.Close)
+	h.server.queue = q
+	h.http = h.server.Routes()
 }
 
 // do issues a request, optionally as a bearer credential.
@@ -559,5 +576,105 @@ func TestChangePasswordEndpoint(t *testing.T) {
 		"current_password": "x", "new_password": "new-password",
 	}); w.Code != http.StatusConflict {
 		t.Errorf("SSO change = %d, want 409 (%s)", w.Code, w.Body.String())
+	}
+}
+
+// With anonymous access on, an unidentified caller reaches the annotation flow
+// but not administration — and /auth/me says so, which is what the UI decides
+// whether to show a login wall from.
+func TestAllowAnonymous(t *testing.T) {
+	h := newHarness(t)
+	h.server.cfg.AllowAnonymous = true
+	h.http = h.server.Routes()
+
+	var me struct {
+		Anonymous      bool `json:"anonymous"`
+		Admin          bool `json:"admin"`
+		AllowAnonymous bool `json:"allow_anonymous"`
+	}
+	w := h.do("GET", "/api/v1/auth/me", "", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if !me.Anonymous || me.Admin || !me.AllowAnonymous {
+		t.Errorf("me = %+v; want anonymous, not admin, allow_anonymous", me)
+	}
+
+	for _, p := range []string{"/api/v1/ping", "/api/v1/snapshots", "/api/v1/sources"} {
+		if got := h.do("GET", p, "", nil); got.Code != http.StatusOK {
+			t.Errorf("anonymous GET %s = %d, want 200", p, got.Code)
+		}
+	}
+	// Opening the annotation flow must not open the catalog.
+	if got := h.do("GET", "/api/v1/admin/users", "", nil); got.Code != http.StatusUnauthorized {
+		t.Errorf("anonymous GET /admin/users = %d, want 401", got.Code)
+	}
+
+	// And a private source stays invisible: anonymous is in no team, so it is
+	// granted nothing.
+	if err := h.cat.PutSource(context.Background(), catalog.Source{
+		ID: "secret", Name: "secret", Version: "1", Kind: "vcf", Build: "GRCh38",
+		Visibility: catalog.VisibilityPrivate,
+		TOML:       "[[sources]]\nname = \"secret\"\nversion = \"1\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	w = h.do("GET", "/api/v1/sources", "", nil)
+	if strings.Contains(w.Body.String(), "secret") {
+		t.Errorf("a private source is visible anonymously: %s", w.Body.String())
+	}
+}
+
+// An anonymous submitter must be able to read back their own job, and only
+// their own. Without a scope there is nothing to match on, and the alternative
+// to a 404 would be showing them everyone's.
+func TestAnonymousJobHistoryIsScoped(t *testing.T) {
+	h := newHarness(t)
+	h.server.cfg.AllowAnonymous = true
+	h.withQueue(t)
+
+	submit := func(session string) string {
+		t.Helper()
+		r := httptest.NewRequest("POST", "/api/v1/annotate",
+			strings.NewReader(`{"snapshot":"s","variants":["chr1:100:A:G"]}`))
+		r.Header.Set("Content-Type", "application/json")
+		if session != "" {
+			r.Header.Set("X-Varhub-Session", session)
+		}
+		w := httptest.NewRecorder()
+		h.http.ServeHTTP(w, r)
+		if w.Code != http.StatusAccepted && w.Code != http.StatusOK {
+			t.Fatalf("submit = %d (%s)", w.Code, w.Body.String())
+		}
+		var body struct {
+			JobID string `json:"job_id"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body.JobID
+	}
+	read := func(id, session string) int {
+		t.Helper()
+		r := httptest.NewRequest("GET", "/api/v1/jobs/"+id, nil)
+		if session != "" {
+			r.Header.Set("X-Varhub-Session", session)
+		}
+		w := httptest.NewRecorder()
+		h.http.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	mine := submit("browser-a")
+	if got := read(mine, "browser-a"); got != http.StatusOK {
+		t.Errorf("reading my own job = %d, want 200", got)
+	}
+	// Someone else's browser, and no scope at all, both get a 404 rather than
+	// a 403 — confirming the job exists is itself a small leak.
+	if got := read(mine, "browser-b"); got != http.StatusNotFound {
+		t.Errorf("another browser reading it = %d, want 404", got)
+	}
+	if got := read(mine, ""); got != http.StatusNotFound {
+		t.Errorf("an unscoped read = %d, want 404", got)
 	}
 }

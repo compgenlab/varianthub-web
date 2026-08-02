@@ -111,6 +111,8 @@ export interface Me {
   can_change_password?: boolean;
   /** True when institutional (CILogon) sign-in is configured. */
   sso_enabled?: boolean;
+  /** True when the server lets callers with no account annotate. */
+  allow_anonymous?: boolean;
 }
 
 export interface ExternalIdentity {
@@ -255,10 +257,32 @@ export function setToken(t: string) {
   else sessionStorage.removeItem(TOKEN_KEY);
 }
 
+// A per-browser id scoping an anonymous visitor's own job history.
+//
+// This is not a credential and grants nothing: the server treats it as a
+// self-asserted history scope, and a job that has a real account behind it
+// ignores it entirely. It exists because without one an anonymous caller can
+// submit a job and then get a 404 reading it back — there would be nothing to
+// scope the result to, and returning everyone's jobs instead is not an option.
+//
+// localStorage rather than sessionStorage so a reload or a new tab still finds
+// yesterday's results, which is the whole point of a history.
+const SESSION_KEY = "vh_history";
+
+function historyID(): string {
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
+}
+
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = { ...extra };
   const t = getToken();
   if (t) h.Authorization = `Bearer ${t}`;
+  h["X-Varhub-Session"] = historyID();
   return h;
 }
 

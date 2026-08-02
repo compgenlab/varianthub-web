@@ -15,6 +15,7 @@ import {
   HardDrive,
   ChartColumn,
   LogOut,
+  LogIn,
   UserRound,
   UsersRound,
 } from "lucide-react";
@@ -65,7 +66,23 @@ function StepHeader() {
   );
 }
 
-function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
+/** What an unidentified caller looks like before the server has said otherwise. */
+const anonymousMe: Me = {
+  anonymous: true,
+  admin: false,
+  label: "anonymous",
+  bootstrap: false,
+};
+
+function Shell({
+  me,
+  onSignIn,
+  children,
+}: {
+  me: Me;
+  onSignIn: () => void;
+  children: React.ReactNode;
+}) {
   const [version, setVersion] = useState("");
   const [snapshots, setSnapshots] = useState<number | null>(null);
 
@@ -92,9 +109,11 @@ function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
             <Table2 /> Results
           </NavLink>
 
-          <NavLink to="/account">
-            <UserRound /> Account
-          </NavLink>
+          {!me.anonymous && (
+            <NavLink to="/account">
+              <UserRound /> Account
+            </NavLink>
+          )}
 
           {/* Role-gated. Hidden rather than disabled for a non-admin: the server
               refuses these routes anyway, and showing them would only advertise
@@ -149,25 +168,35 @@ function Shell({ me, children }: { me: Me; children: React.ReactNode }) {
           style={{ marginTop: "auto", padding: 14, borderTop: "1px solid var(--border)" }}
         >
           <div style={{ fontSize: 12, color: "var(--text-3)", marginBottom: 8 }}>
-            {me.user?.email ?? me.label}
+            {me.anonymous ? "Not signed in" : (me.user?.email ?? me.label)}
           </div>
-          <button
-            className="btn link"
-            style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
-            onClick={async () => {
-              // Ends the session server-side too; clearing the cookie alone
-              // would leave a credential that still works if it is replayed.
-              try {
-                await api.logout();
-              } catch {
-                /* signing out locally matters more than the round trip */
-              }
-              setToken("");
-              location.reload();
-            }}
-          >
-            <LogOut size={14} /> Sign out
-          </button>
+          {me.anonymous ? (
+            <button
+              className="btn link"
+              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
+              onClick={onSignIn}
+            >
+              <LogIn size={14} /> Sign in
+            </button>
+          ) : (
+            <button
+              className="btn link"
+              style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5 }}
+              onClick={async () => {
+                // Ends the session server-side too; clearing the cookie alone
+                // would leave a credential that still works if it is replayed.
+                try {
+                  await api.logout();
+                } catch {
+                  /* signing out locally matters more than the round trip */
+                }
+                setToken("");
+                location.reload();
+              }}
+            >
+              <LogOut size={14} /> Sign out
+            </button>
+          )}
         </div>
       </aside>
 
@@ -194,6 +223,9 @@ export default function App() {
   // indistinguishable here, and only the server can tell them apart.
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
+  // Set when an anonymous visitor asks to sign in, so the wall can be reached
+  // deliberately on an open instance rather than only by being turned away.
+  const [signIn, setSignIn] = useState(false);
 
   useEffect(() => {
     api
@@ -204,7 +236,12 @@ export default function App() {
   }, []);
 
   if (!ready) return null;
-  if (!me || me.anonymous) {
+  // An anonymous visitor gets the app when the server allows it, and the login
+  // wall otherwise. Deciding here from what the server reported keeps the two
+  // in agreement — a UI that gates on its own opinion would show a login screen
+  // for endpoints that would have answered.
+  const anon = !me || me.anonymous;
+  if (anon && !(me?.allow_anonymous && !signIn)) {
     return (
       <SignIn
         me={me ?? { anonymous: true, admin: false, label: "anonymous", bootstrap: false }}
@@ -216,7 +253,7 @@ export default function App() {
   return (
     <BrowserRouter>
       <AnnotateProvider>
-        <Shell me={me}>
+        <Shell me={me ?? anonymousMe} onSignIn={() => setSignIn(true)}>
           <Routes>
             <Route path="/" element={<Navigate to="/annotate/sources" replace />} />
             <Route path="/annotate/sources" element={<ChooseSources />} />
@@ -229,8 +266,8 @@ export default function App() {
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="/admin/metrics" element={<Metrics />} />
-            <Route path="/admin/people" element={<People me={me} />} />
-            <Route path="/account" element={<Account me={me} />} />
+            <Route path="/admin/people" element={<People me={me ?? anonymousMe} />} />
+            <Route path="/account" element={<Account me={me ?? anonymousMe} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>
         </Shell>

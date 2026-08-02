@@ -159,6 +159,11 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
       AWS_REGION: ${AWS_REGION:-us-east-1}
     volumes:
+      # Repeated from x-web, not inherited: a YAML merge key replaces a list
+      # rather than appending to it, so declaring volumes here drops every
+      # volume the anchor set. Leaving it out cost the worker its config file
+      # and left every job queued.
+      - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
       # Working data: tool images, reference files, the annotation cache.
       - varhub-data:/var/lib/varianthub
       # Downloaded source data, always mounted at /mnt/storage inside the

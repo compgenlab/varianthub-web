@@ -18,9 +18,13 @@
   url = ""
 
 [auth]
-  # Let callers with no account use the annotation flow. Off by default:
-  # opening an instance up should be a decision someone made.
-  allow_anonymous = false                           # VHW_ALLOW_ANONYMOUS
+  # On for the dev stack: annotating without signing in is what is being
+  # developed against, and a login wall in front of it slows every test run.
+  #
+  # This is the dev file only. The shipped example leaves it off, and a real
+  # deployment should too — an anonymous caller is exactly who the submit rate
+  # limit exists for.
+  allow_anonymous = true                            # VHW_ALLOW_ANONYMOUS
 
 # Institutional sign-in. All three of client_id, client_secret and redirect_url
 # must be set to enable it; an incomplete set leaves sign-in password-only.
