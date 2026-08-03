@@ -64,6 +64,12 @@ type Source struct {
 	TOML        string `json:"-"` // never serialized to API clients by default
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
+
+	// prefixOverride is this deployment's annotation prefix for the source,
+	// loaded with it by sourceCols. Unexported because it is not part of the
+	// API shape: it has already been folded into the names Annotations()
+	// reports, and offering it separately invites a second interpretation.
+	prefixOverride string
 }
 
 // Ref is the "name:version" reference a snapshot manifest uses.
@@ -158,14 +164,21 @@ func (s *Store) Close() { s.pool.Close() }
 // no benefit, and the two stores would then hold inconsistent views under load.
 func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 
+// The annotation prefix is joined in rather than left to callers to fetch: it
+// renames every field the source contributes, so a Source loaded without it
+// reports names that materialization would not produce, and a snapshot built
+// from those names fails at annotate time with "unknown annotation" — far from
+// the listing that invented them.
 const sourceCols = `id, name, version, title, detail, kind, build, visibility,
-	index_status, origin, toml_text, created_at, updated_at`
+	index_status, origin, toml_text, created_at, updated_at,
+	COALESCE((SELECT annotation_prefix FROM source_settings st
+	          WHERE st.source_id = source.id), '')`
 
 func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	var s Source
 	err := row.Scan(&s.ID, &s.Name, &s.Version, &s.Title, &s.Detail, &s.Kind,
 		&s.Build, &s.Visibility, &s.IndexStatus, &s.Origin, &s.TOML,
-		&s.CreatedAt, &s.UpdatedAt)
+		&s.CreatedAt, &s.UpdatedAt, &s.prefixOverride)
 	if err == nil {
 		s.Stream = streamFromTOML(s.TOML)
 	}

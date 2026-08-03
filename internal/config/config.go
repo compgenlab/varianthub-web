@@ -113,6 +113,8 @@ func Defaults() *Config {
 	return &Config{
 		Addr:            ":8080",
 		Workers:         2,
+		JobSlots:        0, // 0 = follow Workers
+		DownloadWeight:  2,
 		VarhubBin:       "varhub",
 		DataDir:         "/var/lib/varianthub/data",
 		CacheDir:        "/var/lib/varianthub/cache",

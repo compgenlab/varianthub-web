@@ -138,14 +138,69 @@ func AnnotationsFromTOML(text string) []Annotation {
 	return out
 }
 
-// Annotations returns the source's declared fields, attributed to it.
+// Annotations returns the source's output fields, attributed to it and named as
+// this deployment will actually emit them.
+//
+// The prefix is applied here rather than at the call sites because these names
+// are contracts: a snapshot pins its defaults by name, and the field picker
+// submits them back. A listing that showed the manifest's names while
+// materialization emitted prefixed ones would hand out selections that cannot
+// resolve — which is how it failed.
 func (s Source) Annotations() []Annotation {
 	anns := AnnotationsFromTOML(s.TOML)
+	declared, effective := ManifestPrefix(s.TOML), s.EffectiveAnnotationPrefix()
 	for i := range anns {
 		anns[i].Source = s.DisplayName()
 		anns[i].SourceRef = s.Ref()
+		if declared != effective {
+			applyPrefix(&anns[i], declared, effective)
+		}
 	}
 	return anns
+}
+
+// EffectiveAnnotationPrefix is the prefix this deployment applies: its override,
+// else whatever the manifest declared for itself.
+//
+// "-" means deliberately no prefix, which an empty string cannot express — unset
+// has to fall through to the manifest rather than clear it. This mirrors
+// varhub's own resolution, and must keep mirroring it: the two disagreeing is
+// precisely the bug this exists to prevent.
+func (s Source) EffectiveAnnotationPrefix() string {
+	switch s.prefixOverride {
+	case "-":
+		return ""
+	case "":
+		return ManifestPrefix(s.TOML)
+	}
+	return s.prefixOverride
+}
+
+// applyPrefix renames one annotation from the prefix its manifest declares to
+// the effective one.
+//
+// A substitution, not a prepend: a manifest declares the prefix its names
+// already carry — VEP names every field VEP_Allele — so swapping in VEP_113_
+// must replace VEP_ rather than stack onto it.
+//
+// Field is pinned first, because it falls back to Name when empty: renaming
+// Name without that would leave the annotator looking for VEP_113_Allele in a
+// file containing VEP_Allele. A builtin is exempt — it computes its value
+// rather than reading a field, and giving it one would be describing a column
+// that does not exist.
+func applyPrefix(a *Annotation, declared, effective string) {
+	if a.Name == "" {
+		return
+	}
+	if a.Field == "" && a.Builtin == "" {
+		a.Field = a.Name // what the source actually writes, before renaming
+	}
+	switch {
+	case declared != "" && strings.HasPrefix(a.Name, declared):
+		a.Name = effective + strings.TrimPrefix(a.Name, declared)
+	case effective != "" && !strings.HasPrefix(a.Name, effective):
+		a.Name = effective + a.Name
+	}
 }
 
 // DisplayName is the source's title, falling back to its name.

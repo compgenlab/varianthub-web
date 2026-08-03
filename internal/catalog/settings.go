@@ -24,20 +24,120 @@ func (s SourceSettings) Empty() bool {
 
 // PutSettings records a source's settings, removing the row when nothing is set
 // so "no settings" is one state rather than two.
+//
+// A prefix change also rewrites the snapshot defaults that named the source's
+// fields, because those are stored denormalized as plain strings. Without it,
+// setting a prefix silently invalidates every snapshot pinning that source: the
+// bundle still lists auto_id, materialization now emits CG_auto_id, and every
+// job against it fails at annotate time with "unknown annotation" — a long way
+// from the settings form that caused it.
 func (s *Store) PutSettings(ctx context.Context, sourceID string, set SourceSettings) error {
-	if set.Empty() {
-		_, err := s.pool.Exec(ctx, `DELETE FROM source_settings WHERE source_id=$1`, sourceID)
+	before, err := s.effectiveNames(ctx, sourceID)
+	if err != nil {
 		return err
 	}
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO source_settings (source_id, annotation_prefix, cache_setup, updated_at)
-		VALUES ($1,$2,$3,$4)
-		ON CONFLICT (source_id) DO UPDATE
-		   SET annotation_prefix = excluded.annotation_prefix,
-		       cache_setup       = excluded.cache_setup,
-		       updated_at        = excluded.updated_at`,
-		sourceID, strings.TrimSpace(set.AnnotationPrefix), set.CacheSetup, s.nowFn())
-	return err
+
+	if set.Empty() {
+		_, err = s.pool.Exec(ctx, `DELETE FROM source_settings WHERE source_id=$1`, sourceID)
+	} else {
+		_, err = s.pool.Exec(ctx, `
+			INSERT INTO source_settings (source_id, annotation_prefix, cache_setup, updated_at)
+			VALUES ($1,$2,$3,$4)
+			ON CONFLICT (source_id) DO UPDATE
+			   SET annotation_prefix = excluded.annotation_prefix,
+			       cache_setup       = excluded.cache_setup,
+			       updated_at        = excluded.updated_at`,
+			sourceID, strings.TrimSpace(set.AnnotationPrefix), set.CacheSetup, s.nowFn())
+	}
+	if err != nil {
+		return err
+	}
+
+	after, err := s.effectiveNames(ctx, sourceID)
+	if err != nil {
+		return err
+	}
+	return s.renameSnapshotDefaults(ctx, sourceID, before, after)
+}
+
+// effectiveNames lists a source's output names as they stand right now, indexed
+// by the manifest name they came from — the stable identity across a rename.
+func (s *Store) effectiveNames(ctx context.Context, sourceID string) (map[string]string, error) {
+	src, err := s.GetSource(ctx, sourceID)
+	if err != nil {
+		return nil, nil // a source that is not there yet has no names to carry
+	}
+	// Pair manifest name to emitted name positionally: both lists are built from
+	// the same manifest in the same order, so index i is the same annotation.
+	raw, eff := AnnotationsFromTOML(src.TOML), src.Annotations()
+	out := make(map[string]string, len(raw))
+	for i := range raw {
+		if i < len(eff) {
+			out[raw[i].Name] = eff[i].Name
+		}
+	}
+	return out, nil
+}
+
+// renameSnapshotDefaults carries a rename into the bundles that pinned the old
+// names, leaving every other default untouched.
+//
+// Only defaults belonging to this source are considered: two sources can emit
+// the same bare name, and rewriting another source's default because the string
+// matched would silently repoint it.
+func (s *Store) renameSnapshotDefaults(ctx context.Context, sourceID string, before, after map[string]string) error {
+	rename := map[string]string{}
+	for manifestName, old := range before {
+		if now, ok := after[manifestName]; ok && now != old {
+			rename[old] = now
+		}
+	}
+	if len(rename) == 0 {
+		return nil
+	}
+
+	rows, err := s.pool.Query(ctx, `
+		SELECT sn.id, sn.defaults
+		  FROM snapshot sn
+		  JOIN snapshot_source ss ON ss.snapshot_id = sn.id
+		 WHERE ss.source_id = $1`, sourceID)
+	if err != nil {
+		return err
+	}
+	type update struct {
+		id   string
+		defs []string
+	}
+	var todo []update
+	for rows.Next() {
+		var u update
+		if err := rows.Scan(&u.id, &u.defs); err != nil {
+			rows.Close()
+			return err
+		}
+		changed := false
+		for i, d := range u.defs {
+			if now, ok := rename[d]; ok {
+				u.defs[i], changed = now, true
+			}
+		}
+		if changed {
+			todo = append(todo, u)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
+	for _, u := range todo {
+		if _, err := s.pool.Exec(ctx,
+			`UPDATE snapshot SET defaults=$2, updated_at=$3 WHERE id=$1`,
+			u.id, u.defs, s.nowFn()); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Settings returns one source's settings; the zero value when it has none.

@@ -337,3 +337,31 @@ func TestDownloadTimeout(t *testing.T) {
 			d.DownloadTimeout, d.JobTimeout)
 	}
 }
+
+// The weight model is inert if its defaults are zero: weightOf(0) is 1, so a
+// download would occupy one slot like an annotation and two would run at once —
+// exactly what the model exists to prevent. This asserts the resolved values
+// rather than the code that sets them, because the way this broke was an edit
+// that silently did not apply.
+func TestPoolDefaults(t *testing.T) {
+	t.Chdir(t.TempDir())
+	t.Setenv("VHW_CONFIG", "")
+	t.Setenv("VHW_DATABASE_URL", "postgres://x/db")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.DownloadWeight < 2 {
+		t.Errorf("DownloadWeight = %d; a download must cost more than an annotation",
+			c.DownloadWeight)
+	}
+	if c.JobSlots != c.Workers {
+		t.Errorf("JobSlots = %d, want it to follow Workers (%d)", c.JobSlots, c.Workers)
+	}
+	// The property that matters: one download fills the pool, so a second waits.
+	if c.DownloadWeight*2 <= c.JobSlots {
+		t.Errorf("two downloads fit in the pool (weight %d each, %d slots)",
+			c.DownloadWeight, c.JobSlots)
+	}
+}
