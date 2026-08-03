@@ -177,6 +177,16 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer q.Close()
 
+	// Recover jobs a previous worker died holding. Only the worker does this,
+	// and only before it starts claiming: the API opens the same queue, and
+	// recovering inside Open meant an API restart requeued whatever this worker
+	// was running, underneath it.
+	if n, rErr := q.RequeueInterrupted(ctx); rErr != nil {
+		return rErr
+	} else if n > 0 {
+		log.Printf("worker: requeued %d job(s) left running by a previous worker", n)
+	}
+
 	q.SetMaxJobsPerIP(cfg.MaxJobsPerIP)
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))

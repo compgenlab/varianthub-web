@@ -233,6 +233,7 @@ type Runner func(ctx context.Context, job Job, input []byte) (Outcome, error)
 // Queue is the job queue and its worker pool.
 type Queue struct {
 	pool  *pgxpool.Pool
+	dsn   string // retained so callers can open a second connection to the same database
 	nowFn func() int64
 
 	maxJobsPerIP int // per-IP concurrent running-job cap (<=0 = unlimited)
@@ -268,18 +269,38 @@ func Open(ctx context.Context, dsn string) (*Queue, error) {
 	}
 	q := &Queue{
 		pool:    pool,
+		dsn:     dsn,
 		nowFn:   func() int64 { return time.Now().Unix() },
 		waiters: map[string][]chan struct{}{},
 		queued:  make(chan struct{}, 1),
 		running: map[string]*runningJob{},
 	}
-	if _, err := pool.Exec(ctx,
-		`UPDATE job SET status=$1, started_at=NULL WHERE status=$2`,
-		StatusQueued, StatusRunning); err != nil {
-		pool.Close()
-		return nil, fmt.Errorf("requeue interrupted jobs: %w", err)
-	}
 	return q, nil
+}
+
+// RequeueInterrupted returns jobs left running by a crashed worker to the queue,
+// reporting how many it recovered.
+//
+// Deliberately not part of Open. Both the API and the worker open the queue, so
+// recovering there meant restarting the API reset every running job underneath
+// the worker still executing it — the row became claimable while the original
+// process kept going, so a multi-hour download could run twice at once against
+// the same destination, with nothing logged to say so.
+//
+// Only the worker calls this, and only before it starts claiming. That makes it
+// correct for one worker process, which is what a deployment runs today. With
+// several worker replicas it is not: a replica starting up cannot tell a job
+// abandoned by a dead peer from one a live peer is running, and would take both.
+// Fixing that needs a claim to carry an owner and a lease it renews, so an
+// unrenewed lease is the signal rather than the mere fact of starting up.
+func (q *Queue) RequeueInterrupted(ctx context.Context) (int, error) {
+	tag, err := q.pool.Exec(ctx,
+		`UPDATE job SET status=$1, started_at=NULL WHERE status=$2`,
+		StatusQueued, StatusRunning)
+	if err != nil {
+		return 0, fmt.Errorf("requeue interrupted jobs: %w", err)
+	}
+	return int(tag.RowsAffected()), nil
 }
 
 // Close releases the connection pool.
@@ -566,6 +587,14 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 // lock the nullable side of an outer join, and r is a LEFT JOIN subquery. Locking
 // only j is both legal and what we want. SKIP LOCKED is what lets N workers claim
 // N distinct jobs concurrently instead of serializing on the same head-of-queue row.
+//
+// An idle pool takes the next job whatever it weighs. Without that, a job heavier
+// than the entire budget is unclaimable rather than merely exclusive: on a
+// one-slot pool 0+2 <= 1 is false, so a weight-2 download waits behind nothing at
+// all, forever and silently. VHW_WORKERS=1 is an ordinary deployment and slots
+// follow workers, so that is a default configuration, not a corner. Weight is
+// there to stop jobs overlapping, not to make them unrunnable — one too big for
+// the pool should run alone, which is what an empty pool already guarantees.
 const claimQuery = `
 UPDATE job SET status = $1, started_at = $2
 WHERE id = (
@@ -574,8 +603,11 @@ WHERE id = (
   LEFT JOIN (
     SELECT client_ip, COUNT(*) AS c FROM job WHERE status = $1 GROUP BY client_ip
   ) r ON r.client_ip = j.client_ip
+  CROSS JOIN (
+    SELECT COALESCE(SUM(weight),0) AS used FROM job WHERE status = $1
+  ) p
   WHERE j.status = $3 AND COALESCE(r.c, 0) < $4
-    AND (SELECT COALESCE(SUM(weight),0) FROM job WHERE status = $1) + j.weight <= $5
+    AND (p.used = 0 OR p.used + j.weight <= $5)
   ORDER BY COALESCE(r.c, 0) ASC, j.created_at ASC, j.id ASC
   FOR UPDATE OF j SKIP LOCKED
   LIMIT 1

@@ -330,3 +330,47 @@ func TestLightJobsStillShareThePool(t *testing.T) {
 		t.Error("a third job was claimed with both slots in use")
 	}
 }
+
+// A job heavier than the whole pool must still run — alone.
+//
+// Otherwise it is unclaimable: the predicate asks whether the running total
+// plus this job fits, and on an idle single-slot pool 0+2 <= 1 is false, so a
+// weight-2 download sits queued forever behind nothing at all. There is no
+// error and no log line; the queue simply never picks it up, which reads as a
+// hung worker rather than a budget that cannot express the job.
+//
+// VHW_WORKERS=1 is an ordinary small deployment, and JobSlots follows Workers,
+// so this is the default single-worker configuration rather than a corner.
+func TestAJobHeavierThanThePoolStillRuns(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	q.SetSlots(1) // one worker; a download weighs 2
+
+	id, err := q.Enqueue(ctx, NewJob{
+		Kind: KindDownload, Snapshot: "s", Weight: 2, Body: []byte("{}"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, _, ok, err := q.claimNext(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatalf("weight-2 job never claimed on a 1-slot pool: it would queue forever")
+	}
+	if got.ID != id {
+		t.Fatalf("claimed %s, want %s", got.ID, id)
+	}
+
+	// It still holds the pool exclusively: nothing else may join it.
+	if _, err = q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err = q.claimNext(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Error("a second job joined an already-oversubscribed pool")
+	}
+}

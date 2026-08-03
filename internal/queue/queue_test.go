@@ -469,3 +469,45 @@ func TestConcurrentClaimsAreDistinct(t *testing.T) {
 		t.Errorf("claimed %d of %d jobs; workers lost claims instead of taking distinct rows", claimed, n)
 	}
 }
+
+// Opening the queue must not disturb work already in flight.
+//
+// Crash recovery used to live in Open, which both the API and the worker call.
+// So restarting the API — a config change, a redeploy, `make dev-tls` — reset
+// every running job to queued underneath the worker still executing it. The
+// worker kept going and the row was claimable again, so a multi-hour VEP or
+// CADD download could run twice at once, each unaware of the other, writing the
+// same destination. Nothing logged an error; the job simply appeared to restart.
+func TestOpeningTheQueueLeavesRunningJobsAlone(t *testing.T) {
+	dsn := os.Getenv("VHW_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("VHW_TEST_DATABASE_URL not set")
+	}
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	// A second process opens the same database — this is the API starting up
+	// while the worker is busy.
+	other, err := Open(ctx, q.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+
+	job, ok, err := q.Get(ctx, id)
+	if err != nil || !ok {
+		t.Fatalf("get: ok=%v err=%v", ok, err)
+	}
+	if job.Status != StatusRunning {
+		t.Fatalf("job is %q after another process opened the queue; "+
+			"it was still running and is now claimable a second time", job.Status)
+	}
+}
