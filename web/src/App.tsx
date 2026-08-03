@@ -32,6 +32,8 @@ import Account from "./screens/Account";
 import Groups from "./screens/Groups";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
+import SourceDetail from "./screens/SourceDetail";
+import SnapshotDetail from "./screens/SnapshotDetail";
 import JobDetail from "./screens/JobDetail";
 import SystemJobs from "./screens/SystemJobs";
 import Files from "./screens/Files";
@@ -263,6 +265,8 @@ export default function App() {
             <Route path="/jobs" element={<JobsList />} />
             <Route path="/jobs/:jobId" element={<JobResults />} />
             <Route path="/admin" element={<Admin />} />
+            <Route path="/admin/sources/:sourceId" element={<SourceDetail />} />
+            <Route path="/admin/snapshots/:snapshotId" element={<SnapshotDetail />} />
             <Route path="/admin/storage" element={<Files />} />
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Check, Cloud, Globe, HardDrive, Plus, Settings2, Trash2, X } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Check, Cloud, Globe, HardDrive, Plus, X } from "lucide-react";
 
 import {
   api,
@@ -10,7 +11,6 @@ import {
   type SourceFile,
   type SourceAsset,
   type StorageLocation,
-  type Team,
 } from "../api";
 import { humanSize } from "./Files";
 
@@ -169,7 +169,7 @@ export default function Admin() {
               <Plus size={15} /> New snapshot
             </button>
           </div>
-          <SnapshotList snapshots={snapshots} allSources={sources} onChange={load} />
+          <SnapshotList snapshots={snapshots} onChange={load} />
         </>
       )}
     </div>
@@ -189,9 +189,7 @@ function SourceTable({
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
-  const [showConfig, setShowConfig] = useState("");
-  const [showGrants, setShowGrants] = useState("");
-  const [showSettings, setShowSettings] = useState("");
+
 
   // A source is "provisioned" when files are recorded for it. Summarized per
   // source *and* per location: a source can be in two places at once, and
@@ -229,22 +227,13 @@ function SourceTable({
           }}
         >
           <span>
-            <button
-              onClick={() => setShowConfig(showConfig === s.id ? "" : s.id)}
-              title="Show this source's manifest"
-              style={{
-                background: "none",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-                textAlign: "left",
-                fontSize: 14,
-                fontWeight: 500,
-                color: "var(--accent-text)",
-              }}
+            <Link
+              to={`/admin/sources/${encodeURIComponent(s.id)}`}
+              title="Open this source"
+              style={{ fontSize: 14, fontWeight: 500, color: "var(--accent-text)" }}
             >
               {s.title || s.name}
-            </button>
+            </Link>
             <br />
             <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
               {s.origin || s.id}
@@ -270,19 +259,7 @@ function SourceTable({
               color: s.visibility === "private" ? "var(--private)" : "var(--text-2)",
             }}
           >
-            {s.visibility === "private" ? (
-              // Private is the default, so most sources land here; the button
-              // is what decides who can actually see them.
-              <button
-                className="btn link"
-                style={{ fontSize: 12.5, padding: 0, color: "var(--private)" }}
-                onClick={() => setShowGrants(showGrants === s.id ? "" : s.id)}
-              >
-                Private ▾
-              </button>
-            ) : (
-              "Public"
-            )}
+            {s.visibility === "private" ? "Private" : "Public"}
           </span>
           <ProvisionCell
             source={s}
@@ -291,116 +268,22 @@ function SourceTable({
             targets={targets}
             onChange={onChange}
           />
-          <span className="row gap-8" style={{ justifyContent: "flex-end" }}>
-            <button
+          <span style={{ textAlign: "right" }}>
+            <Link
+              to={`/admin/sources/${encodeURIComponent(s.id)}`}
               className="btn link"
-              style={{ fontSize: 12 }}
-              title="Settings for this source"
-              onClick={() => setShowSettings(showSettings === s.id ? "" : s.id)}
+              style={{ fontSize: 12.5 }}
             >
-              <Settings2 size={14} />
-            </button>
-            <DeleteSource source={s} onChange={onChange} />
+              Open
+            </Link>
           </span>
-          {showConfig === s.id && <SourceConfig id={s.id} />}
-          {showGrants === s.id && <SourceGrants id={s.id} />}
-          {showSettings === s.id && <SourceSettingsPanel source={s} />}
         </div>
       ))}
     </div>
   );
 }
 
-/**
- * Shows a source's stored manifest.
- *
- * The manifest is the source of truth — the listed columns are a projection of
- * it — so this is how an admin checks what a source actually declares instead
- * of inferring it from the row.
- */
-function SourceConfig({ id }: { id: string }) {
-  const [toml, setToml] = useState("");
-  const [err, setErr] = useState("");
 
-  useEffect(() => {
-    let live = true;
-    api
-      .sourceConfig(id)
-      .then((r) => live && setToml(r.config))
-      .catch((e) => live && setErr(String(e.message ?? e)));
-    return () => {
-      live = false;
-    };
-  }, [id]);
-
-  return (
-    <pre
-      className="mono"
-      style={{
-        gridColumn: "1 / -1",
-        margin: "10px 0 0",
-        padding: 12,
-        fontSize: 12,
-        lineHeight: 1.5,
-        background: "var(--surface-2)",
-        border: "1px solid var(--hairline)",
-        borderRadius: 6,
-        overflowX: "auto",
-        whiteSpace: "pre",
-        color: err ? "var(--danger)" : "var(--text-1)",
-      }}
-    >
-      {err || toml || "Loading…"}
-    </pre>
-  );
-}
-
-/**
- * Removes a source. Refused server-side while a snapshot pins it — removing it
- * would silently change what those snapshots mean — so the error names the
- * snapshots to detach rather than the button being pre-disabled on a guess.
- */
-function DeleteSource({ source, onChange }: { source: Source; onChange: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  return (
-    <span>
-      <button
-        className="icon-btn"
-        title={`Remove ${source.name}`}
-        disabled={busy}
-        onClick={async () => {
-          if (
-            !confirm(
-              `Remove source "${source.title || source.name}"?\n\n` +
-                `Its downloaded files are reclaimed in the background. ` +
-                `This is refused if any snapshot pins it.`,
-            )
-          )
-            return;
-          setBusy(true);
-          setErr("");
-          try {
-            await api.deleteSource(source.id);
-            onChange();
-          } catch (e) {
-            setErr(e instanceof Error ? e.message : String(e));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Trash2 size={14} />
-      </button>
-      {err && (
-        <span className="err" style={{ fontSize: 11, display: "block", marginTop: 4 }}>
-          {err}
-        </span>
-      )}
-    </span>
-  );
-}
 
 /**
  * One place a source's data is stored.
@@ -581,15 +464,12 @@ function ProvisionCell({
 
 function SnapshotList({
   snapshots,
-  allSources,
   onChange,
 }: {
   snapshots: Snapshot[];
-  allSources: Source[];
   onChange: () => void;
 }) {
   const [busy, setBusy] = useState("");
-  const [editing, setEditing] = useState("");
   const [err, setErr] = useState("");
 
   async function act(id: string, fn: () => Promise<unknown>) {
@@ -614,7 +494,12 @@ function SnapshotList({
           <div className="between" style={{ gap: 14 }}>
             <div>
               <div className="row gap-10">
-                <span style={{ fontSize: 15, fontWeight: 600 }}>{s.title || s.id}</span>
+                <Link
+                  to={`/admin/snapshots/${encodeURIComponent(s.id)}`}
+                  style={{ fontSize: 15, fontWeight: 600, color: "var(--accent-text)" }}
+                >
+                  {s.title || s.id}
+                </Link>
                 <span
                   className="mono"
                   style={{
@@ -634,12 +519,13 @@ function SnapshotList({
               </div>
             </div>
             <div className="row gap-8">
-              <button
+              <Link
                 className="btn secondary sm"
-                onClick={() => setEditing(editing === s.id ? "" : s.id)}
+                style={{ textDecoration: "none" }}
+                to={`/admin/snapshots/${encodeURIComponent(s.id)}`}
               >
-                {editing === s.id ? "Close" : "Edit"}
-              </button>
+                Open
+              </Link>
               {s.state !== "published" && (
                 <button
                   className="btn sm"
@@ -668,123 +554,12 @@ function SnapshotList({
             </div>
           </div>
 
-          {editing === s.id && (
-            <>
-              <EditSnapshot
-                snapshot={s}
-                onDone={() => {
-                  setEditing("");
-                  onChange();
-                }}
-              />
-              <EditSnapshotSources snapshot={s} sources={allSources} onChange={onChange} />
-            </>
-          )}
         </div>
       ))}
     </div>
   );
 }
 
-/**
- * Edits a snapshot's title and default fields.
- *
- * Available on a published snapshot too. Publishing fixes the pinned source
- * *versions* — that is what reproducibility rests on — not the label or which
- * fields are pre-checked. A job records the annotations it actually ran with, so
- * changing a default does not rewrite history.
- */
-function EditSnapshot({ snapshot, onDone }: { snapshot: Snapshot; onDone: () => void }) {
-  const [title, setTitle] = useState(snapshot.title ?? "");
-  const [defaults, setDefaults] = useState((snapshot.defaults ?? []).join(", "));
-  const [fields, setFields] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    api
-      .snapshot(snapshot.id)
-      .then((d) => setFields((d.annotations ?? []).map((a) => a.name)))
-      .catch(() => {});
-  }, [snapshot.id]);
-
-  const chosen = defaults.split(",").map((d) => d.trim()).filter(Boolean);
-
-  return (
-    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--hairline)" }}>
-      <div className="row gap-14" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
-        <div style={{ flex: 1, minWidth: 240 }}>
-          <label className="label">Title</label>
-          <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
-        </div>
-        <div style={{ flex: 2, minWidth: 280 }}>
-          <label className="label">Default fields (comma-separated)</label>
-          <input
-            className="input mono"
-            style={{ fontSize: 12 }}
-            value={defaults}
-            onChange={(e) => setDefaults(e.target.value)}
-          />
-        </div>
-      </div>
-
-      {fields.length > 0 && (
-        <div className="row gap-8" style={{ flexWrap: "wrap", marginTop: 10 }}>
-          {fields.map((f) => {
-            const on = chosen.includes(f);
-            return (
-              <button
-                key={f}
-                className="tag"
-                style={{
-                  cursor: "pointer",
-                  border: "none",
-                  background: on ? "var(--accent-tint)" : "var(--neutral-fill)",
-                  color: on ? "var(--accent-text)" : "var(--text-2)",
-                }}
-                onClick={() =>
-                  setDefaults(
-                    (on ? chosen.filter((c) => c !== f) : [...chosen, f]).join(", "),
-                  )
-                }
-              >
-                {on ? "✓ " : "+ "}
-                {f}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {err && <p className="err" style={{ fontSize: 12.5, marginTop: 10 }}>{err}</p>}
-
-      <div className="row gap-8" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-        <button
-          className="btn sm"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            setErr("");
-            try {
-              await api.updateSnapshotMeta(snapshot.id, { title, defaults: chosen });
-              onDone();
-            } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {busy ? "Saving…" : "Save"}
-        </button>
-      </div>
-      <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
-        Pinned source versions cannot be changed once published — that is what makes
-        a snapshot reproducible. Create a new snapshot to change them.
-      </p>
-    </div>
-  );
-}
 
 function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => void }) {
   const [toml, setToml] = useState(DEFAULT_TOML);
@@ -1532,310 +1307,5 @@ function BuildSnapshot({
   );
 }
 
-/**
- * Adds and removes a snapshot's sources.
- *
- * Refused server-side once published: a published snapshot is a reproducibility
- * claim, so changing which sources it contains would silently change what every
- * past result meant. The checkboxes are disabled rather than the request being
- * allowed to fail, since there is nothing the user could do to make it succeed.
- *
- * Sources whose assembly differs from the snapshot's are also disabled, with the
- * mismatch named. A wrong assembly does not error at annotate time — it returns
- * plausible answers at coordinates that mean something else — so it is worth
- * refusing at the point of choosing rather than explaining afterwards.
- */
-function EditSnapshotSources({
-  snapshot,
-  sources,
-  onChange,
-}: {
-  snapshot: Snapshot;
-  sources: Source[];
-  onChange: () => void;
-}) {
-  const pinned = new Set((snapshot.sources ?? []).map((s) => s.id));
-  const [picked, setPicked] = useState<Set<string>>(new Set(pinned));
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const frozen = snapshot.state === "published";
 
-  const dirty =
-    picked.size !== pinned.size || [...picked].some((id) => !pinned.has(id));
 
-  function toggle(id: string) {
-    const next = new Set(picked);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setPicked(next);
-  }
-
-  async function save() {
-    setBusy(true);
-    setErr("");
-    try {
-      await api.setSnapshotSources(snapshot.id, [...picked]);
-      onChange();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--hairline)" }}>
-      <div className="between" style={{ marginBottom: 8 }}>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>Sources</span>
-        {!frozen && dirty && (
-          <button className="btn sm" disabled={busy || picked.size === 0} onClick={save}>
-            {busy ? "Saving…" : "Save sources"}
-          </button>
-        )}
-      </div>
-      {frozen && (
-        <p style={{ fontSize: 12, color: "var(--text-3)", margin: "0 0 8px" }}>
-          Published — its sources are fixed. Duplicate it to change them.
-        </p>
-      )}
-      {err && <p className="err">{err}</p>}
-      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        {sources.map((src) => {
-          const clash = !!src.build && !!snapshot.build && src.build !== snapshot.build;
-          return (
-            <label
-              key={src.id}
-              className="row gap-8"
-              style={{
-                fontSize: 13,
-                opacity: frozen || clash ? 0.55 : 1,
-                cursor: frozen || clash ? "not-allowed" : "pointer",
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={picked.has(src.id)}
-                disabled={frozen || clash}
-                onChange={() => toggle(src.id)}
-              />
-              <span>{src.title || src.name}</span>
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
-                {src.id}
-              </span>
-              {clash && (
-                <span style={{ fontSize: 11, color: "var(--path-fg)" }}>
-                  {src.build}, not {snapshot.build}
-                </span>
-              )}
-            </label>
-          );
-        })}
-      </div>
-    </div>
-  );
-}
-
-/**
- * What this deployment decided about a source.
- *
- * Separate from the manifest, which belongs to whoever published it: a prefix
- * chosen here has to survive re-fetching that manifest from a registry, so the
- * two are stored apart and shown apart.
- */
-function SourceSettingsPanel({ source }: { source: Source }) {
-  const [prefix, setPrefix] = useState("");
-  const [cacheSetup, setCacheSetup] = useState(false);
-  const [manifestPrefix, setManifestPrefix] = useState("");
-  const [isTool, setIsTool] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    let live = true;
-    api
-      .sourceSettings(source.id)
-      .then((r) => {
-        if (!live) return;
-        setPrefix(r.settings.annotation_prefix ?? "");
-        setCacheSetup(!!r.settings.cache_setup);
-        setManifestPrefix(r.manifest_prefix ?? "");
-        setIsTool(r.is_tool);
-      })
-      .catch((e) => live && setErr(e instanceof Error ? e.message : String(e)));
-    return () => {
-      live = false;
-    };
-  }, [source.id]);
-
-  async function save() {
-    setBusy(true);
-    setErr("");
-    try {
-      await api.setSourceSettings(source.id, {
-        annotation_prefix: prefix.trim(),
-        cache_setup: cacheSetup,
-      });
-      setSaved(true);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div
-      style={{
-        gridColumn: "1 / -1",
-        padding: "12px 4px 4px",
-        borderTop: "1px solid var(--hairline)",
-        marginTop: 10,
-      }}
-    >
-      <div className="label" style={{ marginBottom: 8 }}>
-        Settings
-      </div>
-
-      <label className="label" style={{ marginBottom: 4 }}>
-        Annotation prefix
-      </label>
-      <div className="row gap-8" style={{ flexWrap: "wrap" }}>
-        <input
-          className="input mono"
-          style={{ width: 220 }}
-          value={prefix}
-          placeholder={manifestPrefix || "(none)"}
-          onChange={(e) => {
-            setPrefix(e.target.value);
-            setSaved(false);
-          }}
-        />
-        <label className="row gap-8" style={{ fontSize: 12.5 }}>
-          <input
-            type="checkbox"
-            checked={cacheSetup}
-            disabled={!isTool}
-            onChange={(e) => {
-              setCacheSetup(e.target.checked);
-              setSaved(false);
-            }}
-          />
-          {/* Only a tool has setup output, and only an object-store target has
-              anywhere to put it. */}
-          Publish setup data{isTool ? "" : " (tools only)"}
-        </label>
-        <button className="btn" disabled={busy} onClick={save}>
-          {busy ? "Saving…" : saved ? "Saved" : "Save"}
-        </button>
-      </div>
-      <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0", lineHeight: 1.55 }}>
-        {/* An empty box and "no prefix" look the same but are not, so say which
-            this is. */}
-        {manifestPrefix
-          ? `Blank falls back to the manifest's own prefix, ${manifestPrefix}. Enter "-" for no prefix at all.`
-          : `This source's manifest declares no prefix, so blank means its fields keep the names it gives them.`}{" "}
-        Renaming affects output field names only, not what is read from the file.
-      </p>
-      {err && (
-        <p className="err" style={{ fontSize: 12.5, marginTop: 8 }}>
-          {err}
-        </p>
-      )}
-    </div>
-  );
-}
-
-/**
- * Which groups may see a private source.
- *
- * Grants attach to groups rather than to individuals so that access survives
- * membership changes: adding someone to the group is one action, not one per
- * source they need. (The API still calls these teams.)
- */
-function SourceGrants({ id }: { id: string }) {
-  const [granted, setGranted] = useState<Team[]>([]);
-  const [teams, setTeams] = useState<Team[]>([]);
-  const [err, setErr] = useState("");
-
-  async function load() {
-    try {
-      const [g, all] = await Promise.all([api.grants(id), api.teams()]);
-      setGranted(g.teams ?? []);
-      setTeams(all.teams ?? []);
-      setErr("");
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  }
-  useEffect(() => {
-    load();
-  }, [id]);
-
-  async function act<T>(fn: () => Promise<T>) {
-    try {
-      await fn();
-      await load();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    }
-  }
-
-  return (
-    <div
-      style={{
-        gridColumn: "1 / -1",
-        padding: "12px 4px 4px",
-        borderTop: "1px solid var(--hairline)",
-        marginTop: 10,
-      }}
-    >
-      <div className="label" style={{ marginBottom: 8 }}>
-        Groups with access
-      </div>
-      {err && <p className="err" style={{ fontSize: 12.5 }}>{err}</p>}
-      <div className="row gap-8" style={{ flexWrap: "wrap" }}>
-        {granted.map((t) => (
-          <span key={t.id} className="tag" style={{ display: "inline-flex", gap: 6 }}>
-            {t.name}
-            <button
-              className="btn link"
-              style={{ padding: 0, fontSize: 11 }}
-              onClick={() => act(() => api.revokeGrant(id, t.id))}
-              title="Revoke access"
-            >
-              ×
-            </button>
-          </span>
-        ))}
-        {granted.length === 0 && (
-          <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
-            No groups — only administrators can see this source.
-          </span>
-        )}
-      </div>
-      <select
-        className="select"
-        style={{ fontSize: 12.5, padding: "4px 8px", marginTop: 10, maxWidth: 260 }}
-        value=""
-        onChange={(e) => {
-          if (e.target.value) act(() => api.grant(id, e.target.value));
-        }}
-      >
-        <option value="">Grant to a group…</option>
-        {teams
-          .filter((t) => !granted.some((g) => g.id === t.id))
-          .map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name}
-            </option>
-          ))}
-      </select>
-      {teams.length === 0 && (
-        <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
-          No groups exist yet — create one under <strong>Users &amp; groups</strong>.
-        </p>
-      )}
-    </div>
-  );
-}
