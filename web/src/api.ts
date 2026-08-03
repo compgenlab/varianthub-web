@@ -472,7 +472,18 @@ export const api = {
   // token is effectively an administrative credential.
 
   validateSource: (toml: string) =>
-    req<{ valid: boolean; error?: string; id?: string; name?: string; version?: string; kind?: string }>(
+    req<{
+      valid: boolean;
+      error?: string;
+      id?: string;
+      name?: string;
+      version?: string;
+      kind?: string;
+      /** True when the source has files to fetch before it can be annotated with. */
+      needs_data?: boolean;
+      /** True when it is read from its origin instead. */
+      stream?: boolean;
+    }>(
       "/admin/sources/validate",
       {
         method: "POST",

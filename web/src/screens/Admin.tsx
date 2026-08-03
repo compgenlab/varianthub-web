@@ -775,11 +775,25 @@ function EditSnapshot({ snapshot, onDone }: { snapshot: Snapshot; onDone: () => 
 
 function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => void }) {
   const [toml, setToml] = useState(DEFAULT_TOML);
-  const [check, setCheck] = useState<{ valid: boolean; error?: string; id?: string; kind?: string } | null>(null);
+  // Derived from the client rather than restated: this had drifted from what
+  // the endpoint actually returns, so fields the server sent were invisible here.
+  const [check, setCheck] = useState<Awaited<ReturnType<typeof api.validateSource>> | null>(null);
   const [priv, setPriv] = useState(false);
   const [origin, setOrigin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  // Where the data should go, asked here rather than after registering.
+  //
+  // A source with files is not usable until they are fetched, and the previous
+  // flow ended at "registered" — leaving a source that looks present and fails
+  // at annotate time with "sources not downloaded". Asking now means one
+  // decision instead of a second trip through a different screen.
+  const [targets, setTargets] = useState<StorageLocation[]>([]);
+  const [target, setTarget] = useState("");
+  // Off for a streamed source: it reads from its origin, so a copy is a
+  // deliberate extra rather than the thing that makes it work.
+  const [alsoCopy, setAlsoCopy] = useState(false);
 
   const [registries, setRegistries] = useState<Registry[]>([]);
   const [regID, setRegID] = useState("");
@@ -800,6 +814,14 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   }
   useEffect(() => {
     loadRegistries();
+    api
+      .storage()
+      .then((r) => {
+        const usable = (r.storage ?? []).filter((l) => l.usable);
+        setTargets(usable);
+        setTarget(usable.find((l) => l.is_default)?.id ?? usable[0]?.id ?? "");
+      })
+      .catch(() => setTargets([]));
   }, []);
 
   // Fetching a registry's catalog hits a remote; keep it out of the render path
@@ -840,15 +862,41 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
     }
   }
 
+  // What this source will need after it is registered.
+  const needsData = check?.valid === true && check.needs_data === true;
+  const streamed = check?.valid === true && check.stream === true;
+  const willDownload = (needsData || (streamed && alsoCopy)) && !!target;
+
   async function register() {
     setBusy(true);
     setErr("");
     try {
-      await api.createSource({
+      const created = await api.createSource({
         toml,
         visibility: priv ? "private" : "public",
         origin: origin || undefined,
       });
+      if (willDownload) {
+        // Queued immediately, and separately: the source is registered either
+        // way. A queue that refuses the job should not roll back a manifest
+        // that is already correct — it should say so and leave the download to
+        // be retried from the sources list.
+        try {
+          await api.download({
+            sources: [created.id],
+            storage_id: target,
+            include_streamed: streamed,
+          });
+        } catch (e) {
+          setErr(
+            `Registered ${created.ref}, but the download could not be queued: ` +
+              (e instanceof Error ? e.message : String(e)) +
+              ". Start it from the sources list.",
+          );
+          setBusy(false);
+          return;
+        }
+      }
       onDone();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -1003,18 +1051,125 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             </p>
           )}
 
+          {(needsData || streamed) && (
+            <DownloadTarget
+              needsData={needsData}
+              streamed={streamed}
+              targets={targets}
+              target={target}
+              setTarget={setTarget}
+              alsoCopy={alsoCopy}
+              setAlsoCopy={setAlsoCopy}
+            />
+          )}
+
           {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
 
           <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
             <button className="btn secondary" onClick={onCancel}>
               Cancel
             </button>
-            <button className="btn" disabled={busy || !check?.valid} onClick={register}>
-              {busy ? "Registering…" : "Validate & register"}
+            <button
+              className="btn"
+              disabled={busy || !check?.valid || (needsData && targets.length > 0 && !target)}
+              onClick={register}
+            >
+              {busy
+                ? willDownload
+                  ? "Registering & queueing…"
+                  : "Registering…"
+                : willDownload
+                  ? "Register & download"
+                  : "Validate & register"}
             </button>
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * Where a newly registered source's data should go.
+ *
+ * Shown before registering rather than after, because "registered" and "usable"
+ * are different states and the gap between them is invisible: a source with no
+ * data looks fine in the list and fails at annotate time. Asking here collapses
+ * the two into one decision.
+ */
+function DownloadTarget({
+  needsData,
+  streamed,
+  targets,
+  target,
+  setTarget,
+  alsoCopy,
+  setAlsoCopy,
+}: {
+  needsData: boolean;
+  streamed: boolean;
+  targets: StorageLocation[];
+  target: string;
+  setTarget: (v: string) => void;
+  alsoCopy: boolean;
+  setAlsoCopy: (v: boolean) => void;
+}) {
+  if (needsData && targets.length === 0) {
+    return (
+      <div
+        className="card"
+        style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+      >
+        <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
+          This source has data to download, but no storage location is configured.
+          It can still be registered — add a location under{" "}
+          <strong>Storage &amp; files</strong>, then download it from the sources
+          list.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card" style={{ padding: 12, marginTop: 14 }}>
+      <div className="label" style={{ marginBottom: 8 }}>
+        {needsData ? "Download to" : "Local copy"}
+      </div>
+
+      {streamed && (
+        <label className="row gap-8" style={{ fontSize: 13, marginBottom: alsoCopy ? 10 : 0 }}>
+          <input
+            type="checkbox"
+            checked={alsoCopy}
+            onChange={(e) => setAlsoCopy(e.target.checked)}
+          />
+          {/* Unchecked by default: this source already works without a copy. */}
+          Also keep a local copy — this source reads from its origin, so a copy
+          is optional
+        </label>
+      )}
+
+      {(needsData || alsoCopy) && (
+        <>
+          <select
+            className="select"
+            style={{ maxWidth: 320 }}
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            aria-label="Download location"
+          >
+            {targets.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.name} — {l.uri}
+              </option>
+            ))}
+          </select>
+          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0" }}>
+            The download is queued as soon as the source is registered. Watch it
+            under <strong>System jobs</strong>.
+          </p>
+        </>
+      )}
     </div>
   );
 }

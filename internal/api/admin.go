@@ -100,6 +100,13 @@ func (s *Server) handleValidateSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"valid": true, "id": src.ID, "name": src.Name,
 		"version": src.Version, "kind": src.Kind, "title": src.Title,
+		// Whether registering this will leave something still to do. The
+		// register form asks where the data should go *before* writing the
+		// manifest, so it has to know from the draft rather than after the fact
+		// — a source registered and then forgotten is one that fails at
+		// annotate time with "sources not downloaded".
+		"needs_data": src.NeedsData(),
+		"stream":     src.Stream,
 	})
 }
 

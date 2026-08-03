@@ -678,3 +678,59 @@ func TestAnonymousJobHistoryIsScoped(t *testing.T) {
 		t.Errorf("an unscoped read = %d, want 404", got)
 	}
 }
+
+// The register form asks where data should go before writing the manifest, so
+// validation has to say whether there will be any. Without this the form cannot
+// tell a source that is ready to use from one that still needs fetching.
+func TestValidateReportsWhetherDataIsNeeded(t *testing.T) {
+	h := newHarness(t)
+	_, adminTok := h.admin(t)
+
+	for _, tc := range []struct {
+		name      string
+		toml      string
+		needsData bool
+		stream    bool
+	}{
+		{
+			name: "a plain data source needs a download",
+			toml: "[[sources]]\nname=\"revel\"\nversion=\"1.3\"\nformat=\"tab\"\n" +
+				"assembly=\"GRCh38\"\nurl=\"https://example.org/revel.zip\"\n",
+			needsData: true,
+		},
+		{
+			name: "a streamed source is read from its origin",
+			toml: "[[sources]]\nname=\"gnomad\"\nversion=\"4.1\"\nassembly=\"GRCh38\"\n" +
+				"stream=true\nurl=\"https://example.org/g.vcf.bgz\"\n",
+			needsData: false, stream: true,
+		},
+		{
+			name:      "a builtin computes from the variant",
+			toml:      "[[sources]]\nname=\"builtins\"\nversion=\"1\"\ntype=\"builtin\"\n",
+			needsData: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := h.do("POST", "/api/v1/admin/sources/validate", adminTok,
+				map[string]string{"toml": tc.toml})
+			if w.Code != http.StatusOK {
+				t.Fatalf("validate = %d (%s)", w.Code, w.Body.String())
+			}
+			var got struct {
+				Valid     bool `json:"valid"`
+				NeedsData bool `json:"needs_data"`
+				Stream    bool `json:"stream"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if !got.Valid {
+				t.Fatalf("manifest rejected: %s", w.Body.String())
+			}
+			if got.NeedsData != tc.needsData || got.Stream != tc.stream {
+				t.Errorf("needs_data=%v stream=%v; want %v/%v",
+					got.NeedsData, got.Stream, tc.needsData, tc.stream)
+			}
+		})
+	}
+}
