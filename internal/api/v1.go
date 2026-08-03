@@ -136,6 +136,7 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		catalog.Snapshot
 		SourceCount     int  `json:"source_count"`
 		ContainsPrivate bool `json:"contains_private"`
+		ContainsRemote  bool `json:"contains_remote"`
 	}
 	out := make([]item, 0, len(snaps))
 	for _, sn := range snaps {
@@ -157,6 +158,7 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 			Snapshot:        sn,
 			SourceCount:     len(full.Sources),
 			ContainsPrivate: full.ContainsPrivate(),
+			ContainsRemote:  full.ContainsRemote(),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
@@ -192,6 +194,7 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"snapshot":         snap,
 		"contains_private": snap.ContainsPrivate(),
+		"contains_remote":  snap.ContainsRemote(),
 		"annotations":      snapshotAnnotations(snap),
 	})
 }

@@ -350,3 +350,9 @@ table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline)
 
 .token-row  { grid-template-columns: 1.6fr 1.2fr 1.4fr 1.4fr .4fr; }
 .people-row { grid-template-columns: 2fr 1.4fr .9fr .8fr .9fr; }
+
+/* A source read over the network rather than from storage we control. */
+.tag-remote {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--accent-tint-alt); color: var(--accent-text);
+}

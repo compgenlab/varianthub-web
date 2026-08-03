@@ -29,7 +29,7 @@ import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
 import SignIn from "./screens/SignIn";
 import Account from "./screens/Account";
-import People from "./screens/People";
+import Groups from "./screens/Groups";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
 import SystemJobs from "./screens/SystemJobs";
@@ -158,8 +158,8 @@ function Shell({
           <NavLink to="/admin/metrics">
             <ChartColumn /> Metrics
           </NavLink>
-          <NavLink to="/admin/people">
-            <UsersRound /> People &amp; teams
+          <NavLink to="/admin/groups">
+            <UsersRound /> Users &amp; groups
           </NavLink>
           </>
           )}
@@ -266,7 +266,7 @@ export default function App() {
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="/admin/metrics" element={<Metrics />} />
-            <Route path="/admin/people" element={<People me={me ?? anonymousMe} />} />
+            <Route path="/admin/groups" element={<Groups me={me ?? anonymousMe} />} />
             <Route path="/account" element={<Account me={me ?? anonymousMe} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>

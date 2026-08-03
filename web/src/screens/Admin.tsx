@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Plus, Trash2, X } from "lucide-react";
+import { Check, Cloud, Globe, HardDrive, Plus, Trash2, X } from "lucide-react";
 
 import {
   api,
@@ -191,14 +191,17 @@ function SourceTable({
   const [showConfig, setShowConfig] = useState("");
   const [showGrants, setShowGrants] = useState("");
 
-  // A source is "provisioned" when files are recorded for it. Summarize per
-  // source so the row can show a footprint instead of a bare yes/no.
-  const provisioned = new Map<string, { bytes: number; count: number }>();
+  // A source is "provisioned" when files are recorded for it. Summarized per
+  // source *and* per location: a source can be in two places at once, and
+  // "1.2 GB somewhere" does not answer the question the row is being read for.
+  const provisioned = new Map<string, Map<string, { bytes: number; count: number }>>();
   for (const f of files) {
-    const cur = provisioned.get(f.source_id) ?? { bytes: 0, count: 0 };
+    const byLoc = provisioned.get(f.source_id) ?? new Map();
+    const cur = byLoc.get(f.storage_id) ?? { bytes: 0, count: 0 };
     cur.bytes += f.size_bytes;
     cur.count += 1;
-    provisioned.set(f.source_id, cur);
+    byLoc.set(f.storage_id, cur);
+    provisioned.set(f.source_id, byLoc);
   }
   const targets = storage.filter((l) => l.usable);
 
@@ -248,7 +251,17 @@ function SourceTable({
           <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
             {s.version}
           </span>
-          <span className="tag">{s.kind}</span>
+          <span className="row gap-8" style={{ flexWrap: "wrap" }}>
+            <span className="tag">{s.kind}</span>
+            {/* A remote source is read from its origin over the network. It
+                needs no download, so without this it reads as one that has
+                simply not been fetched yet. */}
+            {s.stream && (
+              <span className="tag tag-remote" title="Read from its origin over the network">
+                <Globe size={10} /> remote
+              </span>
+            )}
+          </span>
           <span
             style={{
               fontSize: 12.5,
@@ -272,6 +285,7 @@ function SourceTable({
           <ProvisionCell
             source={s}
             have={provisioned.get(s.id)}
+            storage={storage}
             targets={targets}
             onChange={onChange}
           />
@@ -376,6 +390,40 @@ function DeleteSource({ source, onChange }: { source: Source; onChange: () => vo
 }
 
 /**
+ * One place a source's data is stored.
+ *
+ * Names the location rather than just the kind: a deployment can have several
+ * buckets, and "in S3" does not say which one to look in — or which one to
+ * clean up when the disk bill arrives.
+ */
+function StoredAt({
+  location,
+  bytes,
+  count,
+}: {
+  location?: StorageLocation;
+  bytes: number;
+  count: number;
+}) {
+  const s3 = location?.kind === "s3";
+  // The bucket, for an s3 location: the URI is the operational identifier, and
+  // the friendly name may be anything someone typed.
+  const where = s3 ? (location?.uri ?? "").replace(/^s3:\/\//, "") : location?.name;
+  return (
+    <span className="row gap-8" style={{ fontSize: 12.5 }}>
+      <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
+      {s3 ? <Cloud size={12} /> : <HardDrive size={12} />}
+      <span>
+        {humanSize(bytes)}{" "}
+        <span style={{ color: "var(--text-3)" }}>
+          ({count} file{count === 1 ? "" : "s"}) · {where ?? "unknown location"}
+        </span>
+      </span>
+    </span>
+  );
+}
+
+/**
  * Shows a source's data footprint, or offers to fetch it.
  *
  * A registered source is not usable until its data is downloaded — annotating
@@ -386,11 +434,13 @@ function DeleteSource({ source, onChange }: { source: Source; onChange: () => vo
 function ProvisionCell({
   source,
   have,
+  storage,
   targets,
   onChange,
 }: {
   source: Source;
-  have?: { bytes: number; count: number };
+  have?: Map<string, { bytes: number; count: number }>;
+  storage: StorageLocation[];
   targets: StorageLocation[];
   onChange: () => void;
 }) {
@@ -413,16 +463,19 @@ function ProvisionCell({
   // change upstream. Offered, not pressed: the default stays "no copy".
   const streamed = source.needs_data === false && source.stream;
 
-  if (have) {
+  if (have && have.size > 0) {
     return (
-      <span className="row gap-8">
-        <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
-        <span style={{ fontSize: 12.5 }}>
-          {humanSize(have.bytes)}{" "}
-          <span style={{ color: "var(--text-3)" }}>
-            ({have.count} file{have.count === 1 ? "" : "s"})
+      <span style={{ display: "block" }}>
+        {[...have].map(([id, v]) => (
+          <StoredAt key={id} location={storage.find((l) => l.id === id)} {...v} />
+        ))}
+        {/* A streamed source that also has a copy: say so, or the copy looks
+            like the only way it is read. */}
+        {streamed && (
+          <span style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}>
+            also readable from its origin
           </span>
-        </span>
+        )}
       </span>
     );
   }
@@ -463,6 +516,18 @@ function ProvisionCell({
 
   return (
     <span>
+      {/* Without this a working remote source looks exactly like a broken
+          un-provisioned one — same dropdown, same Download button. It is
+          already usable; the copy is an optimisation, so say that before
+          offering the control rather than only in a tooltip. */}
+      {streamed && (
+        <span
+          className="row gap-8"
+          style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 4 }}
+        >
+          <Globe size={11} /> reads from origin — copy optional
+        </span>
+      )}
       <span className="row gap-8">
         <select
           className="select"
@@ -489,7 +554,7 @@ function ProvisionCell({
               : undefined
           }
         >
-          {busy ? "…" : "Download"}
+          {busy ? "…" : streamed ? "Copy locally" : "Download"}
         </button>
       </span>
       {err && (
@@ -1118,7 +1183,15 @@ function BuildSnapshot({
             </span>
             <span>
               <span style={{ fontWeight: 500 }}>{s.title || s.name}</span>{" "}
-              <span className="tag">{s.kind}</span>
+              <span className="tag">{s.kind}</span>{" "}
+              {/* Pinning a remote source makes the snapshot depend on somebody
+                  else's server staying up, which is worth knowing before it is
+                  published rather than after a run fails. */}
+              {s.stream && (
+                <span className="tag tag-remote" title="Read from its origin over the network">
+                  <Globe size={10} /> remote
+                </span>
+              )}
             </span>
             <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
               {s.version}
@@ -1269,11 +1342,11 @@ function EditSnapshotSources({
 }
 
 /**
- * Which teams may see a private source.
+ * Which groups may see a private source.
  *
- * Grants attach to teams rather than to people so that access survives
- * membership changes: adding someone to the team is one action, not one per
- * source they need.
+ * Grants attach to groups rather than to individuals so that access survives
+ * membership changes: adding someone to the group is one action, not one per
+ * source they need. (The API still calls these teams.)
  */
 function SourceGrants({ id }: { id: string }) {
   const [granted, setGranted] = useState<Team[]>([]);
@@ -1313,7 +1386,7 @@ function SourceGrants({ id }: { id: string }) {
       }}
     >
       <div className="label" style={{ marginBottom: 8 }}>
-        Teams with access
+        Groups with access
       </div>
       {err && <p className="err" style={{ fontSize: 12.5 }}>{err}</p>}
       <div className="row gap-8" style={{ flexWrap: "wrap" }}>
@@ -1332,7 +1405,7 @@ function SourceGrants({ id }: { id: string }) {
         ))}
         {granted.length === 0 && (
           <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
-            No teams — only administrators can see this source.
+            No groups — only administrators can see this source.
           </span>
         )}
       </div>
@@ -1344,7 +1417,7 @@ function SourceGrants({ id }: { id: string }) {
           if (e.target.value) act(() => api.grant(id, e.target.value));
         }}
       >
-        <option value="">Grant to a team…</option>
+        <option value="">Grant to a group…</option>
         {teams
           .filter((t) => !granted.some((g) => g.id === t.id))
           .map((t) => (
@@ -1355,7 +1428,7 @@ function SourceGrants({ id }: { id: string }) {
       </select>
       {teams.length === 0 && (
         <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
-          No teams exist yet — create one under <strong>People &amp; teams</strong>.
+          No groups exist yet — create one under <strong>Users &amp; groups</strong>.
         </p>
       )}
     </div>

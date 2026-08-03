@@ -9,6 +9,8 @@ export interface Snapshot {
   state: string;
   source_count?: number;
   contains_private?: boolean;
+  /** True when a pinned source is read from its origin rather than our storage. */
+  contains_remote?: boolean;
   defaults?: string[];
   tags?: string[];
   sources?: Source[];
@@ -340,7 +342,12 @@ export const api = {
   snapshots: (includeDrafts = false) =>
     req<{ snapshots: Snapshot[] }>(`/snapshots${includeDrafts ? "?state=all" : ""}`),
   snapshot: (id: string) =>
-    req<{ snapshot: Snapshot; contains_private: boolean; annotations: Annotation[] }>(
+    req<{
+      snapshot: Snapshot;
+      contains_private: boolean;
+      contains_remote: boolean;
+      annotations: Annotation[];
+    }>(
       `/snapshots/${encodeURIComponent(id)}`,
     ),
   sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),

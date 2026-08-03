@@ -4,13 +4,17 @@ import { ShieldCheck, Trash2, UserPlus, Users } from "lucide-react";
 import { api, type Me, type Team, type User } from "../api";
 
 /**
- * Accounts and teams.
+ * Users and groups.
  *
- * Teams exist because grants attach to them rather than to people: a private
- * source is shared with a group, and someone joining or leaving that group
+ * Groups exist because grants attach to them rather than to individuals: a
+ * private source is shared with a group, and someone joining or leaving it
  * should not mean revisiting every source.
+ *
+ * The API and the schema still say "team". The rename is deliberate at this
+ * layer only — renaming the tables would be a migration through the grant
+ * model to change a word nobody outside this screen reads.
  */
-export default function People({ me }: { me: Me }) {
+export default function Groups({ me }: { me: Me }) {
   const [users, setUsers] = useState<User[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
   const [err, setErr] = useState("");
@@ -41,9 +45,9 @@ export default function People({ me }: { me: Me }) {
 
   return (
     <div className="page page-wide" style={{ paddingTop: 30 }}>
-      <h1 className="title">People &amp; teams</h1>
+      <h1 className="title">Users &amp; groups</h1>
       <p className="lede" style={{ fontSize: 13.5, margin: "6px 0 18px" }}>
-        Accounts sign in with a password and carry their own API tokens. Teams are
+        Users sign in with a password and carry their own API tokens. Groups are
         what private sources are granted to.
       </p>
 
@@ -55,10 +59,10 @@ export default function People({ me }: { me: Me }) {
 
       <div className="between" style={{ marginBottom: 10 }}>
         <span className="label" style={{ margin: 0 }}>
-          Accounts
+          Users
         </span>
         <button className="btn" onClick={() => setAdding(!adding)}>
-          <UserPlus size={14} /> New account
+          <UserPlus size={14} /> New user
         </button>
       </div>
 
@@ -107,7 +111,7 @@ export default function People({ me }: { me: Me }) {
 
       <div className="between" style={{ margin: "26px 0 10px" }}>
         <span className="label" style={{ margin: 0 }}>
-          Teams
+          Groups
         </span>
         <NewTeam onDone={load} onError={setErr} />
       </div>
@@ -115,7 +119,7 @@ export default function People({ me }: { me: Me }) {
       <div className="card">
         {teams.length === 0 && (
           <div style={{ padding: "16px 18px", fontSize: 13, color: "var(--text-3)" }}>
-            No teams yet. Create one to grant access to private sources.
+            No groups yet. Create one to grant access to private sources.
           </div>
         )}
         {teams.map((t) => (
@@ -129,7 +133,7 @@ export default function People({ me }: { me: Me }) {
                 onClick={() => {
                   if (
                     confirm(
-                      `Delete team "${t.name}"? Sources granted only to this team ` +
+                      `Delete group "${t.name}"? Sources granted only to this group ` +
                         `become invisible again.`,
                     )
                   )
@@ -148,7 +152,7 @@ export default function People({ me }: { me: Me }) {
                     className="btn link"
                     style={{ padding: 0, fontSize: 11 }}
                     onClick={() => act(() => api.removeMember(t.id, m.user.id))}
-                    title="Remove from team"
+                    title="Remove from group"
                   >
                     ×
                   </button>
@@ -166,7 +170,7 @@ export default function People({ me }: { me: Me }) {
                 if (e.target.value) act(() => api.addMember(t.id, e.target.value));
               }}
             >
-              <option value="">Add a member…</option>
+              <option value="">Add a user…</option>
               {users
                 .filter((u) => !(t.members ?? []).some((m) => m.user.id === u.id))
                 .map((u) => (
@@ -271,7 +275,7 @@ function NewTeam({ onDone, onError }: { onDone: () => void; onError: (s: string)
       <input
         className="input"
         style={{ width: 200, padding: "6px 10px", fontSize: 13 }}
-        placeholder="New team name"
+        placeholder="New group name"
         value={name}
         onChange={(e) => setName(e.target.value)}
       />

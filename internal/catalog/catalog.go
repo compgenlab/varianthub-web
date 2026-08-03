@@ -99,6 +99,22 @@ type Snapshot struct {
 	Sources []Source `json:"sources,omitempty"` // populated by Get, not List
 }
 
+// ContainsRemote reports whether any pinned source is read from its origin
+// rather than from storage this deployment controls.
+//
+// Worth surfacing next to a snapshot rather than only per source: it is the
+// difference between a run that depends on local disk and one that depends on
+// somebody else's server being reachable, and that is a property of the whole
+// snapshot.
+func (s Snapshot) ContainsRemote() bool {
+	for _, src := range s.Sources {
+		if src.Stream {
+			return true
+		}
+	}
+	return false
+}
+
 // ContainsPrivate reports whether any pinned source is private. Drives the lock
 // notice on the snapshot cards.
 func (s Snapshot) ContainsPrivate() bool {

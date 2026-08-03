@@ -205,3 +205,56 @@ func TestCountSources(t *testing.T) {
 		t.Errorf("counts = %+v, want %+v", c, want)
 	}
 }
+
+// A snapshot reports whether it depends on somebody else's server. Derived from
+// its pinned sources rather than stored, so it cannot drift from what is pinned.
+func TestSnapshotContainsRemote(t *testing.T) {
+	local := Source{ID: "local", Stream: false}
+	remote := Source{ID: "remote", Stream: true}
+
+	for _, tc := range []struct {
+		name    string
+		sources []Source
+		want    bool
+	}{
+		{"no sources", nil, false},
+		{"all local", []Source{local, local}, false},
+		{"one remote", []Source{local, remote}, true},
+		{"all remote", []Source{remote}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := (Snapshot{Sources: tc.sources}).ContainsRemote(); got != tc.want {
+				t.Errorf("ContainsRemote = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The flag has to survive a round trip through the database, because it is
+// derived from toml_text on read rather than stored as a column.
+func TestStreamSurvivesAStore(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "streamed", Name: "streamed", Version: "1", Kind: "vcf", Build: "GRCh38",
+		TOML: "[[sources]]\nname=\"streamed\"\nversion=\"1\"\nassembly=\"GRCh38\"\nstream=true\nurl=\"https://x/s.gz\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSnapshot(ctx, Snapshot{
+		ID: "snap", Build: "GRCh38", State: StatePublished,
+	}, []string{"streamed"}); err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.GetSnapshot(ctx, "snap")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !snap.ContainsRemote() {
+		t.Error("a snapshot pinning a streamed source does not report as remote")
+	}
+	if len(snap.Sources) == 0 || !snap.Sources[0].Stream {
+		t.Error("the source lost its stream flag on the way through the database")
+	}
+}
