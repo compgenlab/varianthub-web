@@ -45,6 +45,11 @@ type sourceRequest struct {
 	// gets stored is what was reviewed — the fetch does not import anything on
 	// its own.
 	Assets []catalog.Asset `json:"assets,omitempty"`
+	// Settings this deployment applies to the source, as opposed to what the
+	// manifest says about itself. Accepted at registration so a prefix can be
+	// chosen when a second version of something is added, which is when the
+	// need for one becomes obvious.
+	Settings *catalog.SourceSettings `json:"settings,omitempty"`
 }
 
 // derive builds a catalog.Source from the request, applying overrides over the
@@ -141,6 +146,12 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 	if err := s.catalog.PutAssets(r.Context(), src.ID, req.Assets); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if req.Settings != nil {
+		if err := s.catalog.PutSettings(r.Context(), src.ID, *req.Settings); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
 	}
 	// Anything the manifest names but nobody supplied. Reported rather than
 	// refused: a hand-written manifest is a legitimate way to register a source,
@@ -412,6 +423,58 @@ func (s *Server) handleRegistryFetch(w http.ResponseWriter, r *http.Request) {
 		"origin": "registry: " + reg.ID,
 		"assets": assets,
 	})
+}
+
+// handleSourceSettings reads a source's deployment-local settings.
+func (s *Server) handleSourceSettings(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	src, err := s.catalog.GetSource(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "no such source")
+		return
+	}
+	set, err := s.catalog.Settings(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"settings": set,
+		// What the manifest itself declares, so the UI can show what a blank
+		// override falls back to rather than implying there is no prefix.
+		"manifest_prefix": catalog.ManifestPrefix(src.TOML),
+		// Only a tool provisioned to an object store can publish its setup, so
+		// the UI can say why the control does nothing rather than offering it.
+		"is_tool": src.Kind == "tool",
+	})
+}
+
+// handleSetSourceSettings replaces them.
+func (s *Server) handleSetSourceSettings(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	if _, err := s.catalog.GetSource(r.Context(), id); err != nil {
+		writeError(w, http.StatusNotFound, "no such source")
+		return
+	}
+	var set catalog.SourceSettings
+	if err := decodeJSON(r, &set); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := s.catalog.PutSettings(r.Context(), id, set); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("api: settings for source %s changed by %s", id, callerOf(r).Label())
+	writeJSON(w, http.StatusOK, map[string]any{"settings": set})
 }
 
 // slug turns a display name into an id.

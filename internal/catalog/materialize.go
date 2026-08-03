@@ -75,6 +75,12 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	if err != nil {
 		return "", nil, err
 	}
+	// What this deployment decided about these sources — output naming, and
+	// whether a tool's setup output is published.
+	settings, err := m.Store.SettingsFor(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		// Nothing downloaded yet, or no clear majority. Use the default location
@@ -93,7 +99,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -101,11 +107,12 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil)
+	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil, nil)
 }
 
 func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string,
-	roots map[string]string, assets map[string][]Asset) error {
+	roots map[string]string, assets map[string][]Asset,
+	settings map[string]SourceSettings) error {
 
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
@@ -194,13 +201,29 @@ default_snapshot = %s
 				return fmt.Errorf("write asset %s for %s: %w", a.Name, src.Ref(), err)
 			}
 		}
-		// A location overlay beside the manifest, when this source lives
-		// somewhere other than the job's cache_dir. That is what lets one job
-		// read sources from different places — cache_dir names only one.
+		// The overlay beside the manifest: everything this deployment knows
+		// about the source that the source does not know about itself.
+		//
+		// A root when the source lives somewhere other than the job's cache_dir
+		// — that is what lets one job read sources from different places, since
+		// cache_dir names only one — plus whatever settings an administrator
+		// has set for it.
+		var body string
 		if root := roots[src.ID]; root != "" && root != cacheDir {
-			overlay := fmt.Sprintf(`# Generated per job from the VariantHub catalog. Do not edit.
-root = %s
-`, tomlString(root))
+			body += fmt.Sprintf("root = %s\n", tomlString(root))
+		}
+		if set := settings[src.ID]; !set.Empty() {
+			if set.AnnotationPrefix != "" {
+				body += fmt.Sprintf("annotation_prefix = %s\n", tomlString(set.AnnotationPrefix))
+			}
+			if set.CacheSetup {
+				body += "cache_setup = true\n"
+			}
+		}
+		// Written only when there is something to say. A file of nothing but a
+		// header reads as an overlay whose content went missing.
+		if body != "" {
+			overlay := "# Generated per job from the VariantHub catalog. Do not edit.\n" + body
 			if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".locations.toml"),
 				overlay); err != nil {
 				return fmt.Errorf("write locations for %s: %w", src.Ref(), err)
@@ -291,6 +314,10 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 	if err != nil {
 		return "", nil, err
 	}
+	settings, err := m.Store.SettingsFor(ctx, sourceIDs)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
@@ -305,7 +332,7 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
 		cleanup()
 		return "", nil, err
 	}

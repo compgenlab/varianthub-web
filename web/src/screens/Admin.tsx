@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Check, Cloud, Globe, HardDrive, Plus, Trash2, X } from "lucide-react";
+import { Check, Cloud, Globe, HardDrive, Plus, Settings2, Trash2, X } from "lucide-react";
 
 import {
   api,
@@ -191,6 +191,7 @@ function SourceTable({
   // Which source's manifest is expanded, if any.
   const [showConfig, setShowConfig] = useState("");
   const [showGrants, setShowGrants] = useState("");
+  const [showSettings, setShowSettings] = useState("");
 
   // A source is "provisioned" when files are recorded for it. Summarized per
   // source *and* per location: a source can be in two places at once, and
@@ -290,9 +291,20 @@ function SourceTable({
             targets={targets}
             onChange={onChange}
           />
-          <DeleteSource source={s} onChange={onChange} />
+          <span className="row gap-8" style={{ justifyContent: "flex-end" }}>
+            <button
+              className="btn link"
+              style={{ fontSize: 12 }}
+              title="Settings for this source"
+              onClick={() => setShowSettings(showSettings === s.id ? "" : s.id)}
+            >
+              <Settings2 size={14} />
+            </button>
+            <DeleteSource source={s} onChange={onChange} />
+          </span>
           {showConfig === s.id && <SourceConfig id={s.id} />}
           {showGrants === s.id && <SourceGrants id={s.id} />}
+          {showSettings === s.id && <SourceSettingsPanel source={s} />}
         </div>
       ))}
     </div>
@@ -800,6 +812,9 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   // the manifest, so what is stored is what was on screen.
   const [assets, setAssets] = useState<SourceAsset[]>([]);
   const [assetErr, setAssetErr] = useState("");
+  // Offered at registration because that is when the need becomes obvious:
+  // adding a second version of something already installed.
+  const [prefix, setPrefix] = useState("");
 
   const [registries, setRegistries] = useState<Registry[]>([]);
   const [regID, setRegID] = useState("");
@@ -884,6 +899,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         visibility: priv ? "private" : "public",
         origin: origin || undefined,
         assets: assets.length > 0 ? assets : undefined,
+        settings: prefix.trim() ? { annotation_prefix: prefix.trim() } : undefined,
       });
       if (willDownload) {
         // Queued immediately, and separately: the source is registered either
@@ -1054,6 +1070,24 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
             Private (licensed data — access grants are not implemented yet)
           </label>
+
+          <label className="label" style={{ marginTop: 14, marginBottom: 4 }}>
+            Annotation prefix{" "}
+            <span style={{ textTransform: "none", letterSpacing: 0 }}>(optional)</span>
+          </label>
+          <input
+            className="input mono"
+            style={{ maxWidth: 260 }}
+            value={prefix}
+            placeholder={check?.valid ? "(manifest default)" : ""}
+            onChange={(e) => setPrefix(e.target.value)}
+          />
+          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "6px 0 0", lineHeight: 1.5 }}>
+            Renames this source&apos;s output fields. Worth setting when a second
+            version of something already registered goes in — two sources whose
+            fields share a name collide silently, and the prefix is what keeps
+            them apart. Blank uses whatever the manifest declares.
+          </p>
           {origin && (
             <p className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
               origin: {origin}
@@ -1570,6 +1604,117 @@ function EditSnapshotSources({
           );
         })}
       </div>
+    </div>
+  );
+}
+
+/**
+ * What this deployment decided about a source.
+ *
+ * Separate from the manifest, which belongs to whoever published it: a prefix
+ * chosen here has to survive re-fetching that manifest from a registry, so the
+ * two are stored apart and shown apart.
+ */
+function SourceSettingsPanel({ source }: { source: Source }) {
+  const [prefix, setPrefix] = useState("");
+  const [cacheSetup, setCacheSetup] = useState(false);
+  const [manifestPrefix, setManifestPrefix] = useState("");
+  const [isTool, setIsTool] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [err, setErr] = useState("");
+
+  useEffect(() => {
+    let live = true;
+    api
+      .sourceSettings(source.id)
+      .then((r) => {
+        if (!live) return;
+        setPrefix(r.settings.annotation_prefix ?? "");
+        setCacheSetup(!!r.settings.cache_setup);
+        setManifestPrefix(r.manifest_prefix ?? "");
+        setIsTool(r.is_tool);
+      })
+      .catch((e) => live && setErr(e instanceof Error ? e.message : String(e)));
+    return () => {
+      live = false;
+    };
+  }, [source.id]);
+
+  async function save() {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.setSourceSettings(source.id, {
+        annotation_prefix: prefix.trim(),
+        cache_setup: cacheSetup,
+      });
+      setSaved(true);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        gridColumn: "1 / -1",
+        padding: "12px 4px 4px",
+        borderTop: "1px solid var(--hairline)",
+        marginTop: 10,
+      }}
+    >
+      <div className="label" style={{ marginBottom: 8 }}>
+        Settings
+      </div>
+
+      <label className="label" style={{ marginBottom: 4 }}>
+        Annotation prefix
+      </label>
+      <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+        <input
+          className="input mono"
+          style={{ width: 220 }}
+          value={prefix}
+          placeholder={manifestPrefix || "(none)"}
+          onChange={(e) => {
+            setPrefix(e.target.value);
+            setSaved(false);
+          }}
+        />
+        <label className="row gap-8" style={{ fontSize: 12.5 }}>
+          <input
+            type="checkbox"
+            checked={cacheSetup}
+            disabled={!isTool}
+            onChange={(e) => {
+              setCacheSetup(e.target.checked);
+              setSaved(false);
+            }}
+          />
+          {/* Only a tool has setup output, and only an object-store target has
+              anywhere to put it. */}
+          Publish setup data{isTool ? "" : " (tools only)"}
+        </label>
+        <button className="btn" disabled={busy} onClick={save}>
+          {busy ? "Saving…" : saved ? "Saved" : "Save"}
+        </button>
+      </div>
+      <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0", lineHeight: 1.55 }}>
+        {/* An empty box and "no prefix" look the same but are not, so say which
+            this is. */}
+        {manifestPrefix
+          ? `Blank falls back to the manifest's own prefix, ${manifestPrefix}. Enter "-" for no prefix at all.`
+          : `This source's manifest declares no prefix, so blank means its fields keep the names it gives them.`}{" "}
+        Renaming affects output field names only, not what is read from the file.
+      </p>
+      {err && (
+        <p className="err" style={{ fontSize: 12.5, marginTop: 8 }}>
+          {err}
+        </p>
+      )}
     </div>
   );
 }

@@ -156,6 +156,14 @@ export interface SourceAsset {
   content: string;
 }
 
+/** What this deployment decided about a source, as opposed to what its manifest says. */
+export interface SourceSettings {
+  /** Renames the source's output fields. "-" means no prefix at all. */
+  annotation_prefix?: string;
+  /** Publish a tool's setup output so another machine can restore it. */
+  cache_setup?: boolean;
+}
+
 export interface RegistryEntry {
   name: string;
   version?: string;
@@ -508,6 +516,7 @@ export const api = {
     visibility?: "public" | "private";
     origin?: string;
     assets?: SourceAsset[];
+    settings?: SourceSettings;
   }) =>
     req<{
       id: string;
@@ -673,6 +682,18 @@ export const api = {
     req<{ job_id: string; output: string; recorded: boolean }>(
       `/jobs/${encodeURIComponent(id)}/log`,
     ),
+
+  sourceSettings: (id: string) =>
+    req<{ settings: SourceSettings; manifest_prefix: string; is_tool: boolean }>(
+      `/admin/sources/${encodeURIComponent(id)}/settings`,
+    ),
+
+  setSourceSettings: (id: string, body: SourceSettings) =>
+    req<{ settings: SourceSettings }>(`/admin/sources/${encodeURIComponent(id)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
 
   metrics: () => req<Metrics>("/admin/metrics"),
 

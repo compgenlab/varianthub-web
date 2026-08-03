@@ -156,6 +156,23 @@ func (s Source) DisplayName() string {
 	return s.Name
 }
 
+// ManifestPrefix is the annotation prefix a manifest declares for itself.
+//
+// Shown beside the override so a blank field reads as "falls back to this"
+// rather than "no prefix" — the two look identical in an empty input and mean
+// different things.
+func ManifestPrefix(text string) string {
+	var f struct {
+		Sources []struct {
+			AnnotationPrefix string `toml:"annotation_prefix"`
+		} `toml:"sources"`
+	}
+	if _, err := toml.Decode(text, &f); err != nil || len(f.Sources) == 0 {
+		return ""
+	}
+	return f.Sources[0].AnnotationPrefix
+}
+
 // streamFromTOML reports whether a manifest asks to be read from its url rather
 // than downloaded. Derived on read for the same reason the annotation list is:
 // it is a projection of toml_text, so nothing needs backfilling.
