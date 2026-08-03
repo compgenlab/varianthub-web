@@ -815,6 +815,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   // Offered at registration because that is when the need becomes obvious:
   // adding a second version of something already installed.
   const [prefix, setPrefix] = useState("");
+  const [missing, setMissing] = useState<string[]>([]);
 
   const [registries, setRegistries] = useState<Registry[]>([]);
   const [regID, setRegID] = useState("");
@@ -894,6 +895,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
     setBusy(true);
     setErr("");
     try {
+      setMissing([]);
       const created = await api.createSource({
         toml,
         visibility: priv ? "private" : "public",
@@ -901,6 +903,15 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         assets: assets.length > 0 ? assets : undefined,
         settings: prefix.trim() ? { annotation_prefix: prefix.trim() } : undefined,
       });
+      // Declared by the manifest and supplied by nobody. Not fatal — a source
+      // can be registered and its files added later — but it will fail at
+      // provisioning time, and saying so now is the difference between a
+      // two-second fix and finding out after a multi-gigabyte image pull.
+      if (created.missing_assets?.length) {
+        setMissing(created.missing_assets);
+        setBusy(false);
+        return;
+      }
       if (willDownload) {
         // Queued immediately, and separately: the source is registered either
         // way. A queue that refuses the job should not roll back a manifest
@@ -1110,11 +1121,27 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             />
           )}
 
+          {missing.length > 0 && (
+            <div
+              className="card"
+              style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+            >
+              <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0, lineHeight: 1.55 }}>
+                <strong>Registered, but incomplete.</strong> This source declares
+                helper files that nobody supplied:{" "}
+                <span className="mono">{missing.join(", ")}</span>. Its build or
+                tool steps will fail without them. A registry copy should ship
+                them beside the manifest — if it does not, the registry entry is
+                missing them upstream.
+              </p>
+            </div>
+          )}
+
           {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
 
           <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
-            <button className="btn secondary" onClick={onCancel}>
-              Cancel
+            <button className="btn secondary" onClick={missing.length ? onDone : onCancel}>
+              {missing.length ? "Done" : "Cancel"}
             </button>
             <button
               className="btn"
