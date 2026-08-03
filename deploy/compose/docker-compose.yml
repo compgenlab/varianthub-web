@@ -180,6 +180,28 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+    # Tool sources (VEP, ANNOVAR) run inside apptainer, which needs kernel
+    # privileges a normal container does not get: it mounts a SIF through a loop
+    # device or FUSE and then overlays it.
+    #
+    # Off by default. The worker only needs this to run tool sources, and a
+    # deployment that has none should not hold these privileges for nothing:
+    #
+    #   VHW_WORKER_PRIVILEGED=true make dev-tls
+    #
+    # Privileged rather than a capability list, and that is not laziness — it
+    # was measured on this host. SYS_ADMIN + seccomp=unconfined alone fails on
+    # mount propagation (AppArmor, which the usual flag list omits); adding
+    # apparmor=unconfined moves the failure to attaching /dev/loop0; passing the
+    # loop devices moves it again to CAP_DAC_READ_SEARCH. Each step reconstructs
+    # a little more of privileged, so the honest configuration is privileged
+    # plus a note about what it costs.
+    #
+    # On Kubernetes this is securityContext.privileged, or SYS_ADMIN plus a
+    # /dev/fuse device plugin — both commonly refused. A cluster that refuses
+    # them cannot run tool sources at all, which is better known at deploy time
+    # than discovered mid-annotation.
+    privileged: ${VHW_WORKER_PRIVILEGED:-false}
     # Lets a container reach a service on the host, which is how a streamed
     # source pointed at a locally-served file resolves. Docker Desktop provides
     # this name; on Linux it has to be mapped explicitly.

@@ -204,6 +204,33 @@ already covers the compose network, so the rate limiter sees real client IPs.
 The one setting that does need updating is `auth.cilogon.redirect_url`, which
 must be the public HTTPS URL and match what CILogon has registered.
 
+## Tool sources (VEP, ANNOVAR)
+
+A tool source runs inside a container, which varhub drives with apptainer. The
+worker image ships apptainer, but it needs kernel privileges a normal container
+does not get — it mounts a SIF through a loop device or FUSE and overlays it —
+so this is opt-in:
+
+```sh
+VHW_WORKER_PRIVILEGED=true make dev-tls
+```
+
+**Privileged, rather than a capability list.** That was measured, not assumed:
+`SYS_ADMIN` + `seccomp=unconfined` fails on mount propagation (AppArmor, which
+the usual flag list omits); adding `apparmor=unconfined` moves the failure to
+attaching `/dev/loop0`; passing the loop devices moves it again to
+`CAP_DAC_READ_SEARCH`. Each step reconstructs more of privileged.
+
+On Kubernetes the equivalent is `securityContext.privileged`, or `SYS_ADMIN`
+plus a `/dev/fuse` device plugin. Clusters commonly refuse both — a cluster that
+does cannot run tool sources at all, which is worth knowing at deploy time
+rather than mid-annotation.
+
+**Tool data is never in an object store.** A container binds `{datadir}` and
+apptainer runs a `.sif` from a path, so both resolve against local storage even
+when `cache_dir` is a bucket — see `tool_dir` in the varhub config. Source data
+still reads from S3 with range requests; only tools need a filesystem.
+
 ## Configuration
 
 Settings resolve in three layers, each overriding the one before:

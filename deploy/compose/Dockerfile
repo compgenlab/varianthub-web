@@ -66,6 +66,32 @@ FROM alpine:3.20
 # naming it rather than an image that tries to contain every possibility.
 RUN apk add --no-cache ca-certificates tzdata bash python3 curl \
  && adduser -D -u 10001 varianthub
+
+# Apptainer, for tool sources that run in a container (VEP, ANNOVAR).
+#
+# Alpine has no apptainer package, so it comes from the edge community repo
+# pinned by that name rather than by version — this is a development image, and
+# a broken pin here is a broken build rather than a broken deployment.
+#
+# Apptainer needs kernel features a default container does not get: it mounts
+# SIF images through a loop device or FUSE. The compose file grants
+# CAP_SYS_ADMIN, an unconfined seccomp profile, /dev/loop-control and /dev/fuse
+# to match. On Kubernetes the same requirements become a securityContext with
+# SYS_ADMIN and a device plugin for /dev/fuse — the part clusters most often
+# refuse, and the reason this is opt-in rather than always on.
+# libseccomp comes from edge as well: the edge apptainer links against symbols
+# the 3.20 library does not export, and installing only the binary leaves it
+# failing at exec with "symbol not found" rather than at build.
+RUN apk add --no-cache \
+      --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main \
+      --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
+      apptainer libseccomp fuse3 squashfs-tools squashfuse e2fsprogs \
+ || echo "apptainer unavailable for this arch; tool sources will report it at run time"
+
+# Apptainer bind-mounts /etc/localtime into every container it runs and fails
+# outright when the source is missing. Alpine installs tzdata without creating
+# the symlink, so the file has to exist before any tool source will start.
+RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 COPY --from=web-build    /out/varianthub-web /usr/local/bin/varianthub-web
 COPY --from=varhub-build /out/varhub         /usr/local/bin/varhub
 
