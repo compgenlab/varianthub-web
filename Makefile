@@ -107,11 +107,23 @@ dev:
 # VH_SITE names the certificate; the default is this machine's hostname with an
 # internal CA. API_BIND keeps the plain-http port on loopback so https is the
 # only way in from the network.
+# Every address this machine answers to, so the certificate matches whichever
+# one a browser can actually resolve. A LAN box usually has no DNS entry, so the
+# IP is the one that always works.
+#
+# 127.0.0.1 is deliberately absent: an IP client sends no SNI, only one
+# certificate can be the no-SNI default, and that slot goes to the LAN address —
+# the one someone else needs. Loopback has "localhost", which does send SNI.
+TLS_NAMES = $(shell hostname) $(shell hostname).local $(shell hostname -I | awk '{print $$1}') localhost
 dev-tls:
-	@VH_HOST=$${VH_HOST:-$$(hostname)} API_BIND=127.0.0.1 \
+	@VH_HOSTS="$$(echo '$(TLS_NAMES)' | tr ' ' '\n' | sed 's|^|https://|' | paste -sd, | sed 's|,|, |g')" \
+	 VH_HTTP_HOSTS="$$(echo '$(TLS_NAMES)' | tr ' ' '\n' | sed 's|^|http://|' | paste -sd, | sed 's|,|, |g')" \
+	 VH_DEFAULT_SNI="$$(hostname -I | awk '{print $$1}')" \
+	 API_BIND=127.0.0.1 \
 	  $(COMPOSE) --profile tls up --build -d
 	@echo
 	@echo "web: https://$$(hostname):$(TLS_PORT)"
+	@echo "     https://$$(hostname -I | awk '{print $$1}'):$(TLS_PORT)   (no DNS needed)"
 	@echo
 	@echo "The certificate comes from Caddy's internal CA, so a browser warns"
 	@echo "until that CA is trusted. Export it with:"

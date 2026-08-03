@@ -10,18 +10,35 @@
 #   2. The session cookie starts being marked Secure. The app decides that from
 #      X-Forwarded-Proto, which Caddy sets automatically on a reverse_proxy.
 #
-# VH_HOST names the site. Default is the LAN hostname with an internal
-# certificate; set it to a public name to have Caddy fetch a real one:
+# VH_HOSTS is every name the certificate should cover, comma-and-space separated
+# (Caddy requires the space; a bare comma is a parse error).
+# It has to include the *IP* as well as the hostname: on a LAN there is often no
+# DNS entry and no mDNS responder, so an address is the only thing that reliably
+# resolves — and a certificate naming only the hostname fails with a name
+# mismatch, which reads as a broken certificate rather than a missing SAN.
 #
-#   VH_HOST=varianthub.example.org VH_TLS= docker compose --profile tls up -d
+# make dev-tls fills this in with the hostname, its .local form, the LAN address
+# and localhost. For a real deployment, name the public host and turn the
+# internal CA off so a public one issues instead:
+#
+#   VH_HOSTS=varianthub.example.org VH_TLS= docker compose --profile tls up -d
 #
 {
 	# Where Caddy mails expiry warnings for a publicly-issued certificate.
 	# Ignored by the internal CA, so it is harmless when left unset.
 	email {$VH_ACME_EMAIL:admin@localhost}
+
+	# Which certificate to serve when the client sends no SNI.
+	#
+	# A browser addressing this by IP sends none — SNI carries a hostname and an
+	# IP is not one — so without this Caddy has nothing to match and aborts the
+	# handshake with an internal error, which looks like a broken server rather
+	# than a missing default. Set to the LAN address, because addressing by IP
+	# is exactly the case that arrives without SNI.
+	default_sni {$VH_DEFAULT_SNI:localhost}
 }
 
-https://{$VH_HOST:debian-vm1} {
+{$VH_HOSTS:https://debian-vm1} {
 	# An internal certificate by default: a LAN hostname cannot be validated by
 	# a public CA, so asking for a real one would fail and leave no TLS at all.
 	# Browsers will warn until the CA is trusted — see the README — which is the
@@ -63,6 +80,8 @@ https://{$VH_HOST:debian-vm1} {
 # k3s ingress controller, an existing nginx — this stack is published elsewhere
 # and the automatic redirect sends the browser to whatever does own it, which
 # looks like a certificate error on an unrelated service.
-http://{$VH_HOST:debian-vm1} {
+{$VH_HTTP_HOSTS:http://debian-vm1} {
+	# {host} rather than a fixed name: the browser is redirected back to
+	# whichever address it already used, which is the one that resolves for it.
 	redir https://{host}:{$VH_HTTPS_PORT:18443}{uri} permanent
 }

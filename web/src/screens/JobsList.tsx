@@ -16,6 +16,34 @@ function when(sec: number) {
   return new Date(sec * 1000).toLocaleString();
 }
 
+/**
+ * A job's failure message.
+ *
+ * varhub writes a diagnostic that usually names both the problem and its
+ * subject — "REVEL:1.3: required software not found on PATH: python3" — so it
+ * is shown verbatim rather than mapped to a friendlier phrasing that would
+ * throw away the half telling you what to fix.
+ */
+function JobError({ message }: { message: string }) {
+  return (
+    <div
+      className="mono"
+      style={{
+        padding: "9px 18px 12px",
+        borderBottom: "1px solid var(--hairline)",
+        background: "var(--path-bg)",
+        color: "var(--path-fg)",
+        fontSize: 11.5,
+        lineHeight: 1.55,
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+      }}
+    >
+      {message}
+    </div>
+  );
+}
+
 export default function JobsList({
   kind = "annotation",
   title = "Jobs",
@@ -97,12 +125,14 @@ export default function JobsList({
           // A download has no results table to open.
           const open = j.status === "done" && !isDownloads;
           return (
+            <div key={j.job_id}>
             <button
-              key={j.job_id}
               className="trow rowgrid"
               style={{
                 gridTemplateColumns: cols,
                 cursor: open ? "pointer" : "default",
+                width: "100%",
+                borderBottom: j.error ? "none" : undefined,
               }}
               onClick={() => open && nav(`/jobs/${j.job_id}`)}
             >
@@ -132,6 +162,12 @@ export default function JobsList({
                 color={open ? "var(--text-3)" : "rgba(22,24,29,.12)"}
               />
             </button>
+            {/* Why it failed, on the row that failed.
+                The message was always captured and returned; it was simply
+                never rendered, so a failure said "Failed" and nothing else and
+                the only way to learn more was the database. */}
+            {j.error && <JobError message={j.error} />}
+            </div>
           );
         })}
       </div>

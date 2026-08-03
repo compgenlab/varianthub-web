@@ -411,7 +411,47 @@ func (e *ExitError) Error() string {
 	if msg := cliMessage(e.Stderr, e.Home); msg != "" {
 		return msg
 	}
+	// No "error:" line — a crash, a signal, a panic, or a failure inside a build
+	// recipe's own tooling. This used to report "<op> failed" and nothing else,
+	// which is exactly backwards: the cases with no recognisable message are the
+	// ones where a bare "failed" leaves nowhere to go next.
+	if tail := stderrTail(e.Stderr, e.Home); tail != "" {
+		return op + " failed:\n  " + tail
+	}
 	return op + " failed"
+}
+
+// stderrTail returns the last few lines the process wrote, for the case where
+// nothing matched the expected error shape.
+//
+// Raw output rather than a summary, because by definition we do not know what
+// this failure looks like — any attempt to interpret it would be guessing. The
+// ephemeral home is redacted for the same reason it is in cliMessage: it is a
+// temp path that means nothing to the reader.
+func stderrTail(stderr, home string) string {
+	var lines []string
+	for _, raw := range strings.Split(stderr, "\n") {
+		if line := strings.TrimRight(raw, "\r"); strings.TrimSpace(line) != "" {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	// The tail, not the head: a failing process usually says what went wrong
+	// last, after whatever progress it printed on the way.
+	if len(lines) > 12 {
+		lines = lines[len(lines)-12:]
+	}
+	out := strings.Join(lines, "\n  ")
+	if home != "" {
+		out = strings.ReplaceAll(out, home, "<config>")
+	}
+	if len(out) > 900 {
+		out = out[len(out)-900:] + ""
+		out = "\u2026" + out
+	}
+	return out
 }
 
 func (e *ExitError) Unwrap() error { return e.Err }

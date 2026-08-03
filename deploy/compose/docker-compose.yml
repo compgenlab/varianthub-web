@@ -238,9 +238,13 @@ services:
     image: caddy:2-alpine
     profiles: ["tls"]
     environment:
-      # The site's hostname. It gets an internal certificate by default; a
-      # public name with VH_TLS="" gets a real one from Let's Encrypt.
-      VH_HOST: ${VH_HOST:-debian-vm1}
+      # Every name the certificate should cover, comma-separated and scheme
+      # qualified. Includes the LAN address: without a DNS or mDNS entry that
+      # is the only thing a browser elsewhere can resolve.
+      VH_HOSTS: ${VH_HOSTS:-https://localhost}
+      VH_HTTP_HOSTS: ${VH_HTTP_HOSTS:-http://localhost}
+      # Served when a client sends no SNI, which is what addressing by IP does.
+      VH_DEFAULT_SNI: ${VH_DEFAULT_SNI:-localhost}
       VH_TLS: ${VH_TLS-internal}
       # The port the https site is published on, so the http redirect points
       # somewhere that answers.
