@@ -8,6 +8,7 @@ import {
   type Snapshot,
   type Source,
   type SourceFile,
+  type SourceAsset,
   type StorageLocation,
   type Team,
 } from "../api";
@@ -795,6 +796,11 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   // deliberate extra rather than the thing that makes it work.
   const [alsoCopy, setAlsoCopy] = useState(false);
 
+  // Helper files that came with a registry fragment. Held here and posted with
+  // the manifest, so what is stored is what was on screen.
+  const [assets, setAssets] = useState<SourceAsset[]>([]);
+  const [assetErr, setAssetErr] = useState("");
+
   const [registries, setRegistries] = useState<Registry[]>([]);
   const [regID, setRegID] = useState("");
   const [entries, setEntries] = useState<RegistryEntry[] | null>(null);
@@ -855,6 +861,8 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
       const d = await api.registryFetch(regID, ref);
       setToml(d.toml);
       setOrigin(d.origin);
+      setAssets(d.assets ?? []);
+      setAssetErr(d.asset_error ?? "");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -875,6 +883,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         toml,
         visibility: priv ? "private" : "public",
         origin: origin || undefined,
+        assets: assets.length > 0 ? assets : undefined,
       });
       if (willDownload) {
         // Queued immediately, and separately: the source is registered either
@@ -1051,6 +1060,10 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             </p>
           )}
 
+          {(assets.length > 0 || assetErr) && (
+            <AssetList assets={assets} error={assetErr} />
+          )}
+
           {(needsData || streamed) && (
             <DownloadTarget
               needsData={needsData}
@@ -1085,6 +1098,71 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The helper files that arrived with a registry fragment.
+ *
+ * Shown, and expandable, rather than imported quietly. A build recipe executes
+ * these — the same reason the fragment itself goes into an editor instead of
+ * being one-click imported applies more strongly to a script than to the TOML
+ * that names it.
+ */
+function AssetList({ assets, error }: { assets: SourceAsset[]; error?: string }) {
+  const [open, setOpen] = useState("");
+  if (error) {
+    return (
+      <div className="card" style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}>
+        <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
+          This source names helper files that could not be fetched: {error}. It can
+          still be registered, but a build recipe will fail without them.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="card" style={{ padding: 12, marginTop: 14 }}>
+      <div className="label" style={{ marginBottom: 8 }}>
+        Helper files ({assets.length})
+      </div>
+      <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "0 0 8px" }}>
+        Scripts this source&apos;s build recipe runs. They are stored with the
+        manifest and written beside it when a job runs.
+      </p>
+      {assets.map((a) => (
+        <div key={a.name} style={{ marginBottom: 6 }}>
+          <button
+            className="btn link mono"
+            style={{ fontSize: 12, padding: 0 }}
+            onClick={() => setOpen(open === a.name ? "" : a.name)}
+          >
+            {open === a.name ? "▾" : "▸"} {a.name}{" "}
+            <span style={{ color: "var(--text-3)" }}>
+              ({a.content.split("\n").length} lines)
+            </span>
+          </button>
+          {open === a.name && (
+            <pre
+              className="mono"
+              style={{
+                margin: "6px 0 0",
+                padding: 10,
+                fontSize: 11.5,
+                lineHeight: 1.5,
+                maxHeight: 260,
+                overflow: "auto",
+                background: "var(--neutral-fill)",
+                borderRadius: 6,
+                whiteSpace: "pre",
+              }}
+            >
+              {a.content}
+            </pre>
+          )}
+        </div>
+      ))}
     </div>
   );
 }

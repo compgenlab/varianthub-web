@@ -23,6 +23,7 @@ var migrationFiles = []string{
 	"../../migrations/0006_storage.sql",
 	"../../migrations/0007_auth.sql",
 	"../../migrations/0008_default_private.sql",
+	"../../migrations/0012_source_asset.sql",
 }
 
 func testStore(t *testing.T) *Store {

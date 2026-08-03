@@ -40,6 +40,11 @@ type sourceRequest struct {
 	Detail     string `json:"detail,omitempty"`
 	Visibility string `json:"visibility,omitempty"`
 	Origin     string `json:"origin,omitempty"`
+	// Assets are the helper files a build recipe or tool step names. They come
+	// back from a registry fetch and are posted here with the manifest, so what
+	// gets stored is what was reviewed — the fetch does not import anything on
+	// its own.
+	Assets []catalog.Asset `json:"assets,omitempty"`
 }
 
 // derive builds a catalog.Source from the request, applying overrides over the
@@ -130,9 +135,23 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Written after the source, because the rows reference it. Replacing the
+	// set on every write keeps the stored files in step with the manifest that
+	// names them.
+	if err := s.catalog.PutAssets(r.Context(), src.ID, req.Assets); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	// Anything the manifest names but nobody supplied. Reported rather than
+	// refused: a hand-written manifest is a legitimate way to register a source,
+	// and the files can be added later — but the caller should learn now, not
+	// from a download that fails at the first recipe step.
+	missing := catalog.MissingAssets(src.TOML, req.Assets)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": src.ID, "ref": src.Ref(), "kind": src.Kind,
-		"visibility": src.Visibility,
+		"visibility": src.Visibility, "assets": len(req.Assets),
+		"missing_assets": missing,
 	})
 }
 
@@ -374,9 +393,24 @@ func (s *Server) handleRegistryFetch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// The helper files the fragment names, fetched with it. Returned rather
+	// than imported: the review-before-registering rule applies to a script a
+	// build step will execute at least as much as it does to the manifest.
+	assets, err := catalog.FetchEntryAssets(r.Context(), reg.URL, entry, body)
+	if err != nil {
+		// The manifest is still useful without them, and saying which asset
+		// could not be fetched beats failing the whole fetch.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ref": entry.Ref(), "entry": entry, "toml": body,
+			"origin": "registry: " + reg.ID,
+			"assets": []catalog.Asset{}, "asset_error": err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ref": entry.Ref(), "entry": entry, "toml": body,
 		"origin": "registry: " + reg.ID,
+		"assets": assets,
 	})
 }
 

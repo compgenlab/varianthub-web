@@ -148,6 +148,12 @@ export interface Registry {
   builtin: boolean;
 }
 
+/** A helper file a build recipe or tool step needs, shipped with the source. */
+export interface SourceAsset {
+  name: string;
+  content: string;
+}
+
 export interface RegistryEntry {
   name: string;
   version?: string;
@@ -499,8 +505,17 @@ export const api = {
     detail?: string;
     visibility?: "public" | "private";
     origin?: string;
+    assets?: SourceAsset[];
   }) =>
-    req<{ id: string; ref: string; kind: string; visibility: string }>("/admin/sources", {
+    req<{
+      id: string;
+      ref: string;
+      kind: string;
+      visibility: string;
+      assets?: number;
+      /** Files the manifest names that nobody supplied. */
+      missing_assets?: string[] | null;
+    }>("/admin/sources", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -704,7 +719,15 @@ export const api = {
   // Returns the entry's manifest for review. Not a one-click import: the
   // fragment is executed by varhub, so it goes into the editor to be read first.
   registryFetch: (id: string, ref: string) =>
-    req<{ ref: string; entry: RegistryEntry; toml: string; origin: string }>(
+    req<{
+      ref: string;
+      entry: RegistryEntry;
+      toml: string;
+      origin: string;
+      assets?: SourceAsset[];
+      /** Set when the manifest arrived but its helper files could not be fetched. */
+      asset_error?: string;
+    }>(
       `/admin/registries/${encodeURIComponent(id)}/fetch?ref=${encodeURIComponent(ref)}`,
     ),
 

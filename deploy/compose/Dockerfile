@@ -47,7 +47,7 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
     CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/varhub ./cmd/varhub
 
 FROM alpine:3.20
-# python3 and curl are here for build-recipe sources, not for the service.
+# bash, python3 and curl are here for build-recipe sources, not for the service.
 #
 # A source like REVEL ships a recipe that converts and merges its inputs before
 # they can be indexed, and declares what it needs: requires = ["unzip",
@@ -55,10 +55,16 @@ FROM alpine:3.20
 # something is missing, so an image without python3 cannot provision REVEL at
 # all. unzip comes from busybox already.
 #
-# This covers the common denominator, not everything: a recipe may require a
+# bash is not optional in the way the others are: varhub runs every recipe step
+# as "bash -c 'set -euo pipefail; ...'" (internal/fetch/fetch.go), and pipefail
+# is a bashism busybox sh does not accept. Alpine ships no bash, so without it
+# no recipe runs at all — and unlike a declared requirement this one is not in
+# the manifest, so the preflight cannot warn about it.
+#
+# The rest covers the common denominator, not everything: a recipe may require a
 # tool nobody anticipated, and the honest answer there is the preflight error
 # naming it rather than an image that tries to contain every possibility.
-RUN apk add --no-cache ca-certificates tzdata python3 curl \
+RUN apk add --no-cache ca-certificates tzdata bash python3 curl \
  && adduser -D -u 10001 varianthub
 COPY --from=web-build    /out/varianthub-web /usr/local/bin/varianthub-web
 COPY --from=varhub-build /out/varhub         /usr/local/bin/varhub

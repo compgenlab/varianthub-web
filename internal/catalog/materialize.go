@@ -62,6 +62,12 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	if err != nil {
 		return "", nil, err
 	}
+	// Helper scripts a build recipe names. They live in the catalog rather than
+	// on this machine, so the worker has no other way to reach them.
+	assets, err := m.Store.AssetsFor(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		// Nothing downloaded yet, or no clear majority. Use the default location
@@ -80,7 +86,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -88,16 +94,27 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir, nil)
+	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil)
 }
 
-func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string, roots map[string]string) error {
+func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string,
+	roots map[string]string, assets map[string][]Asset) error {
+
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}
 		return os.WriteFile(p, []byte(body), 0o600)
+	}
+	// Assets are scripts a build step executes, so they need the mode to match.
+	// Everything else here is data varhub reads, which stays 0600.
+	writeExec := func(rel, body string) error {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(p, []byte(body), 0o700)
 	}
 
 	// config.toml. Absolute data/cache paths, so nothing resolves relative to the
@@ -139,6 +156,18 @@ default_snapshot = %s
 		dir := filepath.Join("annotations", "sources", src.Name, src.Version)
 		if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".toml"), src.TOML); err != nil {
 			return fmt.Errorf("write source %s: %w", src.Ref(), err)
+		}
+		// Helper files the recipe names, beside the manifest where it looks for
+		// them. Executable: an asset is a script a build step runs, and one
+		// written 0600 fails at exec with a permission error that says nothing
+		// about the cause.
+		for _, a := range assets[src.ID] {
+			if err := ValidateAssetName(a.Name); err != nil {
+				return fmt.Errorf("source %s: %w", src.Ref(), err)
+			}
+			if err := writeExec(filepath.Join(dir, a.Name), a.Content); err != nil {
+				return fmt.Errorf("write asset %s for %s: %w", a.Name, src.Ref(), err)
+			}
 		}
 		// A location overlay beside the manifest, when this source lives
 		// somewhere other than the job's cache_dir. That is what lets one job
@@ -231,6 +260,12 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 	if err != nil {
 		return "", nil, err
 	}
+	// This is the provisioning home — the one a download job runs in — so it is
+	// the path that most needs a recipe's helper scripts present.
+	assets, err := m.Store.AssetsFor(ctx, sourceIDs)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
@@ -245,7 +280,7 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets); err != nil {
 		cleanup()
 		return "", nil, err
 	}
