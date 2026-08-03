@@ -83,11 +83,16 @@ type Job struct {
 	// UserID is the owning account, when the submitter had one. Authoritative
 	// where Session is not: a session id is asserted by the client, while this
 	// is written from the credential the server verified.
-	UserID     string `json:"user_id,omitempty"`
-	Label      string `json:"label,omitempty"` // short human label (the locus, or the VCF filename)
-	CreatedAt  int64  `json:"created_at"`
-	StartedAt  int64  `json:"started_at,omitempty"`
-	FinishedAt int64  `json:"finished_at,omitempty"`
+	UserID string `json:"user_id,omitempty"`
+	Label  string `json:"label,omitempty"` // short human label (the locus, or the VCF filename)
+	// Weight is how many slots of the worker pool this job occupies while it
+	// runs. An annotation is 1; provisioning is heavier, because it saturates
+	// disk and CPU for hours and two at once finish later than one after the
+	// other.
+	Weight     int   `json:"weight,omitempty"`
+	CreatedAt  int64 `json:"created_at"`
+	StartedAt  int64 `json:"started_at,omitempty"`
+	FinishedAt int64 `json:"finished_at,omitempty"`
 }
 
 // Terminal reports whether the job has reached a final status.
@@ -104,7 +109,18 @@ type NewJob struct {
 	Session   string
 	UserID    string
 	Label     string
-	Body      []byte
+	// Weight is how much of the pool this job occupies; 0 means 1.
+	Weight int
+	Body   []byte
+}
+
+// weightOf normalizes a job's weight. 0 means the caller did not care, which is
+// one slot — the same as an annotation.
+func weightOf(w int) int {
+	if w < 1 {
+		return 1
+	}
+	return w
 }
 
 // jobCols is the SELECT list backing scanJob. NULLable columns are coalesced in
@@ -112,12 +128,12 @@ type NewJob struct {
 // and then threw the validity flag away, which amounts to the same thing with
 // more ceremony.
 const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
-	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, created_at, ` +
+	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
-	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.created_at, ` +
+	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a job has already finished.
@@ -220,6 +236,10 @@ type Queue struct {
 	nowFn func() int64
 
 	maxJobsPerIP int // per-IP concurrent running-job cap (<=0 = unlimited)
+	// slots is the pool's total capacity in job weight, not job count. A job
+	// runs only when the running set's weight plus its own fits. <=0 disables
+	// the check, which is the pre-weight behaviour.
+	slots int
 
 	wg sync.WaitGroup
 
@@ -272,6 +292,14 @@ func (q *Queue) Ping(ctx context.Context) error { return q.pool.Ping(ctx) }
 // scheduler (<=0 = unlimited). Call before starting workers.
 func (q *Queue) SetMaxJobsPerIP(n int) { q.maxJobsPerIP = n }
 
+// SetSlots sets the pool's capacity in job weight.
+//
+// Separate from the worker count on purpose: the goroutines decide how many
+// jobs can be in flight at all, this decides how much work they may hold. A
+// deployment that wants annotations to keep flowing during a provisioning run
+// gives itself more slots than a download weighs.
+func (q *Queue) SetSlots(n int) { q.slots = n }
+
 // newID returns a random 128-bit hex id.
 func newID() (string, error) {
 	var b [16]byte
@@ -294,10 +322,10 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,weight,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
-		j.ClientIP, j.Session, j.UserID, j.Label, q.nowFn()); err != nil {
+		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight), q.nowFn()); err != nil {
 		return "", err
 	}
 	if _, err := tx.Exec(ctx,
@@ -357,7 +385,7 @@ type rowScanner interface{ Scan(dest ...any) error }
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
-		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label,
+		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
 		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Job{}, err
 	}
@@ -547,6 +575,7 @@ WHERE id = (
     SELECT client_ip, COUNT(*) AS c FROM job WHERE status = $1 GROUP BY client_ip
   ) r ON r.client_ip = j.client_ip
   WHERE j.status = $3 AND COALESCE(r.c, 0) < $4
+    AND (SELECT COALESCE(SUM(weight),0) FROM job WHERE status = $1) + j.weight <= $5
   ORDER BY COALESCE(r.c, 0) ASC, j.created_at ASC, j.id ASC
   FOR UPDATE OF j SKIP LOCKED
   LIMIT 1
@@ -561,7 +590,29 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 	if maxPerIP <= 0 {
 		maxPerIP = 1 << 30
 	}
-	row := q.pool.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP)
+	slots := q.slots
+	if slots <= 0 {
+		slots = 1 << 30
+	}
+
+	// The capacity check reads the running set, which SKIP LOCKED does not lock,
+	// so two workers claiming at the same instant could both see room that only
+	// one of them has. An advisory lock serializes the claim itself.
+	//
+	// It gives back some of what SKIP LOCKED bought, and that is the right
+	// trade: a claim is a single indexed statement measured in microseconds,
+	// while over-committing the budget is exactly the failure this exists to
+	// prevent — two multi-hour downloads on one machine.
+	tx, err := q.pool.Begin(ctx)
+	if err != nil {
+		return Job{}, nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "varhub-job-claim"); err != nil {
+		return Job{}, nil, false, err
+	}
+
+	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots)
 	job, err := scanJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, nil, false, nil
@@ -569,9 +620,15 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 	if err != nil {
 		return Job{}, nil, false, err
 	}
+	// Read the body inside the same transaction, so a claim and its input are
+	// one atomic step: committing the claim and then failing to read the body
+	// would leave a job marked running that no worker is running.
 	var body []byte
-	if err := q.pool.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT body FROM job_input WHERE job_id=$1`, job.ID).Scan(&body); err != nil {
+		return Job{}, nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Job{}, nil, false, err
 	}
 	return job, body, true, nil

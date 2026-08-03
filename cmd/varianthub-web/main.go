@@ -200,6 +200,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	defer cat.Close()
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
+	q.SetSlots(cfg.JobSlots)
 	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat))
 
 	<-ctx.Done()

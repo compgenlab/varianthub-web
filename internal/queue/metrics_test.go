@@ -226,3 +226,107 @@ func TestCancelFinishedJob(t *testing.T) {
 		t.Errorf("Cancel on an unknown id = %v, want ErrNoSuchJob", err)
 	}
 }
+
+// The pool is a budget, not a headcount. A heavy job holds more of it, so two
+// large provisioning runs do not overlap — they finish later that way and gain
+// nothing, and while they overlap there is nothing left for annotation.
+func TestJobWeightLimitsConcurrency(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	q.SetSlots(2)
+
+	heavy := func() string {
+		t.Helper()
+		id, err := q.Enqueue(ctx, NewJob{
+			Kind: KindDownload, Snapshot: "s", Weight: 2, Body: []byte("{}"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	light := func() string {
+		t.Helper()
+		id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+
+	first, second := heavy(), heavy()
+
+	// The first fills the budget on its own.
+	got, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("first claim: ok=%v err=%v", ok, err)
+	}
+	// Which of the two goes first is not asserted: they were created in the
+	// same second, and the ordering then falls to a random id — a real property
+	// of the queue rather than something this test should pin.
+	if got.ID != first && got.ID != second {
+		t.Fatalf("claimed %s, which is neither queued job", got.ID)
+	}
+	if got.Weight != 2 {
+		t.Fatalf("claimed weight %d, want 2", got.Weight)
+	}
+	running := got.ID
+
+	// The second cannot start, and neither can a light job — there is no room.
+	if _, _, ok, err = q.claimNext(ctx); err != nil || ok {
+		t.Errorf("a second heavy job was claimed with no slots free: ok=%v err=%v", ok, err)
+	}
+	lightID := light()
+	if _, _, ok, err = q.claimNext(ctx); err != nil || ok {
+		t.Errorf("a light job was claimed with no slots free: ok=%v err=%v", ok, err)
+	}
+
+	// When the heavy one finishes, the budget frees up. Which of the two
+	// waiting jobs goes first is not asserted: they were created in the same
+	// second, and the ordering then falls to a random id — a real property of
+	// the queue, not something this test should pin.
+	q.finish(ctx, running, StatusDone, "", Outcome{})
+	got, _, ok, err = q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("claim after the first finished: ok=%v err=%v", ok, err)
+	}
+	if got.ID == running || (got.ID != first && got.ID != second && got.ID != lightID) {
+		t.Fatalf("claimed %s, which is not one of the waiting jobs", got.ID)
+	}
+	// The budget still holds: if the light one went first, the heavy one has to
+	// keep waiting, because 1 free slot cannot take a weight of 2.
+	if got.ID == lightID {
+		if _, _, ok, _ := q.claimNext(ctx); ok {
+			t.Error("a weight-2 job was claimed with only one slot free")
+		}
+	}
+}
+
+// A deployment with room runs light jobs alongside each other, which is the
+// behaviour a weight of 1 has to keep.
+func TestLightJobsStillShareThePool(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	q.SetSlots(2)
+
+	for i := 0; i < 2; i++ {
+		if _, err := q.Enqueue(ctx, NewJob{
+			Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0." + string(rune('1'+i)),
+			Body: []byte("{}"),
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+			t.Fatalf("claim %d: ok=%v err=%v", i, ok, err)
+		}
+	}
+	// ...and the third waits, because the budget is spent.
+	if _, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, _ := q.claimNext(ctx); ok {
+		t.Error("a third job was claimed with both slots in use")
+	}
+}

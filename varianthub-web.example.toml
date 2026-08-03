@@ -40,6 +40,17 @@
 
 [worker]
   count = 2                                         # VHW_WORKERS
+  # The pool measured in job weight rather than job count. Defaults to count,
+  # so a weight-1 job behaves exactly as it always did.
+  #
+  # A provisioning job weighs download_weight because it saturates disk and CPU
+  # for as long as it runs: two large ones on a machine finish later than one
+  # after the other and gain nothing by overlapping. With slots = 2 and a
+  # weight of 2, downloads are exclusive. To keep annotation flowing during a
+  # long install, raise slots rather than lowering the weight — the download
+  # should still hold what it costs.
+  slots = 2                                         # VHW_JOB_SLOTS
+  download_weight = 2                               # VHW_DOWNLOAD_WEIGHT
   varhub_bin = "varhub"                             # VHW_VARHUB_BIN
   # Fixed VARHUB_HOME. Empty means materialize one per job from the catalog,
   # which is what a deployment normally wants.

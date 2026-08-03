@@ -50,6 +50,8 @@ type fileConfig struct {
 
 	Worker struct {
 		Count           *int   `toml:"count"`
+		Slots           *int   `toml:"slots"`
+		DownloadWeight  *int   `toml:"download_weight"`
 		VarhubBin       string `toml:"varhub_bin"`
 		VarhubHome      string `toml:"varhub_home"`
 		DataDir         string `toml:"data_dir"`
@@ -136,6 +138,8 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setList(&c.CILogonAutoProvision, f.Auth.CILogon.AutoProvisionDomains)
 
 	setInt(&c.Workers, f.Worker.Count)
+	setInt(&c.JobSlots, f.Worker.Slots)
+	setInt(&c.DownloadWeight, f.Worker.DownloadWeight)
 	setStr(&c.VarhubBin, f.Worker.VarhubBin)
 	setStr(&c.VarhubHome, f.Worker.VarhubHome)
 	setStr(&c.DataDir, f.Worker.DataDir)

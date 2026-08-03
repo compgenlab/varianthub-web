@@ -763,7 +763,10 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		// to the storage location — so job state is the only evidence that one
 		// has been installed at all.
 		Selection: strings.Join(req.Sources, ","),
-		Body:      body,
+		// Heavier than an annotation: this saturates disk and CPU for as long as
+		// it runs, so it holds more of the pool while it does.
+		Weight: s.cfg.DownloadWeight,
+		Body:   body,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())

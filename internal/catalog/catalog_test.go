@@ -26,6 +26,7 @@ var migrationFiles = []string{
 	"../../migrations/0012_source_asset.sql",
 	"../../migrations/0014_source_settings.sql",
 	"../../migrations/0015_source_state.sql",
+	"../../migrations/0016_job_weight.sql",
 }
 
 func testStore(t *testing.T) *Store {

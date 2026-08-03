@@ -45,11 +45,24 @@ type Config struct {
 	// not by itself a reason to have an account here.
 	CILogonAutoProvision []string
 
-	Workers    int    // worker pool size
-	VarhubBin  string // path to the varhub CLI
-	VarhubHome string // fixed VARHUB_HOME; empty = materialize per job from the catalog
-	DataDir    string // shared, persistent: downloaded source files
-	CacheDir   string // shared, persistent: built indexes and the annotation cache
+	Workers int // worker pool size
+	// JobSlots is the pool's capacity measured in job weight rather than job
+	// count. Defaults to Workers, which makes a 1-weight job behave exactly as
+	// before.
+	JobSlots int
+	// DownloadWeight is how many slots a provisioning job holds. 2 against the
+	// default 2 slots makes downloads exclusive of each other, which is the
+	// point: two large downloads on one machine finish later than one after the
+	// other, and gain nothing by overlapping.
+	//
+	// A deployment that wants annotation to continue during a long provisioning
+	// run raises JobSlots above this rather than lowering it — the download
+	// should still hold what it actually costs.
+	DownloadWeight int
+	VarhubBin      string // path to the varhub CLI
+	VarhubHome     string // fixed VARHUB_HOME; empty = materialize per job from the catalog
+	DataDir        string // shared, persistent: downloaded source files
+	CacheDir       string // shared, persistent: built indexes and the annotation cache
 	// StoragePaths are filesystem download targets declared by the deployment, as
 	// "name=/abs/path" entries. The first is the default. They are reconciled into
 	// the catalog at startup so the config file stays authoritative for them.
@@ -151,6 +164,9 @@ func Load() (*Config, error) {
 				"an account, and VHW_ALLOW_ANONYMOUS is the only opt-out", k)
 		}
 	}
+	if c.JobSlots <= 0 {
+		c.JobSlots = c.Workers
+	}
 	return c, nil
 }
 
@@ -178,6 +194,8 @@ func applyEnv(c *Config) {
 	envListInto("VHW_CILOGON_AUTO_PROVISION_DOMAINS", &c.CILogonAutoProvision)
 
 	envIntInto("VHW_WORKERS", &c.Workers)
+	envIntInto("VHW_JOB_SLOTS", &c.JobSlots)
+	envIntInto("VHW_DOWNLOAD_WEIGHT", &c.DownloadWeight)
 	envStr("VHW_VARHUB_BIN", &c.VarhubBin)
 	envStr("VHW_VARHUB_HOME", &c.VarhubHome)
 	envStr("VHW_DATA_DIR", &c.DataDir)

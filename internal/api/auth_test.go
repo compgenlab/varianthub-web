@@ -33,6 +33,7 @@ var authMigrations = []string{
 	"../../migrations/0008_default_private.sql",
 	"../../migrations/0009_bootstrap.sql",
 	"../../migrations/0010_job_user.sql",
+	"../../migrations/0016_job_weight.sql",
 	"../../migrations/0011_external_identity.sql",
 	"../../migrations/0012_source_asset.sql",
 	"../../migrations/0013_job_log.sql",
