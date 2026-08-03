@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -76,5 +77,53 @@ func TestStatsOnEmptyQueue(t *testing.T) {
 	}
 	if s != (Stats{}) {
 		t.Errorf("empty queue reports %+v", s)
+	}
+}
+
+// A run's output is kept so it can be read without shell access to the worker,
+// and survives the container that produced it.
+func TestJobLog(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing recorded yet is distinguishable from a run that printed nothing.
+	out, found, err := q.Log(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found || out != "" {
+		t.Errorf("a fresh job reports a log: %q (found=%v)", out, found)
+	}
+
+	if err := q.SetLog(ctx, id, "varhub: fetching\nvarhub: done\n"); err != nil {
+		t.Fatal(err)
+	}
+	out, found, err = q.Log(ctx, id)
+	if err != nil || !found {
+		t.Fatalf("Log = %q, %v, %v", out, found, err)
+	}
+	if !strings.Contains(out, "fetching") {
+		t.Errorf("output = %q", out)
+	}
+
+	// A retry replaces rather than appends: the log describes the run that is
+	// recorded on the job, and two runs' output interleaved describes neither.
+	if err := q.SetLog(ctx, id, "second run\n"); err != nil {
+		t.Fatal(err)
+	}
+	out, _, _ = q.Log(ctx, id)
+	if strings.Contains(out, "fetching") || !strings.Contains(out, "second run") {
+		t.Errorf("after a second run: %q", out)
+	}
+
+	// Empty output is a no-op, so a quiet run does not create a row that would
+	// read as "recorded, but empty".
+	if err := q.SetLog(ctx, id+"-nonexistent", ""); err != nil {
+		t.Errorf("empty SetLog on an unknown job: %v", err)
 	}
 }

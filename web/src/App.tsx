@@ -32,6 +32,7 @@ import Account from "./screens/Account";
 import Groups from "./screens/Groups";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
+import JobDetail from "./screens/JobDetail";
 import SystemJobs from "./screens/SystemJobs";
 import Files from "./screens/Files";
 import StorageBrowser from "./screens/StorageBrowser";
@@ -265,6 +266,7 @@ export default function App() {
             <Route path="/admin/storage" element={<Files />} />
             <Route path="/admin/storage/:id" element={<StorageBrowser />} />
             <Route path="/admin/jobs" element={<SystemJobs />} />
+            <Route path="/admin/jobs/:jobId" element={<JobDetail />} />
             <Route path="/admin/metrics" element={<Metrics />} />
             <Route path="/admin/groups" element={<Groups me={me ?? anonymousMe} />} />
             <Route path="/account" element={<Account me={me ?? anonymousMe} />} />

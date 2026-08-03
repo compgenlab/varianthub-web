@@ -107,6 +107,35 @@ const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.er
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
+// SetLog records what a job's run printed.
+//
+// Written separately from the outcome and best-effort at the call site: a log
+// that fails to store must not turn a successful job into a failed one, and a
+// failed job's log is worth keeping even when the failure itself is what is
+// being recorded.
+func (q *Queue) SetLog(ctx context.Context, id, output string) error {
+	if output == "" {
+		return nil
+	}
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO job_log (job_id, output) VALUES ($1,$2)
+		ON CONFLICT (job_id) DO UPDATE SET output = excluded.output`, id, output)
+	return err
+}
+
+// Log returns what a job's run printed, and whether anything was recorded.
+func (q *Queue) Log(ctx context.Context, id string) (string, bool, error) {
+	var out string
+	err := q.pool.QueryRow(ctx, `SELECT output FROM job_log WHERE job_id=$1`, id).Scan(&out)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return out, true, nil
+}
+
 // Outcome is what a Runner produces for a completed job.
 type Outcome struct {
 	// Result is the annotation JSON, stored verbatim. It is what the CLI emitted,

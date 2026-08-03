@@ -661,6 +661,11 @@ export const api = {
       { method: "DELETE" },
     ),
 
+  jobLog: (id: string) =>
+    req<{ job_id: string; output: string; recorded: boolean }>(
+      `/jobs/${encodeURIComponent(id)}/log`,
+    ),
+
   metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),

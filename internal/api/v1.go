@@ -685,6 +685,32 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, job)
 }
 
+// handleJobLog serves what a job's run printed.
+//
+// Separate from the job itself because it is large and wanted only when someone
+// is looking into a particular run — the same reason the results blob is its own
+// endpoint. Ownership is enforced by the same rule: a log describes a job, so
+// seeing it is seeing the job.
+func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return
+	}
+	out, found, err := s.queue.Log(r.Context(), job.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": job.ID,
+		"output": out,
+		// Distinguishes "nothing was recorded" from "it printed nothing", which
+		// look identical in an empty string and mean different things: the first
+		// is a job from before logs were kept, the second is a quiet run.
+		"recorded": found,
+	})
+}
+
 // handleExport streams a finished job's entire result set.
 //
 // This is the bulk path: no pagination, no sorting, no filtering. A consumer

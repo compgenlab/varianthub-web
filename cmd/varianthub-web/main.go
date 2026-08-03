@@ -199,7 +199,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	defer cat.Close()
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
-	q.StartWorkers(ctx, cfg.Workers, adapt(exec, cat))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -269,11 +269,16 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // adapt bridges runner.Runner to queue.Runner. The two are deliberately separate
 // types: the queue knows nothing about how annotation happens, and the runner
 // knows nothing about job persistence.
-func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
+//
+// The queue is passed in as well, for the run's output. That is persistence, so
+// it belongs to the queue rather than to either of the two types this bridges —
+// and it is written outside the Outcome because an Outcome is the job's result,
+// while a log exists for the runs that produced no result at all.
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
-			return runDownload(ctx, r, cat, job, input)
+			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
 			return runCleanup(job, input)
 		}
@@ -284,11 +289,13 @@ func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 			Body:      input,
 		})
 		if err != nil {
-			// Log the full diagnostic; return only the safe message, which is what
-			// gets stored on the job and served to clients.
+			// The full diagnostic goes to the log and to the job, so it can be
+			// read without shell access to this container — and survives the
+			// container being replaced, which the log does not.
 			var ee *runner.ExitError
 			if errors.As(err, &ee) {
 				log.Printf("worker: job %s: %s", job.ID, ee.Detail())
+				storeLog(ctx, q, job.ID, ee.Detail())
 			}
 			return queue.Outcome{}, err
 		}
@@ -308,7 +315,24 @@ func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 //
 // The inventory is written here, in the worker, because only the worker is
 // guaranteed to have the storage volume mounted — the API server may not.
-func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
+// storeLog persists a run's output, best effort.
+//
+// Never fails the job: a log that could not be written is a worse thing to
+// report than the outcome the job actually had, and the log is a diagnostic aid
+// rather than part of the result.
+func storeLog(ctx context.Context, q *queue.Queue, id, output string) {
+	if q == nil || output == "" {
+		return
+	}
+	// WithoutCancel because this often runs while the job's own context is
+	// already cancelled — a timeout, a shutdown — and those are exactly the runs
+	// whose output is most worth having.
+	if err := q.SetLog(context.WithoutCancel(ctx), id, output); err != nil {
+		log.Printf("worker: job %s: store log: %v", id, err)
+	}
+}
+
+func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *catalog.Store,
 	job queue.Job, input []byte) (queue.Outcome, error) {
 
 	exec, ok := r.(*runner.ExecRunner)
@@ -336,9 +360,14 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		var ee *runner.ExitError
 		if errors.As(err, &ee) {
 			log.Printf("worker: download job %s: %s", job.ID, ee.Detail())
+			storeLog(ctx, q, job.ID, ee.Detail())
 		}
 		return queue.Outcome{}, err
 	}
+	// A successful download has output worth keeping too: which files it
+	// fetched, what it skipped as already present, how long a build recipe
+	// took. "It worked" is not the only question asked of a finished job.
+	storeLog(ctx, q, job.ID, res.Log)
 
 	// Attribute files to their source by the directory varhub lays out per
 	// source: <cache>/<name>/<version>/... A file outside that shape belongs to no

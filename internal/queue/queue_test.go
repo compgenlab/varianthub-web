@@ -26,6 +26,7 @@ var migrationFiles = []string{
 	"../../migrations/0001_job_queue.sql",
 	"../../migrations/0003_job_variant.sql",
 	"../../migrations/0010_job_user.sql",
+	"../../migrations/0013_job_log.sql",
 }
 
 func testQueue(t *testing.T) *Queue {

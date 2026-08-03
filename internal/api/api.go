@@ -101,6 +101,7 @@ func (s *Server) Routes() http.Handler {
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.Handle("GET /api/v1/jobs", s.requireAuth(http.HandlerFunc(s.handleListJobs)))
 	v1.Handle("GET /api/v1/jobs/{id}", s.requireAuth(http.HandlerFunc(s.handleGetJob)))
+	v1.Handle("GET /api/v1/jobs/{id}/log", s.requireAuth(http.HandlerFunc(s.handleJobLog)))
 	v1.Handle("GET /api/v1/jobs/{id}/results", s.requireAuth(http.HandlerFunc(s.handleResults)))
 	v1.Handle("GET /api/v1/jobs/{id}/export", s.requireAuth(http.HandlerFunc(s.handleExport)))
 

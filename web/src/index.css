@@ -356,3 +356,9 @@ table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline)
   display: inline-flex; align-items: center; gap: 4px;
   background: var(--accent-tint-alt); color: var(--accent-text);
 }
+
+/* Job detail: metadata in a grid that reflows rather than truncating. */
+.job-fields {
+  display: grid; gap: 14px 22px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}
