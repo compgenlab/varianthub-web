@@ -256,7 +256,7 @@ function SourceSettingsPanel({ source }: { source: Source }) {
           />
           {/* Only a tool has setup output, and only an object-store target has
               anywhere to put it. */}
-          Publish setup data{isTool ? "" : " (tools only)"}
+          Reuse this install on other machines{isTool ? "" : " (tools only)"}
         </label>
         <button className="btn" disabled={busy} onClick={save}>
           {busy ? "Saving…" : saved ? "Saved" : "Save"}
@@ -270,6 +270,16 @@ function SourceSettingsPanel({ source }: { source: Source }) {
           : `This source's manifest declares no prefix, so blank means its fields keep the names it gives them.`}{" "}
         Renaming affects output field names only, not what is read from the file.
       </p>
+      {isTool && (
+        <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "6px 0 0", lineHeight: 1.55 }}>
+          Reuse copies this tool&apos;s installed data to the storage location it
+          was downloaded to, so a machine that has none unpacks it instead of
+          repeating the install. It stays within this deployment — nothing is
+          made public. It does nothing unless that location is an S3 bucket: a
+          filesystem location already holds the data where other machines
+          reading that path can see it.
+        </p>
+      )}
       {err && (
         <p className="err" style={{ fontSize: 12.5, marginTop: 8 }}>
           {err}
