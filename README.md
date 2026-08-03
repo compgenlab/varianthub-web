@@ -207,24 +207,27 @@ must be the public HTTPS URL and match what CILogon has registered.
 ## Tool sources (VEP, ANNOVAR)
 
 A tool source runs inside a container, which varhub drives with apptainer. The
-worker image ships apptainer, but it needs kernel privileges a normal container
-does not get — it mounts a SIF through a loop device or FUSE and overlays it —
-so this is opt-in:
+worker image ships it, and runs it **unprivileged** — as the ordinary non-root
+user, with no capabilities at all (`CapEff: 0000000000000000`).
 
-```sh
-VHW_WORKER_PRIVILEGED=true make dev-tls
-```
+Apptainer does this with a user namespace rather than with capabilities. Three
+settings are what that needs, and each was confirmed by removing it:
 
-**Privileged, rather than a capability list.** That was measured, not assumed:
-`SYS_ADMIN` + `seccomp=unconfined` fails on mount propagation (AppArmor, which
-the usual flag list omits); adding `apparmor=unconfined` moves the failure to
-attaching `/dev/loop0`; passing the loop devices moves it again to
-`CAP_DAC_READ_SEARCH`. Each step reconstructs more of privileged.
+| Setting | Why |
+|---|---|
+| `seccomp=unconfined` | permits `unshare(CLONE_NEWUSER)`; without it the namespace is denied |
+| `apparmor=unconfined` | permits the namespace and its mounts |
+| `/dev/fuse` | squashfuse mounts the image, so no loop device and no `SYS_ADMIN` |
 
-On Kubernetes the equivalent is `securityContext.privileged`, or `SYS_ADMIN`
-plus a `/dev/fuse` device plugin. Clusters commonly refuse both — a cluster that
-does cannot run tool sources at all, which is worth knowing at deploy time
-rather than mid-annotation.
+The commonly cited recipe — `--cap-add=SYS_ADMIN` with loop devices — is a
+different and worse route. It omits AppArmor, so it fails on mount propagation;
+adding loop devices then moves the failure to `CAP_DAC_READ_SEARCH`, and each
+step rebuilds more of `privileged`. None of it is needed once the user namespace
+is allowed to exist.
+
+On Kubernetes this is a `seccompProfile: Unconfined`, an AppArmor unconfined
+annotation, and `/dev/fuse` from a device plugin. Some clusters restrict those,
+but they are far more attainable than `privileged`.
 
 **Tool data is never in an object store.** A container binds `{datadir}` and
 apptainer runs a `.sif` from a path, so both resolve against local storage even

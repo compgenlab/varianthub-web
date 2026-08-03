@@ -180,28 +180,35 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
-    # Tool sources (VEP, ANNOVAR) run inside apptainer, which needs kernel
-    # privileges a normal container does not get: it mounts a SIF through a loop
-    # device or FUSE and then overlays it.
+    # Tool sources (VEP, ANNOVAR) run inside apptainer, which mounts a SIF and
+    # overlays it — operations a container is normally not allowed.
     #
-    # Off by default. The worker only needs this to run tool sources, and a
-    # deployment that has none should not hold these privileges for nothing:
+    # Granted unprivileged, as the ordinary non-root user. Apptainer does this
+    # with a user namespace rather than with capabilities, and the three
+    # settings below are exactly what that needs — each was checked by removing
+    # it and watching the failure:
     #
-    #   VHW_WORKER_PRIVILEGED=true make dev-tls
+    #   seccomp=unconfined   permits unshare(CLONE_NEWUSER); without it the
+    #                        namespace is denied outright
+    #   apparmor=unconfined  permits the namespace and its mounts; this is the
+    #                        one the usual SYS_ADMIN flag list omits, and its
+    #                        absence looks like a mount-propagation error
+    #   /dev/fuse            lets squashfuse mount the image, so no loop device
+    #                        is needed and no SYS_ADMIN with it
     #
-    # Privileged rather than a capability list, and that is not laziness — it
-    # was measured on this host. SYS_ADMIN + seccomp=unconfined alone fails on
-    # mount propagation (AppArmor, which the usual flag list omits); adding
-    # apparmor=unconfined moves the failure to attaching /dev/loop0; passing the
-    # loop devices moves it again to CAP_DAC_READ_SEARCH. Each step reconstructs
-    # a little more of privileged, so the honest configuration is privileged
-    # plus a note about what it costs.
+    # No CAP_SYS_ADMIN, no privileged, no loop devices. An earlier version of
+    # this was privileged, because the first non-root attempt was missing
+    # apparmor=unconfined and the failure was read as needing more privilege
+    # rather than a different one.
     #
-    # On Kubernetes this is securityContext.privileged, or SYS_ADMIN plus a
-    # /dev/fuse device plugin — both commonly refused. A cluster that refuses
-    # them cannot run tool sources at all, which is better known at deploy time
-    # than discovered mid-annotation.
-    privileged: ${VHW_WORKER_PRIVILEGED:-false}
+    # On Kubernetes this is a seccompProfile of Unconfined, an AppArmor
+    # unconfined annotation, and /dev/fuse from a device plugin — restricted on
+    # some clusters, but far more attainable than privileged.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
     # Lets a container reach a service on the host, which is how a streamed
     # source pointed at a locally-served file resolves. Docker Desktop provides
     # this name; on Linux it has to be mapped explicitly.
