@@ -37,6 +37,13 @@ const (
 	StatusRunning = "running"
 	StatusDone    = "done"
 	StatusError   = "error"
+	// StatusCancelled is a job someone stopped on purpose.
+	//
+	// Its own status rather than an error with a message: a cancel is a
+	// decision, not a fault, and counting one as a failure would make a
+	// deliberate stop indistinguishable from something going wrong — on the
+	// metrics page most of all, where the failure rate is what gets watched.
+	StatusCancelled = "cancelled"
 )
 
 // Job kinds.
@@ -55,6 +62,10 @@ const (
 // Postgres NOTIFY channels.
 const (
 	chanQueued = "job_queued"
+	// chanCancel carries a job id whose run should stop. The worker holding it
+	// may be in another process, which is the whole reason this goes through
+	// the database rather than a method call.
+	chanCancel = "job_cancel"
 	chanDone   = "job_done"
 )
 
@@ -80,7 +91,9 @@ type Job struct {
 }
 
 // Terminal reports whether the job has reached a final status.
-func (j Job) Terminal() bool { return j.Status == StatusDone || j.Status == StatusError }
+func (j Job) Terminal() bool {
+	return j.Status == StatusDone || j.Status == StatusError || j.Status == StatusCancelled
+}
 
 // NewJob is the metadata for enqueuing a job (plus its input body).
 type NewJob struct {
@@ -106,6 +119,52 @@ const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
+
+// ErrNotCancellable is returned when a job has already finished.
+var ErrNotCancellable = errors.New("job is not running")
+
+// ErrNoSuchJob is returned for an unknown id.
+var ErrNoSuchJob = errors.New("no such job")
+
+// Cancel stops a job.
+//
+// A queued job is settled here and never starts. A running one is signalled
+// over NOTIFY, because the worker executing it is usually in another process —
+// that is the whole reason this goes through the database rather than a method
+// call. Its worker records the outcome, so a cancel does not race the run to
+// write the row.
+func (q *Queue) Cancel(ctx context.Context, id string) (Job, error) {
+	// Settle it here if it has not started: no worker is involved, so there is
+	// nothing to signal and nothing to wait for.
+	row := q.pool.QueryRow(ctx, `
+		UPDATE job SET status=$2, error='cancelled', finished_at=$3
+		 WHERE id=$1 AND status=$4
+		RETURNING `+jobCols, id, StatusCancelled, q.nowFn(), StatusQueued)
+	job, err := scanJob(row)
+	if err == nil {
+		// Wake anyone in WaitFor: the job is terminal now.
+		_, _ = q.pool.Exec(ctx, `SELECT pg_notify($1,$2)`, chanDone, id)
+		return job, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return Job{}, err
+	}
+
+	job, ok, err := q.Get(ctx, id)
+	if err != nil {
+		return Job{}, err
+	}
+	if !ok {
+		return Job{}, ErrNoSuchJob
+	}
+	if job.Status != StatusRunning {
+		return job, ErrNotCancellable
+	}
+	if _, err := q.pool.Exec(ctx, `SELECT pg_notify($1,$2)`, chanCancel, id); err != nil {
+		return Job{}, err
+	}
+	return job, nil
+}
 
 // SetLog records what a job's run printed.
 //
@@ -167,6 +226,11 @@ type Queue struct {
 	mu      sync.Mutex
 	waiters map[string][]chan struct{} // job id -> waiters blocked in WaitFor
 	queued  chan struct{}              // wakes one worker (cap 1, non-blocking send)
+	// running tracks jobs this process is executing, so a cancel arriving over
+	// NOTIFY can reach the right subprocess. Only ever holds jobs claimed here;
+	// a cancel for another replica's job finds nothing and is ignored, which is
+	// correct — that replica is listening too.
+	running map[string]*runningJob
 }
 
 // Open connects to Postgres and prepares the queue. Jobs left "running" by a
@@ -187,6 +251,7 @@ func Open(ctx context.Context, dsn string) (*Queue, error) {
 		nowFn:   func() int64 { return time.Now().Unix() },
 		waiters: map[string][]chan struct{}{},
 		queued:  make(chan struct{}, 1),
+		running: map[string]*runningJob{},
 	}
 	if _, err := pool.Exec(ctx,
 		`UPDATE job SET status=$1, started_at=NULL WHERE status=$2`,
@@ -513,10 +578,43 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 }
 
 // process runs the job's runner and records its outcome.
+// runningJob is a job executing in this process, and the handle to stop it.
+type runningJob struct {
+	cancel    context.CancelFunc
+	cancelled bool // set when a cancel was requested, so the outcome says so
+}
+
 func (q *Queue) process(ctx context.Context, job Job, input []byte, runner Runner) {
 	start := time.Now()
 	log.Printf("queue: job %s running (kind=%s, ip=%s)", job.ID, job.Kind, job.ClientIP)
-	out, err := runner(ctx, job, input)
+
+	// A context per job, so cancelling one does not touch the others this
+	// worker has run or will run.
+	runCtx, cancel := context.WithCancel(ctx)
+	rj := &runningJob{cancel: cancel}
+	q.mu.Lock()
+	q.running[job.ID] = rj
+	q.mu.Unlock()
+	defer func() {
+		cancel()
+		q.mu.Lock()
+		delete(q.running, job.ID)
+		q.mu.Unlock()
+	}()
+
+	out, err := runner(runCtx, job, input)
+
+	q.mu.Lock()
+	cancelled := rj.cancelled
+	q.mu.Unlock()
+	if cancelled {
+		// Whatever the subprocess reported on the way down, the reason it went
+		// down is known and is not a failure.
+		log.Printf("queue: job %s cancelled after %s",
+			job.ID, time.Since(start).Round(time.Millisecond))
+		q.finish(ctx, job.ID, StatusCancelled, "cancelled", Outcome{})
+		return
+	}
 	if err != nil {
 		log.Printf("queue: job %s failed after %s: %v",
 			job.ID, time.Since(start).Round(time.Millisecond), err)

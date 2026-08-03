@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { RefreshCw } from "lucide-react";
+import { Ban, RefreshCw } from "lucide-react";
 
 import { api, type Job } from "../api";
 
@@ -9,6 +9,7 @@ const STATUS: Record<string, { label: string; color: string }> = {
   running: { label: "Running", color: "var(--vus-fg)" },
   queued: { label: "Queued", color: "var(--text-3)" },
   error: { label: "Failed", color: "var(--path-fg)" },
+  cancelled: { label: "Cancelled", color: "var(--text-3)" },
 };
 
 function when(sec?: number): string {
@@ -51,6 +52,7 @@ export default function JobDetail() {
   const [job, setJob] = useState<Job | null>(null);
   const [log, setLog] = useState<{ output: string; recorded: boolean } | null>(null);
   const [err, setErr] = useState("");
+  const [cancelling, setCancelling] = useState(false);
 
   async function load() {
     try {
@@ -73,9 +75,27 @@ export default function JobDetail() {
     load();
   }, [jobId]);
 
+  async function cancel() {
+    if (!confirm("Cancel this job? Work already done is not undone.")) return;
+    setCancelling(true);
+    try {
+      const r = await api.cancelJob(jobId);
+      setJob(r.job);
+      // Reload rather than trusting the returned row: a running job is stopped
+      // asynchronously by its worker, so the status here is the state at the
+      // moment of asking, not the settled one.
+      window.setTimeout(load, 600);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   // Follow a job that is still going, and stop once it settles.
   useEffect(() => {
-    if (!job || job.status === "done" || job.status === "error") return;
+    if (!job || job.status === "done" || job.status === "error" || job.status === "cancelled")
+      return;
     const t = window.setInterval(load, 3000);
     return () => window.clearInterval(t);
   }, [job?.status, jobId]);
@@ -113,9 +133,16 @@ export default function JobDetail() {
         <h1 className="title mono" style={{ fontSize: 21 }}>
           #{job.job_id.slice(0, 12)}
         </h1>
-        <button className="btn secondary" onClick={load} title="Refresh">
-          <RefreshCw size={14} /> Refresh
-        </button>
+        <div className="row gap-8">
+          {live && (
+            <button className="btn secondary" onClick={cancel} disabled={cancelling}>
+              <Ban size={14} /> {cancelling ? "Cancelling…" : "Cancel job"}
+            </button>
+          )}
+          <button className="btn secondary" onClick={load} title="Refresh">
+            <RefreshCw size={14} /> Refresh
+          </button>
+        </div>
       </div>
       <p className="lede" style={{ fontSize: 13.5, margin: "0 0 20px" }}>
         {job.label || job.kind}
@@ -144,7 +171,7 @@ export default function JobDetail() {
         </div>
       </div>
 
-      {job.error && (
+      {job.error && job.status !== "cancelled" && (
         <>
           <h2 className="label" style={{ marginBottom: 8 }}>
             Error

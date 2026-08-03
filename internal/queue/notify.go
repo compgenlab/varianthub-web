@@ -42,7 +42,7 @@ func (q *Queue) listen(ctx context.Context) error {
 	}
 	defer conn.Release()
 
-	for _, ch := range []string{chanQueued, chanDone} {
+	for _, ch := range []string{chanQueued, chanDone, chanCancel} {
 		// Channel names are compile-time constants, not user input.
 		if _, err := conn.Exec(ctx, `LISTEN `+ch); err != nil {
 			return err
@@ -58,8 +58,31 @@ func (q *Queue) listen(ctx context.Context) error {
 			q.poke()
 		case chanDone:
 			q.wake(n.Payload)
+		case chanCancel:
+			q.stopLocal(n.Payload)
 		}
 	}
+}
+
+// stopLocal cancels a job this process is running.
+//
+// A cancel for a job running in another replica finds nothing here and is
+// ignored, which is correct: every replica listens, so the one holding it will
+// act. A cancel for a job that has already finished likewise does nothing.
+func (q *Queue) stopLocal(id string) {
+	q.mu.Lock()
+	rj := q.running[id]
+	if rj != nil {
+		// Recorded before cancelling, so the worker sees the flag rather than
+		// racing to interpret a context error it cannot attribute.
+		rj.cancelled = true
+	}
+	q.mu.Unlock()
+	if rj == nil {
+		return
+	}
+	log.Printf("queue: cancelling job %s", id)
+	rj.cancel()
 }
 
 // wake releases everyone blocked in WaitFor for job id.

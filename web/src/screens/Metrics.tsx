@@ -9,6 +9,7 @@ import {
   HardDrive,
   Hourglass,
   Loader,
+  Ban,
 } from "lucide-react";
 
 import { api, type Metrics as MetricsData } from "../api";
@@ -113,7 +114,10 @@ export default function Metrics() {
   const remote = m.remote ?? [];
   const onDisk = stored.filter((s) => s.kind === "path");
   const inBuckets = stored.filter((s) => s.kind === "s3");
-  const failRate = j.total > 0 ? (j.failed / j.total) * 100 : 0;
+  // Cancelled jobs are excluded from the denominator: a rate that moves
+  // because someone stopped a job on purpose is not a rate worth watching.
+  const decided = Math.max(0, j.total - (j.cancelled ?? 0));
+  const failRate = decided > 0 ? (j.failed / decided) * 100 : 0;
 
   return (
     <div className="page page-wide" style={{ paddingTop: 30 }}>
@@ -137,15 +141,21 @@ export default function Metrics() {
           icon={<CircleCheck size={13} />}
           label="Successful"
           value={humanCount(j.succeeded)}
-          sub={j.total > 0 ? `${(100 - failRate).toFixed(1)}% of all jobs` : "no jobs yet"}
+          sub={decided > 0 ? `${(100 - failRate).toFixed(1)}% of completed jobs` : "no jobs yet"}
           tone="ok"
         />
         <Stat
           icon={<CircleAlert size={13} />}
           label="Failed"
           value={humanCount(j.failed)}
-          sub={j.total > 0 ? `${failRate.toFixed(1)}% of all jobs` : undefined}
+          sub={decided > 0 ? `${failRate.toFixed(1)}% of completed jobs` : undefined}
           tone={j.failed > 0 ? "bad" : undefined}
+        />
+        <Stat
+          icon={<Ban size={13} />}
+          label="Cancelled"
+          value={humanCount(j.cancelled ?? 0)}
+          sub="stopped on purpose"
         />
         <Stat
           icon={<Database size={13} />}

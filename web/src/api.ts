@@ -41,6 +41,8 @@ export interface JobStats {
   running: number;
   /** Creation time of the longest-waiting queued job; absent when none wait. */
   oldest_queued_at?: number;
+  /** Stopped on purpose — counted apart from failed. */
+  cancelled: number;
   /** Variants across successful jobs only. */
   variants: number;
   last_24h: number;
@@ -200,7 +202,7 @@ export interface Job {
   kind: string;
   snapshot: string;
   selection?: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   error?: string;
   n_variants: number;
   label?: string;
@@ -659,6 +661,12 @@ export const api = {
     req<void>(
       `/admin/sources/${encodeURIComponent(sourceId)}/grants/${encodeURIComponent(teamId)}`,
       { method: "DELETE" },
+    ),
+
+  cancelJob: (id: string) =>
+    req<{ job: Job; cancelled: boolean; detail?: string }>(
+      `/jobs/${encodeURIComponent(id)}/cancel`,
+      { method: "POST" },
     ),
 
   jobLog: (id: string) =>

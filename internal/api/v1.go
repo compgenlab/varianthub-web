@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -683,6 +684,39 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleCancelJob stops a job.
+//
+// Gated by the same ownership rule as reading it: a caller who may see a job may
+// stop it. Cancelling is strictly less powerful than submitting — someone who
+// can start work can already occupy a worker, and letting them stop it again
+// frees the slot they are holding rather than taking anything from anyone else.
+// An administrator can cancel anything, which is what the system jobs view uses.
+func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.queue.Cancel(r.Context(), job.ID)
+	switch {
+	case errors.Is(err, queue.ErrNotCancellable):
+		// Not an error worth a failure status: the caller wanted it stopped and
+		// it is stopped. Report the state so the UI can settle on it.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"job": out, "cancelled": false,
+			"detail": "job had already finished",
+		})
+		return
+	case errors.Is(err, queue.ErrNoSuchJob):
+		writeError(w, http.StatusNotFound, "no such job")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("api: job %s cancelled by %s", job.ID, callerOf(r).Label())
+	writeJSON(w, http.StatusOK, map[string]any{"job": out, "cancelled": true})
 }
 
 // handleJobLog serves what a job's run printed.

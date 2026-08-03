@@ -9,6 +9,7 @@ const STATUS: Record<Job["status"], { label: string; color: string }> = {
   running: { label: "Running", color: "var(--vus-dot)" },
   queued: { label: "Queued", color: "var(--text-4)" },
   error: { label: "Failed", color: "var(--path-dot)" },
+  cancelled: { label: "Cancelled", color: "var(--text-3)" },
 };
 
 function when(sec: number) {

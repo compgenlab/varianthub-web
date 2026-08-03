@@ -2,8 +2,10 @@ package queue
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStats(t *testing.T) {
@@ -125,5 +127,102 @@ func TestJobLog(t *testing.T) {
 	// read as "recorded, but empty".
 	if err := q.SetLog(ctx, id+"-nonexistent", ""); err != nil {
 		t.Errorf("empty SetLog on an unknown job: %v", err)
+	}
+}
+
+// Cancelling a queued job settles it without a worker ever seeing it.
+func TestCancelQueuedJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	job, err := q.Cancel(ctx, id)
+	if err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	if job.Status != StatusCancelled {
+		t.Errorf("status = %q, want %q", job.Status, StatusCancelled)
+	}
+	if !job.Terminal() {
+		t.Error("a cancelled job does not report as terminal")
+	}
+	// It must not then be claimable: a cancelled job that a worker picks up
+	// anyway is worse than one that never cancelled.
+	if _, _, ok, err := q.claimNext(ctx); err != nil || ok {
+		t.Errorf("claimNext after cancel: ok=%v err=%v", ok, err)
+	}
+}
+
+// The case that matters: a job already executing stops, and is recorded as
+// cancelled rather than as a failure.
+func TestCancelRunningJob(t *testing.T) {
+	q := testQueue(t)
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	q.StartListener(ctx)
+
+	started := make(chan struct{})
+	q.StartWorkers(ctx, 1, func(runCtx context.Context, job Job, input []byte) (Outcome, error) {
+		close(started)
+		// Block until cancelled, as a long download would.
+		<-runCtx.Done()
+		return Outcome{}, runCtx.Err()
+	})
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job never started")
+	}
+
+	if _, err := q.Cancel(ctx, id); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	var job Job
+	for time.Now().Before(deadline) {
+		job, _, _ = q.Get(ctx, id)
+		if job.Terminal() {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if job.Status != StatusCancelled {
+		t.Fatalf("status = %q, want %q (error=%q)", job.Status, StatusCancelled, job.Error)
+	}
+	// The run reported a context error on its way down, but the reason it went
+	// down is known — recording it as a failure would misattribute a decision.
+	if job.Error != "cancelled" {
+		t.Errorf("error = %q, want %q", job.Error, "cancelled")
+	}
+}
+
+// Cancelling something already finished is not an error: the caller wanted it
+// stopped, and it is stopped.
+func TestCancelFinishedJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.pool.Exec(ctx,
+		`UPDATE job SET status=$1, finished_at=$2 WHERE id=$3`, StatusDone, 1, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Cancel(ctx, id); !errors.Is(err, ErrNotCancellable) {
+		t.Errorf("Cancel on a finished job = %v, want ErrNotCancellable", err)
+	}
+	if _, err := q.Cancel(ctx, "no-such-id"); !errors.Is(err, ErrNoSuchJob) {
+		t.Errorf("Cancel on an unknown id = %v, want ErrNoSuchJob", err)
 	}
 }

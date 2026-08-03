@@ -8,6 +8,10 @@ type Stats struct {
 	Total     int64 `json:"total"`
 	Succeeded int64 `json:"succeeded"`
 	Failed    int64 `json:"failed"`
+	// Cancelled is counted apart from failed: someone stopping a job on
+	// purpose is not the deployment going wrong, and folding the two together
+	// would make the failure rate move for reasons nobody needs to chase.
+	Cancelled int64 `json:"cancelled"`
 
 	// What is in flight right now.
 	Queued  int64 `json:"queued"`
@@ -41,6 +45,7 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		SELECT count(*),
 		       count(*) FILTER (WHERE status = $1),
 		       count(*) FILTER (WHERE status = $2),
+		       count(*) FILTER (WHERE status = $7),
 		       count(*) FILTER (WHERE status = $3),
 		       count(*) FILTER (WHERE status = $4),
 		       coalesce(min(created_at) FILTER (WHERE status = $3), 0),
@@ -49,8 +54,8 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		       count(*) FILTER (WHERE finished_at >= $6)
 		  FROM job`,
 		StatusDone, StatusError, StatusQueued, StatusRunning,
-		now-24*3600, now-7*24*3600).
-		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Queued, &s.Running,
+		now-24*3600, now-7*24*3600, StatusCancelled).
+		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Cancelled, &s.Queued, &s.Running,
 			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d)
 	return s, err
 }
