@@ -44,6 +44,14 @@
   # Fixed VARHUB_HOME. Empty means materialize one per job from the catalog,
   # which is what a deployment normally wants.
   varhub_home = ""                                  # VHW_VARHUB_HOME
+  # Container images and tool data (VEP's cache and the like) live under
+  # data_dir, and always on a filesystem — a container binds the data directory
+  # and apptainer runs a .sif from a path, so neither can be read from a bucket
+  # even when source data is.
+  #
+  # A tool's setup runs once per data_dir. Several machines with separate
+  # data_dirs each pay it: point them at one shared mount to pay it once, or see
+  # cache_setup below for the case where there is no shared mount.
   data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
   cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
   job_timeout = "1h"                                # VHW_JOB_TIMEOUT
@@ -51,6 +59,17 @@
 
 # Where downloaded source data goes. Filesystem entries come first and the first
 # of those is the default target. Both take "name=<target>" entries.
+#
+# A plain directory is a complete configuration — no object store is required
+# for any of this. It is also the simpler one for tools: with a filesystem
+# target, a tool's image and data live directly inside it, so a folder on shared
+# storage is shared by every worker with nothing to synchronise.
+#
+# An S3 target is for the case where there is no shared mount. Source files are
+# then read in place with range requests, but a tool still needs a directory, so
+# its data is archived and unpacked locally — a source opts into that with
+# cache_setup = true in its manifest. That setting does nothing with a
+# filesystem target, because there is nothing to copy.
 [storage]
   paths = ["default=/var/lib/varianthub/sources"]   # VHW_STORAGE_PATHS
   s3 = []                                           # VHW_STORAGE_S3

@@ -231,8 +231,23 @@ but they are far more attainable than `privileged`.
 
 **Tool data is never in an object store.** A container binds `{datadir}` and
 apptainer runs a `.sif` from a path, so both resolve against local storage even
-when `cache_dir` is a bucket — see `tool_dir` in the varhub config. Source data
-still reads from S3 with range requests; only tools need a filesystem.
+when the source cache is a bucket. Source data still reads from S3 with range
+requests; only tools need a filesystem.
+
+A tool's setup runs **once per `data_dir`**, gated by a sentinel. What that costs
+depends on how many machines you have and what they share:
+
+| Deployment | What to do |
+|---|---|
+| One machine | Nothing. A plain directory is a complete configuration. |
+| Several, shared mount | Point `data_dir` at it — setup runs once for all of them. |
+| Several, no shared mount | An S3 storage target plus `cache_setup = true` in the tool's manifest: setup is archived once and unpacked on each machine. |
+
+**No object store is required for any of this.** With a filesystem target a
+tool's image and data live directly inside it, so a shared folder is shared by
+every worker with nothing to synchronise — `cache_setup` is then a no-op,
+because there is nothing to copy. The S3 machinery exists only because a bucket
+cannot *be* the directory a tool opens files in.
 
 ## Configuration
 
