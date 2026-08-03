@@ -55,6 +55,11 @@
   paths = ["default=/mnt/storage"]                   # VHW_STORAGE_PATHS
   s3 = []                                            # VHW_STORAGE_S3
 
+# Reference FASTAs by assembly, for tool steps using {ref}. Empty until a tool
+# needs one; the file must be readable by the worker, so mount it in first.
+[references]
+  # GRCh38 = "/mnt/ref/GRCh38.fa"
+
 [limits]
   # The submit rate applies to anonymous callers only; an account is
   # accountable, and throttling a signed-in bulk load would make it throttle

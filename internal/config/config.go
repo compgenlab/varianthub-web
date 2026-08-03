@@ -59,11 +59,28 @@ type Config struct {
 	// as "name=s3://bucket/prefix". Separate from StoragePaths because the two
 	// are validated differently and because a deployment usually has one of
 	// each, not a mixed list.
-	StorageS3      []string
-	JobTimeout     time.Duration // per-job wall clock
-	JobTTL         time.Duration // terminal jobs GC'd after this
-	SubmitWaitCap  time.Duration // ceiling on ?wait=
-	MaxUploadBytes int64         // cap on a POST /annotate/vcf body
+	StorageS3 []string
+	// References maps an assembly to a reference FASTA on the worker's
+	// filesystem, e.g. {"GRCh38": "/mnt/ref/GRCh38.fa"}.
+	//
+	// Declared by the deployment rather than in the catalog, for the same reason
+	// storage paths are: a path only means something if the worker can open it,
+	// and a tool step binds the FASTA's directory into a container.
+	//
+	// Assembly names are matched exactly and deliberately not normalized —
+	// "GRCh38" and "hg38" are different keys. A false mismatch is a loud error
+	// fixed by editing one line; a false match would annotate against the wrong
+	// coordinates and say nothing.
+	References map[string]string
+	JobTimeout time.Duration // per-job wall clock
+	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
+	// default: a tool's one-time install fetches tens of gigabytes, and being
+	// killed partway leaves a half-populated data directory that the next
+	// attempt has to redo from the start.
+	DownloadTimeout time.Duration
+	JobTTL          time.Duration // terminal jobs GC'd after this
+	SubmitWaitCap   time.Duration // ceiling on ?wait=
+	MaxUploadBytes  int64         // cap on a POST /annotate/vcf body
 
 	RatePerMin   int      // per-IP submit rate
 	RateBurst    int      // per-IP burst
@@ -81,19 +98,21 @@ type Config struct {
 // without anything noticing.
 func Defaults() *Config {
 	return &Config{
-		Addr:           ":8080",
-		Workers:        2,
-		VarhubBin:      "varhub",
-		DataDir:        "/var/lib/varianthub/data",
-		CacheDir:       "/var/lib/varianthub/cache",
-		StoragePaths:   []string{"default=/var/lib/varianthub/sources"},
-		JobTimeout:     time.Hour,
-		JobTTL:         24 * time.Hour,
-		SubmitWaitCap:  10 * time.Second,
-		MaxUploadBytes: 64 << 20,
-		RatePerMin:     30,
-		RateBurst:      10,
-		MaxJobsPerIP:   2,
+		Addr:            ":8080",
+		Workers:         2,
+		VarhubBin:       "varhub",
+		DataDir:         "/var/lib/varianthub/data",
+		CacheDir:        "/var/lib/varianthub/cache",
+		StoragePaths:    []string{"default=/var/lib/varianthub/sources"},
+		JobTimeout:      time.Hour,
+		DownloadTimeout: 12 * time.Hour,
+		JobTTL:          24 * time.Hour,
+		SubmitWaitCap:   10 * time.Second,
+		MaxUploadBytes:  64 << 20,
+		RatePerMin:      30,
+		RateBurst:       10,
+		MaxJobsPerIP:    2,
+		References:      map[string]string{},
 		TrustedProxy: []string{
 			"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		},
@@ -164,10 +183,26 @@ func applyEnv(c *Config) {
 	envStr("VHW_DATA_DIR", &c.DataDir)
 	envStr("VHW_CACHE_DIR", &c.CacheDir)
 	envDurInto("VHW_JOB_TIMEOUT", &c.JobTimeout)
+	envDurInto("VHW_DOWNLOAD_TIMEOUT", &c.DownloadTimeout)
 	envDurInto("VHW_JOB_TTL", &c.JobTTL)
 
 	envListInto("VHW_STORAGE_PATHS", &c.StoragePaths)
 	envListInto("VHW_STORAGE_S3", &c.StorageS3)
+	if v, ok := lookup("VHW_REFERENCES"); ok {
+		// "GRCh38=/mnt/ref/GRCh38.fa,GRCh37=/mnt/ref/hs37d5.fa" — the same
+		// name=value shape as the storage variables.
+		refs := map[string]string{}
+		for _, entry := range strings.Split(v, ",") {
+			name, path, found := strings.Cut(strings.TrimSpace(entry), "=")
+			if !found {
+				continue
+			}
+			if name, path = strings.TrimSpace(name), strings.TrimSpace(path); name != "" && path != "" {
+				refs[name] = path
+			}
+		}
+		c.References = refs
+	}
 
 	envIntInto("VHW_RATE_PER_MIN", &c.RatePerMin)
 	envIntInto("VHW_RATE_BURST", &c.RateBurst)

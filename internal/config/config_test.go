@@ -311,3 +311,29 @@ func TestFileSecretDetection(t *testing.T) {
 		t.Error("warned about a 0600 file")
 	}
 }
+
+// Provisioning gets its own bound, and an existing deployment that set only
+// job_timeout keeps the behaviour it had.
+func TestDownloadTimeout(t *testing.T) {
+	withFile(t, `
+[database]
+  url = "postgres://x/db"
+[worker]
+  job_timeout = "30m"
+  download_timeout = "6h"
+`)
+	c, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.JobTimeout != 30*time.Minute || c.DownloadTimeout != 6*time.Hour {
+		t.Errorf("job=%v download=%v", c.JobTimeout, c.DownloadTimeout)
+	}
+
+	// The default is longer than an annotation's, which is the whole point.
+	d := Defaults()
+	if d.DownloadTimeout <= d.JobTimeout {
+		t.Errorf("download timeout %v is not longer than job timeout %v",
+			d.DownloadTimeout, d.JobTimeout)
+	}
+}

@@ -49,14 +49,19 @@ type fileConfig struct {
 	} `toml:"auth"`
 
 	Worker struct {
-		Count      *int   `toml:"count"`
-		VarhubBin  string `toml:"varhub_bin"`
-		VarhubHome string `toml:"varhub_home"`
-		DataDir    string `toml:"data_dir"`
-		CacheDir   string `toml:"cache_dir"`
-		JobTimeout string `toml:"job_timeout"`
-		JobTTL     string `toml:"job_ttl"`
+		Count           *int   `toml:"count"`
+		VarhubBin       string `toml:"varhub_bin"`
+		VarhubHome      string `toml:"varhub_home"`
+		DataDir         string `toml:"data_dir"`
+		CacheDir        string `toml:"cache_dir"`
+		JobTimeout      string `toml:"job_timeout"`
+		DownloadTimeout string `toml:"download_timeout"`
+		JobTTL          string `toml:"job_ttl"`
 	} `toml:"worker"`
+
+	// References maps an assembly to a FASTA path. A bare table so an assembly
+	// name is the key: [references]\n  GRCh38 = "/mnt/ref/GRCh38.fa"
+	References map[string]string `toml:"references"`
 
 	Storage struct {
 		Paths []string `toml:"paths"`
@@ -138,10 +143,16 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	if err := setDur(&c.JobTimeout, f.Worker.JobTimeout, path, "worker.job_timeout"); err != nil {
 		return hasSecret, err
 	}
+	if err := setDur(&c.DownloadTimeout, f.Worker.DownloadTimeout, path, "worker.download_timeout"); err != nil {
+		return hasSecret, err
+	}
 	if err := setDur(&c.JobTTL, f.Worker.JobTTL, path, "worker.job_ttl"); err != nil {
 		return hasSecret, err
 	}
 
+	if len(f.References) > 0 {
+		c.References = f.References
+	}
 	setList(&c.StoragePaths, f.Storage.Paths)
 	setList(&c.StorageS3, f.Storage.S3)
 

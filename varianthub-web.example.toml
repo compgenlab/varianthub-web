@@ -55,6 +55,11 @@
   data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
   cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
   job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Provisioning is a different scale of work: a source can be tens of
+  # gigabytes and a tool's one-time install larger still. Being killed partway
+  # is worse than being slow — it leaves a half-populated data directory with
+  # no sentinel, so the next attempt starts from nothing.
+  download_timeout = "12h"                          # VHW_DOWNLOAD_TIMEOUT
   job_ttl = "24h"                                   # VHW_JOB_TTL
 
 # Where downloaded source data goes. Filesystem entries come first and the first
@@ -73,6 +78,25 @@
 [storage]
   paths = ["default=/var/lib/varianthub/sources"]   # VHW_STORAGE_PATHS
   s3 = []                                           # VHW_STORAGE_S3
+
+# Reference FASTAs, keyed by assembly. Needed by any tool step using {ref} —
+# VEP's --fasta, for instance — and by nothing else, so this can stay empty
+# until a tool wants one.
+#
+# Declared here rather than in the catalog for the same reason storage paths
+# are: a path only means something if the worker can open it, and a tool step
+# binds the FASTA's directory into a container. The file must be on the worker's
+# filesystem, not in an object store.
+#
+# Assembly names are matched exactly and deliberately not normalized: "GRCh38"
+# and "hg38" are different keys. A false mismatch is a loud error fixed by
+# editing one line; a false match would annotate against the wrong coordinates
+# and say nothing.
+#
+# VHW_REFERENCES overrides this as "GRCh38=/path/a.fa,GRCh37=/path/b.fa".
+[references]
+  # GRCh38 = "/mnt/ref/GRCh38.fa"
+  # GRCh37 = "/mnt/ref/hs37d5.fa"
 
 [limits]
   # The submit rate applies to anonymous callers only; an account is

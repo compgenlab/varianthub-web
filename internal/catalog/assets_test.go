@@ -176,3 +176,62 @@ func TestMaterializeWritesAssets(t *testing.T) {
 		t.Errorf("asset is not executable: %04o", info.Mode().Perm())
 	}
 }
+
+// A tool step using {ref} resolves it from the assembly, so the job's config has
+// to carry the reference or the step fails inside the container with a path that
+// was never filled in.
+func TestMaterializeWritesReferences(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "b", Name: "b", Version: "1", Kind: "vcf", Build: "GRCh38",
+		TOML: "[[sources]]\nname=\"b\"\nversion=\"1\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "/mnt/sources",
+		References: map[string]string{
+			"GRCh38": "/mnt/ref/GRCh38.fa",
+			"GRCh37": "/mnt/ref/hs37d5.fa",
+		},
+	}
+	home, cleanup, err := m.HomeForSources(ctx, []string{"b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(body)
+	for _, want := range []string{
+		"[references.GRCh37]", "[references.GRCh38]",
+		`fasta = "/mnt/ref/GRCh38.fa"`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("config.toml is missing %q:\n%s", want, got)
+		}
+	}
+	// Sorted, so the same deployment materializes the same file every time.
+	if strings.Index(got, "[references.GRCh37]") > strings.Index(got, "[references.GRCh38]") {
+		t.Errorf("references are not in a stable order:\n%s", got)
+	}
+
+	// With none configured the section is absent rather than empty — varhub
+	// treats a missing reference as "not configured", which is what it is.
+	m.References = nil
+	home2, cleanup2, err := m.HomeForSources(ctx, []string{"b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup2()
+	body2, _ := os.ReadFile(filepath.Join(home2, "config.toml"))
+	if strings.Contains(string(body2), "[references") {
+		t.Errorf("wrote a references section with none configured:\n%s", body2)
+	}
+}

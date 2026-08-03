@@ -116,6 +116,14 @@ type ExecRunner struct {
 	Bin     string        // path to the varhub binary (default "varhub")
 	Home    HomeProvider  // supplies VARHUB_HOME per job
 	Timeout time.Duration // per-job wall clock (0 = no limit beyond ctx)
+	// DownloadTimeout bounds a provisioning run instead, because provisioning
+	// is a different scale of work: an annotation answers a query, while a
+	// download can be fetching a 24 GB source or running a tool's one-time
+	// install. Sharing one bound means either annotations hang for hours or
+	// installs are killed partway, and the second failure is the worse one — it
+	// leaves a half-populated data directory with no sentinel, so the next
+	// attempt starts from nothing. 0 falls back to Timeout.
+	DownloadTimeout time.Duration
 
 	// OnProgress, if set, receives the CLI's progress lines as they arrive.
 	// varhub -v logs to stderr with a "varhub: " prefix; this is what will drive
@@ -552,6 +560,15 @@ type DownloadedFile struct {
 	ModifiedAt int64  `json:"modified_at"`
 }
 
+// downloadTimeout is the provisioning bound, falling back to the annotation one
+// so an existing deployment that set only Timeout keeps its behaviour.
+func (r *ExecRunner) downloadTimeout() time.Duration {
+	if r.DownloadTimeout > 0 {
+		return r.DownloadTimeout
+	}
+	return r.Timeout
+}
+
 // Download runs `varhub download` for a snapshot, then inventories what landed.
 //
 // The inventory is taken here rather than by the API server because only the
@@ -561,9 +578,9 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	if bin == "" {
 		bin = "varhub"
 	}
-	if r.Timeout > 0 {
+	if d := r.downloadTimeout(); d > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
 	if req.CacheDir == "" {

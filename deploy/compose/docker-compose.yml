@@ -169,8 +169,20 @@ services:
       # volume the anchor set. Leaving it out cost the worker its config file
       # and left every job queued.
       - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
-      # Working data: tool images, reference files, the annotation cache.
-      - varhub-data:/var/lib/varianthub
+      # Working data: container images, tool data (VEP's cache and the like),
+      # and the annotation cache.
+      #
+      # Defaults to a named volume, which lives under /var/lib/docker — usually
+      # the root filesystem, and usually the smallest disk on the machine. A
+      # tool cache is tens of gigabytes, so set VHW_HOST_TOOLS to an absolute
+      # path on a large disk before provisioning one:
+      #
+      #   VHW_HOST_TOOLS=/mnt/data1/varhub-tools make dev-tls
+      #
+      # Docker reads a leading "/" as a bind mount and a bare name as a named
+      # volume, so one variable covers both — the same trick VHW_HOST_STORAGE
+      # uses for source data.
+      - ${VHW_HOST_TOOLS:-varhub-data}:/var/lib/varianthub
       # Downloaded source data, always mounted at /mnt/storage inside the
       # container so VHW_STORAGE_PATHS does not have to change with the host.
       #

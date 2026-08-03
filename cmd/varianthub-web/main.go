@@ -186,9 +186,10 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 	exec := &runner.ExecRunner{
-		Bin:     cfg.VarhubBin,
-		Home:    home,
-		Timeout: cfg.JobTimeout,
+		Bin:             cfg.VarhubBin,
+		Home:            home,
+		Timeout:         cfg.JobTimeout,
+		DownloadTimeout: cfg.DownloadTimeout,
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
@@ -225,9 +226,10 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 	log.Printf("worker: materializing annotation config from the catalog (data=%s cache=%s)",
 		cfg.DataDir, cfg.CacheDir)
 	return &catalog.Materializer{
-		Store:    cat,
-		DataDir:  cfg.DataDir,
-		CacheDir: cfg.CacheDir,
+		Store:      cat,
+		DataDir:    cfg.DataDir,
+		CacheDir:   cfg.CacheDir,
+		References: cfg.References,
 	}, nil
 }
 
