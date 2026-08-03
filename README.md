@@ -240,8 +240,8 @@ depends on how many machines you have and what they share:
 | Deployment | What to do |
 |---|---|
 | One machine | Nothing. A plain directory is a complete configuration. |
-| Several, shared mount | Point `data_dir` at it — setup runs once for all of them. |
-| Several, no shared mount | An S3 storage target plus `cache_setup = true` in the tool's manifest: setup is archived once and unpacked on each machine. |
+| Several machines | Point `data_dir` at shared storage — NFS, Lustre, a PVC — and setup runs once for all of them. |
+| Ephemeral disks (k8s pods) | An S3 storage target plus `cache_setup = true` in the tool's manifest: setup is archived once and unpacked on each machine. |
 
 **No object store is required for any of this.** With a filesystem target a
 tool's image and data live directly inside it, so a shared folder is shared by

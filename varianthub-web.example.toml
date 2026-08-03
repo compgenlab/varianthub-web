@@ -70,11 +70,11 @@
 # target, a tool's image and data live directly inside it, so a folder on shared
 # storage is shared by every worker with nothing to synchronise.
 #
-# An S3 target is for the case where there is no shared mount. Source files are
-# then read in place with range requests, but a tool still needs a directory, so
-# its data is archived and unpacked locally — a source opts into that with
-# cache_setup = true in its manifest. That setting does nothing with a
-# filesystem target, because there is nothing to copy.
+# An S3 target is for containers with ephemeral disks, where a new one starts
+# with nothing. Source files are then read in place with range requests, but a
+# tool still needs a directory, so its data is archived and unpacked locally —
+# a source opts into that with cache_setup = true in its manifest. That setting
+# does nothing with a filesystem target, because there is nothing to copy.
 [storage]
   paths = ["default=/var/lib/varianthub/sources"]   # VHW_STORAGE_PATHS
   s3 = []                                           # VHW_STORAGE_S3
