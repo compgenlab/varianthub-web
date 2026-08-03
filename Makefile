@@ -12,6 +12,7 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 
 # Local Postgres used by `make test-db` and the queue tests.
 TEST_DB_PORT ?= 55440
+TLS_PORT     ?= 18443
 TEST_DB_URL  ?= postgres://postgres:test@localhost:$(TEST_DB_PORT)/varianthub?sslmode=disable
 
 # The React app is part of the build: `make build` produces a binary that serves
@@ -102,9 +103,27 @@ dev:
 	@echo "api:      http://localhost:$${API_PORT:-18080}/healthz"
 	@echo "postgres: localhost:$${POSTGRES_PORT:-55441}"
 
+## dev-tls: bring the stack up behind Caddy on https, API not exposed directly
+# VH_SITE names the certificate; the default is this machine's hostname with an
+# internal CA. API_BIND keeps the plain-http port on loopback so https is the
+# only way in from the network.
+dev-tls:
+	@VH_HOST=$${VH_HOST:-$$(hostname)} API_BIND=127.0.0.1 \
+	  $(COMPOSE) --profile tls up --build -d
+	@echo
+	@echo "web: https://$$(hostname):$(TLS_PORT)"
+	@echo
+	@echo "The certificate comes from Caddy's internal CA, so a browser warns"
+	@echo "until that CA is trusted. Export it with:"
+	@echo "  make dev-tls-ca > caddy-root.crt"
+
+## dev-tls-ca: print Caddy's internal CA certificate, to trust in a browser or OS
+dev-tls-ca:
+	@$(COMPOSE) exec -T caddy cat /data/caddy/pki/authorities/local/root.crt
+
 ## dev-down: stop the stack (keeps volumes, so data survives)
 dev-down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile tls down
 
 ## dev-reset: stop the stack and DELETE its volumes (database + annotation config)
 dev-reset:

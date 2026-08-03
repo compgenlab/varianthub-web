@@ -169,6 +169,41 @@ needs a gene model.
 There is no `source remove` yet; detach a source from its snapshots and delete the
 row directly if you need to.
 
+## TLS
+
+```sh
+make dev-tls                     # brings the stack up behind Caddy
+make dev-tls-ca > caddy-root.crt # the CA to trust, so the browser stops warning
+```
+
+Serves `https://<hostname>:18443`, with the plain-HTTP API bound to loopback so
+HTTPS is the only way in from the network.
+
+This is not only about encryption. Browsers gate a growing set of APIs on a
+**secure context**, and `localhost` is exempt — so plain HTTP works on the dev
+box and breaks for everyone else. `crypto.randomUUID` and `navigator.clipboard`
+are both in that set and both used here. Terminating TLS is what makes the app
+behave the same for every client. The session cookie also starts being marked
+`Secure`, which the app decides from the `X-Forwarded-Proto` Caddy sets.
+
+Ports default to **18443/18081** rather than 443/80 because anything else on the
+host that terminates TLS already owns the standard ones — this machine runs a
+k3s ingress controller, and Docker reports the mapping as successful while k3s
+keeps answering. Set `HTTPS_PORT=443 HTTP_PORT=80` where this stack owns the
+host, which is also what a publicly-issued certificate needs.
+
+For a real certificate, name a public host and turn the internal CA off:
+
+```sh
+VH_HOST=varianthub.example.org VH_TLS= HTTPS_PORT=443 HTTP_PORT=80 make dev-tls
+```
+
+Nothing in the app changes when Caddy is in front: `reverse_proxy` sets
+`X-Forwarded-For`, `-Proto` and `-Host`, and the default `trusted_proxies`
+already covers the compose network, so the rate limiter sees real client IPs.
+The one setting that does need updating is `auth.cilogon.redirect_url`, which
+must be the public HTTPS URL and match what CILogon has registered.
+
 ## Configuration
 
 Settings resolve in three layers, each overriding the one before:

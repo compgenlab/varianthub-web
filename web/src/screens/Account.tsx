@@ -3,6 +3,35 @@ import { Building2, Copy, KeyRound, Lock, Trash2 } from "lucide-react";
 
 import { api, type ApiToken, type ExternalIdentity, type Me } from "../api";
 
+/**
+ * Copy to the clipboard, falling back for insecure contexts.
+ *
+ * navigator.clipboard is secure-context-only too, so over plain http the button
+ * silently did nothing — and this is the one string in the app that cannot be
+ * recovered if it is lost.
+ */
+function copy(text: string, done: (ok: boolean) => void) {
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(
+      () => done(true),
+      () => done(false),
+    );
+    return;
+  }
+  const el = document.createElement("textarea");
+  el.value = text;
+  el.style.position = "fixed";
+  el.style.opacity = "0";
+  document.body.appendChild(el);
+  el.select();
+  try {
+    done(document.execCommand("copy"));
+  } catch {
+    done(false);
+  }
+  document.body.removeChild(el);
+}
+
 function when(ts?: number): string {
   if (!ts) return "—";
   return new Date(ts * 1000).toLocaleString();
@@ -131,10 +160,7 @@ export default function Account({ me }: { me: Me }) {
             <button
               className="btn"
               type="button"
-              onClick={() => {
-                navigator.clipboard?.writeText(fresh.secret);
-                setCopied(true);
-              }}
+              onClick={() => copy(fresh.secret, setCopied)}
             >
               <Copy size={14} /> {copied ? "Copied" : "Copy"}
             </button>

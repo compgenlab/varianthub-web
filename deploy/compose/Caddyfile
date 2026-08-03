@@ -1,0 +1,68 @@
+# TLS in front of the API.
+#
+# Two things follow from terminating TLS here rather than in the app:
+#
+#   1. The browser gets a secure context. Several APIs the front-end uses are
+#      gated on that and are simply undefined over plain http to a hostname —
+#      crypto.randomUUID and navigator.clipboard among them. localhost is
+#      exempt, which is why plain http appears to work on the dev box and fails
+#      for everyone else.
+#   2. The session cookie starts being marked Secure. The app decides that from
+#      X-Forwarded-Proto, which Caddy sets automatically on a reverse_proxy.
+#
+# VH_HOST names the site. Default is the LAN hostname with an internal
+# certificate; set it to a public name to have Caddy fetch a real one:
+#
+#   VH_HOST=varianthub.example.org VH_TLS= docker compose --profile tls up -d
+#
+{
+	# Where Caddy mails expiry warnings for a publicly-issued certificate.
+	# Ignored by the internal CA, so it is harmless when left unset.
+	email {$VH_ACME_EMAIL:admin@localhost}
+}
+
+https://{$VH_HOST:debian-vm1} {
+	# An internal certificate by default: a LAN hostname cannot be validated by
+	# a public CA, so asking for a real one would fail and leave no TLS at all.
+	# Browsers will warn until the CA is trusted — see the README — which is the
+	# honest trade for a development stack. A site named with a public hostname
+	# overrides this by setting VH_TLS to an empty value.
+	tls {$VH_TLS:internal}
+
+	encode gzip zstd
+
+	# The API and the embedded SPA are one origin, so everything goes to one
+	# upstream. reverse_proxy sets X-Forwarded-For, -Proto and -Host itself.
+	reverse_proxy api:8080 {
+		# An annotation of a large VCF can outlast a default timeout, and the
+		# submit path streams an upload. The queue has its own job timeout, so
+		# the useful bound is "longer than a request should ever legitimately
+		# take", not a guess at how long annotation runs.
+		transport http {
+			read_timeout 10m
+			write_timeout 10m
+		}
+	}
+
+	# Sent on https only. Announcing a year of HTTPS-only from a dev stack with
+	# an internal certificate would strand the hostname in browsers that
+	# remember it, so this is deliberately short. Raise it for a real
+	# deployment, once the certificate is one browsers already trust.
+	header Strict-Transport-Security "max-age=3600"
+
+	log {
+		output stderr
+		format console
+	}
+}
+
+# Redirect plain http to https.
+#
+# Written out rather than left to Caddy's automatic redirect, which assumes the
+# https site is on 443. When something else on the host already owns 443 — a
+# k3s ingress controller, an existing nginx — this stack is published elsewhere
+# and the automatic redirect sends the browser to whatever does own it, which
+# looks like a certificate error on an unrelated service.
+http://{$VH_HOST:debian-vm1} {
+	redir https://{host}:{$VH_HTTPS_PORT:18443}{uri} permanent
+}
