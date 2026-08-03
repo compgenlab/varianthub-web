@@ -345,6 +345,24 @@ function ProvisionCell({
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
 
+  // Already being fetched. No control while that is true: a second Download
+  // would queue a duplicate of work already running, and the useful thing to
+  // offer is the job rather than the button.
+  if (source.state?.state === "installing") {
+    return (
+      <span className="row gap-8" style={{ fontSize: 12.5 }}>
+        <i className="status-dot blink" style={{ background: "var(--vus-dot)" }} />
+        {source.state.job ? (
+          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12.5 }}>
+            installing…
+          </Link>
+        ) : (
+          "installing…"
+        )}
+      </span>
+    );
+  }
+
   // Nothing to fetch: a builtin computes from the variant, a streamed source is
   // read from its url. Both are usable the moment they are registered, so say
   // which rather than offering a control that would provision nothing.
@@ -358,6 +376,33 @@ function ProvisionCell({
   // worth having for whole-genome runs, or to pin results to bytes that cannot
   // change upstream. Offered, not pressed: the default stays "no copy".
   const streamed = source.needs_data === false && source.stream;
+
+  if (source.state?.state === "failed") {
+    return (
+      <span style={{ display: "block" }}>
+        <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
+          <i className="status-dot" style={{ background: "var(--path-dot)" }} />
+          install failed
+        </span>
+        {/* The reason, trimmed: the row says what happened, the job page has
+            the run's whole output. */}
+        <span
+          className="mono"
+          style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}
+        >
+          {(source.state.error ?? "").split("\n")[0].slice(0, 90)}
+        </span>
+        <button
+          className="btn secondary"
+          style={{ height: 26, padding: "0 9px", fontSize: 11.5, marginTop: 4 }}
+          disabled={busy || targets.length === 0}
+          onClick={provision}
+        >
+          Retry
+        </button>
+      </span>
+    );
+  }
 
   if (have && have.size > 0) {
     return (

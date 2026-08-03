@@ -259,15 +259,45 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// NeedsData is false for builtins, which compute from the variant and have
 		// nothing to download.
 		NeedsData bool `json:"needs_data"`
+		// State is whether the source can actually be annotated with yet.
+		// Registering one and being able to use it are different things: a tool
+		// needs its image and setup, a build source needs its recipe to have
+		// run, and until then every annotation using it fails.
+		State catalog.SourceState `json:"state"`
 	}
+	states, err := s.catalog.SourceStates(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// What is in flight comes from the queue; what was installed comes from the
+	// catalog, because terminal jobs are collected and the record has to outlive
+	// them.
+	active := map[string]string{}
+	if s.queue != nil {
+		if a, aErr := s.queue.ActiveDownloads(r.Context()); aErr == nil {
+			active = a
+		}
+	}
+
 	out := make([]item, 0, len(srcs))
 	for _, src := range srcs {
 		anns := src.Annotations()
 		if anns == nil {
 			anns = []catalog.Annotation{}
 		}
+		st := states[src.ID]
+		if job, ok := active[src.ID]; ok {
+			st.State, st.Job = catalog.StateInstalling, job
+		}
+		if st.State == "" && !src.NeedsData() {
+			// A builtin or a streamed source has nothing to provision, so it is
+			// usable the moment it is registered.
+			st.State = catalog.StateReady
+		}
 		out = append(out, item{
-			Source: src, Ref: src.Ref(), Annotations: anns, NeedsData: src.NeedsData(),
+			Source: src, Ref: src.Ref(), Annotations: anns,
+			NeedsData: src.NeedsData(), State: st,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": out})

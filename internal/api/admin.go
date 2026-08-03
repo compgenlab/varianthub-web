@@ -757,7 +757,13 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		Session: sessionOf(r),
 		UserID:  callerOf(r).UserID(),
 		Label:   "download " + label + " → " + loc.Name,
-		Body:    body,
+		// Which sources this job is for, so the catalog can ask "is anything
+		// fetching this one" without opening every job's body. A tool records
+		// no files — its image and data go to the worker's local data_dir, not
+		// to the storage location — so job state is the only evidence that one
+		// has been installed at all.
+		Selection: strings.Join(req.Sources, ","),
+		Body:      body,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())

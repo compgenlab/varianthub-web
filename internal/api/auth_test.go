@@ -37,6 +37,7 @@ var authMigrations = []string{
 	"../../migrations/0012_source_asset.sql",
 	"../../migrations/0013_job_log.sql",
 	"../../migrations/0014_source_settings.sql",
+	"../../migrations/0015_source_state.sql",
 }
 
 type harness struct {

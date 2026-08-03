@@ -31,6 +31,14 @@ export interface Source {
   index_status: string;
   origin?: string;
   stream?: boolean;
+  /** Whether the source can be annotated with yet, and what is happening to it. */
+  state?: {
+    state?: "installing" | "ready" | "failed";
+    error?: string;
+    updated_at?: number;
+    /** The download job working on it, when one is. */
+    job?: string;
+  };
 }
 
 export interface JobStats {

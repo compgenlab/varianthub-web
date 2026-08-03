@@ -352,6 +352,16 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
 	}
 
+	// Mark them in flight before the work starts, so the catalog says
+	// "installing" rather than "not installed" while a multi-hour tool setup
+	// runs — the state a source is in for most of the time it matters.
+	if cat != nil {
+		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+			catalog.StateInstalling, ""); sErr != nil {
+			log.Printf("worker: job %s: mark installing: %v", job.ID, sErr)
+		}
+	}
+
 	res, err := exec.Download(ctx, runner.DownloadRequest{
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
@@ -364,7 +374,21 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 			log.Printf("worker: download job %s: %s", job.ID, ee.Detail())
 			storeLog(ctx, q, job.ID, ee.Detail())
 		}
+		if cat != nil {
+			// WithoutCancel: a cancelled or timed-out job still has to leave the
+			// source describing itself accurately, and its context is dead.
+			if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+				catalog.StateFailed, err.Error()); sErr != nil {
+				log.Printf("worker: job %s: mark failed: %v", job.ID, sErr)
+			}
+		}
 		return queue.Outcome{}, err
+	}
+	if cat != nil {
+		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+			catalog.StateReady, ""); sErr != nil {
+			log.Printf("worker: job %s: mark ready: %v", job.ID, sErr)
+		}
 	}
 	// A successful download has output worth keeping too: which files it
 	// fetched, what it skipped as already present, how long a build recipe

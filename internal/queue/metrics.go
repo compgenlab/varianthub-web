@@ -1,6 +1,9 @@
 package queue
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
 // Stats summarises the queue and the work it has done.
 type Stats struct {
@@ -31,6 +34,36 @@ type Stats struct {
 	// Recent activity, by completion time.
 	Last24h int64 `json:"last_24h"`
 	Last7d  int64 `json:"last_7d"`
+}
+
+// ActiveDownloads maps a source id to the download job currently working on it.
+//
+// Only the in-flight part is asked of the queue. Whether a source was ever
+// successfully installed is recorded on the source instead: terminal jobs are
+// garbage collected, so a state read from them would be right on the day and
+// wrong from the next one.
+func (q *Queue) ActiveDownloads(ctx context.Context) (map[string]string, error) {
+	rows, err := q.pool.Query(ctx, `
+		SELECT id, selection FROM job
+		 WHERE kind = $1 AND status IN ($2,$3) AND selection <> ''`,
+		KindDownload, StatusQueued, StatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var id, selection string
+		if err := rows.Scan(&id, &selection); err != nil {
+			return nil, err
+		}
+		for _, sid := range strings.Split(selection, ",") {
+			if sid = strings.TrimSpace(sid); sid != "" {
+				out[sid] = id
+			}
+		}
+	}
+	return out, rows.Err()
 }
 
 // Stats reports queue and throughput counters.

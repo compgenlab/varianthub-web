@@ -249,6 +249,24 @@ export default function ChooseSources() {
                         <Globe size={10} /> remote
                       </span>
                     )}
+                    {/* Registered is not the same as usable: a tool needs its
+                        image and setup, a build source needs its recipe to have
+                        run. Choosing one before that fails the whole run, so it
+                        is worth seeing at the point of choosing. */}
+                    {s.state?.state === "installing" && (
+                      <span className="tag" title="Being downloaded and set up">
+                        installing…
+                      </span>
+                    )}
+                    {s.state?.state === "failed" && (
+                      <span
+                        className="tag"
+                        style={{ background: "var(--path-bg)", color: "var(--path-fg)" }}
+                        title={s.state.error ?? "Provisioning failed"}
+                      >
+                        not installed
+                      </span>
+                    )}
                   </span>
                   <span
                     className="mono"
