@@ -76,6 +76,16 @@ pulled from the load balancer rather than taking traffic it cannot serve.
 {"status": "ok"}
 ```
 
+### `GET /api/v1/ping`
+
+```json
+{"pong": "ok"}
+```
+
+**Authenticated on purpose**, unlike `/healthz`. This is how a client checks that
+its credential works, which an endpoint that answered without one could not tell
+it. Use `/healthz` for liveness.
+
 ### `GET /version`
 
 Liveness and build identification. Deliberately independent of the database — a
@@ -267,6 +277,43 @@ One job, same shape as a list entry.
 an admin grant. This is a deliberate change from the previous server, where
 knowing a job id was sufficient to read it.
 
+### `GET /api/v1/jobs/{id}/log`
+
+What the run printed — the tail of the CLI's progress output.
+
+```json
+{"job_id": "…", "output": "varhub: annotating 1 loci (2 annotation(s) selected)\n…", "recorded": true}
+```
+
+Kept for runs that **succeed as well as fail**. The case with the most to explain
+is a job that finished cleanly having annotated nothing: it is `done`, its result
+set is empty, and only this says whether the sources were consulted and matched
+nothing or were never consulted at all.
+
+`recorded: false` means no output was stored — a job from before logs were kept,
+or one that printed nothing. That is distinct from `output: ""`.
+
+Ownership is enforced as it is for the job itself.
+
+### `POST /api/v1/jobs/{id}/cancel`
+
+Stops a job, returning the job and whether this call is what stopped it.
+
+```json
+{"job": {…}, "cancelled": true}
+```
+
+A job that had already finished returns `200` with `"cancelled": false` and a
+`detail` saying so, rather than an error: the caller wanted it stopped and it is
+stopped. Cancelling is gated by the same ownership rule as reading — someone who
+can start work can already occupy a worker, and stopping it frees the slot they
+are holding rather than taking anything from anyone else. An administrator can
+cancel anything, which is what the system jobs view uses.
+
+A cancelled job ends in status `cancelled`, not `error`: a deliberate stop is a
+decision rather than a fault, and counting one as a failure would distort the
+failure rate on the metrics page.
+
 ### `GET /api/v1/jobs/{id}/results`
 
 One page of annotated variants plus the column definitions needed to render them.
@@ -339,6 +386,9 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
 | `DELETE` | `/api/v1/admin/sources/{id}` | **implemented** — refused with 409 while a snapshot pins it |
 | `GET` | `/api/v1/admin/sources/{id}/config` | **implemented** — the stored TOML manifest |
+| `GET` | `/api/v1/admin/sources/{id}/settings` | **implemented** — this deployment's settings for the source |
+| `PUT` | `/api/v1/admin/sources/{id}/settings` | **implemented** — replaces them; see below |
+| `PUT` | `/api/v1/admin/snapshots/{id}/sources` | **implemented** — replaces the pinned set, order preserved |
 | `GET` | `/api/v1/admin/registries` | **implemented** |
 | `POST` | `/api/v1/admin/registries` | **implemented** — validates by fetching once |
 | `DELETE` | `/api/v1/admin/registries/{id}` | **implemented** (not the builtin default) |
@@ -352,6 +402,41 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `GET` | `/api/v1/admin/files` | **implemented** — downloaded files and sizes; `?source=` / `?storage=` narrow it |
 | `POST` | `/api/v1/admin/downloads` | **implemented** — queues a provisioning job |
 | `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
+
+### Source settings
+
+What this deployment decides about a source, as opposed to what the source's
+manifest says about itself. Stored apart from `toml_text` so re-fetching a
+manifest from a registry cannot silently discard them.
+
+```json
+{"settings": {"annotation_prefix": "GENCODE_48_", "cache_setup": true}}
+```
+
+`annotation_prefix` renames the source's output fields. It is a **substitution,
+not a prepend**: a manifest declares the prefix its names already carry — VEP
+names every field `VEP_Allele` — so swapping in `VEP_113_` replaces `VEP_` rather
+than stacking onto it. `"-"` means deliberately no prefix, which `""` cannot
+express: empty falls through to whatever the manifest declared.
+
+The point is running two versions of the same source side by side, `GENCODE_48_`
+next to `GENCODE_47_`, without their columns colliding.
+
+Two consequences worth knowing, because both were once bugs:
+
+- Every listing that names annotations returns the **effective** names, already
+  renamed. A listing showing manifest names while annotation emitted prefixed
+  ones would hand out selections that cannot resolve, and the failure would
+  surface much later as `default_annotations references unknown annotation`.
+- Changing the prefix **rewrites the snapshot defaults** that named this source's
+  fields, since those are stored denormalized as plain strings. Only defaults
+  belonging to this source move: two sources can emit the same bare name, and
+  rewriting the other one's on a string match would silently repoint it.
+
+`cache_setup` archives a tool's setup output to the object store, so a machine
+with an empty data directory unpacks it instead of re-running an install that
+takes hours. It does nothing for a filesystem storage target, where the directory
+is already where another machine would look.
 
 ### Provisioning
 
@@ -601,6 +686,18 @@ unaccountable browser flooding the queue; an account is accountable — it can b
 disabled and its jobs are attributable — and throttling a signed-in bulk load
 would make that load throttle itself. The per-IP *concurrency* cap still applies
 to everyone, so no one caller monopolises the workers.
+
+### `GET /api/v1/auth/identities`
+
+External identities linked to the calling account — the institutional logins that
+can sign in as this user.
+
+```json
+{"identities": [{"provider": "cilogon", "subject": "http://cilogon.org/serverA/users/…", "email": "…"}]}
+```
+
+Scoped to the caller. An account with no external identity returns an empty list,
+which is the ordinary case for a password account.
 
 ### Bootstrap: the first administrator
 

@@ -26,8 +26,7 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 | `internal/limit/` | Per-IP rate limiting and client-IP resolution |
 | `migrations/` | Numbered SQL, applied by `migrate` |
 | `web/` | React app (embedded into the binary at build time) |
-| `deploy/compose/` | Dev stack (postgres + migrate + seed + api + worker) |
-| `deploy/k8s/` | Reference k8s manifests (production lives in a separate deploy repo) |
+| `deploy/compose/` | The deployment stack (postgres + migrate + seed + api + worker) |
 | `docs/api.md` | The `/api/v1` contract |
 | `design_handoff_varianthub/` | Design reference (prototype HTML + spec) |
 
@@ -85,12 +84,13 @@ Building outside Docker needs Go 1.25+ and a `varhub` on `PATH` for the worker.
 
 ## Deploying
 
-`deploy/compose` is the supported path that ships with this repo: it works from a
-clean checkout and is what self-hosters should use.
+`deploy/compose` is the deployment path that ships with this repo: it works from
+a clean checkout, and it is what this repository supports.
 
-`deploy/k8s` holds reference manifests. Our own production deployment is managed
-in a separate k8s deploy repo, so those files are examples and seed material, not
-the live configuration — see that directory's README.
+Our own Kubernetes deployment lives in a separate, private repository. Nothing
+here depends on it, and the application takes all of its configuration from a
+TOML file and environment variables, so any orchestrator that can set those can
+run it — see `varianthub-web.example.toml` for the full surface.
 
 ## Provisioning source data
 

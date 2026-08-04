@@ -1,4 +1,4 @@
-# Development stack. Production uses deploy/k8s — keep the two independent
+# The stack that ships with this repository, and the supported way to run it
 # rather than trying to share one definition; they have different goals (fast
 # iteration vs. rolling upgrades, managed Postgres, real secrets).
 #
@@ -236,7 +236,7 @@ services:
   # Off by default: it only starts with `--profile s3` (or COMPOSE_PROFILES=s3),
   # because the stack is perfectly usable with a filesystem volume alone and
   # most dev work does not need a bucket. Production does not use this at all —
-  # deploy/k8s points at a real object store.
+  # A real deployment points at an actual object store.
   #
   # versitygw's posix backend treats each top-level directory under its root as
   # a bucket, so the bucket is created by making a directory.
