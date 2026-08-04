@@ -264,6 +264,12 @@ export default function App() {
             <Route path="/annotate/running/:jobId" element={<Running />} />
             <Route path="/jobs" element={<JobsList />} />
             <Route path="/jobs/:jobId" element={<JobResults />} />
+            {/* The same view as the admin one, and gated the same way: the API
+                serves a job to its owner or an administrator and 404s otherwise,
+                so the path a reader arrives by decides nothing. It exists
+                separately because sending someone to /admin to read their own
+                run says the wrong thing about whose job it is. */}
+            <Route path="/jobs/:jobId/run" element={<JobDetail />} />
             <Route path="/admin" element={<Admin />} />
             <Route path="/admin/sources/:sourceId" element={<SourceDetail />} />
             <Route path="/admin/snapshots/:snapshotId" element={<SnapshotDetail />} />

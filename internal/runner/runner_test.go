@@ -614,3 +614,38 @@ func TestMessageWithNoStderr(t *testing.T) {
 		t.Errorf("Error = %q, want %q", got, "download failed")
 	}
 }
+
+// A successful run keeps its output too.
+//
+// Logs used to be stored only when the CLI exited non-zero, so the one case
+// with nothing to read was a job that finished cleanly having annotated
+// nothing — which is exactly what a snapshot pinning names no source emits
+// looks like from the outside. The job is "done", the table is empty, and
+// without this there is no way to tell "consulted the sources, no match" from
+// "never consulted them".
+func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
+	bin, home := testHome(t)
+	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
+
+	res, err := r.Annotate(context.Background(), Request{
+		Kind:      KindLocus,
+		Snapshot:  "test",
+		Selection: "all",
+		Body:      []byte("chr1:115256529:T:C"),
+	})
+	if err != nil {
+		t.Fatalf("Annotate: %v", err)
+	}
+	if res.Log == "" {
+		t.Fatal("a successful run recorded no output")
+	}
+	// It must be the run's own progress, not incidental noise: varhub prefixes
+	// its progress lines, and that prefix is what makes the log worth keeping.
+	if !strings.Contains(res.Log, "varhub:") {
+		t.Errorf("log does not look like varhub progress output:\n%s", res.Log)
+	}
+	// The point of keeping it is learning what the run actually did.
+	if !strings.Contains(res.Log, "annotat") {
+		t.Errorf("log says nothing about annotating:\n%s", res.Log)
+	}
+}

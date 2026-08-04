@@ -314,6 +314,11 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store) queue.Runner {
 			}
 			return queue.Outcome{}, err
 		}
+		// Kept for a run that worked, as downloads already do. A job that
+		// annotated nothing succeeds by every check made here, and the progress
+		// output is the only thing that says whether the sources were consulted.
+		storeLog(ctx, q, job.ID, res.Log)
+
 		var cols []byte
 		if len(res.Columns) > 0 {
 			if b, mErr := json.Marshal(res.Columns); mErr == nil {

@@ -49,6 +49,16 @@ type Result struct {
 	Variants []byte   // the raw JSON array, stored and served verbatim
 	N        int      // number of variants
 	Columns  []Column // the column model for these results, in snapshot order
+
+	// Log is what the run printed — the tail of varhub's progress output.
+	//
+	// Kept on success, not only on failure. "It worked" is not the only question
+	// asked of a finished job: a run that returns nothing at all is a success by
+	// every check the worker makes, and without this there is nothing to say
+	// whether it consulted the sources and found no match or never consulted
+	// them. That is the shape of a prefix rename leaving a snapshot pinning
+	// names nothing emits.
+	Log string `json:"-"`
 }
 
 // Column describes one annotation column of a result set: what to label it, how
@@ -289,7 +299,7 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		log.Printf("runner: column metadata unavailable (%v); falling back to keys", err)
 		cols = fallbackColumns(present)
 	}
-	return Result{Variants: out, N: len(probe), Columns: cols}, nil
+	return Result{Variants: out, N: len(probe), Columns: cols, Log: tail}, nil
 }
 
 // columns asks the CLI for the snapshot's annotation catalog and keeps the
