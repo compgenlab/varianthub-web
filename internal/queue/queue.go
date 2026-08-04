@@ -251,11 +251,38 @@ type Queue struct {
 	// NOTIFY can reach the right subprocess. Only ever holds jobs claimed here;
 	// a cancel for another replica's job finds nothing and is ignored, which is
 	// correct — that replica is listening too.
+	//
+	// It is also exactly the set whose leases this process must renew: a job is
+	// in here for as long as this process is really working on it.
 	running map[string]*runningJob
+
+	// workerID identifies this process in the claims it holds. Random per
+	// process rather than derived from a hostname or pid, both of which a
+	// container reuses across restarts — a restarted worker must not look like
+	// the one that died, or it would appear to be renewing its predecessor's
+	// leases.
+	workerID string
+	// leaseTTL is how long a claim stays valid without renewal, and leaseRenew
+	// how often the holder refreshes it. The gap between them is the margin: a
+	// worker has several chances to renew before anything reclaims its work, so
+	// a slow query or a pause does not cost it a job it is actively running.
+	leaseTTL   time.Duration
+	leaseRenew time.Duration
 }
 
-// Open connects to Postgres and prepares the queue. Jobs left "running" by a
-// previous process (a crash) are reset to "queued" so they are re-processed.
+// Default lease timings. The TTL is generous relative to the renew interval
+// because the cost of the two errors is not symmetric: renewing more often than
+// needed costs one tiny UPDATE, while expiring a lease a live worker still holds
+// takes a job away mid-run and lets a second worker start it again.
+const (
+	defaultLeaseTTL   = 2 * time.Minute
+	defaultLeaseRenew = 20 * time.Second
+)
+
+// Open connects to Postgres and prepares the queue.
+//
+// Jobs left running by a crashed worker are not touched here: see
+// ReclaimExpired, and the comment on it for why recovering on open was wrong.
 //
 // The caller must have applied migrations/ first; Open does not create schema.
 func Open(ctx context.Context, dsn string) (*Queue, error) {
@@ -267,40 +294,118 @@ func Open(ctx context.Context, dsn string) (*Queue, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
+	id, err := newID()
+	if err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("worker id: %w", err)
+	}
 	q := &Queue{
-		pool:    pool,
-		dsn:     dsn,
-		nowFn:   func() int64 { return time.Now().Unix() },
-		waiters: map[string][]chan struct{}{},
-		queued:  make(chan struct{}, 1),
-		running: map[string]*runningJob{},
+		pool:       pool,
+		dsn:        dsn,
+		nowFn:      func() int64 { return time.Now().Unix() },
+		waiters:    map[string][]chan struct{}{},
+		queued:     make(chan struct{}, 1),
+		running:    map[string]*runningJob{},
+		workerID:   id,
+		leaseTTL:   defaultLeaseTTL,
+		leaseRenew: defaultLeaseRenew,
 	}
 	return q, nil
 }
 
-// RequeueInterrupted returns jobs left running by a crashed worker to the queue,
-// reporting how many it recovered.
+// SetLease overrides the claim lease timings. For tests, which cannot wait two
+// minutes to watch one expire.
+func (q *Queue) SetLease(ttl, renew time.Duration) {
+	q.leaseTTL, q.leaseRenew = ttl, renew
+}
+
+// ReclaimExpired returns abandoned jobs to the queue, reporting how many.
 //
-// Deliberately not part of Open. Both the API and the worker open the queue, so
-// recovering there meant restarting the API reset every running job underneath
-// the worker still executing it — the row became claimable while the original
-// process kept going, so a multi-hour download could run twice at once against
-// the same destination, with nothing logged to say so.
+// A job is abandoned when its lease has run out: the worker that claimed it
+// renews while it works, so nobody renewing means nobody is working on it. That
+// is a fact about the job rather than about the caller, which is what makes this
+// safe to run from any process at any time — including while other workers are
+// busy, and including several replicas running it at once.
 //
-// Only the worker calls this, and only before it starts claiming. That makes it
-// correct for one worker process, which is what a deployment runs today. With
-// several worker replicas it is not: a replica starting up cannot tell a job
-// abandoned by a dead peer from one a live peer is running, and would take both.
-// Fixing that needs a claim to carry an owner and a lease it renews, so an
-// unrenewed lease is the signal rather than the mere fact of starting up.
-func (q *Queue) RequeueInterrupted(ctx context.Context) (int, error) {
-	tag, err := q.pool.Exec(ctx,
-		`UPDATE job SET status=$1, started_at=NULL WHERE status=$2`,
-		StatusQueued, StatusRunning)
+// The predecessor of this was a blanket "requeue everything running" in Open.
+// Both the API and the worker open the queue, so restarting the API reset jobs
+// underneath the worker still executing them, and a multi-hour download could
+// end up running twice against the same destination. The signal there was "a
+// process started", which says nothing about whether anyone else is working.
+//
+// A NULL lease is expired: rows claimed before leases existed have nobody
+// renewing them either, so they are abandoned by the same definition.
+func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE job
+		   SET status=$1, started_at=NULL, claimed_by=NULL, lease_until=NULL
+		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3`,
+		StatusQueued, StatusRunning, q.nowFn())
 	if err != nil {
-		return 0, fmt.Errorf("requeue interrupted jobs: %w", err)
+		return 0, fmt.Errorf("reclaim expired jobs: %w", err)
 	}
-	return int(tag.RowsAffected()), nil
+	n := int(tag.RowsAffected())
+	if n > 0 {
+		// Wake a worker: these are claimable now, and nothing else will say so.
+		// Enqueue is what normally notifies, and no enqueue happened here.
+		_, _ = q.pool.Exec(ctx, `SELECT pg_notify($1,'')`, chanQueued)
+	}
+	return n, nil
+}
+
+// StartLeaseKeeper renews this process's claims and reclaims everyone's expired
+// ones, until ctx ends.
+//
+// The two belong on the same timer because they are the same mechanism seen from
+// either side: this process proves it is alive by renewing, and finds out others
+// are not by looking for leases nobody renewed.
+func (q *Queue) StartLeaseKeeper(ctx context.Context) {
+	q.wg.Add(1)
+	go func() {
+		defer q.wg.Done()
+		t := time.NewTicker(q.leaseRenew)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				if err := q.renewLeases(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("queue: renew leases: %v", err)
+				}
+				if n, err := q.ReclaimExpired(ctx); err != nil {
+					if ctx.Err() == nil {
+						log.Printf("queue: reclaim expired: %v", err)
+					}
+				} else if n > 0 {
+					log.Printf("queue: reclaimed %d abandoned job(s)", n)
+				}
+			}
+		}
+	}()
+}
+
+// renewLeases extends the claims this process is actually executing.
+//
+// Driven by the in-process running set rather than by what the table says this
+// worker holds: the point of a lease is to assert that work is really happening
+// here, and only the running map knows that. A row still marked as ours that we
+// are no longer running must be allowed to expire.
+func (q *Queue) renewLeases(ctx context.Context) error {
+	q.mu.Lock()
+	ids := make([]string, 0, len(q.running))
+	for id := range q.running {
+		ids = append(ids, id)
+	}
+	q.mu.Unlock()
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := q.pool.Exec(ctx, `
+		UPDATE job SET lease_until=$1
+		 WHERE id = ANY($2) AND status=$3 AND claimed_by=$4`,
+		q.nowFn()+int64(q.leaseTTL.Seconds()), ids, StatusRunning, q.workerID)
+	return err
 }
 
 // Close releases the connection pool.
@@ -596,7 +701,7 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 // there to stop jobs overlapping, not to make them unrunnable — one too big for
 // the pool should run alone, which is what an empty pool already guarantees.
 const claimQuery = `
-UPDATE job SET status = $1, started_at = $2
+UPDATE job SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7
 WHERE id = (
   SELECT j.id
   FROM job j
@@ -644,7 +749,8 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 		return Job{}, nil, false, err
 	}
 
-	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots)
+	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots,
+		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()))
 	job, err := scanJob(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Job{}, nil, false, nil

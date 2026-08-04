@@ -177,15 +177,17 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer q.Close()
 
-	// Recover jobs a previous worker died holding. Only the worker does this,
-	// and only before it starts claiming: the API opens the same queue, and
-	// recovering inside Open meant an API restart requeued whatever this worker
-	// was running, underneath it.
-	if n, rErr := q.RequeueInterrupted(ctx); rErr != nil {
+	// Take back jobs whose holder stopped renewing — a worker that crashed, or
+	// one killed mid-run. Safe to do while other workers are busy, because a
+	// live one keeps its leases fresh; see ReclaimExpired.
+	if n, rErr := q.ReclaimExpired(ctx); rErr != nil {
 		return rErr
 	} else if n > 0 {
-		log.Printf("worker: requeued %d job(s) left running by a previous worker", n)
+		log.Printf("worker: reclaimed %d abandoned job(s)", n)
 	}
+	// Keep this worker's own claims alive, and keep watching for others going
+	// quiet: a peer can die at any point, not only before we start.
+	q.StartLeaseKeeper(ctx)
 
 	q.SetMaxJobsPerIP(cfg.MaxJobsPerIP)
 	q.StartListener(ctx)

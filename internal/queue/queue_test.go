@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -22,12 +24,28 @@ import (
 //
 // Each test gets its own schema so they can run in parallel without interference.
 // 0002 (the catalog) is not needed here; 0003 adds job_variant and job.columns.
-var migrationFiles = []string{
-	"../../migrations/0001_job_queue.sql",
-	"../../migrations/0003_job_variant.sql",
-	"../../migrations/0010_job_user.sql",
-	"../../migrations/0016_job_weight.sql",
-	"../../migrations/0013_job_log.sql",
+// jobMigrations are the migrations this package's schema needs, discovered
+// rather than listed.
+//
+// The list used to be written out by hand, and had already drifted out of
+// numeric order; adding a column then meant remembering to add it here too, and
+// forgetting showed up as "column does not exist" in every test at once rather
+// than as anything to do with the list. Globbing means a new job migration is
+// picked up by existing tests the moment it lands.
+//
+// Sorted, because migrations are ordered by their numeric prefix and a later one
+// alters what an earlier one created.
+func jobMigrations(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("../../migrations/*_job*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no job migrations found; the glob or the layout has moved")
+	}
+	sort.Strings(files)
+	return files
 }
 
 func testQueue(t *testing.T) *Queue {
@@ -39,7 +57,7 @@ func testQueue(t *testing.T) *Queue {
 	ctx := context.Background()
 
 	var ddl strings.Builder
-	for _, f := range migrationFiles {
+	for _, f := range jobMigrations(t) {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
@@ -494,13 +512,18 @@ func TestOpeningTheQueueLeavesRunningJobsAlone(t *testing.T) {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
 
-	// A second process opens the same database — this is the API starting up
-	// while the worker is busy.
+	// A second process opens the same database and runs recovery — this is the
+	// API starting up, or a peer worker booting, while this worker is busy.
 	other, err := Open(ctx, q.dsn)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer other.Close()
+	if n, err := other.ReclaimExpired(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 0 {
+		t.Errorf("another process reclaimed %d job(s) held by a live worker", n)
+	}
 
 	job, ok, err := q.Get(ctx, id)
 	if err != nil || !ok {
@@ -509,5 +532,96 @@ func TestOpeningTheQueueLeavesRunningJobsAlone(t *testing.T) {
 	if job.Status != StatusRunning {
 		t.Fatalf("job is %q after another process opened the queue; "+
 			"it was still running and is now claimable a second time", job.Status)
+	}
+}
+
+// A lease is what separates "abandoned" from "busy", so both directions matter:
+// a job whose holder went quiet must come back, and one whose holder is renewing
+// must not — no matter who asks or how many times.
+func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
+	if os.Getenv("VHW_TEST_DATABASE_URL") == "" {
+		t.Skip("VHW_TEST_DATABASE_URL not set")
+	}
+	q := testQueue(t)
+	ctx := context.Background()
+	// Short enough to watch expire, with renew well inside the TTL.
+	q.SetLease(2*time.Second, 200*time.Millisecond)
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("claim: ok=%v err=%v", ok, err)
+	}
+
+	statusOf := func() string {
+		t.Helper()
+		job, ok, err := q.Get(ctx, id)
+		if err != nil || !ok {
+			t.Fatalf("get: ok=%v err=%v", ok, err)
+		}
+		return job.Status
+	}
+
+	// The claim records who holds it, which is what renewal is matched on.
+	var holder string
+	if err = q.pool.QueryRow(ctx,
+		`SELECT COALESCE(claimed_by,'') FROM job WHERE id=$1`, id).Scan(&holder); err != nil {
+		t.Fatal(err)
+	}
+	if holder != q.workerID {
+		t.Fatalf("claimed_by = %q, want this worker %q", holder, q.workerID)
+	}
+
+	// While the holder renews, nobody reclaims it — however long that goes on
+	// and however often they look. A download runs for hours; the lease has to
+	// survive arbitrarily longer than its own TTL.
+	q.mu.Lock()
+	q.running[id] = &runningJob{cancel: func() {}}
+	q.mu.Unlock()
+
+	peer, err := Open(ctx, q.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peer.Close()
+
+	deadline := time.Now().Add(3 * time.Second) // past the 2s TTL
+	for time.Now().Before(deadline) {
+		if err = q.renewLeases(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if n, rErr := peer.ReclaimExpired(ctx); rErr != nil {
+			t.Fatal(rErr)
+		} else if n != 0 {
+			t.Fatalf("a peer reclaimed a job whose holder is renewing it")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if s := statusOf(); s != StatusRunning {
+		t.Fatalf("job is %q while its holder renews", s)
+	}
+
+	// The holder goes away: stop renewing, as a crashed process would.
+	q.mu.Lock()
+	delete(q.running, id)
+	q.mu.Unlock()
+
+	waitFor(t, 5*time.Second, func() bool {
+		if _, err := peer.ReclaimExpired(ctx); err != nil {
+			return false
+		}
+		job, ok, err := peer.Get(ctx, id)
+		return err == nil && ok && job.Status == StatusQueued
+	})
+
+	// Reclaiming clears the stale holder, so the next claim starts clean.
+	var claimed *string
+	if err = q.pool.QueryRow(ctx, `SELECT claimed_by FROM job WHERE id=$1`, id).Scan(&claimed); err != nil {
+		t.Fatal(err)
+	}
+	if claimed != nil {
+		t.Errorf("claimed_by = %q after reclaim, want NULL", *claimed)
 	}
 }
