@@ -61,6 +61,17 @@
   data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
   cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
   job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Provisioning is bounded separately, and generously. An annotation answers a
+  # query in seconds; a tool's one-time install is a different kind of work —
+  # VEP fetches a species cache measured in days, not hours. The default 12h
+  # would kill that at hour 12, and being killed partway is worse than being
+  # slow: it leaves a half-populated data directory with no sentinel, so the
+  # next attempt starts from nothing rather than resuming.
+  #
+  # A stuck job is not what this protects against — cancel it from the UI, or
+  # let its lease lapse. This only needs to be longer than the slowest install
+  # that could legitimately succeed.
+  download_timeout = "96h"                          # VHW_DOWNLOAD_TIMEOUT
   job_ttl = "24h"                                   # VHW_JOB_TTL
 
 # Where downloaded source data goes. Filesystem entries come first and the first
