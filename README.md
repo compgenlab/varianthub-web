@@ -22,12 +22,11 @@ React (SPA) ──/api/v1──► Go API server ──► Postgres (jobs, catal
 | `internal/queue/` | Postgres-backed job queue |
 | `internal/catalog/` | Sources and snapshots in Postgres; materializes config per job |
 | `internal/runner/` | The annotation seam — `Runner` interface + `ExecRunner` |
-| `internal/auth/` | HMAC bearer tokens |
+| `internal/identity/` | Accounts, teams, tokens, sessions, grants |
 | `internal/limit/` | Per-IP rate limiting and client-IP resolution |
 | `migrations/` | Numbered SQL, applied by `migrate` |
 | `web/` | React app (embedded into the binary at build time) |
-| `deploy/compose/` | Dev stack (postgres + migrate + seed + api + worker) |
-| `deploy/k8s/` | Reference k8s manifests (production lives in a separate deploy repo) |
+| `deploy/compose/` | The deployment stack (postgres + migrate + seed + api + worker) |
 | `docs/api.md` | The `/api/v1` contract |
 | `design_handoff_varianthub/` | Design reference (prototype HTML + spec) |
 
@@ -39,8 +38,15 @@ open http://localhost:18080           # the web app
 ```
 
 The stack builds the React app into the Go binary, so one container serves both
-the UI and the API. On first load the app asks for an API token — mint one with
-the deployment's `VHW_MASTER_KEY`; the dev default is `dev-master-key-change-me`.
+the UI and the API. On first load the app asks you to create an administrator
+account, using the **bootstrap token** the server printed to its log at startup:
+
+```
+docker compose -f deploy/compose/docker-compose.yml logs api | grep cgl_vhb_
+```
+
+That token stops working the moment the account exists. Everything after that is
+an email and password, or a personal API token for scripts.
 
 That brings up Postgres, applies migrations, seeds a starter snapshot into the
 catalog, and starts the API and a worker. Ordering is enforced by the compose
@@ -78,12 +84,13 @@ Building outside Docker needs Go 1.25+ and a `varhub` on `PATH` for the worker.
 
 ## Deploying
 
-`deploy/compose` is the supported path that ships with this repo: it works from a
-clean checkout and is what self-hosters should use.
+`deploy/compose` is the deployment path that ships with this repo: it works from
+a clean checkout, and it is what this repository supports.
 
-`deploy/k8s` holds reference manifests. Our own production deployment is managed
-in a separate k8s deploy repo, so those files are examples and seed material, not
-the live configuration — see that directory's README.
+Our own Kubernetes deployment lives in a separate, private repository. Nothing
+here depends on it, and the application takes all of its configuration from a
+TOML file and environment variables, so any orchestrator that can set those can
+run it — see `varianthub-web.example.toml` for the full surface.
 
 ## Provisioning source data
 
@@ -162,14 +169,121 @@ needs a gene model.
 There is no `source remove` yet; detach a source from its snapshots and delete the
 row directly if you need to.
 
+## TLS
+
+```sh
+make dev-tls                     # brings the stack up behind Caddy
+make dev-tls-ca > caddy-root.crt # the CA to trust, so the browser stops warning
+```
+
+Serves `https://<hostname>:18443`, with the plain-HTTP API bound to loopback so
+HTTPS is the only way in from the network.
+
+This is not only about encryption. Browsers gate a growing set of APIs on a
+**secure context**, and `localhost` is exempt — so plain HTTP works on the dev
+box and breaks for everyone else. `crypto.randomUUID` and `navigator.clipboard`
+are both in that set and both used here. Terminating TLS is what makes the app
+behave the same for every client. The session cookie also starts being marked
+`Secure`, which the app decides from the `X-Forwarded-Proto` Caddy sets.
+
+Ports default to **18443/18081** rather than 443/80 because anything else on the
+host that terminates TLS already owns the standard ones — this machine runs a
+k3s ingress controller, and Docker reports the mapping as successful while k3s
+keeps answering. Set `HTTPS_PORT=443 HTTP_PORT=80` where this stack owns the
+host, which is also what a publicly-issued certificate needs.
+
+For a real certificate, name a public host and turn the internal CA off:
+
+```sh
+VH_HOST=varianthub.example.org VH_TLS= HTTPS_PORT=443 HTTP_PORT=80 make dev-tls
+```
+
+Nothing in the app changes when Caddy is in front: `reverse_proxy` sets
+`X-Forwarded-For`, `-Proto` and `-Host`, and the default `trusted_proxies`
+already covers the compose network, so the rate limiter sees real client IPs.
+The one setting that does need updating is `auth.cilogon.redirect_url`, which
+must be the public HTTPS URL and match what CILogon has registered.
+
+## Tool sources (VEP, ANNOVAR)
+
+A tool source runs inside a container, which varhub drives with apptainer. The
+worker image ships it, and runs it **unprivileged** — as the ordinary non-root
+user, with no capabilities at all (`CapEff: 0000000000000000`).
+
+Apptainer does this with a user namespace rather than with capabilities. Three
+settings are what that needs, and each was confirmed by removing it:
+
+| Setting | Why |
+|---|---|
+| `seccomp=unconfined` | permits `unshare(CLONE_NEWUSER)`; without it the namespace is denied |
+| `apparmor=unconfined` | permits the namespace and its mounts |
+| `/dev/fuse` | squashfuse mounts the image, so no loop device and no `SYS_ADMIN` |
+
+The commonly cited recipe — `--cap-add=SYS_ADMIN` with loop devices — is a
+different and worse route. It omits AppArmor, so it fails on mount propagation;
+adding loop devices then moves the failure to `CAP_DAC_READ_SEARCH`, and each
+step rebuilds more of `privileged`. None of it is needed once the user namespace
+is allowed to exist.
+
+On Kubernetes this is a `seccompProfile: Unconfined`, an AppArmor unconfined
+annotation, and `/dev/fuse` from a device plugin. Some clusters restrict those,
+but they are far more attainable than `privileged`.
+
+**Tool data is never in an object store.** A container binds `{datadir}` and
+apptainer runs a `.sif` from a path, so both resolve against local storage even
+when the source cache is a bucket. Source data still reads from S3 with range
+requests; only tools need a filesystem.
+
+A tool's setup runs **once per `data_dir`**, gated by a sentinel. What that costs
+depends on how many machines you have and what they share:
+
+| Deployment | What to do |
+|---|---|
+| One machine | Nothing. A plain directory is a complete configuration. |
+| Several machines | Point `data_dir` at shared storage — NFS, Lustre, a PVC — and setup runs once for all of them. |
+| Ephemeral disks (k8s pods) | An S3 storage target plus `cache_setup = true` in the tool's manifest: setup is archived once and unpacked on each machine. |
+
+**No object store is required for any of this.** With a filesystem target a
+tool's image and data live directly inside it, so a shared folder is shared by
+every worker with nothing to synchronise — `cache_setup` is then a no-op,
+because there is nothing to copy. The S3 machinery exists only because a bucket
+cannot *be* the directory a tool opens files in.
+
 ## Configuration
+
+Settings resolve in three layers, each overriding the one before:
+
+1. **Defaults** — compiled in; a deployment that sets nothing still runs.
+2. **A TOML file** — `varianthub-web.toml` in the working directory, or
+   `/etc/varianthub-web/config.toml`, or whatever `VHW_CONFIG` names.
+3. **Environment variables** — every setting has one, so a container can change
+   a single value without templating a file.
+
+```sh
+cp varianthub-web.example.toml varianthub-web.toml   # then edit database.url
+```
+
+`varianthub-web.example.toml` documents every setting and states the built-in
+defaults, so a copy with only `database.url` filled in behaves exactly like no
+file at all. The file that was loaded is logged at startup. A misspelled key
+stops startup with the offending name rather than being silently ignored, which
+is the failure a config file exists to prevent.
+
+The file is optional. An env-only deployment keeps working with no file at all,
+and the two can be mixed: the compose stack keeps the database DSN in the
+environment (it is assembled from `POSTGRES_PASSWORD`) and everything else in a
+mounted file.
 
 | Env var | Default | Purpose |
 |---|---|---|
-| `VHW_ADDR` | `:8080` | Listen address (inside the container) |
+| `VHW_CONFIG` | *(searched)* | Path to the TOML config file; naming one that does not exist is an error |
+| `VHW_ADDR` | `:8080` | Listen address (inside the container) — `server.addr` |
 | `VHW_DATABASE_URL` | — | Postgres DSN (required) |
-| `VHW_MASTER_KEY` | — | HMAC key signing API tokens |
-| `VHW_REQUIRE_TOKEN` | `true` | Bearer auth on `/api/v1` |
+| `VHW_ALLOW_ANONYMOUS` | `false` | Let callers with no account use the annotation flow |
+| `VHW_CILOGON_CLIENT_ID` | — | CILogon OIDC client id (all three required to enable institutional sign-in) |
+| `VHW_CILOGON_CLIENT_SECRET` | — | CILogon OIDC client secret |
+| `VHW_CILOGON_REDIRECT_URL` | — | e.g. `https://varianthub.example/auth/cilogon/callback` |
+| `VHW_CILOGON_AUTO_PROVISION_DOMAINS` | — | Email domains auto-provisioned on first sign-in; empty means invite-only |
 | `VHW_WORKERS` | `2` | Worker pool size |
 | `VHW_VARHUB_BIN` | `varhub` | Path to the CLI the worker execs |
 | `VHW_VARHUB_HOME` | — | Fixed annotation config dir; empty = materialize per job from the catalog |

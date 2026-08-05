@@ -335,3 +335,30 @@ table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline)
   border: 1.5px dashed rgba(47, 125, 146, 0.45); background: var(--accent-dashed-bg);
   border-radius: 10px; padding: 36px; text-align: center; cursor: pointer;
 }
+
+/* --- admin metrics --- */
+
+.metric-grid {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px;
+}
+@media (max-width: 860px) { .metric-grid { grid-template-columns: repeat(2, 1fr); } }
+
+.metric-storage-row { grid-template-columns: 2.4fr 1fr .7fr .7fr .9fr; }
+.metric-remote-row  { grid-template-columns: 2fr 1.6fr 1.2fr .9fr; }
+
+/* --- accounts --- */
+
+.token-row  { grid-template-columns: 1.6fr 1.2fr 1.4fr 1.4fr .4fr; }
+.people-row { grid-template-columns: 2fr 1.4fr .9fr .8fr .9fr; }
+
+/* A source read over the network rather than from storage we control. */
+.tag-remote {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: var(--accent-tint-alt); color: var(--accent-text);
+}
+
+/* Job detail: metadata in a grid that reflows rather than truncating. */
+.job-fields {
+  display: grid; gap: 14px 22px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+}

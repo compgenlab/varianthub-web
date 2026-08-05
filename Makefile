@@ -12,6 +12,7 @@ COMPOSE := docker compose -f deploy/compose/docker-compose.yml
 
 # Local Postgres used by `make test-db` and the queue tests.
 TEST_DB_PORT ?= 55440
+TLS_PORT     ?= 18443
 TEST_DB_URL  ?= postgres://postgres:test@localhost:$(TEST_DB_PORT)/varianthub?sslmode=disable
 
 # The React app is part of the build: `make build` produces a binary that serves
@@ -58,7 +59,7 @@ test:
 
 ## test-unit: run only tests that need no external services
 test-unit:
-	go test -race ./internal/auth/... ./internal/limit/... ./internal/api/...
+	go test -race ./internal/limit/... ./internal/api/...
 
 ## test-integration: run the full suite against a local Postgres + varhub
 # VHW_TEST_VARHUB defaults to a varhub built from a sibling varianthub-cli checkout.
@@ -102,9 +103,39 @@ dev:
 	@echo "api:      http://localhost:$${API_PORT:-18080}/healthz"
 	@echo "postgres: localhost:$${POSTGRES_PORT:-55441}"
 
+## dev-tls: bring the stack up behind Caddy on https, API not exposed directly
+# VH_SITE names the certificate; the default is this machine's hostname with an
+# internal CA. API_BIND keeps the plain-http port on loopback so https is the
+# only way in from the network.
+# Every address this machine answers to, so the certificate matches whichever
+# one a browser can actually resolve. A LAN box usually has no DNS entry, so the
+# IP is the one that always works.
+#
+# 127.0.0.1 is deliberately absent: an IP client sends no SNI, only one
+# certificate can be the no-SNI default, and that slot goes to the LAN address —
+# the one someone else needs. Loopback has "localhost", which does send SNI.
+TLS_NAMES = $(shell hostname) $(shell hostname).local $(shell hostname -I | awk '{print $$1}') localhost
+dev-tls:
+	@VH_HOSTS="$$(echo '$(TLS_NAMES)' | tr ' ' '\n' | sed 's|^|https://|' | paste -sd, | sed 's|,|, |g')" \
+	 VH_HTTP_HOSTS="$$(echo '$(TLS_NAMES)' | tr ' ' '\n' | sed 's|^|http://|' | paste -sd, | sed 's|,|, |g')" \
+	 VH_DEFAULT_SNI="$$(hostname -I | awk '{print $$1}')" \
+	 API_BIND=127.0.0.1 \
+	  $(COMPOSE) --profile tls up --build -d
+	@echo
+	@echo "web: https://$$(hostname):$(TLS_PORT)"
+	@echo "     https://$$(hostname -I | awk '{print $$1}'):$(TLS_PORT)   (no DNS needed)"
+	@echo
+	@echo "The certificate comes from Caddy's internal CA, so a browser warns"
+	@echo "until that CA is trusted. Export it with:"
+	@echo "  make dev-tls-ca > caddy-root.crt"
+
+## dev-tls-ca: print Caddy's internal CA certificate, to trust in a browser or OS
+dev-tls-ca:
+	@$(COMPOSE) exec -T caddy cat /data/caddy/pki/authorities/local/root.crt
+
 ## dev-down: stop the stack (keeps volumes, so data survives)
 dev-down:
-	$(COMPOSE) down
+	$(COMPOSE) --profile tls down
 
 ## dev-reset: stop the stack and DELETE its volumes (database + annotation config)
 dev-reset:

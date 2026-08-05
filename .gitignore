@@ -5,6 +5,7 @@
 
 # local config + secrets
 .env
+varianthub-web.toml
 *.local.yaml
 
 # node / react
@@ -24,3 +25,7 @@ go.work.sum
 
 # local compose overrides (real paths, real secrets)
 deploy/compose/.env
+
+# A local config file at the repo root; deploy/compose/varianthub-web.toml is
+# the tracked example that the dev stack mounts.
+/varianthub-web.toml

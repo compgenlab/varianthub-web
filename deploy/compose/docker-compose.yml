@@ -1,4 +1,4 @@
-# Development stack. Production uses deploy/k8s — keep the two independent
+# The stack that ships with this repository, and the supported way to run it
 # rather than trying to share one definition; they have different goals (fast
 # iteration vs. rolling upgrades, managed Postgres, real secrets).
 #
@@ -20,6 +20,12 @@ name: varianthub-web
 # services run it with different arguments.
 x-web: &web
   image: varianthub-web:dev
+  # An optional config file. Point VHW_CONFIG_FILE at a varianthub-web.toml to
+  # mount it; with nothing set this mounts the in-repo example, which is
+  # harmless because every value in it matches the built-in defaults.
+  #   VHW_CONFIG_FILE=./my-config.toml make dev
+  volumes:
+    - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
   build:
     context: ../..
     dockerfile: deploy/compose/Dockerfile
@@ -31,9 +37,13 @@ x-web: &web
     args:
       VERSION: ${VERSION:-dev}
 
+# The DSN stays an environment variable here because compose assembles it from
+# POSTGRES_PASSWORD. Everything else can live in a mounted varianthub-web.toml —
+# see VHW_CONFIG_FILE below — and the environment still wins over the file, so
+# either style works and they can be mixed.
 x-db-env: &db-env
   VHW_DATABASE_URL: postgres://varianthub:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/varianthub?sslmode=disable
-  VHW_MASTER_KEY: ${VHW_MASTER_KEY:-dev-master-key-change-me}
+  VHW_CONFIG: ${VHW_CONFIG:-/etc/varianthub-web/config.toml}
 
 services:
   postgres:
@@ -109,7 +119,12 @@ services:
       VHW_CORS_ORIGINS: ${VHW_CORS_ORIGINS:-http://localhost:5173}
     ports:
       # Not 8080: like postgres above, a dev machine usually already has one.
-      - "${API_PORT:-18080}:8080"
+      #
+      # Bound to all interfaces so the stack is reachable without a proxy. With
+      # the tls profile up, set API_BIND=127.0.0.1 so the plain-http path stops
+      # being reachable from the network and Caddy is the only way in — it
+      # reaches the API over the compose network, not through this mapping.
+      - "${API_BIND:-0.0.0.0}:${API_PORT:-18080}:8080"
     # Lets a container reach a service on the host, which is how a streamed
     # source pointed at a locally-served file resolves. Docker Desktop provides
     # this name; on Linux it has to be mapped explicitly.
@@ -149,8 +164,25 @@ services:
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
       AWS_REGION: ${AWS_REGION:-us-east-1}
     volumes:
-      # Working data: tool images, reference files, the annotation cache.
-      - varhub-data:/var/lib/varianthub
+      # Repeated from x-web, not inherited: a YAML merge key replaces a list
+      # rather than appending to it, so declaring volumes here drops every
+      # volume the anchor set. Leaving it out cost the worker its config file
+      # and left every job queued.
+      - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
+      # Working data: container images, tool data (VEP's cache and the like),
+      # and the annotation cache.
+      #
+      # Defaults to a named volume, which lives under /var/lib/docker — usually
+      # the root filesystem, and usually the smallest disk on the machine. A
+      # tool cache is tens of gigabytes, so set VHW_HOST_TOOLS to an absolute
+      # path on a large disk before provisioning one:
+      #
+      #   VHW_HOST_TOOLS=/mnt/data1/varhub-tools make dev-tls
+      #
+      # Docker reads a leading "/" as a bind mount and a bare name as a named
+      # volume, so one variable covers both — the same trick VHW_HOST_STORAGE
+      # uses for source data.
+      - ${VHW_HOST_TOOLS:-varhub-data}:/var/lib/varianthub
       # Downloaded source data, always mounted at /mnt/storage inside the
       # container so VHW_STORAGE_PATHS does not have to change with the host.
       #
@@ -160,6 +192,35 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+    # Tool sources (VEP, ANNOVAR) run inside apptainer, which mounts a SIF and
+    # overlays it — operations a container is normally not allowed.
+    #
+    # Granted unprivileged, as the ordinary non-root user. Apptainer does this
+    # with a user namespace rather than with capabilities, and the three
+    # settings below are exactly what that needs — each was checked by removing
+    # it and watching the failure:
+    #
+    #   seccomp=unconfined   permits unshare(CLONE_NEWUSER); without it the
+    #                        namespace is denied outright
+    #   apparmor=unconfined  permits the namespace and its mounts; this is the
+    #                        one the usual SYS_ADMIN flag list omits, and its
+    #                        absence looks like a mount-propagation error
+    #   /dev/fuse            lets squashfuse mount the image, so no loop device
+    #                        is needed and no SYS_ADMIN with it
+    #
+    # No CAP_SYS_ADMIN, no privileged, no loop devices. An earlier version of
+    # this was privileged, because the first non-root attempt was missing
+    # apparmor=unconfined and the failure was read as needing more privilege
+    # rather than a different one.
+    #
+    # On Kubernetes this is a seccompProfile of Unconfined, an AppArmor
+    # unconfined annotation, and /dev/fuse from a device plugin — restricted on
+    # some clusters, but far more attainable than privileged.
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    devices:
+      - /dev/fuse:/dev/fuse
     # Lets a container reach a service on the host, which is how a streamed
     # source pointed at a locally-served file resolves. Docker Desktop provides
     # this name; on Linux it has to be mapped explicitly.
@@ -175,7 +236,7 @@ services:
   # Off by default: it only starts with `--profile s3` (or COMPOSE_PROFILES=s3),
   # because the stack is perfectly usable with a filesystem volume alone and
   # most dev work does not need a bucket. Production does not use this at all —
-  # deploy/k8s points at a real object store.
+  # A real deployment points at an actual object store.
   #
   # versitygw's posix backend treats each top-level directory under its root as
   # a bucket, so the bucket is created by making a directory.
@@ -206,7 +267,58 @@ services:
       retries: 20
       start_period: 5s
 
+  # TLS in front of the API. Opt-in, because a dev stack on localhost does not
+  # need it and an internal certificate is a browser warning nobody asked for:
+  #
+  #   docker compose --profile tls up -d          (or: make dev-tls)
+  #
+  # Everything the app needs from a proxy — X-Forwarded-For, -Proto, -Host —
+  # reverse_proxy sets on its own, and the default trusted_proxies already
+  # covers the compose network, so no app configuration changes with this on.
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["tls"]
+    environment:
+      # Every name the certificate should cover, comma-separated and scheme
+      # qualified. Includes the LAN address: without a DNS or mDNS entry that
+      # is the only thing a browser elsewhere can resolve.
+      VH_HOSTS: ${VH_HOSTS:-https://localhost}
+      VH_HTTP_HOSTS: ${VH_HTTP_HOSTS:-http://localhost}
+      # Served when a client sends no SNI, which is what addressing by IP does.
+      VH_DEFAULT_SNI: ${VH_DEFAULT_SNI:-localhost}
+      VH_TLS: ${VH_TLS-internal}
+      # The port the https site is published on, so the http redirect points
+      # somewhere that answers.
+      VH_HTTPS_PORT: ${HTTPS_PORT:-18443}
+      VH_ACME_EMAIL: ${VH_ACME_EMAIL:-admin@localhost}
+    ports:
+      # Not 443/80 by default. Anything else on the host that terminates TLS —
+      # a k3s ingress controller, an existing nginx — will already hold those,
+      # and docker reports the mapping as successful while the other one keeps
+      # answering, which reads as a Caddy misconfiguration and is not one.
+      #
+      # A deployment where this stack owns the host should set HTTPS_PORT=443
+      # and HTTP_PORT=80, which is also what a publicly-issued certificate
+      # needs: an ACME challenge is answered on the standard ports.
+      - "${HTTPS_PORT:-18443}:443"
+      # Redirects http to https, and answers the ACME HTTP challenge when the
+      # site name is public.
+      - "${HTTP_PORT:-18081}:80"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and keys. A named volume so a restart does not re-issue —
+      # which for a public name would burn Let's Encrypt rate limit, and for an
+      # internal one would mean re-trusting the CA every time.
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   pgdata:
+  caddy-data:
+  caddy-config:
   varhub-data:
   varhub-sources:

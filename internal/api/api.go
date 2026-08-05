@@ -1,7 +1,9 @@
 // Package api is the HTTP surface.
 //
-// Ops endpoints (/healthz, /version) are open; everything under /api/v1 is
-// bearer-gated when VHW_REQUIRE_TOKEN is set. The v1 handlers live in v1.go.
+// Ops endpoints (/healthz, /version) are open. Everything under /api/v1 resolves
+// an identity once in withCaller; /api/v1/admin then requires an administrator
+// account, and the rest requires any identity unless VHW_ALLOW_ANONYMOUS is set.
+// The v1 handlers live in v1.go, identity in identity.go.
 package api
 
 import (
@@ -10,36 +12,43 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/identity"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // Server is the API server.
 type Server struct {
-	cfg     *config.Config
-	queue   *queue.Queue
-	catalog *catalog.Store // nil disables the catalog endpoints
-	spa     *SPA           // nil serves no web UI (API-only)
-	trusted []*net.IPNet
-	limiter *limit.Limiter
+	cfg      *config.Config
+	queue    *queue.Queue
+	catalog  *catalog.Store  // nil disables the catalog endpoints
+	identity *identity.Store // nil disables accounts (open/legacy deployments)
+	spa      *SPA            // nil serves no web UI (API-only)
+	trusted  []*net.IPNet
+	limiter  *limit.Limiter
+	remote   *remoteSizer
+	oidc     *oidcProvider // nil when no external sign-in is configured
 }
 
 // New builds the server. cat may be nil, in which case the catalog endpoints
 // report 503 rather than the process refusing to start -- annotation submission
 // and job polling do not need the catalog.
-func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, spa *SPA) *Server {
+func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, ids *identity.Store, spa *SPA) *Server {
 	return &Server{
-		cfg:     cfg,
-		queue:   q,
-		catalog: cat,
-		spa:     spa,
-		trusted: limit.ParseCIDRs(cfg.TrustedProxy),
-		limiter: limit.New(cfg.RatePerMin, cfg.RateBurst),
+		cfg:      cfg,
+		queue:    q,
+		catalog:  cat,
+		identity: ids,
+		spa:      spa,
+		trusted:  limit.ParseCIDRs(cfg.TrustedProxy),
+		limiter:  limit.New(cfg.RatePerMin, cfg.RateBurst),
+		remote:   newRemoteSizer(),
+		oidc:     newCILogon(cfg),
 	}
 }
 
@@ -51,52 +60,57 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("GET /healthz", s.handleHealthz)
 	mux.HandleFunc("GET /version", s.handleVersion)
 
+	// External sign-in is a browser redirect flow, not an API call: it lands
+	// here rather than under /api/v1 so a JSON error wrapper never intercepts a
+	// 302 the provider needs to follow.
+	if s.oidc != nil {
+		mux.HandleFunc("GET /auth/cilogon", s.handleOIDCLogin)
+		mux.HandleFunc("GET /auth/cilogon/callback", s.handleOIDCCallback)
+	}
+
 	v1 := http.NewServeMux()
-	v1.HandleFunc("GET /api/v1/ping", s.handlePing)
+	// Gated: ping is how a client checks that its credential works, which it
+	// cannot do if an invalid one answers the same as a valid one.
+	v1.Handle("GET /api/v1/ping", s.requireAuth(http.HandlerFunc(s.handlePing)))
+
+	// Signing in has to work without being signed in, and the UI needs to know
+	// who it is talking to before it can render anything — including "this
+	// installation has no administrator yet".
+	v1.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
+	v1.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
+	v1.HandleFunc("GET /api/v1/auth/me", s.handleMe)
+	v1.Handle("POST /api/v1/auth/password", s.requireAuth(http.HandlerFunc(s.handleChangePassword)))
+
+	// A caller's own API tokens. Gated on being someone, not on being an admin:
+	// every account issues its own, and each carries that account's role.
+	v1.Handle("GET /api/v1/auth/identities", s.requireAuth(http.HandlerFunc(s.handleListIdentities)))
+	v1.Handle("GET /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleListTokens)))
+	v1.Handle("POST /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleCreateToken)))
+	v1.Handle("DELETE /api/v1/auth/tokens/{id}", s.requireAuth(http.HandlerFunc(s.handleRevokeToken)))
 
 	// Catalog: what can be annotated, and what a snapshot pins.
-	v1.HandleFunc("GET /api/v1/snapshots", s.handleSnapshots)
-	v1.HandleFunc("GET /api/v1/snapshots/{id}", s.handleSnapshot)
-	v1.HandleFunc("GET /api/v1/sources", s.handleSources)
+	v1.Handle("GET /api/v1/snapshots", s.requireAuth(http.HandlerFunc(s.handleSnapshots)))
+	v1.Handle("GET /api/v1/snapshots/{id}", s.requireAuth(http.HandlerFunc(s.handleSnapshot)))
+	v1.Handle("GET /api/v1/sources", s.requireAuth(http.HandlerFunc(s.handleSources)))
 
 	// Submission. Throttled per client IP, which the handler skips for a
 	// token-bearing service account -- see trustedCaller.
-	v1.Handle("POST /api/v1/annotate", s.throttle(http.HandlerFunc(s.handleAnnotate)))
-	v1.Handle("POST /api/v1/annotate/vcf", s.throttle(http.HandlerFunc(s.handleAnnotateVCF)))
-
-	// Catalog administration. Under /admin so the eventual role gate has one
-	// place to attach; today any valid token can administer (see admin.go).
-	v1.HandleFunc("POST /api/v1/admin/sources/validate", s.handleValidateSource)
-	v1.HandleFunc("POST /api/v1/admin/sources", s.handleCreateSource)
-	v1.HandleFunc("DELETE /api/v1/admin/sources/{id}", s.handleDeleteSource)
-	v1.HandleFunc("GET /api/v1/admin/sources/{id}/config", s.handleSourceConfig)
-	v1.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
-	v1.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
-	v1.HandleFunc("PATCH /api/v1/admin/snapshots/{id}", s.handleUpdateSnapshotMeta)
-	v1.HandleFunc("PUT /api/v1/admin/snapshots/{id}/sources", s.handleSetSnapshotSources)
-	v1.HandleFunc("DELETE /api/v1/admin/snapshots/{id}", s.handleDeleteSnapshot)
-	v1.HandleFunc("GET /api/v1/admin/storage", s.handleListStorage)
-	v1.HandleFunc("POST /api/v1/admin/storage", s.handleCreateStorage)
-	v1.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)
-	v1.HandleFunc("GET /api/v1/admin/files", s.handleFiles)
-	v1.HandleFunc("POST /api/v1/admin/downloads", s.handleDownload)
-	v1.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)
-	v1.HandleFunc("POST /api/v1/admin/registries", s.handleCreateRegistry)
-	v1.HandleFunc("DELETE /api/v1/admin/registries/{id}", s.handleDeleteRegistry)
-	v1.HandleFunc("GET /api/v1/admin/registries/{id}/datasets", s.handleRegistryDatasets)
-	v1.HandleFunc("GET /api/v1/admin/registries/{id}/fetch", s.handleRegistryFetch)
+	v1.Handle("POST /api/v1/annotate", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotate))))
+	v1.Handle("POST /api/v1/annotate/vcf", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotateVCF))))
 
 	// Jobs. Reads are ownership-enforced, not throttled.
-	v1.HandleFunc("GET /api/v1/jobs", s.handleListJobs)
-	v1.HandleFunc("GET /api/v1/jobs/{id}", s.handleGetJob)
-	v1.HandleFunc("GET /api/v1/jobs/{id}/results", s.handleResults)
-	v1.HandleFunc("GET /api/v1/jobs/{id}/export", s.handleExport)
+	v1.Handle("GET /api/v1/jobs", s.requireAuth(http.HandlerFunc(s.handleListJobs)))
+	v1.Handle("GET /api/v1/jobs/{id}", s.requireAuth(http.HandlerFunc(s.handleGetJob)))
+	v1.Handle("GET /api/v1/jobs/{id}/log", s.requireAuth(http.HandlerFunc(s.handleJobLog)))
+	v1.Handle("POST /api/v1/jobs/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelJob)))
+	v1.Handle("GET /api/v1/jobs/{id}/results", s.requireAuth(http.HandlerFunc(s.handleResults)))
+	v1.Handle("GET /api/v1/jobs/{id}/export", s.requireAuth(http.HandlerFunc(s.handleExport)))
 
-	var v1h http.Handler = v1
-	if s.cfg.RequireToken {
-		v1h = auth.RequireToken(s.cfg.MasterKey, v1h)
-	}
-	mux.Handle("/api/v1/", v1h)
+	// Administration is its own mux mounted behind one gate, so a route added
+	// here cannot be left unguarded by forgetting to wrap it.
+	v1.Handle("/api/v1/admin/", s.requireAdmin(s.adminRoutes()))
+
+	mux.Handle("/api/v1/", s.withCaller(v1))
 
 	// The SPA is mounted last and matches "/", so every route above wins. An
 	// unknown /api path therefore 404s as JSON rather than returning the app
@@ -106,6 +120,72 @@ func (s *Server) Routes() http.Handler {
 	}
 
 	return s.withCORS(logRequests(mux))
+}
+
+// adminRoutes is everything behind the administrator gate.
+//
+// Registered on its own mux rather than by prefix on the shared one so that
+// adding a route here inherits the gate automatically — the previous shape left
+// each route to remember for itself, and any valid token could administer.
+func (s *Server) adminRoutes() http.Handler {
+	m := http.NewServeMux()
+
+	m.HandleFunc("POST /api/v1/admin/sources/validate", s.handleValidateSource)
+	m.HandleFunc("POST /api/v1/admin/sources", s.handleCreateSource)
+	m.HandleFunc("DELETE /api/v1/admin/sources/{id}", s.handleDeleteSource)
+	m.HandleFunc("GET /api/v1/admin/sources/{id}/config", s.handleSourceConfig)
+	m.HandleFunc("GET /api/v1/admin/sources/{id}/settings", s.handleSourceSettings)
+	m.HandleFunc("PUT /api/v1/admin/sources/{id}/settings", s.handleSetSourceSettings)
+	m.HandleFunc("GET /api/v1/admin/sources/{id}/grants", s.handleListGrants)
+	m.HandleFunc("POST /api/v1/admin/sources/{id}/grants", s.handleGrant)
+	m.HandleFunc("DELETE /api/v1/admin/sources/{id}/grants/{team}", s.handleRevokeGrant)
+	m.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
+	m.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
+	m.HandleFunc("PATCH /api/v1/admin/snapshots/{id}", s.handleUpdateSnapshotMeta)
+	m.HandleFunc("PUT /api/v1/admin/snapshots/{id}/sources", s.handleSetSnapshotSources)
+	m.HandleFunc("DELETE /api/v1/admin/snapshots/{id}", s.handleDeleteSnapshot)
+	m.HandleFunc("GET /api/v1/admin/metrics", s.handleMetrics)
+	m.HandleFunc("GET /api/v1/admin/storage", s.handleListStorage)
+	m.HandleFunc("POST /api/v1/admin/storage", s.handleCreateStorage)
+	m.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)
+	m.HandleFunc("GET /api/v1/admin/files", s.handleFiles)
+	m.HandleFunc("POST /api/v1/admin/downloads", s.handleDownload)
+	m.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)
+	m.HandleFunc("POST /api/v1/admin/registries", s.handleCreateRegistry)
+	m.HandleFunc("DELETE /api/v1/admin/registries/{id}", s.handleDeleteRegistry)
+	m.HandleFunc("GET /api/v1/admin/registries/{id}/datasets", s.handleRegistryDatasets)
+	m.HandleFunc("GET /api/v1/admin/registries/{id}/fetch", s.handleRegistryFetch)
+
+	// Accounts and teams. Creating a user is also the bootstrap path: the
+	// first-administrator credential passes requireAdmin and nothing else.
+	m.HandleFunc("GET /api/v1/admin/users", s.handleListUsers)
+	m.HandleFunc("POST /api/v1/admin/users", s.handleCreateUser)
+	m.HandleFunc("PATCH /api/v1/admin/users/{id}", s.handleUpdateUser)
+	m.HandleFunc("GET /api/v1/admin/teams", s.handleListTeams)
+	m.HandleFunc("POST /api/v1/admin/teams", s.handleCreateTeam)
+	m.HandleFunc("DELETE /api/v1/admin/teams/{id}", s.handleDeleteTeam)
+	m.HandleFunc("POST /api/v1/admin/teams/{id}/members", s.handleAddMember)
+	m.HandleFunc("DELETE /api/v1/admin/teams/{id}/members/{user}", s.handleRemoveMember)
+
+	return s.requireIdentityStore(m)
+}
+
+// requireIdentityStore fails the account routes clearly when the database is
+// unavailable, rather than panicking on a nil store.
+func (s *Server) requireIdentityStore(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.identity == nil && isAccountRoute(r.URL.Path) {
+			writeError(w, http.StatusServiceUnavailable, "accounts unavailable")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+func isAccountRoute(path string) bool {
+	return strings.Contains(path, "/admin/users") ||
+		strings.Contains(path, "/admin/teams") ||
+		strings.Contains(path, "/grants")
 }
 
 // Run serves until ctx is cancelled, then shuts down gracefully.
@@ -153,12 +233,10 @@ func (s *Server) limiterGC(ctx context.Context) {
 
 // throttle rate-limits by resolved client IP. Wraps submit routes only.
 //
-// A token-bearing service account is exempt: the limit exists to stop an
-// anonymous browser flooding the queue, and applying it to a bulk ingest would
-// make that ingest throttle itself.
+// See throttled: identified callers are exempt, anonymous ones are not.
 func (s *Server) throttle(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.trustedCaller(r) {
+		if !s.throttled(r) {
 			h.ServeHTTP(w, r)
 			return
 		}

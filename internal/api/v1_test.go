@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/identity"
 )
 
 func TestSelectionNormalization(t *testing.T) {
@@ -51,7 +51,7 @@ func TestSelectionNormalization(t *testing.T) {
 }
 
 func TestWaitForClamping(t *testing.T) {
-	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil)
+	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil, nil)
 	cases := []struct {
 		raw  string
 		want time.Duration
@@ -96,9 +96,9 @@ func TestSessionOf(t *testing.T) {
 func openServer(t *testing.T) http.Handler {
 	t.Helper()
 	return New(&config.Config{
-		MasterKey: "test-key", RequireToken: false, Version: "test",
+		AllowAnonymous: true, Version: "test",
 		RatePerMin: 1000, RateBurst: 1000, SubmitWaitCap: time.Second,
-	}, nil, nil, nil).Routes()
+	}, nil, nil, nil, nil).Routes()
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
@@ -240,12 +240,11 @@ func TestCatalogEndpointsWithoutCatalog(t *testing.T) {
 	}
 }
 
-// Every new route must sit behind the bearer gate when tokens are required.
-func TestV1RoutesAreTokenGated(t *testing.T) {
+// Every route below /api/v1 must require an identity by default.
+func TestV1RoutesRequireAnIdentity(t *testing.T) {
 	h := New(&config.Config{
-		MasterKey: "test-key", RequireToken: true, Version: "test",
-		RatePerMin: 1000, RateBurst: 1000,
-	}, nil, nil, nil).Routes()
+		Version: "test", RatePerMin: 1000, RateBurst: 1000,
+	}, nil, nil, nil, nil).Routes()
 
 	paths := []struct{ method, path string }{
 		{"GET", "/api/v1/snapshots"},
@@ -262,37 +261,46 @@ func TestV1RoutesAreTokenGated(t *testing.T) {
 		w := httptest.NewRecorder()
 		h.ServeHTTP(w, r)
 		if w.Code != http.StatusUnauthorized {
-			t.Fatalf("%s %s status = %d, want 401 without a token", p.method, p.path, w.Code)
+			t.Fatalf("%s %s status = %d, want 401 when anonymous", p.method, p.path, w.Code)
 		}
 	}
 }
 
-func TestTrustedCallerNeedsValidToken(t *testing.T) {
-	s := New(&config.Config{MasterKey: "k"}, nil, nil, nil)
+// resolved runs a request through the identity middleware, which is the only
+// thing that populates the caller — calling trustedCaller on a bare request
+// would test nothing but the zero value.
+func resolved(s *Server, r *http.Request) (trusted, throttled bool) {
+	s.withCaller(http.HandlerFunc(func(_ http.ResponseWriter, rr *http.Request) {
+		trusted, throttled = s.trustedCaller(rr), s.throttled(rr)
+	})).ServeHTTP(httptest.NewRecorder(), r)
+	return
+}
 
-	r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
-	if s.trustedCaller(r) {
-		t.Fatal("no Authorization header must not be trusted")
-	}
+// There is no deployment-wide key left to trust. Nothing a caller can put in an
+// Authorization header, on a server with no identity store, makes them anything
+// other than an anonymous — and therefore throttled — stranger.
+func TestNoSharedSecretIsTrusted(t *testing.T) {
+	s := New(&config.Config{}, nil, nil, nil, nil)
 
-	r.Header.Set("Authorization", "Bearer garbage")
-	if s.trustedCaller(r) {
-		t.Fatal("an unsigned token must not be trusted")
-	}
-
-	tok, err := auth.MintToken("k", 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	r.Header.Set("Authorization", "Bearer "+tok)
-	if !s.trustedCaller(r) {
-		t.Fatal("a validly signed token must be trusted")
-	}
-
-	// With no master key configured nothing can be verified, so nothing is trusted.
-	noKey := New(&config.Config{}, nil, nil, nil)
-	if noKey.trustedCaller(r) {
-		t.Fatal("an empty master key must not trust anything")
+	for _, bearer := range []string{
+		"",
+		"garbage",
+		// The exact shape the retired master key had, in case a deployment is
+		// still sending one.
+		"eyJzdWIiOiJ2YXJodWIiLCJpYXQiOjB9.c2ln",
+		identity.TokenPrefix + "looks-real-but-is-not",
+	} {
+		r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
+		if bearer != "" {
+			r.Header.Set("Authorization", "Bearer "+bearer)
+		}
+		trusted, throttled := resolved(s, r)
+		if trusted {
+			t.Errorf("bearer %q was trusted to read anyone's jobs", bearer)
+		}
+		if !throttled {
+			t.Errorf("bearer %q escaped the submit throttle", bearer)
+		}
 	}
 }
 

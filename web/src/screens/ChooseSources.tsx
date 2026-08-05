@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight, Check, Lock, TriangleAlert } from "lucide-react";
+import { ArrowRight, Check, Lock, TriangleAlert, Globe } from "lucide-react";
 
 import { api, type Annotation, type Snapshot, type Source } from "../api";
 import { useFlow } from "../flow";
@@ -172,6 +172,17 @@ export default function ChooseSources() {
                       <Lock size={11} /> Contains private sources
                     </div>
                   )}
+                  {/* Says what it costs, not that something is wrong: a remote
+                      source is a supported way to run, just one that reaches
+                      across the network on every query. */}
+                  {s.contains_remote && (
+                    <div
+                      className="row gap-8"
+                      style={{ marginTop: 6, fontSize: 11.5, color: "var(--text-2)" }}
+                    >
+                      <Globe size={11} /> Reads some sources over the network
+                    </div>
+                  )}
                 </button>
               );
             })}
@@ -227,7 +238,36 @@ export default function ChooseSources() {
                   <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
                     {s.version}
                   </span>
-                  <span className="tag">{s.kind}</span>
+                  <span className="row gap-8" style={{ flexWrap: "wrap" }}>
+                    <span className="tag">{s.kind}</span>
+                    {/* Worth surfacing here, not only in admin: a remote source
+                        is fetched over the network at query time, so a run that
+                        includes one can be slower and depends on somebody
+                        else's server being up. */}
+                    {s.stream && (
+                      <span className="tag tag-remote" title="Read from its origin over the network">
+                        <Globe size={10} /> remote
+                      </span>
+                    )}
+                    {/* Registered is not the same as usable: a tool needs its
+                        image and setup, a build source needs its recipe to have
+                        run. Choosing one before that fails the whole run, so it
+                        is worth seeing at the point of choosing. */}
+                    {s.state?.state === "installing" && (
+                      <span className="tag" title="Being downloaded and set up">
+                        installing…
+                      </span>
+                    )}
+                    {s.state?.state === "failed" && (
+                      <span
+                        className="tag"
+                        style={{ background: "var(--path-bg)", color: "var(--path-fg)" }}
+                        title={s.state.error ?? "Provisioning failed"}
+                      >
+                        not installed
+                      </span>
+                    )}
+                  </span>
                   <span
                     className="mono"
                     style={{

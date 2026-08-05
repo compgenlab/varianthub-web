@@ -1,0 +1,96 @@
+# Development stack configuration. Mounted read-only at
+# /etc/varianthub-web/config.toml; override with VHW_CONFIG_FILE=./yours.toml.
+#
+# Every setting has an environment-variable equivalent that overrides what is
+# here, so a container can change one value without rewriting the file. Run
+# "varianthub-web config" to print what a given deployment actually resolved to.
+
+[server]
+  addr = ":8080"                                    # VHW_ADDR
+  # Browser origins allowed to call the API. Leave empty for a same-origin
+  # deployment, where advertising CORS would only widen the surface.
+  cors_origins = []                                 # VHW_CORS_ORIGINS
+  trusted_proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[database]
+  # Left empty on purpose: compose assembles the DSN from POSTGRES_PASSWORD and
+  # passes it as VHW_DATABASE_URL, which overrides anything written here.
+  url = ""
+
+[auth]
+  # On for the dev stack: annotating without signing in is what is being
+  # developed against, and a login wall in front of it slows every test run.
+  #
+  # This is the dev file only. The shipped example leaves it off, and a real
+  # deployment should too — an anonymous caller is exactly who the submit rate
+  # limit exists for.
+  allow_anonymous = true                            # VHW_ALLOW_ANONYMOUS
+
+# Institutional sign-in. All three of client_id, client_secret and redirect_url
+# must be set to enable it; an incomplete set leaves sign-in password-only.
+[auth.cilogon]
+  client_id = ""                                    # VHW_CILOGON_CLIENT_ID
+  client_secret = ""                                # VHW_CILOGON_CLIENT_SECRET
+  redirect_url = ""                                 # https://host/auth/cilogon/callback
+  # Email domains whose verified holders get an account on first sign-in.
+  # Empty means invite-only: an administrator creates the account and the first
+  # sign-in claims it. CILogon federates thousands of institutions, so
+  # authenticating there is not by itself a reason to have an account here.
+  auto_provision_domains = []                       # VHW_CILOGON_AUTO_PROVISION_DOMAINS
+
+[worker]
+  count = 2                                         # VHW_WORKERS
+  # The pool as a budget in job weight rather than a headcount. Unset, slots
+  # follows count, which is what makes the pair below load-bearing rather than
+  # decorative: with 2 slots and a download weighing 2, one download fills the
+  # pool and a second waits.
+  #
+  # That is right for a dev stack, where two large downloads competing for one
+  # machine's disk finish later than one after the other. A deployment that
+  # wants annotation to keep answering during a multi-hour install raises slots
+  # rather than lowering the weight — the weight is what keeps downloads from
+  # overlapping.
+  #
+  # A job heavier than the whole pool still runs; it just runs alone.
+  slots = 2                                         # VHW_JOB_SLOTS
+  download_weight = 2                               # VHW_DOWNLOAD_WEIGHT
+  varhub_bin = "varhub"                             # VHW_VARHUB_BIN
+  # Fixed VARHUB_HOME. Empty means materialize one per job from the catalog,
+  # which is what a deployment normally wants.
+  varhub_home = ""                                  # VHW_VARHUB_HOME
+  data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
+  cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
+  job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Provisioning is bounded separately, and generously. An annotation answers a
+  # query in seconds; a tool's one-time install is a different kind of work —
+  # VEP fetches a species cache measured in days, not hours. The default 12h
+  # would kill that at hour 12, and being killed partway is worse than being
+  # slow: it leaves a half-populated data directory with no sentinel, so the
+  # next attempt starts from nothing rather than resuming.
+  #
+  # A stuck job is not what this protects against — cancel it from the UI, or
+  # let its lease lapse. This only needs to be longer than the slowest install
+  # that could legitimately succeed.
+  download_timeout = "96h"                          # VHW_DOWNLOAD_TIMEOUT
+  job_ttl = "24h"                                   # VHW_JOB_TTL
+
+# Where downloaded source data goes. Filesystem entries come first and the first
+# of those is the default target. Both take "name=<target>" entries.
+[storage]
+  paths = ["default=/mnt/storage"]                   # VHW_STORAGE_PATHS
+  s3 = []                                            # VHW_STORAGE_S3
+
+# Reference FASTAs by assembly, for tool steps using {ref}. Empty until a tool
+# needs one; the file must be readable by the worker, so mount it in first.
+[references]
+  # GRCh38 = "/mnt/ref/GRCh38.fa"
+
+[limits]
+  # The submit rate applies to anonymous callers only; an account is
+  # accountable, and throttling a signed-in bulk load would make it throttle
+  # itself. The concurrency cap below applies to everyone.
+  rate_per_min = 30                                 # VHW_RATE_PER_MIN
+  rate_burst = 10                                   # VHW_RATE_BURST
+  max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
+  max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+  submit_wait_cap = "10s"                           # VHW_SUBMIT_WAIT_CAP

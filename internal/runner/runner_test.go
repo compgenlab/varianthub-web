@@ -290,17 +290,27 @@ func TestCLIMessageSurfacedAndRedacted(t *testing.T) {
 	}
 }
 
-func TestExitErrorFallsBackToOpaque(t *testing.T) {
+// Unrecognised output used to be withheld entirely, on the theory that a
+// failure mode we do not understand might print something better kept quiet.
+// The cost was that the failures hardest to diagnose were the ones reported as
+// a bare "failed" — so the output is now shown, with the ephemeral home
+// redacted, and the operation is still named.
+func TestExitErrorSurfacesUnrecognisedOutput(t *testing.T) {
 	e := &ExitError{Err: errors.New("exit status 1"), Stderr: "panic: boom"}
-	if e.Error() != "annotation failed" {
-		t.Errorf("Error() = %q, want the opaque fallback", e.Error())
+	if !strings.Contains(e.Error(), "annotation failed") {
+		t.Errorf("Error() = %q, want it to name the operation", e.Error())
 	}
-	// The fallback names the operation: "annotation failed" on a provisioning job
-	// sends the reader looking in the wrong place.
+	if !strings.Contains(e.Error(), "panic: boom") {
+		t.Errorf("Error() = %q, want it to carry the process output", e.Error())
+	}
+
+	// The operation is named either way: "annotation failed" on a provisioning
+	// job sends the reader looking in the wrong place.
 	d := &ExitError{Err: errors.New("exit status 1"), Stderr: "panic", Op: "download"}
-	if d.Error() != "download failed" {
-		t.Errorf("Error() = %q, want %q", d.Error(), "download failed")
+	if !strings.HasPrefix(d.Error(), "download failed") {
+		t.Errorf("Error() = %q, want it to start with %q", d.Error(), "download failed")
 	}
+
 	if !strings.Contains(e.Detail(), "panic: boom") {
 		t.Errorf("Detail() should carry the full diagnostic, got %q", e.Detail())
 	}
@@ -545,5 +555,97 @@ func TestCLIMessageRedactsHome(t *testing.T) {
 	got := cliMessage("error: open /tmp/varhub-home-123/x: no such file\n", "/tmp/varhub-home-123")
 	if strings.Contains(got, "varhub-home-123") {
 		t.Errorf("home not redacted: %q", got)
+	}
+}
+
+// A failure with no recognisable "error:" line used to report "<op> failed" and
+// nothing else — the case where a bare message is least useful, since there is
+// no known shape to fall back on.
+func TestMessageFallsBackToStderrTail(t *testing.T) {
+	e := &ExitError{
+		Op:   "download",
+		Err:  errors.New("exit status 2"),
+		Home: "/tmp/varhub-home-9182",
+		Stderr: "fetching revel_all_chromosomes.csv.zip\n" +
+			"unzipping into /tmp/varhub-home-9182/work\n" +
+			"Traceback (most recent call last):\n" +
+			"  File \"convert.py\", line 4, in <module>\n" +
+			"MemoryError\n",
+	}
+	msg := e.Error()
+
+	// The actual cause has to survive.
+	if !strings.Contains(msg, "MemoryError") {
+		t.Errorf("the failure's own output was dropped:\n%s", msg)
+	}
+	if !strings.Contains(msg, "download failed") {
+		t.Errorf("message does not say what failed:\n%s", msg)
+	}
+	// The ephemeral home is meaningless to a reader and is redacted, as it is
+	// in the recognised-error path.
+	if strings.Contains(msg, "/tmp/varhub-home-9182") {
+		t.Errorf("the temp home leaked into the message:\n%s", msg)
+	}
+	if !strings.Contains(msg, "<config>") {
+		t.Errorf("redaction did not happen:\n%s", msg)
+	}
+}
+
+// A recognised error still wins: the fallback must not bury a message that
+// already names the problem in a wall of progress output.
+func TestRecognisedErrorBeatsTheTail(t *testing.T) {
+	e := &ExitError{
+		Op:  "download",
+		Err: errors.New("exit status 1"),
+		Stderr: "varhub: fetching\nvarhub: unpacking\n" +
+			"error: REVEL:1.3: required software not found on PATH: python3\n",
+	}
+	msg := e.Error()
+	if msg != "REVEL:1.3: required software not found on PATH: python3" {
+		t.Errorf("Error = %q", msg)
+	}
+}
+
+// Nothing on stderr at all leaves the old behaviour, rather than an empty
+// message that reads as a bug in the reporting.
+func TestMessageWithNoStderr(t *testing.T) {
+	e := &ExitError{Op: "download", Err: errors.New("signal: killed")}
+	if got := e.Error(); got != "download failed" {
+		t.Errorf("Error = %q, want %q", got, "download failed")
+	}
+}
+
+// A successful run keeps its output too.
+//
+// Logs used to be stored only when the CLI exited non-zero, so the one case
+// with nothing to read was a job that finished cleanly having annotated
+// nothing — which is exactly what a snapshot pinning names no source emits
+// looks like from the outside. The job is "done", the table is empty, and
+// without this there is no way to tell "consulted the sources, no match" from
+// "never consulted them".
+func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
+	bin, home := testHome(t)
+	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
+
+	res, err := r.Annotate(context.Background(), Request{
+		Kind:      KindLocus,
+		Snapshot:  "test",
+		Selection: "all",
+		Body:      []byte("chr1:115256529:T:C"),
+	})
+	if err != nil {
+		t.Fatalf("Annotate: %v", err)
+	}
+	if res.Log == "" {
+		t.Fatal("a successful run recorded no output")
+	}
+	// It must be the run's own progress, not incidental noise: varhub prefixes
+	// its progress lines, and that prefix is what makes the log worth keeping.
+	if !strings.Contains(res.Log, "varhub:") {
+		t.Errorf("log does not look like varhub progress output:\n%s", res.Log)
+	}
+	// The point of keeping it is learning what the run actually did.
+	if !strings.Contains(res.Log, "annotat") {
+		t.Errorf("log says nothing about annotating:\n%s", res.Log)
 	}
 }

@@ -64,6 +64,12 @@ type Source struct {
 	TOML        string `json:"-"` // never serialized to API clients by default
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
+
+	// prefixOverride is this deployment's annotation prefix for the source,
+	// loaded with it by sourceCols. Unexported because it is not part of the
+	// API shape: it has already been folded into the names Annotations()
+	// reports, and offering it separately invites a second interpretation.
+	prefixOverride string
 }
 
 // Ref is the "name:version" reference a snapshot manifest uses.
@@ -97,6 +103,22 @@ type Snapshot struct {
 	UpdatedAt   int64    `json:"updated_at"`
 
 	Sources []Source `json:"sources,omitempty"` // populated by Get, not List
+}
+
+// ContainsRemote reports whether any pinned source is read from its origin
+// rather than from storage this deployment controls.
+//
+// Worth surfacing next to a snapshot rather than only per source: it is the
+// difference between a run that depends on local disk and one that depends on
+// somebody else's server being reachable, and that is a property of the whole
+// snapshot.
+func (s Snapshot) ContainsRemote() bool {
+	for _, src := range s.Sources {
+		if src.Stream {
+			return true
+		}
+	}
+	return false
 }
 
 // ContainsPrivate reports whether any pinned source is private. Drives the lock
@@ -137,14 +159,26 @@ func Open(ctx context.Context, dsn string) (*Store, error) {
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// Pool exposes the connection pool so the identity store can share it. These
+// are the same database; a second pool would double the connection budget for
+// no benefit, and the two stores would then hold inconsistent views under load.
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
+// The annotation prefix is joined in rather than left to callers to fetch: it
+// renames every field the source contributes, so a Source loaded without it
+// reports names that materialization would not produce, and a snapshot built
+// from those names fails at annotate time with "unknown annotation" — far from
+// the listing that invented them.
 const sourceCols = `id, name, version, title, detail, kind, build, visibility,
-	index_status, origin, toml_text, created_at, updated_at`
+	index_status, origin, toml_text, created_at, updated_at,
+	COALESCE((SELECT annotation_prefix FROM source_settings st
+	          WHERE st.source_id = source.id), '')`
 
 func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	var s Source
 	err := row.Scan(&s.ID, &s.Name, &s.Version, &s.Title, &s.Detail, &s.Kind,
 		&s.Build, &s.Visibility, &s.IndexStatus, &s.Origin, &s.TOML,
-		&s.CreatedAt, &s.UpdatedAt)
+		&s.CreatedAt, &s.UpdatedAt, &s.prefixOverride)
 	if err == nil {
 		s.Stream = streamFromTOML(s.TOML)
 	}
@@ -249,7 +283,10 @@ func (s *Store) PutSource(ctx context.Context, src Source) error {
 		return fmt.Errorf("source %q has no TOML manifest", src.ID)
 	}
 	if src.Visibility == "" {
-		src.Visibility = VisibilityPublic
+		// Default closed. Publishing something private is a disclosure that
+		// cannot be undone; a private source nobody can see is a support
+		// request. The costs are not symmetric.
+		src.Visibility = VisibilityPrivate
 	}
 	if src.IndexStatus == "" {
 		src.IndexStatus = "indexed"

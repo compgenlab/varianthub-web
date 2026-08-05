@@ -18,6 +18,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/api"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/identity"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
@@ -103,8 +104,28 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
-	if !cfg.RequireToken {
-		log.Printf("serve: /api/v1 is OPEN (VHW_REQUIRE_TOKEN=false)")
+	// Accounts share the catalog's pool, so they are available exactly when it
+	// is. Without them the server still runs: it just has no way to identify
+	// anyone, which the middleware treats as everybody being anonymous.
+	var ids *identity.Store
+	if cat != nil {
+		ids = identity.NewStore(cat.Pool())
+		if err := announceBootstrap(ctx, ids); err != nil {
+			log.Printf("serve: bootstrap: %v", err)
+		}
+	}
+
+	if cfg.AllowAnonymous {
+		log.Printf("serve: anonymous annotation is ENABLED (VHW_ALLOW_ANONYMOUS=true)")
+	}
+	if cfg.CILogonClientID != "" {
+		if len(cfg.CILogonAutoProvision) > 0 {
+			log.Printf("serve: CILogon sign-in enabled; accounts auto-created for %v",
+				cfg.CILogonAutoProvision)
+		} else {
+			log.Printf("serve: CILogon sign-in enabled (invite-only — an administrator " +
+				"creates the account, the first sign-in claims it)")
+		}
 	}
 
 	// The web UI is embedded at build time. A binary built without running the
@@ -118,7 +139,34 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		log.Printf("serve: no web UI embedded (run `npm --prefix web run build`)")
 	}
 
-	return api.New(cfg, q, cat, spa).Run(ctx)
+	return api.New(cfg, q, cat, ids, spa).Run(ctx)
+}
+
+// announceBootstrap issues and logs the first-administrator credential when the
+// installation has no administrator yet.
+//
+// Printed to the log rather than written to a file or an env var because the log
+// is the one place an operator is already looking on first start, and because it
+// is the shortest-lived: the token stops working the moment the first
+// administrator account exists.
+func announceBootstrap(ctx context.Context, ids *identity.Store) error {
+	needs, err := ids.NeedsBootstrap(ctx)
+	if err != nil || !needs {
+		return err
+	}
+	secret, err := ids.IssueBootstrap(ctx)
+	if err != nil {
+		return err
+	}
+	log.Printf("serve: this installation has no administrator yet.")
+	log.Printf("serve: create the first one with the bootstrap token below — it stops")
+	log.Printf("serve: working as soon as that account exists, and is reissued on restart.")
+	log.Printf("serve:")
+	log.Printf("serve:     %s", secret)
+	log.Printf("serve:")
+	log.Printf("serve: POST /api/v1/admin/users {\"email\":..., \"password\":..., \"role\":\"admin\"}")
+	log.Printf("serve: with `Authorization: Bearer <token>`, or open the web UI and follow the prompt.")
+	return nil
 }
 
 // worker runs the job pool. It serves no HTTP.
@@ -129,6 +177,18 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer q.Close()
 
+	// Take back jobs whose holder stopped renewing — a worker that crashed, or
+	// one killed mid-run. Safe to do while other workers are busy, because a
+	// live one keeps its leases fresh; see ReclaimExpired.
+	if n, rErr := q.ReclaimExpired(ctx); rErr != nil {
+		return rErr
+	} else if n > 0 {
+		log.Printf("worker: reclaimed %d abandoned job(s)", n)
+	}
+	// Keep this worker's own claims alive, and keep watching for others going
+	// quiet: a peer can die at any point, not only before we start.
+	q.StartLeaseKeeper(ctx)
+
 	q.SetMaxJobsPerIP(cfg.MaxJobsPerIP)
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))
@@ -138,9 +198,10 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 	exec := &runner.ExecRunner{
-		Bin:     cfg.VarhubBin,
-		Home:    home,
-		Timeout: cfg.JobTimeout,
+		Bin:             cfg.VarhubBin,
+		Home:            home,
+		Timeout:         cfg.JobTimeout,
+		DownloadTimeout: cfg.DownloadTimeout,
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
@@ -151,7 +212,8 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	defer cat.Close()
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
-	q.StartWorkers(ctx, cfg.Workers, adapt(exec, cat))
+	q.SetSlots(cfg.JobSlots)
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -177,9 +239,10 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 	log.Printf("worker: materializing annotation config from the catalog (data=%s cache=%s)",
 		cfg.DataDir, cfg.CacheDir)
 	return &catalog.Materializer{
-		Store:    cat,
-		DataDir:  cfg.DataDir,
-		CacheDir: cfg.CacheDir,
+		Store:      cat,
+		DataDir:    cfg.DataDir,
+		CacheDir:   cfg.CacheDir,
+		References: cfg.References,
 	}, nil
 }
 
@@ -221,11 +284,16 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // adapt bridges runner.Runner to queue.Runner. The two are deliberately separate
 // types: the queue knows nothing about how annotation happens, and the runner
 // knows nothing about job persistence.
-func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
+//
+// The queue is passed in as well, for the run's output. That is persistence, so
+// it belongs to the queue rather than to either of the two types this bridges —
+// and it is written outside the Outcome because an Outcome is the job's result,
+// while a log exists for the runs that produced no result at all.
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
-			return runDownload(ctx, r, cat, job, input)
+			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
 			return runCleanup(job, input)
 		}
@@ -236,14 +304,21 @@ func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 			Body:      input,
 		})
 		if err != nil {
-			// Log the full diagnostic; return only the safe message, which is what
-			// gets stored on the job and served to clients.
+			// The full diagnostic goes to the log and to the job, so it can be
+			// read without shell access to this container — and survives the
+			// container being replaced, which the log does not.
 			var ee *runner.ExitError
 			if errors.As(err, &ee) {
 				log.Printf("worker: job %s: %s", job.ID, ee.Detail())
+				storeLog(ctx, q, job.ID, ee.Detail())
 			}
 			return queue.Outcome{}, err
 		}
+		// Kept for a run that worked, as downloads already do. A job that
+		// annotated nothing succeeds by every check made here, and the progress
+		// output is the only thing that says whether the sources were consulted.
+		storeLog(ctx, q, job.ID, res.Log)
+
 		var cols []byte
 		if len(res.Columns) > 0 {
 			if b, mErr := json.Marshal(res.Columns); mErr == nil {
@@ -260,7 +335,24 @@ func adapt(r runner.Runner, cat *catalog.Store) queue.Runner {
 //
 // The inventory is written here, in the worker, because only the worker is
 // guaranteed to have the storage volume mounted — the API server may not.
-func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
+// storeLog persists a run's output, best effort.
+//
+// Never fails the job: a log that could not be written is a worse thing to
+// report than the outcome the job actually had, and the log is a diagnostic aid
+// rather than part of the result.
+func storeLog(ctx context.Context, q *queue.Queue, id, output string) {
+	if q == nil || output == "" {
+		return
+	}
+	// WithoutCancel because this often runs while the job's own context is
+	// already cancelled — a timeout, a shutdown — and those are exactly the runs
+	// whose output is most worth having.
+	if err := q.SetLog(context.WithoutCancel(ctx), id, output); err != nil {
+		log.Printf("worker: job %s: store log: %v", id, err)
+	}
+}
+
+func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *catalog.Store,
 	job queue.Job, input []byte) (queue.Outcome, error) {
 
 	exec, ok := r.(*runner.ExecRunner)
@@ -278,6 +370,16 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
 	}
 
+	// Mark them in flight before the work starts, so the catalog says
+	// "installing" rather than "not installed" while a multi-hour tool setup
+	// runs — the state a source is in for most of the time it matters.
+	if cat != nil {
+		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+			catalog.StateInstalling, ""); sErr != nil {
+			log.Printf("worker: job %s: mark installing: %v", job.ID, sErr)
+		}
+	}
+
 	res, err := exec.Download(ctx, runner.DownloadRequest{
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
@@ -288,9 +390,28 @@ func runDownload(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		var ee *runner.ExitError
 		if errors.As(err, &ee) {
 			log.Printf("worker: download job %s: %s", job.ID, ee.Detail())
+			storeLog(ctx, q, job.ID, ee.Detail())
+		}
+		if cat != nil {
+			// WithoutCancel: a cancelled or timed-out job still has to leave the
+			// source describing itself accurately, and its context is dead.
+			if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+				catalog.StateFailed, err.Error()); sErr != nil {
+				log.Printf("worker: job %s: mark failed: %v", job.ID, sErr)
+			}
 		}
 		return queue.Outcome{}, err
 	}
+	if cat != nil {
+		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
+			catalog.StateReady, ""); sErr != nil {
+			log.Printf("worker: job %s: mark ready: %v", job.ID, sErr)
+		}
+	}
+	// A successful download has output worth keeping too: which files it
+	// fetched, what it skipped as already present, how long a build recipe
+	// took. "It worked" is not the only question asked of a finished job.
+	storeLog(ctx, q, job.ID, res.Log)
 
 	// Attribute files to their source by the directory varhub lays out per
 	// source: <cache>/<name>/<version>/... A file outside that shape belongs to no
@@ -402,7 +523,9 @@ catalog administration:
   snapshot list                      list snapshots
   version   print the version
 
-Configuration is read from the environment; see README.md. VHW_DATABASE_URL is
+Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
+/etc/varianthub-web/config.toml), with environment variables overriding it.
+Copy varianthub-web.example.toml to start; see README.md. A database URL is
 always required.
 `, "\n"))
 }

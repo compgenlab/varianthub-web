@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { Check, Plus, Trash2, X } from "lucide-react";
+import { Link } from "react-router-dom";
+import { Check, Cloud, Globe, HardDrive, Plus, X } from "lucide-react";
 
 import {
   api,
@@ -8,6 +9,7 @@ import {
   type Snapshot,
   type Source,
   type SourceFile,
+  type SourceAsset,
   type StorageLocation,
 } from "../api";
 import { humanSize } from "./Files";
@@ -167,7 +169,7 @@ export default function Admin() {
               <Plus size={15} /> New snapshot
             </button>
           </div>
-          <SnapshotList snapshots={snapshots} allSources={sources} onChange={load} />
+          <SnapshotList snapshots={snapshots} onChange={load} />
         </>
       )}
     </div>
@@ -187,16 +189,19 @@ function SourceTable({
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
-  const [showConfig, setShowConfig] = useState("");
 
-  // A source is "provisioned" when files are recorded for it. Summarize per
-  // source so the row can show a footprint instead of a bare yes/no.
-  const provisioned = new Map<string, { bytes: number; count: number }>();
+
+  // A source is "provisioned" when files are recorded for it. Summarized per
+  // source *and* per location: a source can be in two places at once, and
+  // "1.2 GB somewhere" does not answer the question the row is being read for.
+  const provisioned = new Map<string, Map<string, { bytes: number; count: number }>>();
   for (const f of files) {
-    const cur = provisioned.get(f.source_id) ?? { bytes: 0, count: 0 };
+    const byLoc = provisioned.get(f.source_id) ?? new Map();
+    const cur = byLoc.get(f.storage_id) ?? { bytes: 0, count: 0 };
     cur.bytes += f.size_bytes;
     cur.count += 1;
-    provisioned.set(f.source_id, cur);
+    byLoc.set(f.storage_id, cur);
+    provisioned.set(f.source_id, byLoc);
   }
   const targets = storage.filter((l) => l.usable);
 
@@ -222,22 +227,13 @@ function SourceTable({
           }}
         >
           <span>
-            <button
-              onClick={() => setShowConfig(showConfig === s.id ? "" : s.id)}
-              title="Show this source's manifest"
-              style={{
-                background: "none",
-                border: "none",
-                padding: 0,
-                cursor: "pointer",
-                textAlign: "left",
-                fontSize: 14,
-                fontWeight: 500,
-                color: "var(--accent-text)",
-              }}
+            <Link
+              to={`/admin/sources/${encodeURIComponent(s.id)}`}
+              title="Open this source"
+              style={{ fontSize: 14, fontWeight: 500, color: "var(--accent-text)" }}
             >
               {s.title || s.name}
-            </button>
+            </Link>
             <br />
             <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
               {s.origin || s.id}
@@ -246,7 +242,17 @@ function SourceTable({
           <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
             {s.version}
           </span>
-          <span className="tag">{s.kind}</span>
+          <span className="row gap-8" style={{ flexWrap: "wrap" }}>
+            <span className="tag">{s.kind}</span>
+            {/* A remote source is read from its origin over the network. It
+                needs no download, so without this it reads as one that has
+                simply not been fetched yet. */}
+            {s.stream && (
+              <span className="tag tag-remote" title="Read from its origin over the network">
+                <Globe size={10} /> remote
+              </span>
+            )}
+          </span>
           <span
             style={{
               fontSize: 12.5,
@@ -258,104 +264,57 @@ function SourceTable({
           <ProvisionCell
             source={s}
             have={provisioned.get(s.id)}
+            storage={storage}
             targets={targets}
             onChange={onChange}
           />
-          <DeleteSource source={s} onChange={onChange} />
-          {showConfig === s.id && <SourceConfig id={s.id} />}
+          <span style={{ textAlign: "right" }}>
+            <Link
+              to={`/admin/sources/${encodeURIComponent(s.id)}`}
+              className="btn link"
+              style={{ fontSize: 12.5 }}
+            >
+              Open
+            </Link>
+          </span>
         </div>
       ))}
     </div>
   );
 }
 
+
+
 /**
- * Shows a source's stored manifest.
+ * One place a source's data is stored.
  *
- * The manifest is the source of truth — the listed columns are a projection of
- * it — so this is how an admin checks what a source actually declares instead
- * of inferring it from the row.
+ * Names the location rather than just the kind: a deployment can have several
+ * buckets, and "in S3" does not say which one to look in — or which one to
+ * clean up when the disk bill arrives.
  */
-function SourceConfig({ id }: { id: string }) {
-  const [toml, setToml] = useState("");
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    let live = true;
-    api
-      .sourceConfig(id)
-      .then((r) => live && setToml(r.config))
-      .catch((e) => live && setErr(String(e.message ?? e)));
-    return () => {
-      live = false;
-    };
-  }, [id]);
-
+function StoredAt({
+  location,
+  bytes,
+  count,
+}: {
+  location?: StorageLocation;
+  bytes: number;
+  count: number;
+}) {
+  const s3 = location?.kind === "s3";
+  // The bucket, for an s3 location: the URI is the operational identifier, and
+  // the friendly name may be anything someone typed.
+  const where = s3 ? (location?.uri ?? "").replace(/^s3:\/\//, "") : location?.name;
   return (
-    <pre
-      className="mono"
-      style={{
-        gridColumn: "1 / -1",
-        margin: "10px 0 0",
-        padding: 12,
-        fontSize: 12,
-        lineHeight: 1.5,
-        background: "var(--surface-2)",
-        border: "1px solid var(--hairline)",
-        borderRadius: 6,
-        overflowX: "auto",
-        whiteSpace: "pre",
-        color: err ? "var(--danger)" : "var(--text-1)",
-      }}
-    >
-      {err || toml || "Loading…"}
-    </pre>
-  );
-}
-
-/**
- * Removes a source. Refused server-side while a snapshot pins it — removing it
- * would silently change what those snapshots mean — so the error names the
- * snapshots to detach rather than the button being pre-disabled on a guess.
- */
-function DeleteSource({ source, onChange }: { source: Source; onChange: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  return (
-    <span>
-      <button
-        className="icon-btn"
-        title={`Remove ${source.name}`}
-        disabled={busy}
-        onClick={async () => {
-          if (
-            !confirm(
-              `Remove source "${source.title || source.name}"?\n\n` +
-                `Its downloaded files are reclaimed in the background. ` +
-                `This is refused if any snapshot pins it.`,
-            )
-          )
-            return;
-          setBusy(true);
-          setErr("");
-          try {
-            await api.deleteSource(source.id);
-            onChange();
-          } catch (e) {
-            setErr(e instanceof Error ? e.message : String(e));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Trash2 size={14} />
-      </button>
-      {err && (
-        <span className="err" style={{ fontSize: 11, display: "block", marginTop: 4 }}>
-          {err}
+    <span className="row gap-8" style={{ fontSize: 12.5 }}>
+      <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
+      {s3 ? <Cloud size={12} /> : <HardDrive size={12} />}
+      <span>
+        {humanSize(bytes)}{" "}
+        <span style={{ color: "var(--text-3)" }}>
+          ({count} file{count === 1 ? "" : "s"}) · {where ?? "unknown location"}
         </span>
-      )}
+      </span>
     </span>
   );
 }
@@ -371,11 +330,13 @@ function DeleteSource({ source, onChange }: { source: Source; onChange: () => vo
 function ProvisionCell({
   source,
   have,
+  storage,
   targets,
   onChange,
 }: {
   source: Source;
-  have?: { bytes: number; count: number };
+  have?: Map<string, { bytes: number; count: number }>;
+  storage: StorageLocation[];
   targets: StorageLocation[];
   onChange: () => void;
 }) {
@@ -383,6 +344,24 @@ function ProvisionCell({
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const [err, setErr] = useState("");
+
+  // Already being fetched. No control while that is true: a second Download
+  // would queue a duplicate of work already running, and the useful thing to
+  // offer is the job rather than the button.
+  if (source.state?.state === "installing") {
+    return (
+      <span className="row gap-8" style={{ fontSize: 12.5 }}>
+        <i className="status-dot blink" style={{ background: "var(--vus-dot)" }} />
+        {source.state.job ? (
+          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12.5 }}>
+            installing…
+          </Link>
+        ) : (
+          "installing…"
+        )}
+      </span>
+    );
+  }
 
   // Nothing to fetch: a builtin computes from the variant, a streamed source is
   // read from its url. Both are usable the moment they are registered, so say
@@ -398,16 +377,46 @@ function ProvisionCell({
   // change upstream. Offered, not pressed: the default stays "no copy".
   const streamed = source.needs_data === false && source.stream;
 
-  if (have) {
+  if (source.state?.state === "failed") {
     return (
-      <span className="row gap-8">
-        <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
-        <span style={{ fontSize: 12.5 }}>
-          {humanSize(have.bytes)}{" "}
-          <span style={{ color: "var(--text-3)" }}>
-            ({have.count} file{have.count === 1 ? "" : "s"})
-          </span>
+      <span style={{ display: "block" }}>
+        <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
+          <i className="status-dot" style={{ background: "var(--path-dot)" }} />
+          install failed
         </span>
+        {/* The reason, trimmed: the row says what happened, the job page has
+            the run's whole output. */}
+        <span
+          className="mono"
+          style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}
+        >
+          {(source.state.error ?? "").split("\n")[0].slice(0, 90)}
+        </span>
+        <button
+          className="btn secondary"
+          style={{ height: 26, padding: "0 9px", fontSize: 11.5, marginTop: 4 }}
+          disabled={busy || targets.length === 0}
+          onClick={provision}
+        >
+          Retry
+        </button>
+      </span>
+    );
+  }
+
+  if (have && have.size > 0) {
+    return (
+      <span style={{ display: "block" }}>
+        {[...have].map(([id, v]) => (
+          <StoredAt key={id} location={storage.find((l) => l.id === id)} {...v} />
+        ))}
+        {/* A streamed source that also has a copy: say so, or the copy looks
+            like the only way it is read. */}
+        {streamed && (
+          <span style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}>
+            also readable from its origin
+          </span>
+        )}
       </span>
     );
   }
@@ -448,6 +457,18 @@ function ProvisionCell({
 
   return (
     <span>
+      {/* Without this a working remote source looks exactly like a broken
+          un-provisioned one — same dropdown, same Download button. It is
+          already usable; the copy is an optimisation, so say that before
+          offering the control rather than only in a tooltip. */}
+      {streamed && (
+        <span
+          className="row gap-8"
+          style={{ fontSize: 11.5, color: "var(--text-2)", marginBottom: 4 }}
+        >
+          <Globe size={11} /> reads from origin — copy optional
+        </span>
+      )}
       <span className="row gap-8">
         <select
           className="select"
@@ -474,7 +495,7 @@ function ProvisionCell({
               : undefined
           }
         >
-          {busy ? "…" : "Download"}
+          {busy ? "…" : streamed ? "Copy locally" : "Download"}
         </button>
       </span>
       {err && (
@@ -488,15 +509,12 @@ function ProvisionCell({
 
 function SnapshotList({
   snapshots,
-  allSources,
   onChange,
 }: {
   snapshots: Snapshot[];
-  allSources: Source[];
   onChange: () => void;
 }) {
   const [busy, setBusy] = useState("");
-  const [editing, setEditing] = useState("");
   const [err, setErr] = useState("");
 
   async function act(id: string, fn: () => Promise<unknown>) {
@@ -521,7 +539,12 @@ function SnapshotList({
           <div className="between" style={{ gap: 14 }}>
             <div>
               <div className="row gap-10">
-                <span style={{ fontSize: 15, fontWeight: 600 }}>{s.title || s.id}</span>
+                <Link
+                  to={`/admin/snapshots/${encodeURIComponent(s.id)}`}
+                  style={{ fontSize: 15, fontWeight: 600, color: "var(--accent-text)" }}
+                >
+                  {s.title || s.id}
+                </Link>
                 <span
                   className="mono"
                   style={{
@@ -541,12 +564,13 @@ function SnapshotList({
               </div>
             </div>
             <div className="row gap-8">
-              <button
+              <Link
                 className="btn secondary sm"
-                onClick={() => setEditing(editing === s.id ? "" : s.id)}
+                style={{ textDecoration: "none" }}
+                to={`/admin/snapshots/${encodeURIComponent(s.id)}`}
               >
-                {editing === s.id ? "Close" : "Edit"}
-              </button>
+                Open
+              </Link>
               {s.state !== "published" && (
                 <button
                   className="btn sm"
@@ -575,131 +599,43 @@ function SnapshotList({
             </div>
           </div>
 
-          {editing === s.id && (
-            <>
-              <EditSnapshot
-                snapshot={s}
-                onDone={() => {
-                  setEditing("");
-                  onChange();
-                }}
-              />
-              <EditSnapshotSources snapshot={s} sources={allSources} onChange={onChange} />
-            </>
-          )}
         </div>
       ))}
     </div>
   );
 }
 
-/**
- * Edits a snapshot's title and default fields.
- *
- * Available on a published snapshot too. Publishing fixes the pinned source
- * *versions* — that is what reproducibility rests on — not the label or which
- * fields are pre-checked. A job records the annotations it actually ran with, so
- * changing a default does not rewrite history.
- */
-function EditSnapshot({ snapshot, onDone }: { snapshot: Snapshot; onDone: () => void }) {
-  const [title, setTitle] = useState(snapshot.title ?? "");
-  const [defaults, setDefaults] = useState((snapshot.defaults ?? []).join(", "));
-  const [fields, setFields] = useState<string[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-
-  useEffect(() => {
-    api
-      .snapshot(snapshot.id)
-      .then((d) => setFields((d.annotations ?? []).map((a) => a.name)))
-      .catch(() => {});
-  }, [snapshot.id]);
-
-  const chosen = defaults.split(",").map((d) => d.trim()).filter(Boolean);
-
-  return (
-    <div style={{ marginTop: 14, paddingTop: 14, borderTop: "1px solid var(--hairline)" }}>
-      <div className="row gap-14" style={{ flexWrap: "wrap", alignItems: "flex-end" }}>
-        <div style={{ flex: 1, minWidth: 240 }}>
-          <label className="label">Title</label>
-          <input className="input" value={title} onChange={(e) => setTitle(e.target.value)} />
-        </div>
-        <div style={{ flex: 2, minWidth: 280 }}>
-          <label className="label">Default fields (comma-separated)</label>
-          <input
-            className="input mono"
-            style={{ fontSize: 12 }}
-            value={defaults}
-            onChange={(e) => setDefaults(e.target.value)}
-          />
-        </div>
-      </div>
-
-      {fields.length > 0 && (
-        <div className="row gap-8" style={{ flexWrap: "wrap", marginTop: 10 }}>
-          {fields.map((f) => {
-            const on = chosen.includes(f);
-            return (
-              <button
-                key={f}
-                className="tag"
-                style={{
-                  cursor: "pointer",
-                  border: "none",
-                  background: on ? "var(--accent-tint)" : "var(--neutral-fill)",
-                  color: on ? "var(--accent-text)" : "var(--text-2)",
-                }}
-                onClick={() =>
-                  setDefaults(
-                    (on ? chosen.filter((c) => c !== f) : [...chosen, f]).join(", "),
-                  )
-                }
-              >
-                {on ? "✓ " : "+ "}
-                {f}
-              </button>
-            );
-          })}
-        </div>
-      )}
-
-      {err && <p className="err" style={{ fontSize: 12.5, marginTop: 10 }}>{err}</p>}
-
-      <div className="row gap-8" style={{ marginTop: 12, justifyContent: "flex-end" }}>
-        <button
-          className="btn sm"
-          disabled={busy}
-          onClick={async () => {
-            setBusy(true);
-            setErr("");
-            try {
-              await api.updateSnapshotMeta(snapshot.id, { title, defaults: chosen });
-              onDone();
-            } catch (e) {
-              setErr(e instanceof Error ? e.message : String(e));
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {busy ? "Saving…" : "Save"}
-        </button>
-      </div>
-      <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 8 }}>
-        Pinned source versions cannot be changed once published — that is what makes
-        a snapshot reproducible. Create a new snapshot to change them.
-      </p>
-    </div>
-  );
-}
 
 function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => void }) {
   const [toml, setToml] = useState(DEFAULT_TOML);
-  const [check, setCheck] = useState<{ valid: boolean; error?: string; id?: string; kind?: string } | null>(null);
+  // Derived from the client rather than restated: this had drifted from what
+  // the endpoint actually returns, so fields the server sent were invisible here.
+  const [check, setCheck] = useState<Awaited<ReturnType<typeof api.validateSource>> | null>(null);
   const [priv, setPriv] = useState(false);
   const [origin, setOrigin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  // Where the data should go, asked here rather than after registering.
+  //
+  // A source with files is not usable until they are fetched, and the previous
+  // flow ended at "registered" — leaving a source that looks present and fails
+  // at annotate time with "sources not downloaded". Asking now means one
+  // decision instead of a second trip through a different screen.
+  const [targets, setTargets] = useState<StorageLocation[]>([]);
+  const [target, setTarget] = useState("");
+  // Off for a streamed source: it reads from its origin, so a copy is a
+  // deliberate extra rather than the thing that makes it work.
+  const [alsoCopy, setAlsoCopy] = useState(false);
+
+  // Helper files that came with a registry fragment. Held here and posted with
+  // the manifest, so what is stored is what was on screen.
+  const [assets, setAssets] = useState<SourceAsset[]>([]);
+  const [assetErr, setAssetErr] = useState("");
+  // Offered at registration because that is when the need becomes obvious:
+  // adding a second version of something already installed.
+  const [prefix, setPrefix] = useState("");
+  const [missing, setMissing] = useState<string[]>([]);
 
   const [registries, setRegistries] = useState<Registry[]>([]);
   const [regID, setRegID] = useState("");
@@ -720,6 +656,14 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   }
   useEffect(() => {
     loadRegistries();
+    api
+      .storage()
+      .then((r) => {
+        const usable = (r.storage ?? []).filter((l) => l.usable);
+        setTargets(usable);
+        setTarget(usable.find((l) => l.is_default)?.id ?? usable[0]?.id ?? "");
+      })
+      .catch(() => setTargets([]));
   }, []);
 
   // Fetching a registry's catalog hits a remote; keep it out of the render path
@@ -753,6 +697,8 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
       const d = await api.registryFetch(regID, ref);
       setToml(d.toml);
       setOrigin(d.origin);
+      setAssets(d.assets ?? []);
+      setAssetErr(d.asset_error ?? "");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
     } finally {
@@ -760,15 +706,53 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
     }
   }
 
+  // What this source will need after it is registered.
+  const needsData = check?.valid === true && check.needs_data === true;
+  const streamed = check?.valid === true && check.stream === true;
+  const willDownload = (needsData || (streamed && alsoCopy)) && !!target;
+
   async function register() {
     setBusy(true);
     setErr("");
     try {
-      await api.createSource({
+      setMissing([]);
+      const created = await api.createSource({
         toml,
         visibility: priv ? "private" : "public",
         origin: origin || undefined,
+        assets: assets.length > 0 ? assets : undefined,
+        settings: prefix.trim() ? { annotation_prefix: prefix.trim() } : undefined,
       });
+      // Declared by the manifest and supplied by nobody. Not fatal — a source
+      // can be registered and its files added later — but it will fail at
+      // provisioning time, and saying so now is the difference between a
+      // two-second fix and finding out after a multi-gigabyte image pull.
+      if (created.missing_assets?.length) {
+        setMissing(created.missing_assets);
+        setBusy(false);
+        return;
+      }
+      if (willDownload) {
+        // Queued immediately, and separately: the source is registered either
+        // way. A queue that refuses the job should not roll back a manifest
+        // that is already correct — it should say so and leave the download to
+        // be retried from the sources list.
+        try {
+          await api.download({
+            sources: [created.id],
+            storage_id: target,
+            include_streamed: streamed,
+          });
+        } catch (e) {
+          setErr(
+            `Registered ${created.ref}, but the download could not be queued: ` +
+              (e instanceof Error ? e.message : String(e)) +
+              ". Start it from the sources list.",
+          );
+          setBusy(false);
+          return;
+        }
+      }
       onDone();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -917,24 +901,234 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
             Private (licensed data — access grants are not implemented yet)
           </label>
+
+          <label className="label" style={{ marginTop: 14, marginBottom: 4 }}>
+            Annotation prefix{" "}
+            <span style={{ textTransform: "none", letterSpacing: 0 }}>(optional)</span>
+          </label>
+          <input
+            className="input mono"
+            style={{ maxWidth: 260 }}
+            value={prefix}
+            placeholder={check?.valid ? "(manifest default)" : ""}
+            onChange={(e) => setPrefix(e.target.value)}
+          />
+          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "6px 0 0", lineHeight: 1.5 }}>
+            Renames this source&apos;s output fields. Worth setting when a second
+            version of something already registered goes in — two sources whose
+            fields share a name collide silently, and the prefix is what keeps
+            them apart. Blank uses whatever the manifest declares.
+          </p>
           {origin && (
             <p className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
               origin: {origin}
             </p>
           )}
 
+          {(assets.length > 0 || assetErr) && (
+            <AssetList assets={assets} error={assetErr} />
+          )}
+
+          {(needsData || streamed) && (
+            <DownloadTarget
+              needsData={needsData}
+              streamed={streamed}
+              targets={targets}
+              target={target}
+              setTarget={setTarget}
+              alsoCopy={alsoCopy}
+              setAlsoCopy={setAlsoCopy}
+            />
+          )}
+
+          {missing.length > 0 && (
+            <div
+              className="card"
+              style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+            >
+              <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0, lineHeight: 1.55 }}>
+                <strong>Registered, but incomplete.</strong> This source declares
+                helper files that nobody supplied:{" "}
+                <span className="mono">{missing.join(", ")}</span>. Its build or
+                tool steps will fail without them. A registry copy should ship
+                them beside the manifest — if it does not, the registry entry is
+                missing them upstream.
+              </p>
+            </div>
+          )}
+
           {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
 
           <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
-            <button className="btn secondary" onClick={onCancel}>
-              Cancel
+            <button className="btn secondary" onClick={missing.length ? onDone : onCancel}>
+              {missing.length ? "Done" : "Cancel"}
             </button>
-            <button className="btn" disabled={busy || !check?.valid} onClick={register}>
-              {busy ? "Registering…" : "Validate & register"}
+            <button
+              className="btn"
+              disabled={busy || !check?.valid || (needsData && targets.length > 0 && !target)}
+              onClick={register}
+            >
+              {busy
+                ? willDownload
+                  ? "Registering & queueing…"
+                  : "Registering…"
+                : willDownload
+                  ? "Register & download"
+                  : "Validate & register"}
             </button>
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The helper files that arrived with a registry fragment.
+ *
+ * Shown, and expandable, rather than imported quietly. A build recipe executes
+ * these — the same reason the fragment itself goes into an editor instead of
+ * being one-click imported applies more strongly to a script than to the TOML
+ * that names it.
+ */
+function AssetList({ assets, error }: { assets: SourceAsset[]; error?: string }) {
+  const [open, setOpen] = useState("");
+  if (error) {
+    return (
+      <div className="card" style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}>
+        <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
+          This source names helper files that could not be fetched: {error}. It can
+          still be registered, but a build recipe will fail without them.
+        </p>
+      </div>
+    );
+  }
+  return (
+    <div className="card" style={{ padding: 12, marginTop: 14 }}>
+      <div className="label" style={{ marginBottom: 8 }}>
+        Helper files ({assets.length})
+      </div>
+      <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "0 0 8px" }}>
+        Scripts this source&apos;s build recipe runs. They are stored with the
+        manifest and written beside it when a job runs.
+      </p>
+      {assets.map((a) => (
+        <div key={a.name} style={{ marginBottom: 6 }}>
+          <button
+            className="btn link mono"
+            style={{ fontSize: 12, padding: 0 }}
+            onClick={() => setOpen(open === a.name ? "" : a.name)}
+          >
+            {open === a.name ? "▾" : "▸"} {a.name}{" "}
+            <span style={{ color: "var(--text-3)" }}>
+              ({a.content.split("\n").length} lines)
+            </span>
+          </button>
+          {open === a.name && (
+            <pre
+              className="mono"
+              style={{
+                margin: "6px 0 0",
+                padding: 10,
+                fontSize: 11.5,
+                lineHeight: 1.5,
+                maxHeight: 260,
+                overflow: "auto",
+                background: "var(--neutral-fill)",
+                borderRadius: 6,
+                whiteSpace: "pre",
+              }}
+            >
+              {a.content}
+            </pre>
+          )}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Where a newly registered source's data should go.
+ *
+ * Shown before registering rather than after, because "registered" and "usable"
+ * are different states and the gap between them is invisible: a source with no
+ * data looks fine in the list and fails at annotate time. Asking here collapses
+ * the two into one decision.
+ */
+function DownloadTarget({
+  needsData,
+  streamed,
+  targets,
+  target,
+  setTarget,
+  alsoCopy,
+  setAlsoCopy,
+}: {
+  needsData: boolean;
+  streamed: boolean;
+  targets: StorageLocation[];
+  target: string;
+  setTarget: (v: string) => void;
+  alsoCopy: boolean;
+  setAlsoCopy: (v: boolean) => void;
+}) {
+  if (needsData && targets.length === 0) {
+    return (
+      <div
+        className="card"
+        style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+      >
+        <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
+          This source has data to download, but no storage location is configured.
+          It can still be registered — add a location under{" "}
+          <strong>Storage &amp; files</strong>, then download it from the sources
+          list.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="card" style={{ padding: 12, marginTop: 14 }}>
+      <div className="label" style={{ marginBottom: 8 }}>
+        {needsData ? "Download to" : "Local copy"}
+      </div>
+
+      {streamed && (
+        <label className="row gap-8" style={{ fontSize: 13, marginBottom: alsoCopy ? 10 : 0 }}>
+          <input
+            type="checkbox"
+            checked={alsoCopy}
+            onChange={(e) => setAlsoCopy(e.target.checked)}
+          />
+          {/* Unchecked by default: this source already works without a copy. */}
+          Also keep a local copy — this source reads from its origin, so a copy
+          is optional
+        </label>
+      )}
+
+      {(needsData || alsoCopy) && (
+        <>
+          <select
+            className="select"
+            style={{ maxWidth: 320 }}
+            value={target}
+            onChange={(e) => setTarget(e.target.value)}
+            aria-label="Download location"
+          >
+            {targets.map((l) => (
+              <option key={l.id} value={l.id}>
+                {l.name} — {l.uri}
+              </option>
+            ))}
+          </select>
+          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0" }}>
+            The download is queued as soon as the source is registered. Watch it
+            under <strong>System jobs</strong>.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -1103,7 +1297,15 @@ function BuildSnapshot({
             </span>
             <span>
               <span style={{ fontWeight: 500 }}>{s.title || s.name}</span>{" "}
-              <span className="tag">{s.kind}</span>
+              <span className="tag">{s.kind}</span>{" "}
+              {/* Pinning a remote source makes the snapshot depend on somebody
+                  else's server staying up, which is worth knowing before it is
+                  published rather than after a run fails. */}
+              {s.stream && (
+                <span className="tag tag-remote" title="Read from its origin over the network">
+                  <Globe size={10} /> remote
+                </span>
+              )}
             </span>
             <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
               {s.version}
@@ -1150,105 +1352,5 @@ function BuildSnapshot({
   );
 }
 
-/**
- * Adds and removes a snapshot's sources.
- *
- * Refused server-side once published: a published snapshot is a reproducibility
- * claim, so changing which sources it contains would silently change what every
- * past result meant. The checkboxes are disabled rather than the request being
- * allowed to fail, since there is nothing the user could do to make it succeed.
- *
- * Sources whose assembly differs from the snapshot's are also disabled, with the
- * mismatch named. A wrong assembly does not error at annotate time — it returns
- * plausible answers at coordinates that mean something else — so it is worth
- * refusing at the point of choosing rather than explaining afterwards.
- */
-function EditSnapshotSources({
-  snapshot,
-  sources,
-  onChange,
-}: {
-  snapshot: Snapshot;
-  sources: Source[];
-  onChange: () => void;
-}) {
-  const pinned = new Set((snapshot.sources ?? []).map((s) => s.id));
-  const [picked, setPicked] = useState<Set<string>>(new Set(pinned));
-  const [busy, setBusy] = useState(false);
-  const [err, setErr] = useState("");
-  const frozen = snapshot.state === "published";
 
-  const dirty =
-    picked.size !== pinned.size || [...picked].some((id) => !pinned.has(id));
 
-  function toggle(id: string) {
-    const next = new Set(picked);
-    if (next.has(id)) next.delete(id);
-    else next.add(id);
-    setPicked(next);
-  }
-
-  async function save() {
-    setBusy(true);
-    setErr("");
-    try {
-      await api.setSnapshotSources(snapshot.id, [...picked]);
-      onChange();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div style={{ marginTop: 12, paddingTop: 12, borderTop: "1px solid var(--hairline)" }}>
-      <div className="between" style={{ marginBottom: 8 }}>
-        <span style={{ fontSize: 13, fontWeight: 600 }}>Sources</span>
-        {!frozen && dirty && (
-          <button className="btn sm" disabled={busy || picked.size === 0} onClick={save}>
-            {busy ? "Saving…" : "Save sources"}
-          </button>
-        )}
-      </div>
-      {frozen && (
-        <p style={{ fontSize: 12, color: "var(--text-3)", margin: "0 0 8px" }}>
-          Published — its sources are fixed. Duplicate it to change them.
-        </p>
-      )}
-      {err && <p className="err">{err}</p>}
-      <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-        {sources.map((src) => {
-          const clash = !!src.build && !!snapshot.build && src.build !== snapshot.build;
-          return (
-            <label
-              key={src.id}
-              className="row gap-8"
-              style={{
-                fontSize: 13,
-                opacity: frozen || clash ? 0.55 : 1,
-                cursor: frozen || clash ? "not-allowed" : "pointer",
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={picked.has(src.id)}
-                disabled={frozen || clash}
-                onChange={() => toggle(src.id)}
-              />
-              <span>{src.title || src.name}</span>
-              <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
-                {src.id}
-              </span>
-              {clash && (
-                <span style={{ fontSize: 11, color: "var(--path-fg)" }}>
-                  {src.build}, not {snapshot.build}
-                </span>
-              )}
-            </label>
-          );
-        })}
-      </div>
-    </div>
-  );
-}

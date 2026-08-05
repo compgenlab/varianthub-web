@@ -1,0 +1,120 @@
+# VariantHub web service configuration.
+#
+# Copy to varianthub-web.toml (or /etc/varianthub-web/config.toml, or anywhere
+# and point VHW_CONFIG at it) and edit. Every setting has an environment
+# variable that overrides what is here, so a container can change one value
+# without rewriting the file. Run "varianthub-web config" to print what a given
+# deployment actually resolved to.
+#
+# The values below are the built-in defaults, so a copy of this file with only
+# database.url filled in behaves exactly like no file at all.
+
+[server]
+  addr = ":8080"                                    # VHW_ADDR
+  # Browser origins allowed to call the API. Leave empty for a same-origin
+  # deployment, where advertising CORS would only widen the surface.
+  cors_origins = []                                 # VHW_CORS_ORIGINS
+  trusted_proxies = ["127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+
+[database]
+  # Required. Often left to the environment in a container, where it is
+  # assembled from a secret.
+  url = "postgres://varianthub:CHANGEME@localhost:5432/varianthub?sslmode=disable"
+
+[auth]
+  # Let callers with no account use the annotation flow. Off by default:
+  # opening an instance up should be a decision someone made.
+  allow_anonymous = false                           # VHW_ALLOW_ANONYMOUS
+
+# Institutional sign-in. All three of client_id, client_secret and redirect_url
+# must be set to enable it; an incomplete set leaves sign-in password-only.
+[auth.cilogon]
+  client_id = ""                                    # VHW_CILOGON_CLIENT_ID
+  client_secret = ""                                # VHW_CILOGON_CLIENT_SECRET
+  redirect_url = ""                                 # https://host/auth/cilogon/callback
+  # Email domains whose verified holders get an account on first sign-in.
+  # Empty means invite-only: an administrator creates the account and the first
+  # sign-in claims it. CILogon federates thousands of institutions, so
+  # authenticating there is not by itself a reason to have an account here.
+  auto_provision_domains = []                       # VHW_CILOGON_AUTO_PROVISION_DOMAINS
+
+[worker]
+  count = 2                                         # VHW_WORKERS
+  # The pool measured in job weight rather than job count. Defaults to count,
+  # so a weight-1 job behaves exactly as it always did.
+  #
+  # A provisioning job weighs download_weight because it saturates disk and CPU
+  # for as long as it runs: two large ones on a machine finish later than one
+  # after the other and gain nothing by overlapping. With slots = 2 and a
+  # weight of 2, downloads are exclusive. To keep annotation flowing during a
+  # long install, raise slots rather than lowering the weight — the download
+  # should still hold what it costs.
+  slots = 2                                         # VHW_JOB_SLOTS
+  download_weight = 2                               # VHW_DOWNLOAD_WEIGHT
+  varhub_bin = "varhub"                             # VHW_VARHUB_BIN
+  # Fixed VARHUB_HOME. Empty means materialize one per job from the catalog,
+  # which is what a deployment normally wants.
+  varhub_home = ""                                  # VHW_VARHUB_HOME
+  # Container images and tool data (VEP's cache and the like) live under
+  # data_dir, and always on a filesystem — a container binds the data directory
+  # and apptainer runs a .sif from a path, so neither can be read from a bucket
+  # even when source data is.
+  #
+  # A tool's setup runs once per data_dir. Several machines with separate
+  # data_dirs each pay it: point them at one shared mount to pay it once, or see
+  # cache_setup below for the case where there is no shared mount.
+  data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
+  cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
+  job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Provisioning is a different scale of work: a source can be tens of
+  # gigabytes and a tool's one-time install larger still. Being killed partway
+  # is worse than being slow — it leaves a half-populated data directory with
+  # no sentinel, so the next attempt starts from nothing.
+  download_timeout = "12h"                          # VHW_DOWNLOAD_TIMEOUT
+  job_ttl = "24h"                                   # VHW_JOB_TTL
+
+# Where downloaded source data goes. Filesystem entries come first and the first
+# of those is the default target. Both take "name=<target>" entries.
+#
+# A plain directory is a complete configuration — no object store is required
+# for any of this. It is also the simpler one for tools: with a filesystem
+# target, a tool's image and data live directly inside it, so a folder on shared
+# storage is shared by every worker with nothing to synchronise.
+#
+# An S3 target is for containers with ephemeral disks, where a new one starts
+# with nothing. Source files are then read in place with range requests, but a
+# tool still needs a directory, so its data is archived and unpacked locally —
+# a source opts into that with cache_setup = true in its manifest. That setting
+# does nothing with a filesystem target, because there is nothing to copy.
+[storage]
+  paths = ["default=/var/lib/varianthub/sources"]   # VHW_STORAGE_PATHS
+  s3 = []                                           # VHW_STORAGE_S3
+
+# Reference FASTAs, keyed by assembly. Needed by any tool step using {ref} —
+# VEP's --fasta, for instance — and by nothing else, so this can stay empty
+# until a tool wants one.
+#
+# Declared here rather than in the catalog for the same reason storage paths
+# are: a path only means something if the worker can open it, and a tool step
+# binds the FASTA's directory into a container. The file must be on the worker's
+# filesystem, not in an object store.
+#
+# Assembly names are matched exactly and deliberately not normalized: "GRCh38"
+# and "hg38" are different keys. A false mismatch is a loud error fixed by
+# editing one line; a false match would annotate against the wrong coordinates
+# and say nothing.
+#
+# VHW_REFERENCES overrides this as "GRCh38=/path/a.fa,GRCh37=/path/b.fa".
+[references]
+  # GRCh38 = "/mnt/ref/GRCh38.fa"
+  # GRCh37 = "/mnt/ref/hs37d5.fa"
+
+[limits]
+  # The submit rate applies to anonymous callers only; an account is
+  # accountable, and throttling a signed-in bulk load would make it throttle
+  # itself. The concurrency cap below applies to everyone.
+  rate_per_min = 30                                 # VHW_RATE_PER_MIN
+  rate_burst = 10                                   # VHW_RATE_BURST
+  max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
+  max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+  submit_wait_cap = "10s"                           # VHW_SUBMIT_WAIT_CAP

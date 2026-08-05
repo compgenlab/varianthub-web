@@ -40,6 +40,16 @@ type sourceRequest struct {
 	Detail     string `json:"detail,omitempty"`
 	Visibility string `json:"visibility,omitempty"`
 	Origin     string `json:"origin,omitempty"`
+	// Assets are the helper files a build recipe or tool step names. They come
+	// back from a registry fetch and are posted here with the manifest, so what
+	// gets stored is what was reviewed — the fetch does not import anything on
+	// its own.
+	Assets []catalog.Asset `json:"assets,omitempty"`
+	// Settings this deployment applies to the source, as opposed to what the
+	// manifest says about itself. Accepted at registration so a prefix can be
+	// chosen when a second version of something is added, which is when the
+	// need for one becomes obvious.
+	Settings *catalog.SourceSettings `json:"settings,omitempty"`
 }
 
 // derive builds a catalog.Source from the request, applying overrides over the
@@ -65,7 +75,9 @@ func (req sourceRequest) derive() (catalog.Source, error) {
 		src.Origin = req.Origin
 	}
 	switch req.Visibility {
-	case "", catalog.VisibilityPublic:
+	case "":
+		src.Visibility = catalog.VisibilityPrivate // default closed
+	case catalog.VisibilityPublic:
 		src.Visibility = catalog.VisibilityPublic
 	case catalog.VisibilityPrivate:
 		src.Visibility = catalog.VisibilityPrivate
@@ -98,6 +110,13 @@ func (s *Server) handleValidateSource(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"valid": true, "id": src.ID, "name": src.Name,
 		"version": src.Version, "kind": src.Kind, "title": src.Title,
+		// Whether registering this will leave something still to do. The
+		// register form asks where the data should go *before* writing the
+		// manifest, so it has to know from the draft rather than after the fact
+		// — a source registered and then forgotten is one that fails at
+		// annotate time with "sources not downloaded".
+		"needs_data": src.NeedsData(),
+		"stream":     src.Stream,
 	})
 }
 
@@ -121,9 +140,29 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// Written after the source, because the rows reference it. Replacing the
+	// set on every write keeps the stored files in step with the manifest that
+	// names them.
+	if err := s.catalog.PutAssets(r.Context(), src.ID, req.Assets); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if req.Settings != nil {
+		if err := s.catalog.PutSettings(r.Context(), src.ID, *req.Settings); err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	// Anything the manifest names but nobody supplied. Reported rather than
+	// refused: a hand-written manifest is a legitimate way to register a source,
+	// and the files can be added later — but the caller should learn now, not
+	// from a download that fails at the first recipe step.
+	missing := catalog.MissingAssets(src.TOML, req.Assets)
+
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": src.ID, "ref": src.Ref(), "kind": src.Kind,
-		"visibility": src.Visibility,
+		"visibility": src.Visibility, "assets": len(req.Assets),
+		"missing_assets": missing,
 	})
 }
 
@@ -365,10 +404,77 @@ func (s *Server) handleRegistryFetch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	// The helper files the fragment names, fetched with it. Returned rather
+	// than imported: the review-before-registering rule applies to a script a
+	// build step will execute at least as much as it does to the manifest.
+	assets, err := catalog.FetchEntryAssets(r.Context(), reg.URL, entry, body)
+	if err != nil {
+		// The manifest is still useful without them, and saying which asset
+		// could not be fetched beats failing the whole fetch.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ref": entry.Ref(), "entry": entry, "toml": body,
+			"origin": "registry: " + reg.ID,
+			"assets": []catalog.Asset{}, "asset_error": err.Error(),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ref": entry.Ref(), "entry": entry, "toml": body,
 		"origin": "registry: " + reg.ID,
+		"assets": assets,
 	})
+}
+
+// handleSourceSettings reads a source's deployment-local settings.
+func (s *Server) handleSourceSettings(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	src, err := s.catalog.GetSource(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "no such source")
+		return
+	}
+	set, err := s.catalog.Settings(r.Context(), id)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"settings": set,
+		// What the manifest itself declares, so the UI can show what a blank
+		// override falls back to rather than implying there is no prefix.
+		"manifest_prefix": catalog.ManifestPrefix(src.TOML),
+		// Only a tool provisioned to an object store can publish its setup, so
+		// the UI can say why the control does nothing rather than offering it.
+		"is_tool": src.Kind == "tool",
+	})
+}
+
+// handleSetSourceSettings replaces them.
+func (s *Server) handleSetSourceSettings(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	if _, err := s.catalog.GetSource(r.Context(), id); err != nil {
+		writeError(w, http.StatusNotFound, "no such source")
+		return
+	}
+	var set catalog.SourceSettings
+	if err := decodeJSON(r, &set); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := s.catalog.PutSettings(r.Context(), id, set); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("api: settings for source %s changed by %s", id, callerOf(r).Label())
+	writeJSON(w, http.StatusOK, map[string]any{"settings": set})
 }
 
 // slug turns a display name into an id.
@@ -649,8 +755,18 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
 		Kind:    queue.KindDownload,
 		Session: sessionOf(r),
+		UserID:  callerOf(r).UserID(),
 		Label:   "download " + label + " → " + loc.Name,
-		Body:    body,
+		// Which sources this job is for, so the catalog can ask "is anything
+		// fetching this one" without opening every job's body. A tool records
+		// no files — its image and data go to the worker's local data_dir, not
+		// to the storage location — so job state is the only evidence that one
+		// has been installed at all.
+		Selection: strings.Join(req.Sources, ","),
+		// Heavier than an annotation: this saturates disk and CPU for as long as
+		// it runs, so it holds more of the pool while it does.
+		Weight: s.cfg.DownloadWeight,
+		Body:   body,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
@@ -706,6 +822,7 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		jobID, qErr := s.queue.Enqueue(r.Context(), queue.NewJob{
 			Kind:    queue.KindCleanup,
 			Session: sessionOf(r),
+			UserID:  callerOf(r).UserID(),
 			Label:   "remove " + src.Ref() + " from " + loc.Name,
 			Body:    body,
 		})

@@ -127,6 +127,17 @@ export default function JobResults() {
               Job #{jobId.slice(0, 8)}
             </div>
             <h1 style={{ fontSize: 24, fontWeight: 600 }}>Annotated variants</h1>
+            {/* Reachable whether or not the run went well. An empty table is
+                the case that most needs it: nothing here distinguishes "the
+                sources were consulted and matched nothing" from "the sources
+                were never consulted", and the run output does. */}
+            <button
+              className="btn link"
+              style={{ fontSize: 12.5, padding: 0, marginTop: 2 }}
+              onClick={() => nav(`/jobs/${jobId}/run`)}
+            >
+              View run details
+            </button>
           </div>
 
           <div className="row gap-8" style={{ position: "relative" }}>

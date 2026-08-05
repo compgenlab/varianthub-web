@@ -9,6 +9,7 @@ const STATUS: Record<Job["status"], { label: string; color: string }> = {
   running: { label: "Running", color: "var(--vus-dot)" },
   queued: { label: "Queued", color: "var(--text-4)" },
   error: { label: "Failed", color: "var(--path-dot)" },
+  cancelled: { label: "Cancelled", color: "var(--text-3)" },
 };
 
 function when(sec: number) {
@@ -29,6 +30,11 @@ export default function JobsList({
   const [jobs, setJobs] = useState<Job[] | null>(null);
   const [err, setErr] = useState("");
   const isDownloads = kind === "download";
+
+  // An annotation job opens its results; anything else opens the run itself.
+  // A download has no results table, and its interesting content is the output.
+  const detailPath = (id: string) =>
+    isDownloads ? `/admin/jobs/${id}` : `/jobs/${id}`;
 
   async function load() {
     try {
@@ -94,17 +100,15 @@ export default function JobsList({
 
         {jobs?.map((j) => {
           const st = STATUS[j.status] ?? STATUS.queued;
-          // A download has no results table to open.
-          const open = j.status === "done" && !isDownloads;
           return (
             <button
               key={j.job_id}
               className="trow rowgrid"
-              style={{
-                gridTemplateColumns: cols,
-                cursor: open ? "pointer" : "default",
-              }}
-              onClick={() => open && nav(`/jobs/${j.job_id}`)}
+              style={{ gridTemplateColumns: cols, cursor: "pointer", width: "100%" }}
+              // Every job opens, whatever its state. A failed one is the case
+              // most worth opening, and the detail page is where its output
+              // lives — the row says only that it failed.
+              onClick={() => nav(detailPath(j.job_id))}
             >
               <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
                 #{j.job_id.slice(0, 8)}
@@ -127,10 +131,7 @@ export default function JobsList({
                 />
                 <span style={{ fontSize: 12.5, color: st.color }}>{st.label}</span>
               </span>
-              <ChevronRight
-                size={15}
-                color={open ? "var(--text-3)" : "rgba(22,24,29,.12)"}
-              />
+              <ChevronRight size={15} color="var(--text-3)" />
             </button>
           );
         })}

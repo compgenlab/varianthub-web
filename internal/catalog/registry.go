@@ -241,6 +241,38 @@ func FetchManifest(ctx context.Context, loc string) (*RegistryManifest, error) {
 // The text is handed back for review rather than registered directly: an import
 // is someone adopting a third party's manifest, and it will be executed by
 // varhub. Seeing it first is the point.
+// FetchEntryAssets retrieves the helper files a fragment declares, resolved
+// relative to the fragment itself.
+//
+// The same containment rule as the fragment applies: an asset path is
+// registry-supplied and must stay under the fragment's own directory.
+func FetchEntryAssets(ctx context.Context, loc string, e RegistryEntry, text string) ([]Asset, error) {
+	names := AssetNames(text)
+	if len(names) == 0 {
+		return nil, nil
+	}
+	out := make([]Asset, 0, len(names))
+	for _, n := range names {
+		if err := ValidateAssetName(n); err != nil {
+			return nil, err
+		}
+		target, err := entryURL(loc, path.Join(path.Dir(e.File), n))
+		if err != nil {
+			return nil, fmt.Errorf("asset %q: %w", n, err)
+		}
+		body, err := fetch(ctx, target)
+		if err != nil {
+			return nil, fmt.Errorf("asset %q: %w", n, err)
+		}
+		if len(body) > MaxAssetBytes {
+			return nil, fmt.Errorf("asset %q is %d bytes, over the %d byte limit",
+				n, len(body), MaxAssetBytes)
+		}
+		out = append(out, Asset{Name: n, Content: string(body)})
+	}
+	return out, nil
+}
+
 func FetchEntry(ctx context.Context, loc string, e RegistryEntry) (string, error) {
 	if e.File == "" {
 		return "", fmt.Errorf("registry entry %q has no file", e.Ref())

@@ -18,12 +18,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/compgenlab/varianthub-web/internal/auth"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -82,19 +82,24 @@ func sessionOf(r *http.Request) string {
 	return ""
 }
 
-// trusted reports whether the request carries a valid bearer token.
+// trustedCaller reports whether the caller may read *anyone's* jobs.
 //
-// A token holder is a service account rather than a browser session: it may read
-// any job, and it bypasses the per-IP submit throttle. Those limits exist to stop
-// an anonymous browser flooding the queue, and applying them to a bulk ingest
-// would make it throttle itself — a 3,000-site catalog submitted in chunks would
-// stall on a 30-per-minute cap.
+// Administrators only. Reading other people's results is an operator power, and
+// an ordinary account has no business with it however it authenticated.
 func (s *Server) trustedCaller(r *http.Request) bool {
-	tok, ok := auth.Bearer(r)
-	if !ok || s.cfg.MasterKey == "" {
-		return false
-	}
-	return auth.VerifyToken(s.cfg.MasterKey, tok)
+	return callerOf(r).IsAdmin()
+}
+
+// throttled reports whether this caller is subject to the per-IP submit rate.
+//
+// Anonymous callers are; identified ones are not. The rate limit exists to stop
+// an unaccountable browser flooding the queue, and an account is accountable —
+// it can be disabled, and its jobs are attributable. Applying it to a signed-in
+// bulk load would make that load throttle itself: a 3,000-site catalog submitted
+// in chunks would stall on a 30-per-minute cap. The per-IP *concurrency* cap
+// still applies to everyone, so one caller cannot monopolise the workers.
+func (s *Server) throttled(r *http.Request) bool {
+	return callerOf(r).Anonymous()
 }
 
 // --- catalog ---
@@ -122,10 +127,17 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		}
 		snaps = kept
 	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
 	type item struct {
 		catalog.Snapshot
 		SourceCount     int  `json:"source_count"`
 		ContainsPrivate bool `json:"contains_private"`
+		ContainsRemote  bool `json:"contains_remote"`
 	}
 	out := make([]item, 0, len(snaps))
 	for _, sn := range snaps {
@@ -135,13 +147,19 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		// stops being true.
 		full, err := s.catalog.GetSnapshot(r.Context(), sn.ID)
 		if err != nil {
-			out = append(out, item{Snapshot: sn})
+			// The sources could not be read, so whether it is visible cannot be
+			// decided. Omit it: listing a snapshot that might pin something
+			// private is the one outcome with no way back.
+			continue
+		}
+		if !vis.canSeeSnapshot(full) {
 			continue
 		}
 		out = append(out, item{
 			Snapshot:        sn,
 			SourceCount:     len(full.Sources),
 			ContainsPrivate: full.ContainsPrivate(),
+			ContainsRemote:  full.ContainsRemote(),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
@@ -162,9 +180,22 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no such snapshot")
 		return
 	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !vis.canSeeSnapshot(snap) {
+		// 404, not 403. A snapshot's name and the fact that it exists are
+		// themselves information about what this installation holds, and a 403
+		// would confirm both to someone who guessed.
+		writeError(w, http.StatusNotFound, "no such snapshot")
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"snapshot":         snap,
 		"contains_private": snap.ContainsPrivate(),
+		"contains_remote":  snap.ContainsRemote(),
 		"annotations":      snapshotAnnotations(snap),
 	})
 }
@@ -212,6 +243,13 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	srcs = vis.filterSources(srcs)
+
 	type item struct {
 		catalog.Source
 		Ref string `json:"ref"` // "name:version", how a snapshot manifest pins it
@@ -221,15 +259,45 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// NeedsData is false for builtins, which compute from the variant and have
 		// nothing to download.
 		NeedsData bool `json:"needs_data"`
+		// State is whether the source can actually be annotated with yet.
+		// Registering one and being able to use it are different things: a tool
+		// needs its image and setup, a build source needs its recipe to have
+		// run, and until then every annotation using it fails.
+		State catalog.SourceState `json:"state"`
 	}
+	states, err := s.catalog.SourceStates(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// What is in flight comes from the queue; what was installed comes from the
+	// catalog, because terminal jobs are collected and the record has to outlive
+	// them.
+	active := map[string]string{}
+	if s.queue != nil {
+		if a, aErr := s.queue.ActiveDownloads(r.Context()); aErr == nil {
+			active = a
+		}
+	}
+
 	out := make([]item, 0, len(srcs))
 	for _, src := range srcs {
 		anns := src.Annotations()
 		if anns == nil {
 			anns = []catalog.Annotation{}
 		}
+		st := states[src.ID]
+		if job, ok := active[src.ID]; ok {
+			st.State, st.Job = catalog.StateInstalling, job
+		}
+		if st.State == "" && !src.NeedsData() {
+			// A builtin or a streamed source has nothing to provision, so it is
+			// usable the moment it is registered.
+			st.State = catalog.StateReady
+		}
 		out = append(out, item{
-			Source: src, Ref: src.Ref(), Annotations: anns, NeedsData: src.NeedsData(),
+			Source: src, Ref: src.Ref(), Annotations: anns,
+			NeedsData: src.NeedsData(), State: st,
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": out})
@@ -259,6 +327,9 @@ func (s *Server) resolveSnapshot(r *http.Request, snapshot string, sources []str
 		return "", errors.New(`give either "snapshot" or "sources", not both`)
 	}
 	if snapshot != "" {
+		if err := s.checkSnapshotVisible(r, snapshot); err != nil {
+			return "", err
+		}
 		return snapshot, nil
 	}
 	if len(sources) == 0 {
@@ -270,7 +341,57 @@ func (s *Server) resolveSnapshot(r *http.Request, snapshot string, sources []str
 	if strings.TrimSpace(build) == "" {
 		return "", errors.New(`"build" is required when selecting individual sources`)
 	}
+	if err := s.checkSourcesVisible(r, sources); err != nil {
+		return "", err
+	}
 	return s.catalog.EnsureAdhocSnapshot(r.Context(), build, sources, defaults)
+}
+
+// checkSnapshotVisible refuses to annotate against a snapshot the caller cannot
+// see. Without this, a snapshot hidden from the listing is still annotatable by
+// name — and the results would carry exactly the private annotations the hiding
+// was meant to withhold.
+func (s *Server) checkSnapshotVisible(r *http.Request, id string) error {
+	if s.catalog == nil {
+		return nil // no catalog to check against; the runner will fail loudly
+	}
+	snap, err := s.catalog.GetSnapshot(r.Context(), id)
+	if err != nil {
+		return nil // unknown snapshot: let the existing not-found path report it
+	}
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		return err
+	}
+	if !vis.canSeeSnapshot(snap) {
+		return fmt.Errorf("no such snapshot: %q", id)
+	}
+	return nil
+}
+
+// checkSourcesVisible refuses a selection containing a source the caller cannot
+// see, naming the ones at fault so a mistaken ref is distinguishable from a
+// missing grant.
+func (s *Server) checkSourcesVisible(r *http.Request, ids []string) error {
+	vis, err := s.visibilityFor(r)
+	if err != nil {
+		return err
+	}
+	if vis.admin {
+		return nil
+	}
+	var srcs []catalog.Source
+	for _, id := range ids {
+		src, err := s.catalog.GetSource(r.Context(), id)
+		if err != nil {
+			continue // unknown source: PutSnapshot reports it with better context
+		}
+		srcs = append(srcs, src)
+	}
+	if hidden := vis.hiddenSources(srcs); len(hidden) > 0 {
+		return fmt.Errorf("no such source: %s", strings.Join(hidden, ", "))
+	}
+	return nil
 }
 
 // selection normalizes the `annotations` field to the runner's Selection string:
@@ -354,6 +475,7 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
 		Label:     label,
 		Body:      []byte(strings.Join(loci, "\n")),
 	})
@@ -421,6 +543,7 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
 		Label:     hdr.Filename,
 		Body:      body,
 	})
@@ -516,17 +639,24 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 
 	scoped := !s.trustedCaller(r)
 	if scoped {
-		// An untrusted caller sees only their own submissions. With no session at
-		// all there is nothing to scope to, so return nothing rather than
-		// everything -- the failure mode of a leak is worse than an empty list.
-		sess := sessionOf(r)
-		if sess == "" {
+		// An untrusted caller sees only their own submissions. An account scopes
+		// by user id, which the server wrote from a verified credential; an
+		// anonymous visitor falls back to the session id they assert, which
+		// scopes their own browser history and nothing more.
+		//
+		// With neither there is nothing to scope to, so return nothing rather
+		// than everything — the failure mode of a leak is worse than an empty
+		// list.
+		if uid := callerOf(r).UserID(); uid != "" {
+			f.UserID = uid
+		} else if sess := sessionOf(r); sess != "" {
+			f.Session = sess
+		} else {
 			writeJSON(w, http.StatusOK, map[string]any{
 				"jobs": []any{}, "limit": limit, "offset": offset, "scoped": true,
 			})
 			return
 		}
-		f.Session = sess
 	}
 	jobs, err := s.queue.List(r.Context(), f, limit, offset)
 	if err != nil {
@@ -544,8 +674,8 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 // job loads a job and enforces ownership, writing the error response itself.
 //
 // Knowing a job id is not authorization: ids are handed out to whoever submitted
-// and could be logged or shared. An untrusted caller must match the session that
-// created it.
+// and could be logged or shared. An untrusted caller must own the job — by
+// account where it has one, and only otherwise by the session that created it.
 func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	id := r.PathValue("id")
 	job, ok, err := s.queue.Get(r.Context(), id)
@@ -557,14 +687,25 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 		writeError(w, http.StatusNotFound, "no such job")
 		return queue.Job{}, false
 	}
-	if !s.trustedCaller(r) {
-		if sess := sessionOf(r); sess == "" || sess != job.Session {
-			// 404 rather than 403: confirming a job exists is itself a small leak.
-			writeError(w, http.StatusNotFound, "no such job")
-			return queue.Job{}, false
-		}
+	if !s.trustedCaller(r) && !s.owns(r, job) {
+		// 404 rather than 403: confirming a job exists is itself a small leak.
+		writeError(w, http.StatusNotFound, "no such job")
+		return queue.Job{}, false
 	}
 	return job, true
+}
+
+// owns reports whether the caller submitted this job.
+//
+// A job with an owning account is readable only by that account: the session id
+// on it is client-asserted, so honouring it as well would let anyone who learned
+// the string read a signed-in user's results.
+func (s *Server) owns(r *http.Request, job queue.Job) bool {
+	if job.UserID != "" {
+		return callerOf(r).UserID() == job.UserID
+	}
+	sess := sessionOf(r)
+	return sess != "" && sess == job.Session
 }
 
 func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
@@ -573,6 +714,65 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, job)
+}
+
+// handleCancelJob stops a job.
+//
+// Gated by the same ownership rule as reading it: a caller who may see a job may
+// stop it. Cancelling is strictly less powerful than submitting — someone who
+// can start work can already occupy a worker, and letting them stop it again
+// frees the slot they are holding rather than taking anything from anyone else.
+// An administrator can cancel anything, which is what the system jobs view uses.
+func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return
+	}
+	out, err := s.queue.Cancel(r.Context(), job.ID)
+	switch {
+	case errors.Is(err, queue.ErrNotCancellable):
+		// Not an error worth a failure status: the caller wanted it stopped and
+		// it is stopped. Report the state so the UI can settle on it.
+		writeJSON(w, http.StatusOK, map[string]any{
+			"job": out, "cancelled": false,
+			"detail": "job had already finished",
+		})
+		return
+	case errors.Is(err, queue.ErrNoSuchJob):
+		writeError(w, http.StatusNotFound, "no such job")
+		return
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("api: job %s cancelled by %s", job.ID, callerOf(r).Label())
+	writeJSON(w, http.StatusOK, map[string]any{"job": out, "cancelled": true})
+}
+
+// handleJobLog serves what a job's run printed.
+//
+// Separate from the job itself because it is large and wanted only when someone
+// is looking into a particular run — the same reason the results blob is its own
+// endpoint. Ownership is enforced by the same rule: a log describes a job, so
+// seeing it is seeing the job.
+func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return
+	}
+	out, found, err := s.queue.Log(r.Context(), job.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id": job.ID,
+		"output": out,
+		// Distinguishes "nothing was recorded" from "it printed nothing", which
+		// look identical in an empty string and mean different things: the first
+		// is a job from before logs were kept, the second is a quiet run.
+		"recorded": found,
+	})
 }
 
 // handleExport streams a finished job's entire result set.

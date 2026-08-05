@@ -9,6 +9,8 @@ export interface Snapshot {
   state: string;
   source_count?: number;
   contains_private?: boolean;
+  /** True when a pinned source is read from its origin rather than our storage. */
+  contains_remote?: boolean;
   defaults?: string[];
   tags?: string[];
   sources?: Source[];
@@ -29,6 +31,124 @@ export interface Source {
   index_status: string;
   origin?: string;
   stream?: boolean;
+  /** Whether the source can be annotated with yet, and what is happening to it. */
+  state?: {
+    state?: "installing" | "ready" | "failed";
+    error?: string;
+    updated_at?: number;
+    /** The download job working on it, when one is. */
+    job?: string;
+  };
+}
+
+export interface JobStats {
+  total: number;
+  succeeded: number;
+  failed: number;
+  queued: number;
+  running: number;
+  /** Creation time of the longest-waiting queued job; absent when none wait. */
+  oldest_queued_at?: number;
+  /** Stopped on purpose — counted apart from failed. */
+  cancelled: number;
+  /** Variants across successful jobs only. */
+  variants: number;
+  last_24h: number;
+  last_7d: number;
+}
+
+export interface StorageUsage {
+  storage_id: string;
+  name: string;
+  kind: string;
+  uri: string;
+  /** Set for S3 locations, so usage reads per bucket. */
+  bucket?: string;
+  bytes: number;
+  files: number;
+  sources: number;
+  is_default: boolean;
+}
+
+export interface RemoteUsage {
+  source_id: string;
+  name: string;
+  host: string;
+  files: number;
+  bytes: number;
+  /** Files whose origin reported no length, making bytes a floor. */
+  unmeasured?: number;
+}
+
+export interface Metrics {
+  jobs: JobStats;
+  sources: {
+    total: number;
+    provisioned: number;
+    streamed: number;
+    builtin: number;
+    pending: number;
+  };
+  storage: StorageUsage[];
+  /** Only what this deployment stores; remote bytes are counted separately. */
+  storage_bytes: number;
+  remote: RemoteUsage[];
+  remote_bytes: number;
+  remote_measured: boolean;
+  generated_at: number;
+}
+
+export interface User {
+  id: string;
+  email: string;
+  name?: string;
+  role: string;
+  disabled?: boolean;
+  /** No password is stored here — the account signs in through an identity provider. */
+  sso?: boolean;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface Me {
+  anonymous: boolean;
+  admin: boolean;
+  label: string;
+  bootstrap: boolean;
+  teams?: string[];
+  user?: User;
+  /** True while the installation has no administrator and the bootstrap token works. */
+  needs_bootstrap?: boolean;
+  /** False for an SSO account, which has no password here to change. */
+  can_change_password?: boolean;
+  /** True when institutional (CILogon) sign-in is configured. */
+  sso_enabled?: boolean;
+  /** True when the server lets callers with no account annotate. */
+  allow_anonymous?: boolean;
+}
+
+export interface ExternalIdentity {
+  provider: string;
+  subject: string;
+  email?: string;
+  created_at: number;
+  last_seen_at?: number;
+}
+
+export interface ApiToken {
+  id: string;
+  name?: string;
+  prefix: string;
+  created_at: number;
+  last_used_at?: number;
+  revoked_at?: number;
+}
+
+export interface Team {
+  id: string;
+  name: string;
+  created_at: number;
+  members?: { user: User; role: string }[];
 }
 
 export interface Registry {
@@ -36,6 +156,20 @@ export interface Registry {
   name: string;
   url: string;
   builtin: boolean;
+}
+
+/** A helper file a build recipe or tool step needs, shipped with the source. */
+export interface SourceAsset {
+  name: string;
+  content: string;
+}
+
+/** What this deployment decided about a source, as opposed to what its manifest says. */
+export interface SourceSettings {
+  /** Renames the source's output fields. "-" means no prefix at all. */
+  annotation_prefix?: string;
+  /** Publish a tool's setup output so another machine can restore it. */
+  cache_setup?: boolean;
 }
 
 export interface RegistryEntry {
@@ -84,7 +218,7 @@ export interface Job {
   kind: string;
   snapshot: string;
   selection?: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   error?: string;
   n_variants: number;
   label?: string;
@@ -133,9 +267,11 @@ export class ApiError extends Error {
 // VITE_API_BASE when the dev server runs separately from the API.
 const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
-// The token is held in sessionStorage rather than localStorage so it does not
-// outlive the browser session. Auth is a single shared token until per-user
-// tokens land; see docs/api.md.
+// A bearer token is held in sessionStorage rather than localStorage so it does
+// not outlive the browser tab. It is the *secondary* path: signing in with a
+// password sets an HttpOnly cookie the browser sends automatically, which is
+// what a session should be. This exists for the bootstrap credential and for
+// pasting a personal token, neither of which has a cookie.
 const TOKEN_KEY = "vh_token";
 
 export function getToken(): string {
@@ -147,16 +283,65 @@ export function setToken(t: string) {
   else sessionStorage.removeItem(TOKEN_KEY);
 }
 
+// A per-browser id scoping an anonymous visitor's own job history.
+//
+// This is not a credential and grants nothing: the server treats it as a
+// self-asserted history scope, and a job that has a real account behind it
+// ignores it entirely. It exists because without one an anonymous caller can
+// submit a job and then get a 404 reading it back — there would be nothing to
+// scope the result to, and returning everyone's jobs instead is not an option.
+//
+// localStorage rather than sessionStorage so a reload or a new tab still finds
+// yesterday's results, which is the whole point of a history.
+const SESSION_KEY = "vh_history";
+
+function historyID(): string {
+  let id = localStorage.getItem(SESSION_KEY);
+  if (!id) {
+    id = randomID();
+    localStorage.setItem(SESSION_KEY, id);
+  }
+  return id;
+}
+
+/**
+ * A random identifier that works outside a secure context.
+ *
+ * Deliberately not crypto.randomUUID(): that is secure-context-only, so it is
+ * undefined over plain http on anything but localhost — and because this runs
+ * inside headers(), a throw there fails *every* request, including the one the
+ * app uses to find out who you are. The symptom is a login page on
+ * http://host:18080 and none through an ssh tunnel to localhost, which looks
+ * like a server problem and is not.
+ *
+ * getRandomValues has no such restriction. Math.random is the last resort: this
+ * id scopes a history and is not a credential, so uniqueness is the only
+ * requirement, and a browser too old for getRandomValues should still work.
+ */
+function randomID(): string {
+  const bytes = new Uint8Array(16);
+  if (globalThis.crypto?.getRandomValues) {
+    globalThis.crypto.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = { ...extra };
   const t = getToken();
   if (t) h.Authorization = `Bearer ${t}`;
+  h["X-Varhub-Session"] = historyID();
   return h;
 }
 
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, {
     ...init,
+    // Send the session cookie. Without this a cross-origin dev server would
+    // authenticate every request as anonymous with no visible reason why.
+    credentials: "include",
     headers: headers(init.headers as Record<string, string>),
   });
   if (!res.ok) {
@@ -181,7 +366,12 @@ export const api = {
   snapshots: (includeDrafts = false) =>
     req<{ snapshots: Snapshot[] }>(`/snapshots${includeDrafts ? "?state=all" : ""}`),
   snapshot: (id: string) =>
-    req<{ snapshot: Snapshot; contains_private: boolean; annotations: Annotation[] }>(
+    req<{
+      snapshot: Snapshot;
+      contains_private: boolean;
+      contains_remote: boolean;
+      annotations: Annotation[];
+    }>(
       `/snapshots/${encodeURIComponent(id)}`,
     ),
   sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
@@ -306,7 +496,18 @@ export const api = {
   // token is effectively an administrative credential.
 
   validateSource: (toml: string) =>
-    req<{ valid: boolean; error?: string; id?: string; name?: string; version?: string; kind?: string }>(
+    req<{
+      valid: boolean;
+      error?: string;
+      id?: string;
+      name?: string;
+      version?: string;
+      kind?: string;
+      /** True when the source has files to fetch before it can be annotated with. */
+      needs_data?: boolean;
+      /** True when it is read from its origin instead. */
+      stream?: boolean;
+    }>(
       "/admin/sources/validate",
       {
         method: "POST",
@@ -322,8 +523,18 @@ export const api = {
     detail?: string;
     visibility?: "public" | "private";
     origin?: string;
+    assets?: SourceAsset[];
+    settings?: SourceSettings;
   }) =>
-    req<{ id: string; ref: string; kind: string; visibility: string }>("/admin/sources", {
+    req<{
+      id: string;
+      ref: string;
+      kind: string;
+      visibility: string;
+      assets?: number;
+      /** Files the manifest names that nobody supplied. */
+      missing_assets?: string[] | null;
+    }>("/admin/sources", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -379,6 +590,120 @@ export const api = {
     req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
       method: "POST",
     }),
+
+  me: () => req<Me>("/auth/me"),
+
+  login: (email: string, password: string) =>
+    req<{ user: User }>("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email, password }),
+    }),
+
+  logout: () => req<void>("/auth/logout", { method: "POST" }),
+
+  changePassword: (current: string, next: string) =>
+    req<void>("/auth/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ current_password: current, new_password: next }),
+    }),
+
+  identities: () => req<{ identities: ExternalIdentity[] }>("/auth/identities"),
+
+  tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
+
+  createToken: (name: string) =>
+    req<{ token: ApiToken; secret: string }>("/auth/tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+
+  revokeToken: (id: string) =>
+    req<void>(`/auth/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  users: () => req<{ users: User[] }>("/admin/users"),
+
+  createUser: (body: { email: string; name?: string; role: string; password: string }) =>
+    req<{ user: User }>("/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  updateUser: (id: string, body: { role?: string; disabled?: boolean; password?: string }) =>
+    req<{ user: User }>(`/admin/users/${encodeURIComponent(id)}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  teams: () => req<{ teams: Team[] }>("/admin/teams"),
+
+  createTeam: (name: string) =>
+    req<{ team: Team }>("/admin/teams", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    }),
+
+  deleteTeam: (id: string) =>
+    req<void>(`/admin/teams/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  addMember: (teamId: string, userId: string, role = "member") =>
+    req<void>(`/admin/teams/${encodeURIComponent(teamId)}/members`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ user_id: userId, role }),
+    }),
+
+  removeMember: (teamId: string, userId: string) =>
+    req<void>(
+      `/admin/teams/${encodeURIComponent(teamId)}/members/${encodeURIComponent(userId)}`,
+      { method: "DELETE" },
+    ),
+
+  grants: (sourceId: string) =>
+    req<{ teams: Team[] }>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`),
+
+  grant: (sourceId: string, teamId: string) =>
+    req<void>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ team_id: teamId }),
+    }),
+
+  revokeGrant: (sourceId: string, teamId: string) =>
+    req<void>(
+      `/admin/sources/${encodeURIComponent(sourceId)}/grants/${encodeURIComponent(teamId)}`,
+      { method: "DELETE" },
+    ),
+
+  cancelJob: (id: string) =>
+    req<{ job: Job; cancelled: boolean; detail?: string }>(
+      `/jobs/${encodeURIComponent(id)}/cancel`,
+      { method: "POST" },
+    ),
+
+  jobLog: (id: string) =>
+    req<{ job_id: string; output: string; recorded: boolean }>(
+      `/jobs/${encodeURIComponent(id)}/log`,
+    ),
+
+  sourceSettings: (id: string) =>
+    req<{ settings: SourceSettings; manifest_prefix: string; is_tool: boolean }>(
+      `/admin/sources/${encodeURIComponent(id)}/settings`,
+    ),
+
+  setSourceSettings: (id: string, body: SourceSettings) =>
+    req<{ settings: SourceSettings }>(`/admin/sources/${encodeURIComponent(id)}/settings`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
 
@@ -436,7 +761,15 @@ export const api = {
   // Returns the entry's manifest for review. Not a one-click import: the
   // fragment is executed by varhub, so it goes into the editor to be read first.
   registryFetch: (id: string, ref: string) =>
-    req<{ ref: string; entry: RegistryEntry; toml: string; origin: string }>(
+    req<{
+      ref: string;
+      entry: RegistryEntry;
+      toml: string;
+      origin: string;
+      assets?: SourceAsset[];
+      /** Set when the manifest arrived but its helper files could not be fetched. */
+      asset_error?: string;
+    }>(
       `/admin/registries/${encodeURIComponent(id)}/fetch?ref=${encodeURIComponent(ref)}`,
     ),
 

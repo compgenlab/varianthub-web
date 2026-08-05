@@ -1,0 +1,87 @@
+# TLS in front of the API.
+#
+# Two things follow from terminating TLS here rather than in the app:
+#
+#   1. The browser gets a secure context. Several APIs the front-end uses are
+#      gated on that and are simply undefined over plain http to a hostname —
+#      crypto.randomUUID and navigator.clipboard among them. localhost is
+#      exempt, which is why plain http appears to work on the dev box and fails
+#      for everyone else.
+#   2. The session cookie starts being marked Secure. The app decides that from
+#      X-Forwarded-Proto, which Caddy sets automatically on a reverse_proxy.
+#
+# VH_HOSTS is every name the certificate should cover, comma-and-space separated
+# (Caddy requires the space; a bare comma is a parse error).
+# It has to include the *IP* as well as the hostname: on a LAN there is often no
+# DNS entry and no mDNS responder, so an address is the only thing that reliably
+# resolves — and a certificate naming only the hostname fails with a name
+# mismatch, which reads as a broken certificate rather than a missing SAN.
+#
+# make dev-tls fills this in with the hostname, its .local form, the LAN address
+# and localhost. For a real deployment, name the public host and turn the
+# internal CA off so a public one issues instead:
+#
+#   VH_HOSTS=varianthub.example.org VH_TLS= docker compose --profile tls up -d
+#
+{
+	# Where Caddy mails expiry warnings for a publicly-issued certificate.
+	# Ignored by the internal CA, so it is harmless when left unset.
+	email {$VH_ACME_EMAIL:admin@localhost}
+
+	# Which certificate to serve when the client sends no SNI.
+	#
+	# A browser addressing this by IP sends none — SNI carries a hostname and an
+	# IP is not one — so without this Caddy has nothing to match and aborts the
+	# handshake with an internal error, which looks like a broken server rather
+	# than a missing default. Set to the LAN address, because addressing by IP
+	# is exactly the case that arrives without SNI.
+	default_sni {$VH_DEFAULT_SNI:localhost}
+}
+
+{$VH_HOSTS:https://debian-vm1} {
+	# An internal certificate by default: a LAN hostname cannot be validated by
+	# a public CA, so asking for a real one would fail and leave no TLS at all.
+	# Browsers will warn until the CA is trusted — see the README — which is the
+	# honest trade for a development stack. A site named with a public hostname
+	# overrides this by setting VH_TLS to an empty value.
+	tls {$VH_TLS:internal}
+
+	encode gzip zstd
+
+	# The API and the embedded SPA are one origin, so everything goes to one
+	# upstream. reverse_proxy sets X-Forwarded-For, -Proto and -Host itself.
+	reverse_proxy api:8080 {
+		# An annotation of a large VCF can outlast a default timeout, and the
+		# submit path streams an upload. The queue has its own job timeout, so
+		# the useful bound is "longer than a request should ever legitimately
+		# take", not a guess at how long annotation runs.
+		transport http {
+			read_timeout 10m
+			write_timeout 10m
+		}
+	}
+
+	# Sent on https only. Announcing a year of HTTPS-only from a dev stack with
+	# an internal certificate would strand the hostname in browsers that
+	# remember it, so this is deliberately short. Raise it for a real
+	# deployment, once the certificate is one browsers already trust.
+	header Strict-Transport-Security "max-age=3600"
+
+	log {
+		output stderr
+		format console
+	}
+}
+
+# Redirect plain http to https.
+#
+# Written out rather than left to Caddy's automatic redirect, which assumes the
+# https site is on 443. When something else on the host already owns 443 — a
+# k3s ingress controller, an existing nginx — this stack is published elsewhere
+# and the automatic redirect sends the browser to whatever does own it, which
+# looks like a certificate error on an unrelated service.
+{$VH_HTTP_HOSTS:http://debian-vm1} {
+	# {host} rather than a fixed name: the browser is redirected back to
+	# whichever address it already used, which is the one that resolves for it.
+	redir https://{host}:{$VH_HTTPS_PORT:18443}{uri} permanent
+}

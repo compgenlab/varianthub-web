@@ -49,6 +49,16 @@ type Result struct {
 	Variants []byte   // the raw JSON array, stored and served verbatim
 	N        int      // number of variants
 	Columns  []Column // the column model for these results, in snapshot order
+
+	// Log is what the run printed — the tail of varhub's progress output.
+	//
+	// Kept on success, not only on failure. "It worked" is not the only question
+	// asked of a finished job: a run that returns nothing at all is a success by
+	// every check the worker makes, and without this there is nothing to say
+	// whether it consulted the sources and found no match or never consulted
+	// them. That is the shape of a prefix rename leaving a snapshot pinning
+	// names nothing emits.
+	Log string `json:"-"`
 }
 
 // Column describes one annotation column of a result set: what to label it, how
@@ -116,6 +126,14 @@ type ExecRunner struct {
 	Bin     string        // path to the varhub binary (default "varhub")
 	Home    HomeProvider  // supplies VARHUB_HOME per job
 	Timeout time.Duration // per-job wall clock (0 = no limit beyond ctx)
+	// DownloadTimeout bounds a provisioning run instead, because provisioning
+	// is a different scale of work: an annotation answers a query, while a
+	// download can be fetching a 24 GB source or running a tool's one-time
+	// install. Sharing one bound means either annotations hang for hours or
+	// installs are killed partway, and the second failure is the worse one — it
+	// leaves a half-populated data directory with no sentinel, so the next
+	// attempt starts from nothing. 0 falls back to Timeout.
+	DownloadTimeout time.Duration
 
 	// OnProgress, if set, receives the CLI's progress lines as they arrive.
 	// varhub -v logs to stderr with a "varhub: " prefix; this is what will drive
@@ -281,7 +299,7 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		log.Printf("runner: column metadata unavailable (%v); falling back to keys", err)
 		cols = fallbackColumns(present)
 	}
-	return Result{Variants: out, N: len(probe), Columns: cols}, nil
+	return Result{Variants: out, N: len(probe), Columns: cols, Log: tail}, nil
 }
 
 // columns asks the CLI for the snapshot's annotation catalog and keeps the
@@ -411,7 +429,47 @@ func (e *ExitError) Error() string {
 	if msg := cliMessage(e.Stderr, e.Home); msg != "" {
 		return msg
 	}
+	// No "error:" line — a crash, a signal, a panic, or a failure inside a build
+	// recipe's own tooling. This used to report "<op> failed" and nothing else,
+	// which is exactly backwards: the cases with no recognisable message are the
+	// ones where a bare "failed" leaves nowhere to go next.
+	if tail := stderrTail(e.Stderr, e.Home); tail != "" {
+		return op + " failed:\n  " + tail
+	}
 	return op + " failed"
+}
+
+// stderrTail returns the last few lines the process wrote, for the case where
+// nothing matched the expected error shape.
+//
+// Raw output rather than a summary, because by definition we do not know what
+// this failure looks like — any attempt to interpret it would be guessing. The
+// ephemeral home is redacted for the same reason it is in cliMessage: it is a
+// temp path that means nothing to the reader.
+func stderrTail(stderr, home string) string {
+	var lines []string
+	for _, raw := range strings.Split(stderr, "\n") {
+		if line := strings.TrimRight(raw, "\r"); strings.TrimSpace(line) != "" {
+			lines = append(lines, strings.TrimSpace(line))
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	// The tail, not the head: a failing process usually says what went wrong
+	// last, after whatever progress it printed on the way.
+	if len(lines) > 12 {
+		lines = lines[len(lines)-12:]
+	}
+	out := strings.Join(lines, "\n  ")
+	if home != "" {
+		out = strings.ReplaceAll(out, home, "<config>")
+	}
+	if len(out) > 900 {
+		out = out[len(out)-900:] + ""
+		out = "\u2026" + out
+	}
+	return out
 }
 
 func (e *ExitError) Unwrap() error { return e.Err }
@@ -512,6 +570,15 @@ type DownloadedFile struct {
 	ModifiedAt int64  `json:"modified_at"`
 }
 
+// downloadTimeout is the provisioning bound, falling back to the annotation one
+// so an existing deployment that set only Timeout keeps its behaviour.
+func (r *ExecRunner) downloadTimeout() time.Duration {
+	if r.DownloadTimeout > 0 {
+		return r.DownloadTimeout
+	}
+	return r.Timeout
+}
+
 // Download runs `varhub download` for a snapshot, then inventories what landed.
 //
 // The inventory is taken here rather than by the API server because only the
@@ -521,9 +588,9 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	if bin == "" {
 		bin = "varhub"
 	}
-	if r.Timeout > 0 {
+	if d := r.downloadTimeout(); d > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, r.Timeout)
+		ctx, cancel = context.WithTimeout(ctx, d)
 		defer cancel()
 	}
 	if req.CacheDir == "" {

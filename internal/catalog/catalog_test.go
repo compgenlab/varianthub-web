@@ -21,6 +21,12 @@ var migrationFiles = []string{
 	"../../migrations/0004_registry.sql",
 	"../../migrations/0005_adhoc_snapshot.sql",
 	"../../migrations/0006_storage.sql",
+	"../../migrations/0007_auth.sql",
+	"../../migrations/0008_default_private.sql",
+	"../../migrations/0012_source_asset.sql",
+	"../../migrations/0014_source_settings.sql",
+	"../../migrations/0015_source_state.sql",
+	"../../migrations/0016_job_weight.sql",
 }
 
 func testStore(t *testing.T) *Store {
@@ -762,5 +768,40 @@ func TestAssemblyInvariantOnEveryPath(t *testing.T) {
 	// A source with no declared assembly is agnostic and belongs anywhere.
 	if _, err := s.SetSnapshotSources(ctx, "ok", []string{"h38", "agnostic"}); err != nil {
 		t.Errorf("an assembly-agnostic source was refused: %v", err)
+	}
+}
+
+// A source registered without a stated visibility is private. The two mistakes
+// are not symmetric: publishing something private is a disclosure that cannot
+// be undone, while a private source nobody can see is a support request.
+func TestSourceDefaultsToPrivate(t *testing.T) {
+	s := seeded(t)
+	ctx := context.Background()
+	if err := s.PutSource(ctx, Source{
+		ID: "unstated", Name: "unstated", Version: "1", Kind: "vcf", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetSource(ctx, "unstated")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Visibility != VisibilityPrivate {
+		t.Errorf("visibility = %q, want private", got.Visibility)
+	}
+	// A stated visibility is honoured.
+	if err := s.PutSource(ctx, Source{
+		ID: "stated", Name: "stated", Version: "1", Kind: "vcf",
+		Visibility: VisibilityPublic, TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetSource(ctx, "stated"); got.Visibility != VisibilityPublic {
+		t.Errorf("a stated public visibility was overridden: %q", got.Visibility)
+	}
+	// The starter catalog must remain usable: its only source is a builtin that
+	// computes from the variant and discloses nothing.
+	if b, err := s.GetSource(ctx, "builtins"); err != nil || b.Visibility != VisibilityPublic {
+		t.Errorf("seeded builtins = %q, %v; want public", b.Visibility, err)
 	}
 }

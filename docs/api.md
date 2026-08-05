@@ -36,7 +36,8 @@ here as a change to a shared contract.
 
 `Authorization: Bearer <token>`.
 
-Chunk 1 issues a single HMAC token signed with `VHW_MASTER_KEY`. Chunk 6 replaces
+*Superseded — see **Authentication** at the end of this document.* Chunk 1 issued
+a single HMAC token signed with `VHW_MASTER_KEY`; that key is gone. Chunk 6 replaced
 this with per-user tokens: `cgl_vh_` prefix + random secret, shown once at
 creation, stored only as a hash, and carrying the owner's private-source grants.
 A token must never grant more than its owner has.
@@ -74,6 +75,16 @@ pulled from the load balancer rather than taking traffic it cannot serve.
 ```json
 {"status": "ok"}
 ```
+
+### `GET /api/v1/ping`
+
+```json
+{"pong": "ok"}
+```
+
+**Authenticated on purpose**, unlike `/healthz`. This is how a client checks that
+its credential works, which an endpoint that answered without one could not tell
+it. Use `/healthz` for liveness.
 
 ### `GET /version`
 
@@ -266,6 +277,43 @@ One job, same shape as a list entry.
 an admin grant. This is a deliberate change from the previous server, where
 knowing a job id was sufficient to read it.
 
+### `GET /api/v1/jobs/{id}/log`
+
+What the run printed — the tail of the CLI's progress output.
+
+```json
+{"job_id": "…", "output": "varhub: annotating 1 loci (2 annotation(s) selected)\n…", "recorded": true}
+```
+
+Kept for runs that **succeed as well as fail**. The case with the most to explain
+is a job that finished cleanly having annotated nothing: it is `done`, its result
+set is empty, and only this says whether the sources were consulted and matched
+nothing or were never consulted at all.
+
+`recorded: false` means no output was stored — a job from before logs were kept,
+or one that printed nothing. That is distinct from `output: ""`.
+
+Ownership is enforced as it is for the job itself.
+
+### `POST /api/v1/jobs/{id}/cancel`
+
+Stops a job, returning the job and whether this call is what stopped it.
+
+```json
+{"job": {…}, "cancelled": true}
+```
+
+A job that had already finished returns `200` with `"cancelled": false` and a
+`detail` saying so, rather than an error: the caller wanted it stopped and it is
+stopped. Cancelling is gated by the same ownership rule as reading — someone who
+can start work can already occupy a worker, and stopping it frees the slot they
+are holding rather than taking anything from anyone else. An administrator can
+cancel anything, which is what the system jobs view uses.
+
+A cancelled job ends in status `cancelled`, not `error`: a deliberate stop is a
+decision rather than a fault, and counting one as a failure would distort the
+failure rate on the metrics page.
+
 ### `GET /api/v1/jobs/{id}/results`
 
 One page of annotated variants plus the column definitions needed to render them.
@@ -338,18 +386,57 @@ Selecting a subset of rows (`?selected=`) is not implemented.
 | `PATCH` | `/api/v1/admin/sources/{id}` | not implemented (re-POST the manifest) |
 | `DELETE` | `/api/v1/admin/sources/{id}` | **implemented** — refused with 409 while a snapshot pins it |
 | `GET` | `/api/v1/admin/sources/{id}/config` | **implemented** — the stored TOML manifest |
+| `GET` | `/api/v1/admin/sources/{id}/settings` | **implemented** — this deployment's settings for the source |
+| `PUT` | `/api/v1/admin/sources/{id}/settings` | **implemented** — replaces them; see below |
+| `PUT` | `/api/v1/admin/snapshots/{id}/sources` | **implemented** — replaces the pinned set, order preserved |
 | `GET` | `/api/v1/admin/registries` | **implemented** |
 | `POST` | `/api/v1/admin/registries` | **implemented** — validates by fetching once |
 | `DELETE` | `/api/v1/admin/registries/{id}` | **implemented** (not the builtin default) |
 | `GET` | `/api/v1/admin/registries/{id}/datasets` | **implemented** — live listing |
 | `GET` | `/api/v1/admin/registries/{id}/fetch?ref=` | **implemented** — returns a manifest for review |
 | `POST` | `/api/v1/admin/snapshots/{id}/duplicate` | not implemented |
+| `GET` | `/api/v1/admin/metrics` | **implemented** — throughput, queue state, storage usage |
 | `GET` | `/api/v1/admin/storage` | **implemented** — storage locations |
 | `POST` | `/api/v1/admin/storage` | **implemented** — add an S3 bucket (paths come from config) |
 | `DELETE` | `/api/v1/admin/storage/{id}` | **implemented** (not config-managed ones) |
 | `GET` | `/api/v1/admin/files` | **implemented** — downloaded files and sizes; `?source=` / `?storage=` narrow it |
 | `POST` | `/api/v1/admin/downloads` | **implemented** — queues a provisioning job |
 | `GET`/`PUT` | `/api/v1/admin/grants` | not implemented (needs teams) |
+
+### Source settings
+
+What this deployment decides about a source, as opposed to what the source's
+manifest says about itself. Stored apart from `toml_text` so re-fetching a
+manifest from a registry cannot silently discard them.
+
+```json
+{"settings": {"annotation_prefix": "GENCODE_48_", "cache_setup": true}}
+```
+
+`annotation_prefix` renames the source's output fields. It is a **substitution,
+not a prepend**: a manifest declares the prefix its names already carry — VEP
+names every field `VEP_Allele` — so swapping in `VEP_113_` replaces `VEP_` rather
+than stacking onto it. `"-"` means deliberately no prefix, which `""` cannot
+express: empty falls through to whatever the manifest declared.
+
+The point is running two versions of the same source side by side, `GENCODE_48_`
+next to `GENCODE_47_`, without their columns colliding.
+
+Two consequences worth knowing, because both were once bugs:
+
+- Every listing that names annotations returns the **effective** names, already
+  renamed. A listing showing manifest names while annotation emitted prefixed
+  ones would hand out selections that cannot resolve, and the failure would
+  surface much later as `default_annotations references unknown annotation`.
+- Changing the prefix **rewrites the snapshot defaults** that named this source's
+  fields, since those are stored denormalized as plain strings. Only defaults
+  belonging to this source move: two sources can emit the same bare name, and
+  rewriting the other one's on a string match would silently repoint it.
+
+`cache_setup` archives a tool's setup output to the object store, so a machine
+with an empty data directory unpacks it instead of re-running an install that
+takes hours. It does nothing for a filesystem storage target, where the directory
+is already where another machine would look.
 
 ### Provisioning
 
@@ -506,3 +593,271 @@ Carried from the handoff and from implementation review:
 5. **Column manager** — persisted per user, per job, or per snapshot?
 6. **Large VCF upload** — size ceiling and whether resumable upload is required.
    The current 64 MiB limit is inherited, not chosen.
+
+## `GET /api/v1/admin/metrics`
+
+Counters for the admin dashboard, in one response so the figures agree with each
+other: reading them separately lets a job finish between two requests and produce
+totals that do not add up.
+
+```json
+{
+  "jobs": {
+    "total": 412, "succeeded": 398, "failed": 14,
+    "queued": 2, "running": 1, "oldest_queued_at": 1785600000,
+    "variants": 91422, "last_24h": 37, "last_7d": 210
+  },
+  "sources": {"total": 5, "provisioned": 1, "streamed": 3, "builtin": 1, "pending": 0},
+  "storage": [
+    {"storage_id": "cfg-default", "name": "default", "kind": "path",
+     "uri": "/mnt/storage", "bytes": 0, "files": 0, "sources": 0, "is_default": true},
+    {"storage_id": "cfg-versitygw", "name": "versitygw", "kind": "s3",
+     "uri": "s3://varhub-dev", "bucket": "varhub-dev",
+     "bytes": 78704219, "files": 2, "sources": 1, "is_default": false}
+  ],
+  "storage_bytes": 78704219,
+  "remote": [
+    {"source_id": "gnomad-4.1.0", "name": "gnomAD", "host": "storage.googleapis.com",
+     "files": 24, "bytes": 563049556499}
+  ],
+  "remote_bytes": 563049556499,
+  "remote_measured": true,
+  "generated_at": 1785605894
+}
+```
+
+Notes on what the numbers mean, because several of them could reasonably be
+defined another way:
+
+- **`jobs.variants` counts successful jobs only.** A failed job's variant count is
+  what was *submitted*, not what was annotated, so including it would inflate the
+  total exactly when something is going wrong.
+- **`oldest_queued_at` is absent when nothing is waiting.** A queue depth alone
+  does not distinguish a queue that is moving from one that is stuck.
+- **Every storage location appears, including empty ones.** "This bucket is
+  configured and holds nothing" is usually the answer being looked for, and
+  omitting the row makes it indistinguishable from a location that does not exist.
+- **Locations are never merged.** Two locations in one bucket stay two rows, each
+  carrying `bucket`, so usage can be read per location or summed per bucket.
+- **`remote` is measured, not stored.** Streamed sources are read from their
+  origin with range requests and occupy nothing here, so their bytes are reported
+  separately and are *not* part of `storage_bytes`. Sizes come from a `HEAD` per
+  file, falling back to a one-byte ranged `GET` for origins that refuse `HEAD`,
+  cached for six hours.
+- **`remote_measured: false` makes `remote_bytes` a floor.** Some origins report
+  no length; the per-source `unmeasured` count says how many files are missing
+  from the figure rather than quietly under-reporting.
+- **`?remote=0`** skips the origin probes and returns the local figures alone.
+
+## Authentication
+
+Three credentials, in the order the middleware tries them. Whichever resolves
+becomes the request's caller; nothing downstream authenticates separately.
+
+| Credential | Header / cookie | Who it is |
+| --- | --- | --- |
+| Personal API token | `Authorization: Bearer cgl_vh_…` | the account that owns it |
+| Session | `vh_auth` cookie, set by `POST /auth/login` | the account that signed in |
+| Bootstrap token | `Authorization: Bearer cgl_vhb_…` | nobody — the first-administrator path |
+
+There is no deployment-wide shared key. `VHW_MASTER_KEY` was removed: a shared
+secret cannot be attributed to anyone, cannot be revoked without rotating it for
+every holder at once, and is indistinguishable from a copy of itself. Scripts and
+bulk loaders now hold a personal API token belonging to an account — often an
+account created for that purpose — which is individually revocable and shows when
+it was last used. Setting the variable is warned about at startup rather than
+silently ignored.
+
+An unrecognised credential is anonymous, not an error: a stale token gets the
+same treatment as no token, so a client that kept one past its revocation sees a
+sign-in prompt rather than a hard failure it cannot interpret.
+
+### Administration is a property of the account
+
+`/api/v1/admin/*` requires `role = admin`. A token administers only because the
+person who owns it does — the role is read from the account on every request, so
+promoting takes effect on tokens already issued and demoting revokes them all at
+once, with nothing to reissue or clean up.
+
+Reading *anyone's* jobs is likewise administrator-only.
+
+**The submit rate limit applies to anonymous callers only.** It exists to stop an
+unaccountable browser flooding the queue; an account is accountable — it can be
+disabled and its jobs are attributable — and throttling a signed-in bulk load
+would make that load throttle itself. The per-IP *concurrency* cap still applies
+to everyone, so no one caller monopolises the workers.
+
+### `GET /api/v1/auth/identities`
+
+External identities linked to the calling account — the institutional logins that
+can sign in as this user.
+
+```json
+{"identities": [{"provider": "cilogon", "subject": "http://cilogon.org/serverA/users/…", "email": "…"}]}
+```
+
+Scoped to the caller. An account with no external identity returns an empty list,
+which is the ordinary case for a password account.
+
+### Bootstrap: the first administrator
+
+An installation with no accounts cannot be administered, and an administrator
+cannot be created without administering. The service breaks that circle by
+minting one bootstrap token at startup whenever no enabled administrator exists,
+and logging it:
+
+```
+serve: this installation has no administrator yet.
+serve:     cgl_vhb_ravjR2Fl5TP8abeRd7Onhz4_vAcqJHI8i1vjALxH0TI
+```
+
+It passes `requireAdmin` and nothing else, and it dies three ways: it is consumed
+when it creates an administrator, it stops resolving the moment any enabled
+administrator exists (so an unspent one is not a standing back door), and a
+restart replaces it (so a token printed into a log and never used stops working).
+`GET /auth/me` reports `needs_bootstrap` so the sign-in screen can ask for it.
+
+After that, people sign in with an email and password.
+
+### Changing a password
+
+`POST /auth/password` takes `current_password` and `new_password`. The current
+one is required even though the caller is already authenticated: a session cookie
+and an API token are both bearer credentials, and if one is stolen, setting a new
+password without knowing the old one would turn a read of the account into a
+takeover. Re-proving knowledge of the password is what prevents that.
+
+Succeeding ends the account's **other** sessions — someone changing a password
+because they think it leaked expects that — while leaving API tokens alone, since
+those are separate credentials with their own revocation and silently breaking a
+CI job is not what the request asked for.
+
+An account with no password stored here is refused with `409`. `GET /auth/me`
+reports `can_change_password`, and a user carries `sso: true`, so the UI shows no
+form rather than one that always fails. Hiding the form is courtesy; the server
+check is the control.
+
+### Personal API tokens
+
+`POST /auth/tokens` returns `{"token": {...}, "secret": "cgl_vh_…"}`. The secret
+is shown once and stored only as a SHA-256 hash, so a database leak yields no
+working credentials. The `cgl_vh_` marker exists so a leaked token is greppable
+by secret scanners, and the stored prefix locates the row without the hash being
+reversible — presenting the prefix alone never authenticates.
+
+One account holds as many tokens as it likes. Each is revoked on its own and
+carries `last_used_at`, so a machine that is decommissioned costs one revocation
+rather than a rotation of everything, and a token nobody has used is visibly safe
+to remove. Revoked tokens stay listed: the row is the record that the token
+existed and when it stopped working, which is what an audit of a leak needs.
+
+### CILogon (institutional sign-in)
+
+Configured with three variables; an incomplete set leaves sign-in
+password-only rather than half-enabled.
+
+| Variable | Purpose |
+| --- | --- |
+| `VHW_CILOGON_CLIENT_ID` | OIDC client id |
+| `VHW_CILOGON_CLIENT_SECRET` | OIDC client secret |
+| `VHW_CILOGON_REDIRECT_URL` | e.g. `https://varianthub.example/auth/cilogon/callback` |
+| `VHW_CILOGON_AUTO_PROVISION_DOMAINS` | email domains that get an account on first sign-in; empty = invite-only |
+
+Two browser routes, deliberately outside `/api/v1` so no JSON error wrapper
+intercepts a redirect the provider has to follow:
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `GET` | `/auth/cilogon` | redirects to CILogon; `?next=/path` survives the round trip |
+| `GET` | `/auth/cilogon/callback` | exchanges the code, issues `vh_auth`, redirects to `next` |
+
+**Accounts are not created just because CILogon vouched for someone.** CILogon
+federates several thousand institutional providers, so a successful login proves
+only that *an* institution recognises the person — not that they belong on this
+deployment. Resolution runs in three steps:
+
+1. **By subject.** The provider's `sub` claim is the join key, not the email, so
+   someone whose institutional address changes returns to the same account
+   instead of acquiring a second one.
+2. **By verified email.** An account an administrator already created is linked
+   on first sign-in. This is the invitation: create the account with an empty
+   password (it is then an SSO account with nothing to leak) and the first
+   sign-in claims it.
+3. **By allow-listed domain.** Only if `VHW_CILOGON_AUTO_PROVISION_DOMAINS`
+   covers the verified address. A configured `iu.edu` also matches
+   `umail.iu.edu`, because institutions routinely issue mail on a subdomain —
+   but not `notiu.edu`. Auto-provisioned accounts are always **members**;
+   administration is granted deliberately, never by having the right email.
+
+Anything else is refused with `?error=sso_no_account`, which the sign-in screen
+renders as "ask an administrator to add you". A disabled account is refused too:
+SSO is not a way back in.
+
+The `state` parameter is held in a short-lived, path-scoped, `HttpOnly` cookie
+and compared on return, so another site's callback cannot be replayed into a
+browser as a login. `?next=` is restricted to same-origin absolute paths —
+`//host` is rejected because a browser reads it as protocol-relative and leaves
+the site.
+
+An account may hold a password *and* an identity, either alone. Unlinking the
+last one is refused when there is no password, since that would leave an account
+nobody can sign in to.
+
+### Visibility
+
+A source is **private by default** and visible to administrators plus any team it
+has been granted to. Grants attach to teams rather than to people so access
+survives membership changes.
+
+A snapshot pinning a source the caller cannot see is **hidden entirely** — absent
+from the listing, `404` (not `403`) when fetched by name, and refused by
+`POST /annotate`. All-or-nothing is deliberate: a snapshot is a claim about which
+annotations a result carries, and returning it with a source quietly dropped
+would answer a different question than the one asked, with nothing in the
+response to say so. The `404` matters for the same reason a `403` would not — a
+snapshot's name and existence are themselves information about what an
+installation holds.
+
+Selecting sources individually is checked the same way, so the ad-hoc path is not
+a way around the snapshot rule.
+
+### Job ownership
+
+Jobs carry `user_id`, written from the verified credential. A job with an owner is
+readable only by that account, by an administrator, or by the service account.
+Jobs submitted anonymously still scope by the client-asserted `X-Varhub-Session`,
+which is all an anonymous visitor has — but that header is never honoured for a
+job that has an owner, or anyone who learned the string could read a signed-in
+user's results.
+
+### Configuration
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `VHW_ALLOW_ANONYMOUS` | `false` | let callers with no account use the annotation flow |
+
+`VHW_MASTER_KEY` and `VHW_REQUIRE_TOKEN` were removed; both are warned about at
+startup if still set.
+
+### Endpoints
+
+| Method | Path | Notes |
+| --- | --- | --- |
+| `POST` | `/api/v1/auth/login` | email + password → `vh_auth` cookie |
+| `POST` | `/api/v1/auth/logout` | ends the session server-side |
+| `POST` | `/api/v1/auth/password` | change your own password; `409` for an SSO account |
+| `GET` | `/api/v1/auth/me` | caller, role, teams, `needs_bootstrap` |
+| `GET` | `/api/v1/auth/tokens` | the caller's own tokens |
+| `POST` | `/api/v1/auth/tokens` | mint one; the secret is in this response only |
+| `DELETE` | `/api/v1/auth/tokens/{id}` | revoke one |
+| `GET` | `/api/v1/admin/users` | accounts |
+| `POST` | `/api/v1/admin/users` | create — also the bootstrap path |
+| `PATCH` | `/api/v1/admin/users/{id}` | role, disabled, password |
+| `GET` | `/api/v1/admin/teams` | teams with their members |
+| `POST` | `/api/v1/admin/teams` | create |
+| `DELETE` | `/api/v1/admin/teams/{id}` | delete; its grants go with it |
+| `POST` | `/api/v1/admin/teams/{id}/members` | add a member |
+| `DELETE` | `/api/v1/admin/teams/{id}/members/{user}` | remove one |
+| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a private source |
+| `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
+| `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |

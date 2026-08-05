@@ -51,8 +51,12 @@ func (s *Store) Seed(ctx context.Context) error {
 		Title:   "Built-in annotators",
 		Detail:  "auto_id, tstv, indel — computed from the variant, no data files",
 		Kind:    "builtin",
-		Origin:  "built in to varhub",
-		TOML:    builtinsTOML,
+		// Stated rather than inherited: sources default to private now, and a
+		// starter catalog whose only source nobody can see is a broken install.
+		// A builtin computes from the variant and discloses nothing.
+		Visibility: VisibilityPublic,
+		Origin:     "built in to varhub",
+		TOML:       builtinsTOML,
 	}); err != nil {
 		return err
 	}

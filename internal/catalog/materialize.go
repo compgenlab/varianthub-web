@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -27,6 +28,12 @@ type Materializer struct {
 
 	// Root is where per-job config trees are created (default: os.TempDir()).
 	Root string
+
+	// References maps an assembly to a reference FASTA on this worker. Written
+	// into every job's config, because varhub resolves {ref} from the assembly
+	// the snapshot declares — a tool step using {ref} gets an empty path
+	// otherwise and fails inside the container with "no such file".
+	References map[string]string
 }
 
 // Home materializes the snapshot's config tree into a fresh directory and
@@ -62,6 +69,18 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	if err != nil {
 		return "", nil, err
 	}
+	// Helper scripts a build recipe names. They live in the catalog rather than
+	// on this machine, so the worker has no other way to reach them.
+	assets, err := m.Store.AssetsFor(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
+	// What this deployment decided about these sources — output naming, and
+	// whether a tool's setup output is published.
+	settings, err := m.Store.SettingsFor(ctx, ids)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		// Nothing downloaded yet, or no clear majority. Use the default location
@@ -80,7 +99,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -88,16 +107,28 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir, nil)
+	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil, nil)
 }
 
-func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string, roots map[string]string) error {
+func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string,
+	roots map[string]string, assets map[string][]Asset,
+	settings map[string]SourceSettings) error {
+
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 			return err
 		}
 		return os.WriteFile(p, []byte(body), 0o600)
+	}
+	// Assets are scripts a build step executes, so they need the mode to match.
+	// Everything else here is data varhub reads, which stays 0600.
+	writeExec := func(rel, body string) error {
+		p := filepath.Join(dir, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return err
+		}
+		return os.WriteFile(p, []byte(body), 0o700)
 	}
 
 	// config.toml. Absolute data/cache paths, so nothing resolves relative to the
@@ -108,6 +139,24 @@ cache_dir        = %s
 annotations_dir  = "./annotations"
 default_snapshot = %s
 `, tomlString(m.DataDir), tomlString(cacheDir), tomlString(snap.ID))
+
+	// Reference FASTAs, keyed by assembly. Written in sorted order so a given
+	// deployment materializes the same file every time — a job home that differs
+	// run to run is needlessly hard to compare.
+	//
+	// All of them, not just this snapshot's: the file is cheap, and selecting by
+	// assembly here would duplicate a lookup varhub already does correctly.
+	if len(m.References) > 0 {
+		names := make([]string, 0, len(m.References))
+		for name := range m.References {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			cfg += fmt.Sprintf("\n[references.%s]\n  fasta = %s\n",
+				name, tomlString(m.References[name]))
+		}
+	}
 	if err := writeFile("config.toml", cfg); err != nil {
 		return fmt.Errorf("write config.toml: %w", err)
 	}
@@ -140,13 +189,41 @@ default_snapshot = %s
 		if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".toml"), src.TOML); err != nil {
 			return fmt.Errorf("write source %s: %w", src.Ref(), err)
 		}
-		// A location overlay beside the manifest, when this source lives
-		// somewhere other than the job's cache_dir. That is what lets one job
-		// read sources from different places — cache_dir names only one.
+		// Helper files the recipe names, beside the manifest where it looks for
+		// them. Executable: an asset is a script a build step runs, and one
+		// written 0600 fails at exec with a permission error that says nothing
+		// about the cause.
+		for _, a := range assets[src.ID] {
+			if err := ValidateAssetName(a.Name); err != nil {
+				return fmt.Errorf("source %s: %w", src.Ref(), err)
+			}
+			if err := writeExec(filepath.Join(dir, a.Name), a.Content); err != nil {
+				return fmt.Errorf("write asset %s for %s: %w", a.Name, src.Ref(), err)
+			}
+		}
+		// The overlay beside the manifest: everything this deployment knows
+		// about the source that the source does not know about itself.
+		//
+		// A root when the source lives somewhere other than the job's cache_dir
+		// — that is what lets one job read sources from different places, since
+		// cache_dir names only one — plus whatever settings an administrator
+		// has set for it.
+		var body string
 		if root := roots[src.ID]; root != "" && root != cacheDir {
-			overlay := fmt.Sprintf(`# Generated per job from the VariantHub catalog. Do not edit.
-root = %s
-`, tomlString(root))
+			body += fmt.Sprintf("root = %s\n", tomlString(root))
+		}
+		if set := settings[src.ID]; !set.Empty() {
+			if set.AnnotationPrefix != "" {
+				body += fmt.Sprintf("annotation_prefix = %s\n", tomlString(set.AnnotationPrefix))
+			}
+			if set.CacheSetup {
+				body += "cache_setup = true\n"
+			}
+		}
+		// Written only when there is something to say. A file of nothing but a
+		// header reads as an overlay whose content went missing.
+		if body != "" {
+			overlay := "# Generated per job from the VariantHub catalog. Do not edit.\n" + body
 			if err := writeFile(filepath.Join(dir, src.Name+"-"+src.Version+".locations.toml"),
 				overlay); err != nil {
 				return fmt.Errorf("write locations for %s: %w", src.Ref(), err)
@@ -231,6 +308,16 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 	if err != nil {
 		return "", nil, err
 	}
+	// This is the provisioning home — the one a download job runs in — so it is
+	// the path that most needs a recipe's helper scripts present.
+	assets, err := m.Store.AssetsFor(ctx, sourceIDs)
+	if err != nil {
+		return "", nil, err
+	}
+	settings, err := m.Store.SettingsFor(ctx, sourceIDs)
+	if err != nil {
+		return "", nil, err
+	}
 	cacheDir := commonRoot(roots)
 	if cacheDir == "" {
 		if def, dErr := m.Store.DefaultStorage(ctx); dErr == nil {
@@ -245,7 +332,7 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir, roots); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
 		cleanup()
 		return "", nil, err
 	}

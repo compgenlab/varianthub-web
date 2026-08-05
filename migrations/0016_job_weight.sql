@@ -1,0 +1,12 @@
+-- How much of the worker pool a job occupies.
+--
+-- Jobs are not interchangeable. An annotation answers a query someone is
+-- waiting on and costs seconds; provisioning a source runs for hours and
+-- saturates disk and CPU. Counting both as "one job" meant two downloads could
+-- claim every worker and starve annotation entirely — and gained nothing, since
+-- two large downloads sharing a machine finish later than one after the other.
+--
+-- A weight lets the pool be a budget rather than a headcount, which is also what
+-- a fanned-out annotation will need: several parts of one run, each holding a
+-- share of the pool.
+ALTER TABLE job ADD COLUMN IF NOT EXISTS weight INT NOT NULL DEFAULT 1;
