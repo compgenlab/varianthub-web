@@ -216,8 +216,28 @@ default_snapshot = %s
 			if set.AnnotationPrefix != "" {
 				body += fmt.Sprintf("annotation_prefix = %s\n", tomlString(set.AnnotationPrefix))
 			}
+			// varhub wants the destination, not a flag: an empty value means
+			// "do not archive", so one field says both whether and where.
+			//
+			// This used to write `cache_setup = true`, for which varhub has no
+			// field — an unknown key, ignored on parse. The setting read as
+			// enabled in the UI and did nothing at all, so a 24-hour VEP install
+			// finished with no archive and nothing to say why. Writing the
+			// locator is what actually turns it on.
+			//
+			// The job's own storage target is the destination: it is where this
+			// source's data is going anyway, so a deployment that can write the
+			// data can write the archive beside it, with no second location to
+			// configure or to get wrong. A source pinned to a different root
+			// archives there instead, for the same reason.
 			if set.CacheSetup {
-				body += "cache_setup = true\n"
+				dest := cacheDir
+				if root := roots[src.ID]; root != "" {
+					dest = root
+				}
+				if dest != "" {
+					body += fmt.Sprintf("tool_cache = %s\n", tomlString(dest))
+				}
 			}
 		}
 		// Written only when there is something to say. A file of nothing but a

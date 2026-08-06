@@ -100,10 +100,86 @@ func TestSettingsMaterializeIntoTheOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no overlay written: %v", err)
 	}
-	for _, want := range []string{`annotation_prefix = "GENCODE_LATEST_"`, "cache_setup = true"} {
+	// tool_cache carries the destination, not a flag. This asserted
+	// `cache_setup = true` until 2026-08-06 — a key varhub has no field for, so
+	// it was ignored on parse and the setting did nothing. The test passed
+	// throughout, because it checked what we wrote rather than what varhub
+	// reads.
+	for _, want := range []string{
+		`annotation_prefix = "GENCODE_LATEST_"`,
+		`tool_cache = "/mnt/sources"`, // the job's storage target
+	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("overlay missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(string(body), "cache_setup") {
+		t.Errorf("overlay still writes cache_setup, which varhub ignores:\n%s", body)
+	}
+}
+
+// overlayKeys are the top-level keys varhub's config.Locations declares. An
+// overlay key outside this set is not an error anywhere — TOML parsing ignores
+// what it has no field for — so writing one is silent and total: the setting
+// appears set and does nothing.
+//
+// That is exactly how tool archiving was broken. This list is the contract with
+// the CLI, and it has to be updated by hand when varhub's Locations struct
+// changes, which is the point: the update is where someone notices.
+var overlayKeys = map[string]bool{
+	"root": true, "gtf_index": true, "file": true,
+	"tool_cache": true, "annotation_prefix": true,
+}
+
+func TestOverlayWritesOnlyKeysVarhubReads(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Every setting on at once, so the overlay carries everything it can.
+	if err := s.PutSettings(ctx, "vep-113", SourceSettings{
+		AnnotationPrefix: "VEP_113_", CacheSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "s3://bucket/prefix",
+	}
+	home, cleanup, err := m.HomeForSources(ctx, []string{"vep-113"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(home, "annotations", "sources", "vep", "113",
+		"vep-113.locations.toml"))
+	if err != nil {
+		t.Fatalf("no overlay written: %v", err)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		key, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if key = strings.TrimSpace(key); !overlayKeys[key] {
+			t.Errorf("overlay writes %q, which varhub has no field for — it will be "+
+				"ignored on parse and the setting will silently do nothing:\n%s", key, body)
+		}
+	}
+	// And the archive destination is the job's storage target.
+	if !strings.Contains(string(body), `tool_cache = "s3://bucket/prefix"`) {
+		t.Errorf("tool_cache is not the job's storage target:\n%s", body)
 	}
 }
 
