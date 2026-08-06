@@ -86,6 +86,7 @@ function Shell({
   onSignIn: () => void;
   children: React.ReactNode;
 }) {
+  const { pathname } = useLocation();
   const [version, setVersion] = useState("");
   const [snapshots, setSnapshots] = useState<number | null>(null);
 
@@ -149,7 +150,23 @@ function Shell({
               </span>
             </span>
           </div>
-          <NavLink to="/admin">
+          {/* `end` because NavLink matches by prefix, and without it "/admin"
+              stays highlighted on every /admin/* page — so two tabs looked
+              selected at once. The detail pages still belong to this tab
+              though: a source or snapshot opened from the list is the same
+              section, and losing the highlight there would read as having
+              navigated away from it. */}
+          <NavLink
+            to="/admin"
+            end
+            className={() =>
+              pathname === "/admin" ||
+              pathname.startsWith("/admin/sources/") ||
+              pathname.startsWith("/admin/snapshots/")
+                ? "active"
+                : ""
+            }
+          >
             <ShieldCheck /> Sources &amp; snapshots
           </NavLink>
           <NavLink to="/admin/storage">

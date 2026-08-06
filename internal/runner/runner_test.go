@@ -649,3 +649,45 @@ func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
 		t.Errorf("log says nothing about annotating:\n%s", res.Log)
 	}
 }
+
+// The archive destination must follow the job, not the catalog's default.
+//
+// The materializer fills tool_cache from whichever storage is default. A
+// download is sent wherever the caller chose, and only an object store can hold
+// an archive — so a default of "/mnt/storage" against a job going to
+// "s3://bucket" means no archive at all, silently, because a filesystem path is
+// not an archive destination. That is what produced nothing after a 24-hour VEP
+// install with the setting showing as enabled.
+func TestToolCacheFollowsTheJobsStorage(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("data_dir = \"/d\"\ncache_dir = \"/mnt/storage\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, "annotations", "sources", "vep", "113")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(dir, "vep-113.locations.toml")
+	if err := os.WriteFile(overlay,
+		[]byte("# generated\ntool_cache = \"/mnt/storage\"\nannotation_prefix = \"VEP_\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rewriteCacheDir(home, "s3://bucket/prefix", "/data"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `tool_cache = "s3://bucket/prefix"`) {
+		t.Errorf("tool_cache still points at the catalog default, so nothing will be "+
+			"archived:\n%s", got)
+	}
+	// Everything else in the overlay survives.
+	if !strings.Contains(string(got), `annotation_prefix = "VEP_"`) {
+		t.Errorf("rewriting tool_cache dropped another setting:\n%s", got)
+	}
+}

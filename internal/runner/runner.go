@@ -744,7 +744,51 @@ func rewriteCacheDir(home, cacheDir, dataDir string) error {
 			out = append(out, line)
 		}
 	}
-	return os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600)
+	if err := os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600); err != nil {
+		return err
+	}
+	return rewriteToolCache(home, cacheDir)
+}
+
+// rewriteToolCache repoints the archive destination in every source overlay to
+// this job's storage target.
+//
+// For the same reason cache_dir is rewritten above: the materializer fills the
+// overlay from the catalog, where the destination is whichever storage is
+// default, while the job is being sent somewhere a caller chose. Leaving the
+// catalog's answer means archiving to the wrong place — or, when the default is
+// a filesystem path and the job is going to a bucket, not archiving at all,
+// since only an object store is an archive destination.
+//
+// That second case is not hypothetical: it is what silently produced no archive
+// after a 24-hour VEP install, with the setting showing as enabled throughout.
+func rewriteToolCache(home, cacheDir string) error {
+	overlays, err := filepath.Glob(filepath.Join(home,
+		"annotations", "sources", "*", "*", "*.locations.toml"))
+	if err != nil {
+		return err
+	}
+	for _, p := range overlays {
+		body, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("read overlay %s: %w", filepath.Base(p), err)
+		}
+		if !strings.Contains(string(body), "tool_cache") {
+			continue // nothing to repoint
+		}
+		var out []string
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "tool_cache") {
+				out = append(out, fmt.Sprintf("tool_cache = %q", cacheDir))
+				continue
+			}
+			out = append(out, line)
+		}
+		if err := os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600); err != nil {
+			return fmt.Errorf("write overlay %s: %w", filepath.Base(p), err)
+		}
+	}
+	return nil
 }
 
 // inventory walks a directory and reports every regular file, relative to root.
