@@ -24,7 +24,16 @@ import (
 
 // Config is the resolved service configuration.
 type Config struct {
-	Addr        string // listen address
+	Addr string // listen address, e.g. ":8080" or "10.0.0.5:8080"
+	// PublicURL is where this installation answers from, e.g.
+	// "https://varianthub.compgenlab.org".
+	//
+	// One setting because the domain was otherwise written three times — the
+	// CORS origin, the CILogon callback, and the address a generated API client
+	// points at — and three copies of a hostname is three chances to move one
+	// and forget another. Each still has its own override for the cases that
+	// genuinely differ; this is what they fall back to.
+	PublicURL   string
 	DatabaseURL string // Postgres DSN
 
 	// AllowAnonymous lets a caller with no credential use the annotation flow.
@@ -176,7 +185,30 @@ func Load() (*Config, error) {
 	if c.JobSlots <= 0 {
 		c.JobSlots = c.Workers
 	}
+	c.applyPublicURL()
 	return c, nil
+}
+
+// applyPublicURL fills in what the site's address implies.
+//
+// Only where nothing was set explicitly: a deployment that names its CORS
+// origins or its CILogon callback has a reason to, and this must not overrule
+// it. The point is that the ordinary case — one hostname, everything derived —
+// needs one setting instead of three that can disagree.
+func (c *Config) applyPublicURL() {
+	c.PublicURL = strings.TrimRight(strings.TrimSpace(c.PublicURL), "/")
+	if c.PublicURL == "" {
+		return
+	}
+	if len(c.CORSOrigins) == 0 {
+		// The browser calling this API is the app served from the same origin.
+		c.CORSOrigins = []string{c.PublicURL}
+	}
+	if c.CILogonRedirectURL == "" {
+		// The path is fixed by the route this server registers, so deriving it
+		// removes a value that can only ever be wrong by being out of step.
+		c.CILogonRedirectURL = c.PublicURL + "/auth/cilogon/callback"
+	}
 }
 
 // configHint names the file in an error, or suggests where one would go.
@@ -194,6 +226,7 @@ func configHint(path string) string {
 // out during an incident is not the moment.
 func applyEnv(c *Config) {
 	envStr("VHW_ADDR", &c.Addr)
+	envStr("VHW_PUBLIC_URL", &c.PublicURL)
 	envStr("VHW_DATABASE_URL", &c.DatabaseURL)
 	envBoolInto("VHW_ALLOW_ANONYMOUS", &c.AllowAnonymous)
 	envBoolInto("VHW_NO_CACHE", &c.NoCache)

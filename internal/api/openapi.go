@@ -267,7 +267,7 @@ func (s *Server) openAPI() map[string]any {
 				"are part of the web application rather than of this contract, and are " +
 				"not reachable with a token.",
 		},
-		"servers": []map[string]any{{"url": "/"}},
+		"servers": []map[string]any{{"url": s.serverURL()}},
 		"components": map[string]any{
 			"securitySchemes": map[string]any{
 				"bearer": map[string]any{
@@ -279,6 +279,19 @@ func (s *Server) openAPI() map[string]any {
 		"security": []map[string]any{{"bearer": []string{}}},
 		"paths":    paths,
 	}
+}
+
+// serverURL is the address a client generated from this document should call.
+//
+// The deployment's public URL when it has one. Falling back to "/" keeps a
+// document fetched from a dev stack usable — it resolves against wherever it was
+// fetched from — but a published contract naming a real host is what makes a
+// generated client work without editing.
+func (s *Server) serverURL() string {
+	if s.cfg != nil && s.cfg.PublicURL != "" {
+		return s.cfg.PublicURL
+	}
+	return "/"
 }
 
 // tagFor groups operations in the document by their first path segment.

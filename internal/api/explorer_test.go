@@ -118,3 +118,28 @@ func TestExplorerTokenCanSubmitWork(t *testing.T) {
 			"authenticated and fail only on the snapshot", got.Code, got.Body.String())
 	}
 }
+
+// An anonymous visitor cannot mint a token, so the explorer is not for them.
+//
+// The nav hides it and the page explains itself, but neither is the guarantee:
+// this is. A token belongs to an account, and anonymous browsing has none —
+// which is why the page is hidden rather than shown and left to fail on the
+// first click.
+func TestAnonymousCannotMintATokenForTheExplorer(t *testing.T) {
+	h := newHarness(t)
+	h.server.cfg.AllowAnonymous = true
+	h.http = h.server.Routes()
+
+	visitor := h.anon(t)
+	w := h.doAnon("POST", "/api/v1/auth/tokens", visitor,
+		map[string]any{"name": "API explorer", "days": 1})
+	if w.Code == http.StatusCreated {
+		t.Fatalf("an anonymous visitor minted a token: %s", w.Body.String())
+	}
+	if w.Code != http.StatusForbidden {
+		t.Errorf("mint as anonymous = %d, want 403", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "account") {
+		t.Errorf("the refusal does not say why: %s", w.Body.String())
+	}
+}

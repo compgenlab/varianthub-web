@@ -103,9 +103,15 @@ function Shell({
           <NavLink to="/jobs">
             <Table2 /> Results
           </NavLink>
-          <NavLink to="/api">
-            <Terminal /> API
-          </NavLink>
+          {/* Signed-in only, for the same reason as the admin group below: the
+              REST API takes a token, tokens belong to an account, and an
+              anonymous visitor following this link could read the contract and
+              then not run a single request. */}
+          {!me.anonymous && (
+            <NavLink to="/api">
+              <Terminal /> API
+            </NavLink>
+          )}
 
           {/* Role-gated. Hidden rather than disabled for a non-admin: the server
               refuses these routes anyway, and showing them would only advertise

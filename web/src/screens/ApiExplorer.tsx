@@ -51,6 +51,7 @@ type Spec = {
 };
 
 export default function ApiExplorer() {
+  const [anonymous, setAnonymous] = useState<boolean | null>(null);
   const [spec, setSpec] = useState<Spec | null>(null);
   const [err, setErr] = useState("");
   const [selected, setSelected] = useState<string>("");
@@ -62,6 +63,16 @@ export default function ApiExplorer() {
   const [tokenNote, setTokenNote] = useState("");
   const [minting, setMinting] = useState(false);
   const [remember, setRemember] = useState(false);
+
+  // The nav hides this from an anonymous visitor, but a link can be typed or
+  // bookmarked, and the page is useless without an account: every request needs
+  // a token, and a token belongs to somebody.
+  useEffect(() => {
+    api
+      .me()
+      .then((m) => setAnonymous(!!m.anonymous))
+      .catch(() => setAnonymous(true));
+  }, []);
 
   useEffect(() => {
     api
@@ -119,6 +130,26 @@ export default function ApiExplorer() {
     setRemember(v);
     if (v && token) sessionStorage.setItem("vh_explorer_token", token);
     else sessionStorage.removeItem("vh_explorer_token");
+  }
+
+  if (anonymous) {
+    return (
+      <div className="page" style={{ paddingTop: 26 }}>
+        <h1 className="title">API</h1>
+        <p className="lede">
+          The REST API is authenticated with a personal token, and a token belongs
+          to an account — so this page needs you signed in. Annotating here does
+          not: browsing anonymously works, it just cannot issue a credential to
+          call the API with.
+        </p>
+        <div className="card" style={{ padding: 16, marginTop: 14 }}>
+          <p style={{ margin: 0, fontSize: 13.5 }}>
+            Sign in from the menu at the top right, then come back. Your token is
+            issued here and carries your own permissions.
+          </p>
+        </div>
+      </div>
+    );
   }
 
   return (

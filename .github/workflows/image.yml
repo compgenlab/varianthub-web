@@ -1,0 +1,95 @@
+# Build and publish the container image.
+#
+# The image carries two binaries — varianthub-web and the varhub CLI its worker
+# execs — because a worker without the CLI cannot run a job. varhub lives in a
+# second repository, so this workflow checks it out and hands it to the build as
+# the `varhub-src` context, which is the same seam the compose stack fills from a
+# local checkout.
+#
+# Which varhub goes in is recorded rather than left to chance: VARHUB_REF pins
+# it, defaulting to main, and the resolved commit is written into an image label
+# so any deployed image can be traced back to the exact CLI it contains.
+name: image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      varhub_ref:
+        description: "varianthub-cli ref to build the CLI from"
+        default: main
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Check out varianthub-web
+        uses: actions/checkout@v4
+        with:
+          path: web
+
+      # A second private repository, so this needs a token with access to it.
+      # VARHUB_TOKEN is a fine-grained PAT with read access to varianthub-cli;
+      # GITHUB_TOKEN is scoped to this repository alone and cannot see it.
+      - name: Check out varianthub-cli
+        uses: actions/checkout@v4
+        with:
+          repository: compgenlab/varianthub-cli
+          ref: ${{ github.event.inputs.varhub_ref || 'main' }}
+          token: ${{ secrets.VARHUB_TOKEN || github.token }}
+          path: cli
+
+      - name: Record which varhub this is
+        id: varhub
+        run: echo "sha=$(git -C cli rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to the registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # A tag push publishes that version and moves :latest; a push to main
+      # publishes :main and a sha tag, so a deploy can pin something specific
+      # without waiting for a release.
+      - name: Work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=VariantHub
+            org.opencontainers.image.description=Annotate variants against versioned, pinned bundles of reference sources
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.compgenlab.varhub.revision=${{ steps.varhub.outputs.sha }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: web
+          file: web/deploy/compose/Dockerfile
+          build-contexts: varhub-src=cli
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # The Go and npm caches are the whole build; without this every run
+          # recompiles the React app and the module graph from nothing.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
