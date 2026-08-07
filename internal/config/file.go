@@ -29,7 +29,10 @@ var SearchPaths = []string{
 
 type fileConfig struct {
 	Server struct {
-		Addr           string   `toml:"addr"`
+		Addr string `toml:"addr"`
+		// PublicURL is where this installation answers from. The CORS origin
+		// and the CILogon callback are derived from it when they are not set.
+		PublicURL      string   `toml:"public_url"`
 		CORSOrigins    []string `toml:"cors_origins"`
 		TrustedProxies []string `toml:"trusted_proxies"`
 	} `toml:"server"`
@@ -127,6 +130,7 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 		redactDSN(f.Database.URL) != f.Database.URL
 
 	setStr(&c.Addr, f.Server.Addr)
+	setStr(&c.PublicURL, f.Server.PublicURL)
 	setList(&c.CORSOrigins, f.Server.CORSOrigins)
 	setList(&c.TrustedProxy, f.Server.TrustedProxies)
 

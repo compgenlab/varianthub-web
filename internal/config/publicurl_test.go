@@ -1,6 +1,10 @@
 package config
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // One hostname, everything derived. The domain was otherwise written three
 // times — CORS, the CILogon callback, and the address a generated client calls —
@@ -57,5 +61,44 @@ func TestPublicURLAbsentDerivesNothing(t *testing.T) {
 	c.applyPublicURL()
 	if len(c.CORSOrigins) != 0 || c.CILogonRedirectURL != "" {
 		t.Errorf("derived %v / %q from no public URL", c.CORSOrigins, c.CILogonRedirectURL)
+	}
+}
+
+// Everything settable by environment is settable in the file, which is what a
+// deployment that keeps its configuration in git actually uses. A setting
+// reachable only through an env var would be one the config file cannot express.
+func TestPublicURLComesFromTheFileToo(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "varianthub-web.toml")
+	if err := os.WriteFile(path, []byte(`
+[server]
+addr = "10.0.0.5:8080"
+public_url = "https://varianthub.compgenlab.org"
+
+[database]
+url = "postgres://example/db"
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c := Defaults()
+	if _, err := applyFile(c, path); err != nil {
+		t.Fatal(err)
+	}
+	c.applyPublicURL()
+
+	if c.Addr != "10.0.0.5:8080" {
+		t.Errorf("addr = %q; the listen endpoint is not file-settable", c.Addr)
+	}
+	if c.DatabaseURL != "postgres://example/db" {
+		t.Errorf("database url = %q; it is not file-settable", c.DatabaseURL)
+	}
+	if c.PublicURL != "https://varianthub.compgenlab.org" {
+		t.Errorf("public_url = %q; it is not file-settable", c.PublicURL)
+	}
+	// And the derivations still happen from a file-supplied value.
+	if len(c.CORSOrigins) != 1 || c.CILogonRedirectURL == "" {
+		t.Errorf("nothing derived from the file's public_url: %v / %q",
+			c.CORSOrigins, c.CILogonRedirectURL)
 	}
 }
