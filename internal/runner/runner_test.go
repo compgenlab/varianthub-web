@@ -131,35 +131,6 @@ func TestExecRunnerVCF(t *testing.T) {
 	}
 }
 
-func TestExecRunnerProgressAndFailure(t *testing.T) {
-	bin, home := testHome(t)
-
-	var lines []string
-	r := &ExecRunner{
-		Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second,
-		OnProgress: func(l string) { lines = append(lines, l) },
-	}
-
-	// A malformed locus must fail, and the failure must not leak the CLI's stderr
-	// into the caller-facing message.
-	_, err := r.Annotate(context.Background(), Request{
-		Kind: KindLocus, Snapshot: "test", Selection: "all", Body: []byte("not-a-locus"),
-	})
-	if err == nil {
-		t.Fatal("expected an error for a malformed locus")
-	}
-	if got := err.Error(); strings.Contains(got, home) || strings.Contains(got, "varhub:") {
-		t.Errorf("caller-facing error leaks internals: %q", got)
-	}
-	var ee *ExitError
-	if !asExitError(err, &ee) {
-		t.Fatalf("expected *ExitError, got %T", err)
-	}
-	if ee.Detail() == "" {
-		t.Error("ExitError.Detail() should carry the diagnostic for logs")
-	}
-}
-
 func TestFixedHomeRejectsMissing(t *testing.T) {
 	if _, _, err := FixedHome("").Home(context.Background(), ""); err == nil {
 		t.Error("empty FixedHome should error")

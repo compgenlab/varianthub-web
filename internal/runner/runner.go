@@ -147,11 +147,6 @@ type ExecRunner struct {
 	//
 	// Off by default: the cache is what makes a repeated query cheap.
 	NoCache bool
-
-	// OnProgress, if set, receives the CLI's progress lines as they arrive.
-	// varhub -v logs to stderr with a "varhub: " prefix; this is what will drive
-	// the job stage/percent the design's Running screen wants.
-	OnProgress func(line string)
 }
 
 var _ Runner = (*ExecRunner)(nil)
@@ -262,9 +257,6 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
-			if r.OnProgress != nil {
-				r.OnProgress(line)
-			}
 			mu.Lock()
 			tailLines = append(tailLines, line)
 			if len(tailLines) > 20 {
@@ -677,9 +669,6 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
-			if r.OnProgress != nil {
-				r.OnProgress(line)
-			}
 			mu.Lock()
 			lines = append(lines, line)
 			if len(lines) > 40 {
