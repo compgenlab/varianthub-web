@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 
@@ -147,4 +148,102 @@ func s3Exists(ctx context.Context, uri string) bool {
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
 	return err == nil
+}
+
+// Transfer copies one file between locations, either of which may be a
+// filesystem path or an object locator.
+//
+// Copy, never move: the caller deletes the original only after the copy is
+// confirmed. A move that deletes first turns a transient network failure into
+// lost data, and these are the files a deployment cannot cheaply re-fetch.
+func Transfer(ctx context.Context, src, dst string) (int64, error) {
+	srcS3 := strings.HasPrefix(src, "s3://")
+	dstS3 := strings.HasPrefix(dst, "s3://")
+
+	switch {
+	case !srcS3 && !dstS3:
+		if err := CopyTo(ctx, src, dst); err != nil {
+			return 0, err
+		}
+		fi, err := os.Stat(dst)
+		if err != nil {
+			return 0, err
+		}
+		return fi.Size(), nil
+
+	case !srcS3 && dstS3:
+		fi, err := os.Stat(src)
+		if err != nil {
+			return 0, err
+		}
+		if err := s3Put(ctx, src, dst); err != nil {
+			return 0, err
+		}
+		return fi.Size(), nil
+
+	case srcS3 && !dstS3:
+		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+			return 0, err
+		}
+		tmp := dst + ".part"
+		f, err := os.Create(tmp)
+		if err != nil {
+			return 0, err
+		}
+		n, err := s3Get(ctx, src, f)
+		f.Close()
+		if err != nil {
+			os.Remove(tmp)
+			return 0, err
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			os.Remove(tmp)
+			return 0, err
+		}
+		return n, nil
+
+	default:
+		// Bucket to bucket. Streamed through this process rather than served by
+		// a server-side copy, because the two ends may be different endpoints —
+		// versitygw and AWS, say — and a CopyObject cannot cross that.
+		tmp, err := os.CreateTemp("", "varhub-move-*")
+		if err != nil {
+			return 0, err
+		}
+		defer os.Remove(tmp.Name())
+		n, err := s3Get(ctx, src, tmp)
+		if err != nil {
+			tmp.Close()
+			return 0, err
+		}
+		if err := tmp.Close(); err != nil {
+			return 0, err
+		}
+		if err := s3Put(ctx, tmp.Name(), dst); err != nil {
+			return 0, err
+		}
+		return n, nil
+	}
+}
+
+// Remove deletes a file at a path or an object locator, tolerating absence.
+func Remove(ctx context.Context, loc string) error {
+	if !strings.HasPrefix(loc, "s3://") {
+		if err := os.Remove(loc); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		return nil
+	}
+	bucket, key, err := splitS3(loc)
+	if err != nil {
+		return err
+	}
+	c, err := s3c(ctx)
+	if err != nil {
+		return err
+	}
+	_, err = c.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(bucket), Key: aws.String(key),
+	})
+	return err
 }

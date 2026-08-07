@@ -290,3 +290,32 @@ func (s *Store) StorageRootsForSources(ctx context.Context, sourceIDs []string) 
 	}
 	return out, rows.Err()
 }
+
+// StorageForSource lists the locations that currently hold a source's files.
+//
+// Normally one. More than one means a move was interrupted after the copy and
+// before the old rows were cleared — which is the safe half of the failure, so
+// it is reported rather than treated as impossible.
+func (s *Store) StorageForSource(ctx context.Context, sourceID string) ([]StorageLocation, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT DISTINCT sl.id, sl.name, sl.kind, sl.uri, sl.from_config, sl.is_default,
+		       sl.created_at, sl.updated_at
+		  FROM storage_location sl
+		  JOIN source_file f ON f.storage_id = sl.id
+		 WHERE f.source_id = $1
+		 ORDER BY sl.name`, sourceID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StorageLocation
+	for rows.Next() {
+		var l StorageLocation
+		if err := rows.Scan(&l.ID, &l.Name, &l.Kind, &l.URI, &l.FromConfig,
+			&l.IsDefault, &l.CreatedAt, &l.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}

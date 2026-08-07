@@ -150,6 +150,7 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)
 	m.HandleFunc("GET /api/v1/admin/files", s.handleFiles)
 	m.HandleFunc("POST /api/v1/admin/downloads", s.handleDownload)
+	m.HandleFunc("POST /api/v1/admin/sources/{id}/move", s.handleMoveSource)
 	m.HandleFunc("POST /api/v1/admin/sources/{id}/default-reference", s.handleSetDefaultReference)
 	m.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)
 	m.HandleFunc("POST /api/v1/admin/registries", s.handleCreateRegistry)

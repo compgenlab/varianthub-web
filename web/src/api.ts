@@ -709,6 +709,12 @@ export const api = {
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
 
+  moveSource: (id: string, storageID: string) =>
+    req<{ job_id: string; from: string; to: string }>(
+      `/admin/sources/${encodeURIComponent(id)}/move`,
+      { method: "POST", body: JSON.stringify({ storage_id: storageID }) },
+    ),
+
   setDefaultReference: (id: string) =>
     req<void>(`/admin/sources/${encodeURIComponent(id)}/default-reference`, {
       method: "POST",

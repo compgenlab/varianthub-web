@@ -911,3 +911,84 @@ func (s *Server) handleSetDefaultReference(w http.ResponseWriter, r *http.Reques
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// handleMoveSource relocates a source's files to another storage location.
+//
+// Queued rather than done inline: it moves the same volume of data a download
+// does — tens of gigabytes for a large source — and only the worker can reach
+// both ends.
+func (s *Server) handleMoveSource(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil || s.queue == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		StorageID string `json:"storage_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	sourceID := r.PathValue("id")
+	src, err := s.catalog.GetSource(r.Context(), sourceID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	to, err := s.catalog.GetStorage(r.Context(), req.StorageID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !to.Usable() {
+		writeError(w, http.StatusBadRequest, to.UnusableReason())
+		return
+	}
+
+	// Which location it is leaving is derived rather than asked for: a caller
+	// naming the wrong origin would move nothing and report success.
+	locs, err := s.catalog.StorageForSource(r.Context(), sourceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var from catalog.StorageLocation
+	for _, l := range locs {
+		if l.ID != req.StorageID {
+			from = l
+			break
+		}
+	}
+	if from.ID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"%s has no files to move (it is already in %s, or has not been downloaded)",
+			src.Ref(), to.Name))
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"source_id": sourceID, "from_storage": from.ID, "to_storage": to.ID,
+		"from_uri": from.URI, "to_uri": to.URI,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+		Kind:      queue.KindMove,
+		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
+		Label:     "move " + src.Ref() + ": " + from.Name + " → " + to.Name,
+		Selection: sourceID,
+		// Same volume of data as fetching it, so the same cost to the pool.
+		Weight: s.cfg.DownloadWeight,
+		Body:   body,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": id, "from": from.Name, "to": to.Name,
+	})
+}

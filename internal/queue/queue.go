@@ -57,6 +57,10 @@ const (
 	// KindCleanup reclaims a removed source's files, for the same reason
 	// downloads are jobs: only the worker mounts the storage.
 	KindCleanup = "cleanup"
+	// KindMove relocates a source's files between storage locations. A job
+	// because it moves the same volume of data a download does, and because
+	// only the worker can reach both ends.
+	KindMove = "move"
 )
 
 // Postgres NOTIFY channels.
