@@ -136,6 +136,35 @@ func (h *harness) session(t *testing.T) string {
 	return h.sessionFor(t, u.ID)
 }
 
+// anon issues a server-side anonymous session, the credential a visitor gets
+// from loading the site.
+func (h *harness) anon(t *testing.T) string {
+	t.Helper()
+	id, err := h.ids.CreateAnonSession(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// doAnon issues a request as an anonymous visitor carrying that session.
+func (h *harness) doAnon(method, path, anon string, body any) *httptest.ResponseRecorder {
+	var r *http.Request
+	if body != nil {
+		b, _ := json.Marshal(body)
+		r = httptest.NewRequest(method, path, bytes.NewReader(b))
+		r.Header.Set("Content-Type", "application/json")
+	} else {
+		r = httptest.NewRequest(method, path, nil)
+	}
+	if anon != "" {
+		r.AddCookie(&http.Cookie{Name: AnonCookie, Value: anon})
+	}
+	w := httptest.NewRecorder()
+	h.http.ServeHTTP(w, r)
+	return w
+}
+
 // sessionFor returns a browser session for an account that already exists, so a
 // test can hold both a token and a session for the same person.
 func (h *harness) sessionFor(t *testing.T, userID string) string {
@@ -654,7 +683,9 @@ func TestAllowAnonymous(t *testing.T) {
 		Admin          bool `json:"admin"`
 		AllowAnonymous bool `json:"allow_anonymous"`
 	}
-	w := h.do("GET", "/api/v1/auth/me", "", nil)
+	visitor := h.anon(t)
+
+	w := h.doAnon("GET", "/api/v1/auth/me", visitor, nil)
 	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
 		t.Fatal(err)
 	}
@@ -663,8 +694,18 @@ func TestAllowAnonymous(t *testing.T) {
 	}
 
 	for _, p := range []string{"/api/v1/ping", "/api/v1/snapshots", "/api/v1/sources"} {
-		if got := h.do("GET", p, "", nil); got.Code != http.StatusOK {
+		if got := h.doAnon("GET", p, visitor, nil); got.Code != http.StatusOK {
 			t.Errorf("anonymous GET %s = %d, want 200", p, got.Code)
+		}
+		// Anonymous means a visitor who loaded the site, not a request with no
+		// credential. Allowing the second would publish the whole API to
+		// anybody, which is what a token is for.
+		if got := h.do("GET", p, "", nil); got.Code != http.StatusUnauthorized {
+			t.Errorf("no credential GET %s = %d, want 401", p, got.Code)
+		}
+		// And a session the client invented is not one we issued.
+		if got := h.doAnon("GET", p, "made-up", nil); got.Code != http.StatusUnauthorized {
+			t.Errorf("self-asserted session GET %s = %d, want 401", p, got.Code)
 		}
 	}
 	// Opening the annotation flow must not open the catalog.
@@ -681,7 +722,7 @@ func TestAllowAnonymous(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	w = h.do("GET", "/api/v1/sources", "", nil)
+	w = h.doAnon("GET", "/api/v1/sources", visitor, nil)
 	if strings.Contains(w.Body.String(), "secret") {
 		t.Errorf("a private source is visible anonymously: %s", w.Body.String())
 	}
@@ -701,7 +742,7 @@ func TestAnonymousJobHistoryIsScoped(t *testing.T) {
 			strings.NewReader(`{"snapshot":"s","variants":["chr1:100:A:G"]}`))
 		r.Header.Set("Content-Type", "application/json")
 		if session != "" {
-			r.Header.Set("X-Varhub-Session", session)
+			r.AddCookie(&http.Cookie{Name: AnonCookie, Value: session})
 		}
 		w := httptest.NewRecorder()
 		h.http.ServeHTTP(w, r)
@@ -720,24 +761,29 @@ func TestAnonymousJobHistoryIsScoped(t *testing.T) {
 		t.Helper()
 		r := httptest.NewRequest("GET", "/api/v1/jobs/"+id, nil)
 		if session != "" {
-			r.Header.Set("X-Varhub-Session", session)
+			r.AddCookie(&http.Cookie{Name: AnonCookie, Value: session})
 		}
 		w := httptest.NewRecorder()
 		h.http.ServeHTTP(w, r)
 		return w.Code
 	}
 
-	mine := submit("browser-a")
-	if got := read(mine, "browser-a"); got != http.StatusOK {
+	browserA, browserB := h.anon(t), h.anon(t)
+
+	mine := submit(browserA)
+	if got := read(mine, browserA); got != http.StatusOK {
 		t.Errorf("reading my own job = %d, want 200", got)
 	}
 	// Someone else's browser, and no scope at all, both get a 404 rather than
 	// a 403 — confirming the job exists is itself a small leak.
-	if got := read(mine, "browser-b"); got != http.StatusNotFound {
+	if got := read(mine, browserB); got != http.StatusNotFound {
 		t.Errorf("another browser reading it = %d, want 404", got)
 	}
-	if got := read(mine, ""); got != http.StatusNotFound {
-		t.Errorf("an unscoped read = %d, want 404", got)
+	// No credential at all is now refused before ownership is considered: it is
+	// not an anonymous visitor reading somebody else's job, it is a request that
+	// presented nothing. 401 says which, and says it is fixable.
+	if got := read(mine, ""); got != http.StatusUnauthorized {
+		t.Errorf("an unscoped read = %d, want 401", got)
 	}
 }
 

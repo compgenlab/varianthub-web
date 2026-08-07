@@ -72,14 +72,15 @@ func normalizeLocus(s string) string {
 }
 
 // sessionOf identifies the submitter for history scoping.
+//
+// The server-issued anonymous session, not the X-Varhub-Session header this
+// used to read. That header was a random id the browser generated for itself,
+// so it scoped a history but proved nothing — and being indistinguishable from
+// a value anyone could send is what let a bare curl look like a visitor.
+//
+// Empty for a signed-in caller, whose jobs scope by account instead.
 func sessionOf(r *http.Request) string {
-	if s := strings.TrimSpace(r.Header.Get("X-Varhub-Session")); s != "" {
-		return s
-	}
-	if c, err := r.Cookie("varhub_session"); err == nil {
-		return strings.TrimSpace(c.Value)
-	}
-	return ""
+	return callerOf(r).Scope()
 }
 
 // trustedCaller reports whether the caller may read *anyone's* jobs.

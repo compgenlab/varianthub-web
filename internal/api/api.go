@@ -138,7 +138,7 @@ func (s *Server) Routes() http.Handler {
 	// unknown /api path therefore 404s as JSON rather than returning the app
 	// shell, which would be a confusing thing to debug from a client.
 	if s.spa != nil {
-		mux.Handle("/", s.spa.Handler())
+		mux.Handle("/", s.issueAnonSession(s.spa.Handler()))
 	}
 
 	return s.withCORS(logRequests(mux))

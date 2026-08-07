@@ -19,6 +19,10 @@ import (
 // and it must not be mistaken for proof of who they are.
 const SessionCookie = "vh_auth"
 
+// AnonCookie carries the server-issued session for a visitor who has not signed
+// in. Handed out with the app shell, so having one means having loaded the site.
+const AnonCookie = "vh_anon"
+
 type callerKey struct{}
 
 // callerOf returns the identity resolved for this request. An unauthenticated
@@ -70,15 +74,64 @@ func (s *Server) resolveCaller(r *http.Request) (identity.Caller, error) {
 	if c, err := r.Cookie(SessionCookie); err == nil {
 		session = strings.TrimSpace(c.Value)
 	}
-	return s.identity.Resolve(r.Context(), bearer, session)
+	caller, err := s.identity.Resolve(r.Context(), bearer, session)
+	if err != nil {
+		return caller, err
+	}
+	// An anonymous session is resolved even for a signed-in caller, so that
+	// signing in mid-visit does not orphan the jobs submitted before it. It
+	// never contributes identity — Resolve has already settled who this is.
+	if c, cErr := r.Cookie(AnonCookie); cErr == nil {
+		id := strings.TrimSpace(c.Value)
+		// Checked against the table rather than trusted: an id the client made
+		// up must not work, or this is the self-asserted history scope again
+		// under a new name.
+		ok, aErr := s.identity.AnonSession(r.Context(), id)
+		if aErr != nil {
+			return caller, aErr
+		}
+		if ok {
+			caller.AnonSession = id
+		}
+	}
+	return caller, nil
 }
 
-// requireAuth rejects an unidentified caller unless the deployment opted into
-// anonymous access with VHW_ALLOW_ANONYMOUS.
+// requireAuth rejects a caller who presents nothing at all.
+//
+// "Anonymous access" means a visitor browsing the site without an account, not
+// an unauthenticated request. Those were the same thing while anonymity was a
+// header the client wrote itself, which is how a bare curl could submit against
+// the published API by claiming to be somebody browsing. A visitor now carries
+// a session this server issued, so the two are distinguishable and only the
+// first is served.
+//
+// A token counts, of course: that is what the published API is for.
 func (s *Server) requireAuth(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.cfg.AllowAnonymous || !callerOf(r).Anonymous() {
+		c := callerOf(r)
+		if !c.Anonymous() {
 			h.ServeHTTP(w, r)
+			return
+		}
+		if s.cfg.AllowAnonymous && c.Credentialed() {
+			h.ServeHTTP(w, r)
+			return
+		}
+		// With no identity store there is nothing to issue a session from, so
+		// requiring one would turn AllowAnonymous into "allow nobody". A
+		// deployment without accounts is the one case where anonymous really
+		// does mean "no credential".
+		if s.cfg.AllowAnonymous && s.identity == nil {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if s.cfg.AllowAnonymous {
+			// Distinguished from "sign in": there is nothing to sign in to, and
+			// the fix is to use a token or to load the site in a browser.
+			writeError(w, http.StatusUnauthorized,
+				"no credential: the REST API needs an API token, and browsing "+
+					"anonymously needs a session from loading the site")
 			return
 		}
 		writeError(w, http.StatusUnauthorized, "sign in to continue")
@@ -351,6 +404,61 @@ func (s *Server) webOnly(h http.Handler) http.Handler {
 				"not part of the REST API; this endpoint serves the web application")
 			return
 		}
+		h.ServeHTTP(w, r)
+	})
+}
+
+// issueAnonSession hands the app shell a session, so a visitor who never signs
+// in still has one this server issued.
+//
+// Wrapped around the SPA rather than the API: a session should mean somebody
+// loaded the site. Minting one for any request that lacked a cookie would hand
+// them out to the very callers this is meant to distinguish, and the check
+// would prove nothing.
+//
+// Only when the deployment allows anonymous use. Where it does not, everyone
+// signs in and their jobs scope by account, so a row per visit would be
+// bookkeeping for nothing.
+func (s *Server) issueAnonSession(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.identity == nil || !s.cfg.AllowAnonymous {
+			h.ServeHTTP(w, r)
+			return
+		}
+		// Assets are fetched by a page that already got one, and there can be
+		// dozens per load — minting on each would be a row per asset.
+		if strings.HasPrefix(strings.TrimPrefix(r.URL.Path, "/"), "assets/") {
+			h.ServeHTTP(w, r)
+			return
+		}
+		if c, err := r.Cookie(AnonCookie); err == nil {
+			if ok, aErr := s.identity.AnonSession(r.Context(), strings.TrimSpace(c.Value)); aErr == nil && ok {
+				h.ServeHTTP(w, r)
+				return
+			}
+			// An unknown or expired id falls through and is replaced, so a
+			// visitor whose session aged out gets a working one rather than a
+			// cookie that quietly authorizes nothing.
+		}
+		id, err := s.identity.CreateAnonSession(r.Context())
+		if err != nil {
+			// The page still loads; the visitor just cannot submit until a
+			// later request succeeds in issuing one.
+			log.Printf("api: issue anonymous session: %v", err)
+			h.ServeHTTP(w, r)
+			return
+		}
+		http.SetCookie(w, &http.Cookie{
+			Name:  AnonCookie,
+			Value: id,
+			Path:  "/",
+			// HttpOnly: script has no reason to read it, and it scopes a job
+			// history. SameSite=Lax so a link into the app still carries it.
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+			Secure:   r.TLS != nil,
+			MaxAge:   int(identity.AnonTTL / time.Second),
+		})
 		h.ServeHTTP(w, r)
 	})
 }

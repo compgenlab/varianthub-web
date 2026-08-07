@@ -302,56 +302,10 @@ export function setToken(t: string) {
   else sessionStorage.removeItem(TOKEN_KEY);
 }
 
-// A per-browser id scoping an anonymous visitor's own job history.
-//
-// This is not a credential and grants nothing: the server treats it as a
-// self-asserted history scope, and a job that has a real account behind it
-// ignores it entirely. It exists because without one an anonymous caller can
-// submit a job and then get a 404 reading it back — there would be nothing to
-// scope the result to, and returning everyone's jobs instead is not an option.
-//
-// localStorage rather than sessionStorage so a reload or a new tab still finds
-// yesterday's results, which is the whole point of a history.
-const SESSION_KEY = "vh_history";
-
-function historyID(): string {
-  let id = localStorage.getItem(SESSION_KEY);
-  if (!id) {
-    id = randomID();
-    localStorage.setItem(SESSION_KEY, id);
-  }
-  return id;
-}
-
-/**
- * A random identifier that works outside a secure context.
- *
- * Deliberately not crypto.randomUUID(): that is secure-context-only, so it is
- * undefined over plain http on anything but localhost — and because this runs
- * inside headers(), a throw there fails *every* request, including the one the
- * app uses to find out who you are. The symptom is a login page on
- * http://host:18080 and none through an ssh tunnel to localhost, which looks
- * like a server problem and is not.
- *
- * getRandomValues has no such restriction. Math.random is the last resort: this
- * id scopes a history and is not a credential, so uniqueness is the only
- * requirement, and a browser too old for getRandomValues should still work.
- */
-function randomID(): string {
-  const bytes = new Uint8Array(16);
-  if (globalThis.crypto?.getRandomValues) {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = { ...extra };
   const t = getToken();
   if (t) h.Authorization = `Bearer ${t}`;
-  h["X-Varhub-Session"] = historyID();
   return h;
 }
 
