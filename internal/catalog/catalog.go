@@ -140,6 +140,9 @@ func (s Snapshot) ContainsPrivate() bool {
 type Store struct {
 	pool  *pgxpool.Pool
 	nowFn func() int64
+	// Where asset content lives when it is not inline. Nil keeps it in the
+	// database, which is what an installation with no storage configured does.
+	blobs AssetBlobs
 }
 
 // New wraps a pool.

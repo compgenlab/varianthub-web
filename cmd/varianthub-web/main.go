@@ -71,6 +71,8 @@ func run(args []string) error {
 		return cmdSource(ctx, cfg, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, cfg, args[1:])
+	case "assets":
+		return cmdAssets(ctx, cfg, args[1:])
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -96,7 +98,7 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	// a failure here is not survivable in practice -- but the server is still
 	// useful for submitting and polling, so report it rather than refusing to
 	// start, and let those endpoints answer 503.
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		log.Printf("serve: catalog unavailable, /api/v1/snapshots and /sources will 503: %v", err)
 	} else {
@@ -208,7 +210,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -241,7 +243,7 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 		log.Printf("worker: using fixed annotation home %s (catalog bypassed)", cfg.VarhubHome)
 		return runner.FixedHome(cfg.VarhubHome), nil
 	}
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -279,7 +281,7 @@ func syncStorage(ctx context.Context, cfg *config.Config, cat *catalog.Store) er
 
 // seed populates an empty catalog with a starter snapshot.
 func seed(ctx context.Context, cfg *config.Config) error {
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -532,6 +534,8 @@ catalog administration:
   snapshot add <name> --build B --source S [--publish]
                                      create/update a snapshot pinning sources
   snapshot list                      list snapshots
+  assets list                        show helper files still held in Postgres
+  assets backfill                    move them into the configured storage
   version   print the version
 
 Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or

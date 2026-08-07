@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Check, Cloud, Globe, HardDrive, Plus, Trash2, X } from "lucide-react";
+import { Check, Cloud, Globe, HardDrive, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import {
   api,
@@ -553,6 +553,11 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   const [regErr, setRegErr] = useState("");
   const [loadingRef, setLoadingRef] = useState("");
   const [addingReg, setAddingReg] = useState(false);
+  // Bumped to re-run the dataset fetch. The server holds no cache — it re-reads
+  // the registry's manifest on every request — so what goes stale is this
+  // component's copy, taken when the page mounted. Refreshing genuinely
+  // re-reads the remote.
+  const [reload, setReload] = useState(0);
 
   async function loadRegistries(select?: string) {
     try {
@@ -587,7 +592,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
       .registryDatasets(regID)
       .then((d) => setEntries(d.sources ?? []))
       .catch((e) => setRegErr(e instanceof Error ? e.message : String(e)));
-  }, [regID]);
+  }, [regID, reload]);
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -734,7 +739,18 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
           )}
 
           <div className="card">
-            <div className="thead">Available datasets</div>
+            <div className="thead between">
+              <span>Available datasets</span>
+              <button
+                className="btn link"
+                style={{ fontSize: 12 }}
+                disabled={!regID || entries === null}
+                onClick={() => setReload((n) => n + 1)}
+                title="Re-read this registry's manifest"
+              >
+                <RefreshCw size={12} /> {entries === null ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
             {regErr && (
               <div className="empty err" style={{ padding: "16px 13px", fontSize: 12.5 }}>
                 {regErr}

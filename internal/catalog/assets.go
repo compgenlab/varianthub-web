@@ -114,9 +114,29 @@ func (s *Store) PutAssets(ctx context.Context, sourceID string, assets []Asset) 
 			return fmt.Errorf("asset %q is %d bytes, over the %d byte limit",
 				a.Name, len(a.Content), MaxAssetBytes)
 		}
+		content := []byte(a.Content)
+		digest := AssetDigest(content)
+
+		// Upload before the row commits. The other order would let a row claim
+		// a digest that is not there, and a job would then fail at the first
+		// build step with nothing to say why. An upload with no row is only an
+		// unreferenced object.
+		if s.blobs != nil {
+			if err := s.blobs.PutAsset(ctx, digest, content); err != nil {
+				return fmt.Errorf("store asset %q: %w", a.Name, err)
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO source_asset (source_id,name,content,sha256,size_bytes,created_at)
+				 VALUES ($1,$2,NULL,$3,$4,$5)`,
+				sourceID, a.Name, digest, len(content), now); err != nil {
+				return err
+			}
+			continue
+		}
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO source_asset (source_id,name,content,created_at) VALUES ($1,$2,$3,$4)`,
-			sourceID, a.Name, []byte(a.Content), now); err != nil {
+			`INSERT INTO source_asset (source_id,name,content,sha256,size_bytes,created_at)
+			 VALUES ($1,$2,$3,$4,$5,$6)`,
+			sourceID, a.Name, content, digest, len(content), now); err != nil {
 			return err
 		}
 	}
@@ -126,20 +146,42 @@ func (s *Store) PutAssets(ctx context.Context, sourceID string, assets []Asset) 
 // Assets returns a source's stored helper files.
 func (s *Store) Assets(ctx context.Context, sourceID string) ([]Asset, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT name, content FROM source_asset WHERE source_id=$1 ORDER BY name`, sourceID)
+		`SELECT name, content, sha256 FROM source_asset WHERE source_id=$1 ORDER BY name`, sourceID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	out := []Asset{}
+	type pending struct {
+		idx    int
+		digest string
+	}
+	var fetch []pending
 	for rows.Next() {
 		var a Asset
 		var content []byte
-		if err := rows.Scan(&a.Name, &content); err != nil {
+		var digest string
+		if err := rows.Scan(&a.Name, &content, &digest); err != nil {
 			return nil, err
 		}
-		a.Content = string(content)
+		if content == nil {
+			fetch = append(fetch, pending{len(out), digest})
+		} else {
+			a.Content = string(content)
+		}
 		out = append(out, a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Read the rows out before touching storage: holding a pooled connection
+	// open across a network fetch would tie up a connection per asset.
+	for _, p := range fetch {
+		content, err := s.fetchAsset(ctx, out[p.idx].Name, p.digest)
+		if err != nil {
+			return nil, err
+		}
+		out[p.idx].Content = string(content)
 	}
 	return out, rows.Err()
 }
@@ -152,23 +194,48 @@ func (s *Store) AssetsFor(ctx context.Context, sourceIDs []string) (map[string][
 		return out, nil
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT source_id, name, content FROM source_asset
+		`SELECT source_id, name, content, sha256 FROM source_asset
 		  WHERE source_id = ANY($1) ORDER BY source_id, name`, sourceIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
+	type pending struct {
+		id     string
+		idx    int
+		digest string
+	}
+	var fetch []pending
 	for rows.Next() {
 		var id string
 		var a Asset
 		var content []byte
-		if err := rows.Scan(&id, &a.Name, &content); err != nil {
+		var digest string
+		if err := rows.Scan(&id, &a.Name, &content, &digest); err != nil {
+			return nil, err
+		}
+		if content == nil {
+			fetch = append(fetch, pending{id, len(out[id]), digest})
+		} else {
+			a.Content = string(content)
+		}
+		out[id] = append(out[id], a)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// After the rows are drained, for the same reason as Assets: a connection
+	// per asset held across a network fetch would exhaust the pool on a
+	// snapshot with several scripted sources.
+	for _, p := range fetch {
+		a := &out[p.id][p.idx]
+		content, err := s.fetchAsset(ctx, a.Name, p.digest)
+		if err != nil {
 			return nil, err
 		}
 		a.Content = string(content)
-		out[id] = append(out[id], a)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // MissingAssets names the helper files a manifest declares but the catalog does
@@ -185,4 +252,22 @@ func MissingAssets(text string, have []Asset) []string {
 		}
 	}
 	return missing
+}
+
+// fetchAsset resolves one out-of-line asset, verifying it against its digest.
+func (s *Store) fetchAsset(ctx context.Context, name, digest string) ([]byte, error) {
+	if digest == "" {
+		// Neither inline nor addressed. A row is written with one or the other
+		// in the same transaction, so this means something wrote it by hand.
+		return nil, fmt.Errorf("asset %q has neither content nor a digest", name)
+	}
+	if s.blobs == nil {
+		return nil, fmt.Errorf("asset %q is stored as %s but no asset storage is "+
+			"configured for this process", name, digest[:12])
+	}
+	content, err := s.blobs.GetAsset(ctx, digest)
+	if err != nil {
+		return nil, fmt.Errorf("fetch asset %q (%s): %w", name, digest[:12], err)
+	}
+	return content, nil
 }
