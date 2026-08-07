@@ -89,7 +89,32 @@ a { color: var(--accent-text); }
 
 /* --- app shell --- */
 
-.app { display: flex; height: 100%; }
+/* A full-width bar above everything, then sidebar + content beneath it. The bar
+   spans the window rather than only the content column so the wordmark sits in
+   the window's top-left corner, where a person looks for it, and the account
+   menu in the top-right, where they look for that. */
+.app { display: flex; flex-direction: column; height: 100%; }
+.app-body { flex: 1; display: flex; min-height: 0; }
+
+.appbar {
+  flex: none;
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 0 var(--gutter) 0 0;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+/* Matches the sidebar width so the wordmark lines up with the nav beneath it. */
+.appbar .wordmark { width: var(--sidebar); box-sizing: border-box; }
+
+.usermenu { position: relative; }
+.usermenu > button {
+  display: flex; align-items: center; gap: 7px;
+  background: none; border: none; cursor: pointer;
+  font-size: 13px; color: var(--text-2);
+  padding: 7px 9px; border-radius: 7px;
+}
+.usermenu > button:hover { background: var(--neutral-fill); color: var(--text); }
+.usermenu .menu { right: 0; left: auto; top: calc(100% + 4px); min-width: 172px; }
 
 .sidebar {
   width: var(--sidebar);
@@ -132,13 +157,6 @@ a { color: var(--accent-text); }
 
 .main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
 
-.topbar {
-  flex: none;
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 11px var(--gutter);
-  background: var(--surface);
-  border-bottom: 1px solid var(--border);
-}
 .eyebrow {
   font-size: 10px; letter-spacing: 0.09em; text-transform: uppercase;
   color: rgba(22, 24, 29, 0.42);
