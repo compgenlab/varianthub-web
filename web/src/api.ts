@@ -430,7 +430,7 @@ export const api = {
    */
   downloadExport: async (
     id: string,
-    format: "json" | "tsv" | "csv",
+    format: "json" | "tsv" | "csv" | "vcf",
     p: { sort?: string; order?: string; q?: string } = {},
   ) => {
     const q = new URLSearchParams({ format });
