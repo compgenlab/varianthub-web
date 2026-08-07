@@ -892,3 +892,22 @@ func (s *Server) handleSetSnapshotSources(w http.ResponseWriter, r *http.Request
 		"snapshot": snap, "annotations": snapshotAnnotations(snap),
 	})
 }
+
+// handleSetDefaultReference marks a reference genome as the one ad-hoc
+// snapshots pin for its assembly.
+//
+// Ad-hoc annotation assembles a snapshot per job from whatever the caller
+// selected, so it has nobody to ask which genome to use. This is that answer.
+// The chosen source is still pinned into the snapshot, so the default is a
+// decision made once rather than an indirection resolved on every run.
+func (s *Server) handleSetDefaultReference(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.SetDefaultReference(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

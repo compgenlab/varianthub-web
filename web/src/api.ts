@@ -29,6 +29,8 @@ export interface Source {
   build?: string;
   visibility: string;
   index_status: string;
+  /** Set on the reference genome ad-hoc snapshots pin for this assembly. */
+  is_default_reference?: boolean;
   origin?: string;
   stream?: boolean;
   /** Whether the source can be annotated with yet, and what is happening to it. */
@@ -706,6 +708,11 @@ export const api = {
   metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
+
+  setDefaultReference: (id: string) =>
+    req<void>(`/admin/sources/${encodeURIComponent(id)}/default-reference`, {
+      method: "POST",
+    }),
 
 
   addStorage: (body: { name: string; kind: "s3"; uri: string }) =>

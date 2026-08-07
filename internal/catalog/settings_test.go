@@ -370,3 +370,155 @@ func TestToolDirIsPinnedToDataDir(t *testing.T) {
 			"download will not be found when annotating:\n%s", body)
 	}
 }
+
+// refSrc registers a reference source for an assembly.
+func refSrc(t *testing.T, s *Store, ctx context.Context, id, name, build string) {
+	t.Helper()
+	if err := s.PutSource(ctx, Source{
+		ID: id, Name: name, Version: "1", Kind: "reference", Build: build,
+		TOML: "[[sources]]\ntype=\"reference\"\nname=\"" + name + "\"\nversion=\"1\"\n" +
+			"assembly=\"" + build + "\"\nurl=\"https://example.org/" + name + ".fa.gz\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The two snapshot rules, checked where every snapshot passes through.
+//
+// Unmet, varhub renders {ref} as nothing and the tool dies on a mangled command
+// line — VEP reported "Unexpected extra command-line parameter(s): 4" because
+// --fasta swallowed --fork. Nothing in that mentions a genome.
+func TestSnapshotReferenceRules(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	refSrc(t, s, ctx, "GRCh38.p13", "GRCh38.p13", "GRCh38")
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\n" +
+			"assembly=\"GRCh38\"\nrequires_reference=true\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Needs one, none pinned.
+	err := s.PutSnapshot(ctx, Snapshot{ID: "a", Build: "GRCh38"}, []string{"vep-113"})
+	if err == nil {
+		t.Error("a snapshot needing a reference was accepted without one")
+	} else if !strings.Contains(err.Error(), "requires a reference") {
+		t.Errorf("error does not name the cause: %v", err)
+	}
+
+	// Two references: {ref} would have no single answer.
+	err = s.PutSnapshot(ctx, Snapshot{ID: "b", Build: "GRCh38"},
+		[]string{"vep-113", "GRCh38.p14", "GRCh38.p13"})
+	if err == nil {
+		t.Error("a snapshot pinning two references was accepted")
+	} else if !strings.Contains(err.Error(), "one reference") {
+		t.Errorf("error does not name the cause: %v", err)
+	}
+
+	// One reference, requirement met.
+	if err = s.PutSnapshot(ctx, Snapshot{ID: "c", Build: "GRCh38"},
+		[]string{"vep-113", "GRCh38.p14"}); err != nil {
+		t.Fatalf("a well-formed snapshot was rejected: %v", err)
+	}
+}
+
+// An ad-hoc snapshot has nobody to ask which reference to use, so it takes the
+// assembly's default — and pins it, so re-running later cannot drift onto a
+// newer genome.
+func TestAdhocPinsTheDefaultReference(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\n" +
+			"assembly=\"GRCh38\"\nrequires_reference=true\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSource(ctx, Source{
+		ID: "gencode-48", Name: "gencode", Version: "48", Kind: "gtf", Build: "GRCh38",
+		TOML: "[[sources]]\nname=\"gencode\"\nversion=\"48\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No default yet: the failure names the administrator action, not the caller's.
+	if _, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"vep-113"}, nil); err == nil {
+		t.Error("ad-hoc annotation with VEP succeeded without any reference")
+	} else if !strings.Contains(err.Error(), "no default") {
+		t.Errorf("error does not say what to do: %v", err)
+	}
+
+	if err := s.SetDefaultReference(ctx, "GRCh38.p14"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"vep-113"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.GetSnapshot(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinned bool
+	for _, src := range snap.Sources {
+		if src.ID == "GRCh38.p14" {
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Error("the ad-hoc snapshot did not pin the default reference")
+	}
+
+	// A selection needing no reference must not drag one in.
+	id2, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"gencode-48"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap2, err := s.GetSnapshot(ctx, id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range snap2.Sources {
+		if src.IsReference() {
+			t.Error("a selection needing no reference pinned one anyway")
+		}
+	}
+}
+
+// One default per assembly: two would make the ad-hoc choice arbitrary, and the
+// arbitrariness invisible.
+func TestOneDefaultReferencePerAssembly(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	refSrc(t, s, ctx, "GRCh38.p13", "GRCh38.p13", "GRCh38")
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	refSrc(t, s, ctx, "GRCh37", "GRCh37", "GRCh37")
+
+	for _, id := range []string{"GRCh38.p13", "GRCh38.p14"} {
+		if err := s.SetDefaultReference(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetDefaultReference(ctx, "GRCh37"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := s.DefaultReference(ctx, "GRCh38")
+	if err != nil || !ok {
+		t.Fatalf("no default for GRCh38: ok=%v err=%v", ok, err)
+	}
+	if got.ID != "GRCh38.p14" {
+		t.Errorf("default = %s, want the most recently set (GRCh38.p14)", got.ID)
+	}
+	// A different assembly keeps its own.
+	if got, ok, _ = s.DefaultReference(ctx, "GRCh37"); !ok || got.ID != "GRCh37" {
+		t.Errorf("GRCh37 default = %+v", got)
+	}
+}

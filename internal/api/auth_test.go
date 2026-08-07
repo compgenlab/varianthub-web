@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -22,23 +24,27 @@ import (
 
 // The authorization rules are the point of this file, and they are enforced
 // against real rows — a stubbed store would test the stub.
-var authMigrations = []string{
-	"../../migrations/0001_job_queue.sql",
-	"../../migrations/0002_catalog.sql",
-	"../../migrations/0003_job_variant.sql",
-	"../../migrations/0004_registry.sql",
-	"../../migrations/0005_adhoc_snapshot.sql",
-	"../../migrations/0006_storage.sql",
-	"../../migrations/0007_auth.sql",
-	"../../migrations/0008_default_private.sql",
-	"../../migrations/0009_bootstrap.sql",
-	"../../migrations/0010_job_user.sql",
-	"../../migrations/0016_job_weight.sql",
-	"../../migrations/0011_external_identity.sql",
-	"../../migrations/0012_source_asset.sql",
-	"../../migrations/0013_job_log.sql",
-	"../../migrations/0014_source_settings.sql",
-	"../../migrations/0015_source_state.sql",
+// allMigrations are every migration, discovered rather than listed.
+//
+// The list used to be written out by hand — and had drifted out of numeric
+// order, and gone stale twice. A missing entry surfaces as `column "x" does not
+// exist` in whichever test happens to touch it, rather than as anything about
+// the list. Globbing means a new migration is exercised by the existing tests
+// the moment it lands.
+//
+// Sorted, because migrations are ordered by their numeric prefix and a later one
+// alters what an earlier one created.
+func allMigrations(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no migrations found; the glob or the layout has moved")
+	}
+	sort.Strings(files)
+	return files
 }
 
 type harness struct {
@@ -58,7 +64,7 @@ func newHarness(t *testing.T) *harness {
 	ctx := context.Background()
 
 	var ddl strings.Builder
-	for _, f := range authMigrations {
+	for _, f := range allMigrations(t) {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
