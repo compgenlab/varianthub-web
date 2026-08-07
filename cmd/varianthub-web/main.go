@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/api"
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -576,7 +577,7 @@ func runMove(ctx context.Context, cat *catalog.Store, job queue.Job, input []byt
 		src := joinLoc(req.FromURI, f.Path)
 		dst := joinLoc(req.ToURI, f.Path)
 		log.Printf("worker: move %s: %s -> %s", req.SourceID, src, dst)
-		n, err := runner.Transfer(ctx, src, dst)
+		n, err := blob.Transfer(ctx, src, dst)
 		if err != nil {
 			// Nothing is deleted and the catalog is untouched, so the source is
 			// still readable where it was.
@@ -594,7 +595,7 @@ func runMove(ctx context.Context, cat *catalog.Store, job queue.Job, input []byt
 		return queue.Outcome{}, err
 	}
 	for _, f := range files {
-		if err := runner.Remove(ctx, joinLoc(req.FromURI, f.Path)); err != nil {
+		if err := blob.Remove(ctx, joinLoc(req.FromURI, f.Path)); err != nil {
 			// The move succeeded; the leftovers are wasted space, not a failure.
 			log.Printf("worker: move %s: could not remove %s: %v", req.SourceID, f.Path, err)
 		}

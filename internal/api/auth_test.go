@@ -745,3 +745,46 @@ func TestValidateReportsWhetherDataIsNeeded(t *testing.T) {
 		})
 	}
 }
+
+// Re-registering a manifest must not delete the helper files it names.
+//
+// PutAssets replaces the stored set, so a POST that changed one line of TOML and
+// said nothing about assets wiped them — and the failure appeared later, at the
+// next annotation, as a tool unable to open a script, with nothing connecting it
+// to the edit. This destroyed VEP's two scripts in the dev stack.
+func TestReRegisteringKeepsAssets(t *testing.T) {
+	h := newHarness(t)
+	_, tok := h.admin(t)
+
+	manifest := "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n" +
+		"  [[sources.steps]]\n  run=\"python3 {workdir}/helper.py\"\n"
+	body := map[string]any{
+		"toml": manifest,
+		"assets": []map[string]string{
+			{"name": "helper.py", "content": "print('hi')\n"},
+		},
+	}
+	if rec := h.do("POST", "/api/v1/admin/sources", tok, body); rec.Code != 200 {
+		t.Fatalf("register = %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The same manifest with one line changed, and nothing said about assets.
+	body2 := map[string]any{"toml": manifest + "  # a comment\n"}
+	rec := h.do("POST", "/api/v1/admin/sources", tok, body2)
+	if rec.Code != 200 {
+		t.Fatalf("re-register = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"assets":1`) {
+		t.Errorf("re-registering reported %s; the stored asset should survive",
+			rec.Body.String())
+	}
+
+	// An explicit empty list still clears, so "remove them" remains expressible.
+	body3 := map[string]any{"toml": manifest, "assets": []map[string]string{}}
+	if rec = h.do("POST", "/api/v1/admin/sources", tok, body3); rec.Code != 200 {
+		t.Fatalf("clear = %d: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), `"assets":0`) {
+		t.Errorf("an explicit empty list did not clear the assets: %s", rec.Body.String())
+	}
+}

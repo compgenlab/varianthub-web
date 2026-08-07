@@ -1,4 +1,12 @@
-package runner
+// Package blob is the narrow object-store surface this service needs: read one
+// object, write one, ask whether one is there, and copy between locations.
+//
+// Separate from the worker because both processes need it — the API uploads a
+// source's assets when it registers one, and the worker moves and fetches
+// files — and because varhub's own object-store code serves a different
+// purpose: it provisions annotation data, while this handles the artifacts the
+// service itself keeps.
+package blob
 
 import (
 	"context"
@@ -34,7 +42,7 @@ var (
 //
 // Lazy, because an installation with no object store must never see a
 // credential error from a code path it does not use.
-func s3c(ctx context.Context) (*s3.Client, error) {
+func client(ctx context.Context) (*s3.Client, error) {
 	s3Once.Do(func() {
 		cfg, err := awsconfig.LoadDefaultConfig(ctx)
 		if err != nil {
@@ -67,7 +75,7 @@ func firstEnv(names ...string) string {
 }
 
 // splitS3 parses "s3://bucket/key" into its parts.
-func splitS3(uri string) (bucket, key string, err error) {
+func splitURI(uri string) (bucket, key string, err error) {
 	rest := strings.TrimPrefix(uri, "s3://")
 	if rest == uri {
 		return "", "", fmt.Errorf("%q is not an s3:// URI", uri)
@@ -83,12 +91,12 @@ func splitS3(uri string) (bucket, key string, err error) {
 }
 
 // s3Get streams an object into w.
-func s3Get(ctx context.Context, uri string, w io.Writer) (int64, error) {
-	bucket, key, err := splitS3(uri)
+func Get(ctx context.Context, uri string, w io.Writer) (int64, error) {
+	bucket, key, err := splitURI(uri)
 	if err != nil {
 		return 0, err
 	}
-	c, err := s3c(ctx)
+	c, err := client(ctx)
 	if err != nil {
 		return 0, err
 	}
@@ -105,12 +113,12 @@ func s3Get(ctx context.Context, uri string, w io.Writer) (int64, error) {
 // s3Put uploads a local file, using a multipart upload when it is large enough
 // to need one — a reference is most of a gigabyte, so single PutObject is not
 // viable.
-func s3Put(ctx context.Context, localPath, uri string) error {
-	bucket, key, err := splitS3(uri)
+func Put(ctx context.Context, localPath, uri string) error {
+	bucket, key, err := splitURI(uri)
 	if err != nil {
 		return err
 	}
-	c, err := s3c(ctx)
+	c, err := client(ctx)
 	if err != nil {
 		return err
 	}
@@ -135,12 +143,12 @@ func s3Put(ctx context.Context, localPath, uri string) error {
 }
 
 // s3Exists reports whether an object is there.
-func s3Exists(ctx context.Context, uri string) bool {
-	bucket, key, err := splitS3(uri)
+func Exists(ctx context.Context, uri string) bool {
+	bucket, key, err := splitURI(uri)
 	if err != nil {
 		return false
 	}
-	c, err := s3c(ctx)
+	c, err := client(ctx)
 	if err != nil {
 		return false
 	}
@@ -176,7 +184,7 @@ func Transfer(ctx context.Context, src, dst string) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		if err := s3Put(ctx, src, dst); err != nil {
+		if err := Put(ctx, src, dst); err != nil {
 			return 0, err
 		}
 		return fi.Size(), nil
@@ -190,7 +198,7 @@ func Transfer(ctx context.Context, src, dst string) (int64, error) {
 		if err != nil {
 			return 0, err
 		}
-		n, err := s3Get(ctx, src, f)
+		n, err := Get(ctx, src, f)
 		f.Close()
 		if err != nil {
 			os.Remove(tmp)
@@ -211,7 +219,7 @@ func Transfer(ctx context.Context, src, dst string) (int64, error) {
 			return 0, err
 		}
 		defer os.Remove(tmp.Name())
-		n, err := s3Get(ctx, src, tmp)
+		n, err := Get(ctx, src, tmp)
 		if err != nil {
 			tmp.Close()
 			return 0, err
@@ -219,7 +227,7 @@ func Transfer(ctx context.Context, src, dst string) (int64, error) {
 		if err := tmp.Close(); err != nil {
 			return 0, err
 		}
-		if err := s3Put(ctx, tmp.Name(), dst); err != nil {
+		if err := Put(ctx, tmp.Name(), dst); err != nil {
 			return 0, err
 		}
 		return n, nil
@@ -234,11 +242,11 @@ func Remove(ctx context.Context, loc string) error {
 		}
 		return nil
 	}
-	bucket, key, err := splitS3(loc)
+	bucket, key, err := splitURI(loc)
 	if err != nil {
 		return err
 	}
-	c, err := s3c(ctx)
+	c, err := client(ctx)
 	if err != nil {
 		return err
 	}
@@ -246,4 +254,35 @@ func Remove(ctx context.Context, loc string) error {
 		Bucket: aws.String(bucket), Key: aws.String(key),
 	})
 	return err
+}
+
+// CopyTo writes a local file to a destination that may be a filesystem path or
+// an object locator.
+func CopyTo(ctx context.Context, src, dst string) error {
+	if strings.HasPrefix(dst, "s3://") {
+		return Put(ctx, src, dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }

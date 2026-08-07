@@ -44,7 +44,14 @@ type sourceRequest struct {
 	// back from a registry fetch and are posted here with the manifest, so what
 	// gets stored is what was reviewed — the fetch does not import anything on
 	// its own.
-	Assets []catalog.Asset `json:"assets,omitempty"`
+	//
+	// A pointer, so "not mentioned" is distinct from "none". Re-registering a
+	// manifest to change one line used to arrive with no assets and replace the
+	// stored set with nothing, silently deleting the scripts a tool cannot run
+	// without — the failure then appears at the next annotation as a missing
+	// file, with nothing connecting it to the edit. Absent now means keep what
+	// is there; an explicit [] still clears.
+	Assets *[]catalog.Asset `json:"assets,omitempty"`
 	// Settings this deployment applies to the source, as opposed to what the
 	// manifest says about itself. Accepted at registration so a prefix can be
 	// chosen when a second version of something is added, which is when the
@@ -136,16 +143,27 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Read before the write, so a re-registration that says nothing about assets
+	// keeps the ones already stored.
+	var existingAssets []catalog.Asset
+	if prev, err := s.catalog.Assets(r.Context(), src.ID); err == nil {
+		existingAssets = prev
+	}
+
 	if err := s.catalog.PutSource(r.Context(), src); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Written after the source, because the rows reference it. Replacing the
-	// set on every write keeps the stored files in step with the manifest that
-	// names them.
-	if err := s.catalog.PutAssets(r.Context(), src.ID, req.Assets); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	// Written after the source, because the rows reference it. Replacing the set
+	// keeps the stored files in step with the manifest that names them — but
+	// only when the caller said something about them.
+	assets := existingAssets
+	if req.Assets != nil {
+		assets = *req.Assets
+		if err := s.catalog.PutAssets(r.Context(), src.ID, assets); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.Settings != nil {
 		if err := s.catalog.PutSettings(r.Context(), src.ID, *req.Settings); err != nil {
@@ -157,11 +175,11 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 	// refused: a hand-written manifest is a legitimate way to register a source,
 	// and the files can be added later — but the caller should learn now, not
 	// from a download that fails at the first recipe step.
-	missing := catalog.MissingAssets(src.TOML, req.Assets)
+	missing := catalog.MissingAssets(src.TOML, assets)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": src.ID, "ref": src.Ref(), "kind": src.Kind,
-		"visibility": src.Visibility, "assets": len(req.Assets),
+		"visibility": src.Visibility, "assets": len(assets),
 		"missing_assets": missing,
 	})
 }

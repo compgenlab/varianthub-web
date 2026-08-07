@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"hash"
 	"io"
 	"net/http"
@@ -223,37 +224,6 @@ func fastaKind(path string) (fastaCompression, error) {
 	return fastaGzip, nil
 }
 
-// CopyTo writes a local file to a destination that may be a filesystem path or
-// an object locator.
-func CopyTo(ctx context.Context, src, dst string) error {
-	if strings.HasPrefix(dst, "s3://") {
-		return s3Put(ctx, src, dst)
-	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return err
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	tmp := dst + ".part"
-	out, err := os.Create(tmp)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		os.Remove(tmp)
-		return err
-	}
-	if err := out.Close(); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, dst)
-}
-
 // fetchS3 downloads an object, verifying a digest the same way FetchFile does
 // for http.
 func fetchS3(ctx context.Context, uri, dest, checksum string) (int64, error) {
@@ -273,7 +243,7 @@ func fetchS3(ctx context.Context, uri, dest, checksum string) (int64, error) {
 	if h != nil {
 		w = io.MultiWriter(f, h)
 	}
-	n, err := s3Get(ctx, uri, w)
+	n, err := blob.Get(ctx, uri, w)
 	if err != nil {
 		f.Close()
 		return 0, err
@@ -311,7 +281,7 @@ func RestoreFrom(ctx context.Context, durableURI, destDir string) (string, bool)
 	for i, ext := range []string{"", ".fai", ".gzi"} {
 		src, dst := durableURI+ext, local+ext
 		if strings.HasPrefix(durableURI, "s3://") {
-			if !s3Exists(ctx, src) {
+			if !blob.Exists(ctx, src) {
 				if i == 0 {
 					return "", false // no data object: nothing to restore
 				}
@@ -328,7 +298,7 @@ func RestoreFrom(ctx context.Context, durableURI, destDir string) (string, bool)
 			}
 			continue
 		}
-		if err := CopyTo(ctx, src, dst); err != nil {
+		if err := blob.CopyTo(ctx, src, dst); err != nil {
 			return "", false
 		}
 	}

@@ -405,11 +405,48 @@ function ProvisionCell({
   }
 
   if (have && have.size > 0) {
+    // Somewhere else it could go. Offered only when there is an alternative,
+    // because a single-location deployment has no move to make.
+    const elsewhere = storage.filter((l) => !have.has(l.id) && l.usable !== false);
     return (
       <span style={{ display: "block" }}>
         {[...have].map(([id, v]) => (
           <StoredAt key={id} location={storage.find((l) => l.id === id)} {...v} />
         ))}
+        {elsewhere.length > 0 && (
+          <span className="row gap-8" style={{ marginTop: 3 }}>
+            <span style={{ fontSize: 11, color: "var(--text-3)" }}>move to</span>
+            <select
+              value=""
+              disabled={busy}
+              onChange={async (e) => {
+                const to = e.target.value;
+                if (!to) return;
+                setBusy(true);
+                try {
+                  // The files are copied, recorded, and only then deleted, so
+                  // this is safe to interrupt — the source stays readable where
+                  // it is until the copy has landed.
+                  await api.moveSource(source.id, to);
+                  setMsg("moving…");
+                  onChange?.();
+                } catch (err) {
+                  setMsg(String(err));
+                } finally {
+                  setBusy(false);
+                }
+              }}
+              style={{ fontSize: 11.5, height: 22, padding: "0 4px" }}
+            >
+              <option value="">choose…</option>
+              {elsewhere.map((l) => (
+                <option key={l.id} value={l.id}>
+                  {l.name}
+                </option>
+              ))}
+            </select>
+          </span>
+        )}
         {/* A streamed source that also has a copy: say so, or the copy looks
             like the only way it is read. */}
         {streamed && (
