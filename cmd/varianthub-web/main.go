@@ -11,6 +11,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -202,6 +204,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		Home:            home,
 		Timeout:         cfg.JobTimeout,
 		DownloadTimeout: cfg.DownloadTimeout,
+		NoCache:         cfg.NoCache,
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
@@ -211,9 +214,15 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer cat.Close()
 
+	if cfg.NoCache {
+		// Loud, because it is a diagnostic mode with a real cost: every value is
+		// recomputed and nothing is kept, so a repeated query pays full price.
+		log.Printf("worker: annotation cache DISABLED (VHW_NO_CACHE) — every value " +
+			"recomputed, nothing persisted")
+	}
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat, cfg.DataDir))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -289,13 +298,15 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // it belongs to the queue rather than to either of the two types this bridges —
 // and it is written outside the Outcome because an Outcome is the job's result,
 // while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir string) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
 			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
 			return runCleanup(job, input)
+		case queue.KindReference:
+			return runReference(ctx, cat, cfgDataDir, job, input)
 		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
@@ -528,4 +539,73 @@ Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
 Copy varianthub-web.example.toml to start; see README.md. A database URL is
 always required.
 `, "\n"))
+}
+
+// runReference fetches a reference genome onto the worker's filesystem.
+//
+// Local disk, not a storage location: a tool step binds the FASTA's directory
+// into a container, so this is the one artifact that cannot be read from a
+// bucket however much the source data is. It lands under <data_dir>/references/
+// <assembly>/, beside the tool data that uses it.
+//
+// The fetch is the CLI's, so an https:// or s3:// URI, a checksum, and resume
+// behaviour all work the same way they do for a source — there is no second
+// download implementation to keep honest.
+func runReference(ctx context.Context, cat *catalog.Store, dataDir string,
+	job queue.Job, input []byte) (queue.Outcome, error) {
+
+	var req struct {
+		Assembly string `json:"assembly"`
+		URI      string `json:"uri"`
+		Checksum string `json:"checksum"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return queue.Outcome{}, fmt.Errorf("reference job body: %w", err)
+	}
+	if cat == nil {
+		return queue.Outcome{}, errors.New("catalog unavailable")
+	}
+
+	fail := func(err error) (queue.Outcome, error) {
+		// WithoutCancel: a cancelled or timed-out fetch still has to leave the
+		// reference describing itself accurately, and its context is dead.
+		if sErr := cat.SetReferenceFailed(context.WithoutCancel(ctx),
+			req.Assembly, err.Error()); sErr != nil {
+			log.Printf("worker: reference %s: mark failed: %v", req.Assembly, sErr)
+		}
+		return queue.Outcome{}, err
+	}
+
+	dir := filepath.Join(dataDir, "references", req.Assembly)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fail(err)
+	}
+	dest := filepath.Join(dir, path.Base(strings.TrimSuffix(req.URI, "/")))
+
+	log.Printf("worker: reference %s: fetching %s", req.Assembly, req.URI)
+	size, err := runner.FetchFile(ctx, req.URI, dest, req.Checksum)
+	if err != nil {
+		return fail(err)
+	}
+
+	// A tool indexes the FASTA with faidx, which accepts plain or bgzip and
+	// nothing else. Normalizing here means the failure — if any — happens in the
+	// job that chose the file, not later inside a container.
+	dest, err = runner.NormalizeFasta(dest)
+	if err != nil {
+		return fail(err)
+	}
+	if fi, sErr := os.Stat(dest); sErr == nil {
+		size = fi.Size()
+	}
+
+	if err := cat.SetReferenceReady(context.WithoutCancel(ctx),
+		req.Assembly, dest, size); err != nil {
+		return queue.Outcome{}, err
+	}
+	log.Printf("worker: reference %s ready at %s (%d bytes)", req.Assembly, dest, size)
+	body, _ := json.Marshal(map[string]any{
+		"assembly": req.Assembly, "path": dest, "size_bytes": size,
+	})
+	return queue.Outcome{Result: body, N: 1}, nil
 }

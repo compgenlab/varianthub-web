@@ -72,6 +72,13 @@
   # let its lease lapse. This only needs to be longer than the slowest install
   # that could legitimately succeed.
   download_timeout = "96h"                          # VHW_DOWNLOAD_TIMEOUT
+  # Recompute every value instead of reusing a cached one. On here while VEP is
+  # being brought up: a cached value is indistinguishable from a fresh one in
+  # the result, so a source that has started returning nothing looks the same as
+  # one whose old, emptier answers are being replayed — including answers cached
+  # before it was installed. Turn back off once the source is trusted; the cache
+  # is what makes a repeated query cheap.
+  no_cache = true                                   # VHW_NO_CACHE
   job_ttl = "24h"                                   # VHW_JOB_TTL
 
 # Where downloaded source data goes. Filesystem entries come first and the first

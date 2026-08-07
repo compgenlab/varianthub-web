@@ -691,3 +691,58 @@ func TestToolCacheFollowsTheJobsStorage(t *testing.T) {
 		t.Errorf("rewriting tool_cache dropped another setting:\n%s", got)
 	}
 }
+
+// The cache is what makes a stale empty answer indistinguishable from a fresh
+// one, so turning it off has to actually reach the CLI — asserted on the argv,
+// because a flag that is silently dropped looks exactly like a cache that is
+// working correctly.
+func TestNoCacheReachesTheCLI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		noCache bool
+		want    bool
+	}{
+		{"absent by default", false, false},
+		{"passed when set", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			argv := filepath.Join(dir, "argv")
+			// A stub varhub: records how it was called, then emits one variant so
+			// the caller parses a result rather than failing on empty output.
+			bin := filepath.Join(dir, "varhub")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + argv + "\n" +
+				`echo '[{"chrom":"chr1","pos":1,"ref":"A","alt":"T","annotations":{}}]'` + "\n"
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			// FixedHome requires a real config.toml; its contents do not matter
+			// here because the CLI is a stub.
+			hdir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(hdir, "config.toml"), []byte("\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r := &ExecRunner{
+				Bin: bin, Home: FixedHome(hdir), Timeout: 30 * time.Second,
+				NoCache: tc.noCache,
+			}
+			if _, err := r.Annotate(context.Background(), Request{
+				Kind: KindLocus, Snapshot: "s", Selection: "all",
+				Body: []byte("chr1:1:A:T"),
+			}); err != nil {
+				t.Fatalf("Annotate: %v", err)
+			}
+
+			recorded, err := os.ReadFile(argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := strings.Contains(string(recorded), "--no-cache")
+			if got != tc.want {
+				t.Errorf("--no-cache present = %v, want %v; argv was:\n%s",
+					got, tc.want, recorded)
+			}
+		})
+	}
+}

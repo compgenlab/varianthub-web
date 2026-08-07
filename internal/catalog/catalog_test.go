@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -15,18 +16,27 @@ import (
 
 // Like the queue tests, these need a real Postgres; see internal/queue for the
 // container invocation. Each test gets its own schema.
-var migrationFiles = []string{
-	"../../migrations/0001_job_queue.sql",
-	"../../migrations/0002_catalog.sql",
-	"../../migrations/0004_registry.sql",
-	"../../migrations/0005_adhoc_snapshot.sql",
-	"../../migrations/0006_storage.sql",
-	"../../migrations/0007_auth.sql",
-	"../../migrations/0008_default_private.sql",
-	"../../migrations/0012_source_asset.sql",
-	"../../migrations/0014_source_settings.sql",
-	"../../migrations/0015_source_state.sql",
-	"../../migrations/0016_job_weight.sql",
+// allMigrations are every migration, discovered rather than listed.
+//
+// The list used to be written by hand, so adding a table meant remembering to
+// add it here too — and forgetting showed up as `relation "reference" does not
+// exist` in whichever test happened to touch it, rather than as anything about
+// the list. Globbing means a new migration is exercised by the existing tests
+// the moment it lands.
+//
+// Sorted, because migrations are ordered by their numeric prefix and a later one
+// alters what an earlier one created.
+func allMigrations(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no migrations found; the glob or the layout has moved")
+	}
+	sort.Strings(files)
+	return files
 }
 
 func testStore(t *testing.T) *Store {
@@ -38,7 +48,7 @@ func testStore(t *testing.T) *Store {
 	ctx := context.Background()
 
 	var ddl strings.Builder
-	for _, f := range migrationFiles {
+	for _, f := range allMigrations(t) {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)

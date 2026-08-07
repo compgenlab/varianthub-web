@@ -328,3 +328,105 @@ func TestPrefixChangeCarriesSnapshotDefaults(t *testing.T) {
 		t.Errorf("clearing the prefix left %v", got.Defaults)
 	}
 }
+
+// A tool must resolve to the same directory whichever job is running.
+//
+// varhub defaults tool_dir to cache_dir when that is a local path, and to
+// data_dir only when it is remote. Jobs do not agree about cache_dir — a
+// download goes to whichever storage the caller picked, an annotation to
+// wherever its sources resolve — so leaving the default means the same tool has
+// two addresses. A download to a bucket wrote VEP's image under data_dir;
+// annotating against a filesystem-backed snapshot looked under that snapshot's
+// cache_dir, found nothing, and the tool died on a missing .sif with no
+// annotations produced.
+func TestToolDirIsPinnedToDataDir(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A local cache_dir is the case that used to win over data_dir.
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "/mnt/storage",
+	}
+	home, cleanup, err := m.HomeForSources(ctx, []string{"vep-113"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `tool_dir         = "/var/lib/varianthub/data"`) {
+		t.Errorf("tool_dir is not pinned to data_dir, so a tool installed by a "+
+			"download will not be found when annotating:\n%s", body)
+	}
+}
+
+// A reference added through the application must reach a job's config, and must
+// outrank a stale one from deployment configuration.
+func TestCatalogReferencesReachTheJob(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "builtins", Name: "builtins", Version: "1", Kind: "builtin",
+		TOML: "[[sources]]\ntype=\"builtin\"\nname=\"builtins\"\nversion=\"1\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "/mnt/storage",
+		// A path placed on the host by other means: still honoured, but not the
+		// way to add one.
+		References: map[string]string{"GRCh37": "/etc/ref/hs37d5.fa", "GRCh38": "/stale/old.fa"},
+	}
+
+	if err := s.PutReference(ctx, Reference{Assembly: "GRCh38",
+		URI: "https://example.org/GRCh38.fa.gz"}); err != nil {
+		t.Fatal(err)
+	}
+	// Not ready yet: naming a half-fetched FASTA is worse than naming none, since
+	// the tool renders the path and fails deep inside itself.
+	home, cleanup, err := m.HomeForSources(ctx, []string{"builtins"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := os.ReadFile(filepath.Join(home, "config.toml"))
+	if strings.Contains(string(body), "/mnt/ref/GRCh38.fa") {
+		t.Errorf("an unprovisioned reference reached the config:\n%s", body)
+	}
+	cleanup()
+
+	if err := s.SetReferenceReady(ctx, "GRCh38", "/mnt/ref/GRCh38.fa", 900); err != nil {
+		t.Fatal(err)
+	}
+	home, cleanup, err = m.HomeForSources(ctx, []string{"builtins"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	body, err = os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `fasta = "/mnt/ref/GRCh38.fa"`) {
+		t.Errorf("the provisioned reference did not reach the config:\n%s", body)
+	}
+	if strings.Contains(string(body), "/stale/old.fa") {
+		t.Errorf("stale configuration outranked the catalog:\n%s", body)
+	}
+	// Configuration still supplies assemblies the catalog says nothing about.
+	if !strings.Contains(string(body), `fasta = "/etc/ref/hs37d5.fa"`) {
+		t.Errorf("a configured reference was dropped:\n%s", body)
+	}
+}

@@ -85,6 +85,13 @@ type Config struct {
 	// fixed by editing one line; a false match would annotate against the wrong
 	// coordinates and say nothing.
 	References map[string]string
+	// NoCache bypasses varhub's annotation cache, computing every value fresh.
+	// For diagnosis: a cached value is indistinguishable from a fresh one in the
+	// result, so this is what separates "asked and got nothing" from "replaying
+	// an older, emptier answer" — including one cached before a source was
+	// installed. Off by default; the cache is what makes a repeated query cheap.
+	NoCache bool
+
 	JobTimeout time.Duration // per-job wall clock
 	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
 	// default: a tool's one-time install fetches tens of gigabytes, and being
@@ -189,6 +196,7 @@ func applyEnv(c *Config) {
 	envStr("VHW_ADDR", &c.Addr)
 	envStr("VHW_DATABASE_URL", &c.DatabaseURL)
 	envBoolInto("VHW_ALLOW_ANONYMOUS", &c.AllowAnonymous)
+	envBoolInto("VHW_NO_CACHE", &c.NoCache)
 
 	envStr("VHW_CILOGON_CLIENT_ID", &c.CILogonClientID)
 	envStr("VHW_CILOGON_CLIENT_SECRET", &c.CILogonClientSecret)

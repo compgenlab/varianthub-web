@@ -29,11 +29,42 @@ type Materializer struct {
 	// Root is where per-job config trees are created (default: os.TempDir()).
 	Root string
 
-	// References maps an assembly to a reference FASTA on this worker. Written
-	// into every job's config, because varhub resolves {ref} from the assembly
-	// the snapshot declares — a tool step using {ref} gets an empty path
-	// otherwise and fails inside the container with "no such file".
+	// References maps an assembly to a reference FASTA on this worker, from
+	// deployment configuration. Written into every job's config, because varhub
+	// resolves {ref} from the assembly the snapshot declares — a tool step using
+	// {ref} gets an empty path otherwise.
+	//
+	// The catalog's own references take precedence over these (see
+	// referencesFor). Configuration remains as an escape hatch for a path that
+	// was placed on the host by other means, but it is no longer the way to add
+	// one: which references exist is a fact about the installation, and an
+	// administrator should be able to see and change it without editing a file
+	// and restarting.
 	References map[string]string
+}
+
+// referencesFor merges configured references with provisioned ones, the catalog
+// winning on a conflict.
+//
+// The catalog wins because it is the one an administrator can act on: if both
+// name a FASTA for an assembly, the one they added through the application is
+// the one they meant, and a stale config entry should not quietly outrank it.
+func (m *Materializer) referencesFor(ctx context.Context) map[string]string {
+	out := map[string]string{}
+	for k, v := range m.References {
+		out[k] = v
+	}
+	if m.Store != nil {
+		if fromCatalog, err := m.Store.ReadyReferences(ctx); err == nil {
+			for k, v := range fromCatalog {
+				out[k] = v
+			}
+		}
+		// A catalog read that fails is not fatal: the job can still run, and
+		// every source that does not use {ref} is unaffected. One that does will
+		// fail in the tool with a message naming the missing file.
+	}
+	return out
 }
 
 // Home materializes the snapshot's config tree into a fresh directory and
@@ -99,7 +130,8 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
+		m.referencesFor(ctx)); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -107,12 +139,12 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 }
 
 func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil, nil)
+	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil, nil, m.References)
 }
 
 func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string,
 	roots map[string]string, assets map[string][]Asset,
-	settings map[string]SourceSettings) error {
+	settings map[string]SourceSettings, references map[string]string) error {
 
 	writeFile := func(rel, body string) error {
 		p := filepath.Join(dir, rel)
@@ -133,12 +165,24 @@ func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string
 
 	// config.toml. Absolute data/cache paths, so nothing resolves relative to the
 	// ephemeral home and the shared cache is actually shared.
+	// tool_dir is pinned to data_dir rather than left to varhub's default, which
+	// is cache_dir when that is a local path and data_dir only when it is remote.
+	// Every job would then have to agree about cache_dir to agree about where a
+	// tool lives — and they do not: a download goes to whichever storage the
+	// caller picked, an annotation to wherever its sources resolve.
+	//
+	// That mismatch is not theoretical. A download to a bucket wrote VEP's image
+	// under data_dir; annotating against a filesystem-backed snapshot then looked
+	// for it under that snapshot's cache_dir and found nothing, so the tool died
+	// on a missing .sif. Naming the directory once makes provisioning and
+	// annotation agree by construction rather than by coincidence.
 	cfg := fmt.Sprintf(`# Generated per job from the VariantHub catalog. Do not edit.
 data_dir         = %s
 cache_dir        = %s
+tool_dir         = %s
 annotations_dir  = "./annotations"
 default_snapshot = %s
-`, tomlString(m.DataDir), tomlString(cacheDir), tomlString(snap.ID))
+`, tomlString(m.DataDir), tomlString(cacheDir), tomlString(m.DataDir), tomlString(snap.ID))
 
 	// Reference FASTAs, keyed by assembly. Written in sorted order so a given
 	// deployment materializes the same file every time — a job home that differs
@@ -146,15 +190,15 @@ default_snapshot = %s
 	//
 	// All of them, not just this snapshot's: the file is cheap, and selecting by
 	// assembly here would duplicate a lookup varhub already does correctly.
-	if len(m.References) > 0 {
-		names := make([]string, 0, len(m.References))
-		for name := range m.References {
+	if len(references) > 0 {
+		names := make([]string, 0, len(references))
+		for name := range references {
 			names = append(names, name)
 		}
 		sort.Strings(names)
 		for _, name := range names {
 			cfg += fmt.Sprintf("\n[references.%s]\n  fasta = %s\n",
-				name, tomlString(m.References[name]))
+				name, tomlString(references[name]))
 		}
 	}
 	if err := writeFile("config.toml", cfg); err != nil {
@@ -352,7 +396,8 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings); err != nil {
+	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
+		m.referencesFor(ctx)); err != nil {
 		cleanup()
 		return "", nil, err
 	}

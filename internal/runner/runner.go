@@ -135,6 +135,19 @@ type ExecRunner struct {
 	// attempt starts from nothing. 0 falls back to Timeout.
 	DownloadTimeout time.Duration
 
+	// NoCache bypasses varhub's annotation cache, computing every value fresh
+	// and persisting nothing.
+	//
+	// For diagnosis. A cached value is indistinguishable from a freshly computed
+	// one in the result, so when a source starts returning nothing there is no
+	// way from the outside to tell "it was asked and had no answer" from "an
+	// older, emptier answer is being replayed" — including answers cached before
+	// the source was installed at all. Turning the cache off is what separates
+	// those, and without this the only way to do that was to run the CLI by hand.
+	//
+	// Off by default: the cache is what makes a repeated query cheap.
+	NoCache bool
+
 	// OnProgress, if set, receives the CLI's progress lines as they arrive.
 	// varhub -v logs to stderr with a "varhub: " prefix; this is what will drive
 	// the job stage/percent the design's Running screen wants.
@@ -180,6 +193,9 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		args = append(args, "-snapshot", req.Snapshot)
 	}
 	args = append(args, "annotate", "--format", "json", "-v")
+	if r.NoCache {
+		args = append(args, "--no-cache")
+	}
 	switch strings.TrimSpace(req.Selection) {
 	case "":
 		// snapshot defaults
@@ -740,6 +756,11 @@ func rewriteCacheDir(home, cacheDir, dataDir string) error {
 			out = append(out, fmt.Sprintf("cache_dir        = %q", cacheDir))
 		case strings.HasPrefix(strings.TrimSpace(line), "data_dir") && dataDir != "":
 			out = append(out, fmt.Sprintf("data_dir         = %q", dataDir))
+		case strings.HasPrefix(strings.TrimSpace(line), "tool_dir") && dataDir != "":
+			// Moves with data_dir, never independently. The whole point of
+			// pinning it is that provisioning and annotation resolve a tool to
+			// the same directory; letting one drift restores the bug.
+			out = append(out, fmt.Sprintf("tool_dir         = %q", dataDir))
 		default:
 			out = append(out, line)
 		}

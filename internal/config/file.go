@@ -59,6 +59,9 @@ type fileConfig struct {
 		JobTimeout      string `toml:"job_timeout"`
 		DownloadTimeout string `toml:"download_timeout"`
 		JobTTL          string `toml:"job_ttl"`
+		// A pointer so "unset" is distinct from "false": an operator turning the
+		// cache off in the file must not be silently re-enabled by the default.
+		NoCache *bool `toml:"no_cache"`
 	} `toml:"worker"`
 
 	// References maps an assembly to a FASTA path. A bare table so an assembly
@@ -144,6 +147,9 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setStr(&c.VarhubHome, f.Worker.VarhubHome)
 	setStr(&c.DataDir, f.Worker.DataDir)
 	setStr(&c.CacheDir, f.Worker.CacheDir)
+	if f.Worker.NoCache != nil {
+		c.NoCache = *f.Worker.NoCache
+	}
 	if err := setDur(&c.JobTimeout, f.Worker.JobTimeout, path, "worker.job_timeout"); err != nil {
 		return hasSecret, err
 	}

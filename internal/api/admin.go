@@ -892,3 +892,106 @@ func (s *Server) handleSetSnapshotSources(w http.ResponseWriter, r *http.Request
 		"snapshot": snap, "annotations": snapshotAnnotations(snap),
 	})
 }
+
+// handleListReferences lists the installation's reference genomes.
+func (s *Server) handleListReferences(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	refs, err := s.catalog.ListReferences(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"references": refs})
+}
+
+// handlePutReference records a reference genome and queues the fetch.
+//
+// The bytes are named rather than uploaded: a GRCh38 FASTA is most of a
+// gigabyte, and the ones people use are published at stable URLs or already sit
+// in a bucket. An uploaded file arrives the same way once it has been staged —
+// it becomes another URI to fetch from — so this is the one path, not the
+// simpler half of two.
+func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil || s.queue == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		Assembly string `json:"assembly"`
+		URI      string `json:"uri"`
+		Checksum string `json:"checksum"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	req.Assembly = strings.TrimSpace(req.Assembly)
+	req.URI = strings.TrimSpace(req.URI)
+	if req.Assembly == "" {
+		writeError(w, http.StatusBadRequest,
+			"`assembly` is required — the name a snapshot declares, matched exactly (GRCh38, not hg38)")
+		return
+	}
+	if req.URI == "" {
+		writeError(w, http.StatusBadRequest, "`uri` is required (https:// or s3://)")
+		return
+	}
+	// Rejected here rather than in a worker: a typo should be a 400 now, not a
+	// job that fails a minute later in a log nobody is watching.
+	if !strings.HasPrefix(req.URI, "https://") && !strings.HasPrefix(req.URI, "http://") &&
+		!strings.HasPrefix(req.URI, "s3://") {
+		writeError(w, http.StatusBadRequest,
+			"`uri` must be an http(s):// or s3:// address")
+		return
+	}
+
+	if err := s.catalog.PutReference(r.Context(), catalog.Reference{
+		Assembly: req.Assembly, URI: req.URI, Checksum: req.Checksum,
+	}); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"assembly": req.Assembly, "uri": req.URI, "checksum": req.Checksum,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+		Kind:      queue.KindReference,
+		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
+		Label:     "reference " + req.Assembly,
+		Selection: req.Assembly,
+		// A reference is most of a gigabyte and lands on the worker's own disk,
+		// so it costs what a source download costs.
+		Weight: s.cfg.DownloadWeight,
+		Body:   body,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": id, "assembly": req.Assembly,
+	})
+}
+
+// handleDeleteReference forgets a reference. The file is left in place: it may
+// be shared, and reclaiming disk is a separate decision from forgetting a record.
+func (s *Server) handleDeleteReference(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.DeleteReference(r.Context(), r.PathValue("assembly")); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
