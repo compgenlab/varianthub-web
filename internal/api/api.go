@@ -71,7 +71,15 @@ func (s *Server) Routes() http.Handler {
 	v1 := http.NewServeMux()
 	// Gated: ping is how a client checks that its credential works, which it
 	// cannot do if an invalid one answers the same as a valid one.
-	v1.Handle("GET /api/v1/ping", s.requireAuth(http.HandlerFunc(s.handlePing)))
+	// The published API is registered from a table, which the OpenAPI document
+	// is also generated from, so an endpoint cannot appear in one and not the
+	// other. See published.go.
+	s.registerPublished(v1)
+
+	// The document describing that table. Readable by anyone who can reach the
+	// API: it is the contract, and a contract nobody can fetch is documentation
+	// nobody has.
+	v1.Handle("GET /api/v1/openapi.json", s.requireAuth(http.HandlerFunc(s.handleOpenAPI)))
 
 	// Signing in has to work without being signed in, and the UI needs to know
 	// who it is talking to before it can render anything — including "this
@@ -98,24 +106,15 @@ func (s *Server) Routes() http.Handler {
 		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleRevokeToken))))
 
 	// Catalog: what can be annotated, and what a snapshot pins.
-	v1.Handle("GET /api/v1/snapshots", s.requireAuth(http.HandlerFunc(s.handleSnapshots)))
-	v1.Handle("GET /api/v1/snapshots/{id}", s.requireAuth(http.HandlerFunc(s.handleSnapshot)))
 	// The annotation form needs the build list to populate its picker and filter
 	// sources, so it is readable by anyone who can annotate.
-	v1.Handle("GET /api/v1/builds", s.requireAuth(http.HandlerFunc(s.handleListBuilds)))
-	v1.Handle("GET /api/v1/sources", s.requireAuth(http.HandlerFunc(s.handleSources)))
 
 	// Submission. Throttled per client IP, which the handler skips for a
 	// token-bearing service account -- see trustedCaller.
-	v1.Handle("POST /api/v1/annotate", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotate))))
-	v1.Handle("POST /api/v1/annotate/vcf", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotateVCF))))
 
 	// Jobs. Reads are ownership-enforced, not throttled.
-	v1.Handle("GET /api/v1/jobs", s.requireAuth(http.HandlerFunc(s.handleListJobs)))
-	v1.Handle("GET /api/v1/jobs/{id}", s.requireAuth(http.HandlerFunc(s.handleGetJob)))
 	v1.Handle("GET /api/v1/jobs/{id}/log",
 		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleJobLog))))
-	v1.Handle("POST /api/v1/jobs/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelJob)))
 	// Web-only: this is the table feed, paged and sorted for a screen. An
 	// external caller wants the whole result, which is what export is.
 	v1.Handle("GET /api/v1/jobs/{id}/results",
@@ -123,7 +122,6 @@ func (s *Server) Routes() http.Handler {
 	// The published way to get results. Already the whole matching set in a
 	// chosen format, streamed — exactly what a client wants — so it serves both
 	// the browser's download button and the REST API.
-	v1.Handle("GET /api/v1/jobs/{id}/export", s.requireAuth(http.HandlerFunc(s.handleExport)))
 
 	// Administration is its own mux mounted behind one gate, so a route added
 	// here cannot be left unguarded by forgetting to wrap it.
