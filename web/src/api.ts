@@ -31,6 +31,10 @@ export interface Source {
   index_status: string;
   /** Set on the reference genome ad-hoc snapshots pin for this assembly. */
   is_default_reference?: boolean;
+  /** A reference genome. Contributes no annotations, so it is picked separately. */
+  is_reference?: boolean;
+  /** The source cannot run without a reference genome for its build (VEP does). */
+  requires_reference?: boolean;
   origin?: string;
   stream?: boolean;
   /** Whether the source can be annotated with yet, and what is happening to it. */

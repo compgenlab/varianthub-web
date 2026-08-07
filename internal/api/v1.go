@@ -259,6 +259,15 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		// NeedsData is false for builtins, which compute from the variant and have
 		// nothing to download.
 		NeedsData bool `json:"needs_data"`
+		// RequiresReference lets the annotation form ask for a reference genome
+		// only when something in the selection actually needs one. It is a
+		// method on Source, derived from the manifest, so it does not serialize
+		// on its own.
+		RequiresReference bool `json:"requires_reference"`
+		// IsReference keeps reference genomes out of the source list: they
+		// contribute no annotations, so offering one among the sources invites
+		// picking it for what it cannot do.
+		IsReference bool `json:"is_reference"`
 		// State is whether the source can actually be annotated with yet.
 		// Registering one and being able to use it are different things: a tool
 		// needs its image and setup, a build source needs its recipe to have
@@ -298,6 +307,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		out = append(out, item{
 			Source: src, Ref: src.Ref(), Annotations: anns,
 			NeedsData: src.NeedsData(), State: st,
+			RequiresReference: src.RequiresReference(), IsReference: src.IsReference(),
 		})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"sources": out})

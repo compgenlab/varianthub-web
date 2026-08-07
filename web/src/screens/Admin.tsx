@@ -1317,6 +1317,10 @@ function BuildSnapshot({
 // making them records.
 function BuildList() {
   const [builds, setBuilds] = useState<Build[] | null>(null);
+  // References are sources, so which one a build defaults to lives with the
+  // sources — but it is a fact about the build, and this is where someone comes
+  // looking for it.
+  const [refs, setRefs] = useState<Source[]>([]);
   const [err, setErr] = useState("");
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
@@ -1324,10 +1328,26 @@ function BuildList() {
   const [busy, setBusy] = useState(false);
 
   const load = () =>
-    api
-      .builds()
-      .then((r) => setBuilds(r.builds ?? []))
+    Promise.all([api.builds(), api.sources()])
+      .then(([b, s]) => {
+        setBuilds(b.builds ?? []);
+        setRefs((s.sources ?? []).filter((x) => x.is_reference));
+      })
       .catch((e) => setErr(e.message));
+
+  // Exact match, never normalized: a reference offered under the wrong assembly
+  // would annotate against coordinates that mean something else.
+  const refsFor = (build: string) => refs.filter((r) => r.build === build);
+
+  const setDefault = async (sourceID: string) => {
+    setErr("");
+    try {
+      await api.setDefaultReference(sourceID);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
 
   useEffect(() => {
     load();
@@ -1403,19 +1423,49 @@ function BuildList() {
       )}
 
       <div className="card">
-        <div className="rowgrid thead" style={{ gridTemplateColumns: "1.2fr 1.6fr .6fr 90px" }}>
+        <div className="rowgrid thead" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
           <span>Build</span>
           <span>Label</span>
+          <span>Default reference</span>
           <span>Sources</span>
           <span />
         </div>
         {builds?.length === 0 && <div className="empty">No builds defined yet.</div>}
         {builds?.map((b) => (
-          <div key={b.name} className="trow rowgrid" style={{ gridTemplateColumns: "1.2fr 1.6fr .6fr 90px" }}>
+          <div key={b.name} className="trow rowgrid" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
             <span className="mono" style={{ fontWeight: 500 }}>
               {b.name}
             </span>
             <span style={{ color: "var(--text-2)" }}>{b.label || "—"}</span>
+            <span>
+              {/* What an ad-hoc selection pins when something in it requires a
+                  genome. Only references for this build are offered, because a
+                  snapshot may not mix assemblies. */}
+              {refsFor(b.name).length === 0 ? (
+                <span style={{ fontSize: 12, color: "var(--text-3)" }}>
+                  no reference registered
+                </span>
+              ) : (
+                <select
+                  className="select sm mono"
+                  style={{ maxWidth: 240 }}
+                  value={refsFor(b.name).find((r) => r.is_default_reference)?.id ?? ""}
+                  onChange={(e) => e.target.value && setDefault(e.target.value)}
+                >
+                  {/* Present until one is chosen, and never selectable
+                      afterwards: clearing a default is not something this
+                      endpoint does, and offering it would fail silently. */}
+                  {!refsFor(b.name).some((r) => r.is_default_reference) && (
+                    <option value="">— none chosen —</option>
+                  )}
+                  {refsFor(b.name).map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name} {r.version}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </span>
             <span className="mono" style={{ fontSize: 12 }}>
               {b.sources}
             </span>
