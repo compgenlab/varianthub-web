@@ -216,7 +216,7 @@ func (h *harness) admin(t *testing.T) (identity.User, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secret, err := h.ids.CreateToken(context.Background(), u.ID, "test")
+	_, secret, err := h.ids.CreateToken(context.Background(), u.ID, "test", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +230,7 @@ func (h *harness) member(t *testing.T, email string) (identity.User, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secret, err := h.ids.CreateToken(context.Background(), u.ID, "test")
+	_, secret, err := h.ids.CreateToken(context.Background(), u.ID, "test", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestAdminRoutesRequireAnAdminAccount(t *testing.T) {
 func TestRevokedTokenLosesAccess(t *testing.T) {
 	h := newHarness(t)
 	u, _ := h.admin(t)
-	tok, secret, err := h.ids.CreateToken(context.Background(), u.ID, "laptop")
+	tok, secret, err := h.ids.CreateToken(context.Background(), u.ID, "laptop", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

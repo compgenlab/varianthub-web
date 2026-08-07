@@ -346,11 +346,21 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Name string `json:"name"`
+		// Days is how long the token stays valid. Required: a token with no
+		// stated lifetime is the thing this replaced, and defaulting silently
+		// to the longest option would make the deliberate choice optional.
+		Days int `json:"days"`
 	}
 	_ = json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10)).Decode(&req)
 
-	tok, secret, err := s.identity.CreateToken(r.Context(), c.User.ID, req.Name)
+	tok, secret, err := s.identity.CreateToken(r.Context(), c.User.ID, req.Name, req.Days)
 	if err != nil {
+		// A bad lifetime is the caller's mistake, not the server's, and saying
+		// which values are allowed is more use than "internal error".
+		if !identity.ValidLifetime(req.Days) {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}

@@ -147,6 +147,8 @@ export interface ApiToken {
   prefix: string;
   created_at: number;
   last_used_at?: number;
+  /** When it stops working. Absent means it never does (issued before lifetimes). */
+  expires_at?: number;
   revoked_at?: number;
 }
 
@@ -587,11 +589,15 @@ export const api = {
 
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
 
-  createToken: (name: string) =>
+  /** Lifetimes the server accepts. Mirrored from identity.TokenLifetimes; the
+   *  server rejects anything else, so this list only decides what is offered. */
+  tokenLifetimes: [1, 14, 30, 90, 180, 365] as const,
+
+  createToken: (name: string, days: number) =>
     req<{ token: ApiToken; secret: string }>("/auth/tokens", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, days }),
     }),
 
   revokeToken: (id: string) =>

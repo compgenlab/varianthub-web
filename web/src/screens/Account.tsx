@@ -41,6 +41,9 @@ export default function Account({ me }: { me: Me }) {
   const [tokens, setTokens] = useState<ApiToken[]>([]);
   const [identities, setIdentities] = useState<ExternalIdentity[]>([]);
   const [name, setName] = useState("");
+  // 30 days rather than the longest option: the default should be the cautious
+  // one, since a token kept longer than needed is the thing lifetimes address.
+  const [days, setDays] = useState(30);
   const [fresh, setFresh] = useState<{ secret: string; name?: string } | null>(null);
   const [err, setErr] = useState("");
   const [copied, setCopied] = useState(false);
@@ -62,7 +65,7 @@ export default function Account({ me }: { me: Me }) {
   async function create(e: React.FormEvent) {
     e.preventDefault();
     try {
-      const r = await api.createToken(name.trim());
+      const r = await api.createToken(name.trim(), days);
       setFresh({ secret: r.secret, name: r.token.name });
       setName("");
       setCopied(false);
@@ -180,6 +183,19 @@ export default function Account({ me }: { me: Me }) {
           value={name}
           onChange={(e) => setName(e.target.value)}
         />
+        <select
+          className="select"
+          style={{ width: 130 }}
+          value={days}
+          onChange={(e) => setDays(Number(e.target.value))}
+          title="How long this token stays valid"
+        >
+          {api.tokenLifetimes.map((d) => (
+            <option key={d} value={d}>
+              {d === 1 ? "1 day" : d === 365 ? "1 year" : `${d} days`}
+            </option>
+          ))}
+        </select>
         <button className="btn primary">
           <KeyRound size={14} /> Create token
         </button>
@@ -208,6 +224,19 @@ export default function Account({ me }: { me: Me }) {
             {/* A token that has never been used is one nobody will miss. */}
             <span style={{ fontSize: 12.5, color: t.last_used_at ? undefined : "var(--text-3)" }}>
               {t.last_used_at ? when(t.last_used_at) : "never used"}
+              {t.expires_at && t.expires_at * 1000 < Date.now() ? (
+                // Lapsed and revoked are different things to be told: one was a
+                // decision, the other just happened.
+                <>
+                  <br />
+                  <span style={{ color: "var(--danger, #8f2f2f)" }}>expired</span>
+                </>
+              ) : t.expires_at ? (
+                <>
+                  <br />
+                  <span style={{ color: "var(--text-3)" }}>expires {when(t.expires_at)}</span>
+                </>
+              ) : null}
             </span>
             <span style={{ textAlign: "right" }}>
               <button className="btn link" onClick={() => revoke(t)} title="Revoke">
