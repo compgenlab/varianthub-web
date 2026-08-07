@@ -93,6 +93,14 @@ services:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:-varhubdev}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-varhubdevsecret}
       AWS_REGION: ${AWS_REGION:-us-east-1}
+    volumes:
+      # Repeated from x-web, not inherited — see the note on api below.
+      - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
+      # Seeding only writes catalog rows and opens no files, so this is not
+      # needed today. It is here because the service declares the location
+      # above, and a container that advertises a path it cannot reach is the
+      # asymmetry that made the API fail to write assets.
+      - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -117,6 +125,25 @@ services:
       AWS_REGION: ${AWS_REGION:-us-east-1}
       # The Vite dev server's origin, so a locally-run front-end can call the API.
       VHW_CORS_ORIGINS: ${VHW_CORS_ORIGINS:-http://localhost:5173}
+    volumes:
+      # Repeated from x-web, not inherited: a YAML merge key replaces a list
+      # rather than appending to it, so declaring volumes here drops every
+      # volume the anchor set. The same trap cost the worker its config file.
+      - ${VHW_CONFIG_FILE:-./varianthub-web.toml}:/etc/varianthub-web/config.toml:ro
+      # The same source-data volume the worker gets, mounted because this
+      # container declares the location above and therefore has to be able to
+      # reach it.
+      #
+      # Registering a source writes its helper files to storage, and with no s3
+      # profile in use this path is that storage — so without the mount the API
+      # advertises a location it cannot itself write to. That is not theoretical:
+      # `assets backfill` run here failed with "mkdir /mnt/storage: permission
+      # denied" while the worker had the same path mounted and writable.
+      #
+      # Downloads still happen in the worker, so this carries far less traffic
+      # there. It is the same volume either way — the two must not disagree
+      # about what is stored.
+      - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
     ports:
       # Not 8080: like postgres above, a dev machine usually already has one.
       #

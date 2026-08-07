@@ -331,7 +331,13 @@ function UserMenu({ me, onSignIn }: { me: Me; onSignIn: () => void }) {
                   /* signing out locally matters more than the round trip */
                 }
                 setToken("");
-                location.reload();
+                // location, not navigate: a full load is what clears the React
+                // tree, and every screen below holds data fetched as the person
+                // who just signed out. "/" rather than reloading where they
+                // were, because that could be an admin page they can no longer
+                // see — a reload would land them on a 401 instead of a signed-
+                // out home page.
+                location.href = "/";
               }}
             >
               <LogOut size={14} /> Sign out
