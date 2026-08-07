@@ -286,7 +286,9 @@ export class ApiError extends Error {
 
 // The API base is per-deployment, never hardcoded: same-origin by default, or
 // VITE_API_BASE when the dev server runs separately from the API.
-const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+/** The API's origin prefix. Exported for the API explorer, which builds its own
+ *  requests deliberately: it exists to show the wire call, not to wrap it. */
+export const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
 // A bearer token is held in sessionStorage rather than localStorage so it does
 // not outlive the browser tab. It is the *secondary* path: signing in with a
@@ -588,6 +590,12 @@ export const api = {
   identities: () => req<{ identities: ExternalIdentity[] }>("/auth/identities"),
 
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
+
+  /** The OpenAPI document describing the published REST API. */
+  openapi: () => req<{
+    info: { title: string; version: string; description?: string };
+    paths: Record<string, Record<string, never>>;
+  }>("/openapi.json"),
 
   /** Lifetimes the server accepts. Mirrored from identity.TokenLifetimes; the
    *  server rejects anything else, so this list only decides what is offered. */

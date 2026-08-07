@@ -8,26 +8,14 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import {
-  FilePlus2,
-  Table2,
-  ShieldCheck,
-  ServerCog,
-  HardDrive,
-  ChartColumn,
-  LogOut,
-  LogIn,
-  UserRound,
-  ChevronDown,
-  Settings,
-  UsersRound,
-} from "lucide-react";
+import { ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
 
 import { api, setToken, type Me } from "./api";
 import { AnnotateProvider } from "./flow";
 import ChooseSources from "./screens/ChooseSources";
 import EnterVariants from "./screens/EnterVariants";
 import Running from "./screens/Running";
+import ApiExplorer from "./screens/ApiExplorer";
 import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
 import SignIn from "./screens/SignIn";
@@ -114,6 +102,9 @@ function Shell({
           </NavLink>
           <NavLink to="/jobs">
             <Table2 /> Results
+          </NavLink>
+          <NavLink to="/api">
+            <Terminal /> API
           </NavLink>
 
           {/* Role-gated. Hidden rather than disabled for a non-admin: the server
@@ -249,6 +240,7 @@ export default function App() {
             <Route path="/annotate/sources" element={<ChooseSources />} />
             <Route path="/annotate/variants" element={<EnterVariants />} />
             <Route path="/annotate/running/:jobId" element={<Running />} />
+            <Route path="/api" element={<ApiExplorer />} />
             <Route path="/jobs" element={<JobsList />} />
             <Route path="/jobs/:jobId" element={<JobResults />} />
             {/* The same view as the admin one, and gated the same way: the API
