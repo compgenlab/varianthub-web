@@ -407,7 +407,7 @@ func TestCatalogReferencesReachTheJob(t *testing.T) {
 	}
 	cleanup()
 
-	if err := s.SetReferenceReady(ctx, "GRCh38", "/mnt/ref/GRCh38.fa", 900); err != nil {
+	if err := s.SetReferenceReady(ctx, "GRCh38", "/mnt/ref/GRCh38.fa", 900, ""); err != nil {
 		t.Fatal(err)
 	}
 	home, cleanup, err = m.HomeForSources(ctx, []string{"builtins"})

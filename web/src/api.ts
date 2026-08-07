@@ -205,6 +205,21 @@ export interface StorageLocation {
   unusable_reason?: string;
 }
 
+/** A reference genome the installation has, or is fetching. */
+export interface Reference {
+  assembly: string;
+  uri: string;
+  checksum?: string;
+  path?: string;
+  size_bytes?: number;
+  storage_id?: string;
+  durable_uri?: string;
+  state: "installing" | "ready" | "failed";
+  error?: string;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface SourceFile {
   source_id: string;
   storage_id: string;
@@ -706,6 +721,20 @@ export const api = {
   metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
+
+  references: () => req<{ references: Reference[] }>("/admin/references"),
+  putReference: (body: {
+    assembly: string;
+    uri: string;
+    checksum?: string;
+    storage_id?: string;
+  }) =>
+    req<{ job_id: string; assembly: string }>("/admin/references", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteReference: (assembly: string) =>
+    req<void>(`/admin/references/${encodeURIComponent(assembly)}`, { method: "DELETE" }),
 
   addStorage: (body: { name: string; kind: "s3"; uri: string }) =>
     req<{ id: string }>("/admin/storage", {

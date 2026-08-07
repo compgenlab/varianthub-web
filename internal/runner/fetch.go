@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/md5"
@@ -11,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -88,71 +90,172 @@ func FetchFile(ctx context.Context, uri, dest, checksum string) (int64, error) {
 	return n, nil
 }
 
-// NormalizeFasta makes a fetched FASTA indexable, returning the path to use.
+// PrepareFasta makes a fetched FASTA usable by a tool, returning the path to use.
 //
-// htslib's faidx can index an uncompressed FASTA or a bgzip one, and nothing
-// else. Ensembl publishes the primary assembly as plain gzip, so handing it
-// straight to a tool fails with "Cannot index files compressed with gzip,
-// please use bgzip" from inside the container — a long way from the fetch that
-// chose the file.
+// A tool random-accesses the reference, which needs a .fai — and htslib can only
+// index an uncompressed or BGZF file. Ensembl publishes the GRCh38 primary
+// assembly as plain gzip, which is neither, so handing it straight to VEP fails
+// with "Cannot index files compressed with gzip, please use bgzip" from inside
+// the container, a long way from the fetch that chose it.
 //
-// Plain gzip is therefore decompressed. Uncompressing rather than recompressing
-// to bgzip costs disk (about 3 GB against 900 MB) and saves a dependency on an
-// external bgzip; a reference lives on a volume sized for tool data, where that
-// is not the scarce resource. A bgzip file is already indexable and is left
-// alone.
-func NormalizeFasta(path string) (string, error) {
-	if !strings.HasSuffix(path, ".gz") {
-		return path, nil // already plain
-	}
-	f, err := os.Open(path)
+// So: recompress to BGZF when it is not already, then index. Both are varhub
+// subcommands, which keeps htslib out of this image and means one
+// implementation of these formats rather than two that can disagree.
+//
+// Plain gzip is streamed through the decompressor into bgzip rather than landing
+// as an intermediate file — a decompressed GRCh38 is about 3 GB that would exist
+// only to be read once.
+func PrepareFasta(ctx context.Context, varhubBin, path string) (string, error) {
+	kind, err := fastaKind(path)
 	if err != nil {
 		return "", err
-	}
-	defer f.Close()
-
-	// BGZF is gzip with an "BC" extra subfield; gzip.Reader exposes it as Extra.
-	zr, err := gzip.NewReader(f)
-	if err != nil {
-		return "", fmt.Errorf("%s: not gzip: %w", filepath.Base(path), err)
-	}
-	if isBGZF(zr.Header.Extra) {
-		zr.Close()
-		return path, nil // bgzip: faidx handles it
 	}
 
-	plain := strings.TrimSuffix(path, ".gz")
-	out, err := os.Create(plain)
-	if err != nil {
-		zr.Close()
-		return "", err
+	final := path
+	switch kind {
+	case fastaBGZF:
+		// Already indexable.
+	case fastaPlain:
+		final = path + ".gz"
+		if err := runBgzip(ctx, varhubBin, final, func(w io.Writer) error {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			_, err = io.Copy(w, f)
+			return err
+		}); err != nil {
+			return "", err
+		}
+		_ = os.Remove(path)
+	case fastaGzip:
+		final = strings.TrimSuffix(path, ".gz") + ".bgz.gz"
+		if err := runBgzip(ctx, varhubBin, final, func(w io.Writer) error {
+			f, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+			zr, err := gzip.NewReader(f)
+			if err != nil {
+				return err
+			}
+			defer zr.Close()
+			_, err = io.Copy(w, zr)
+			return err
+		}); err != nil {
+			return "", err
+		}
+		_ = os.Remove(path)
+		// Named plainly now that the original is gone.
+		renamed := strings.TrimSuffix(path, ".gz") + ".gz"
+		if err := os.Rename(final, renamed); err == nil {
+			final = renamed
+		}
 	}
-	if _, err := io.Copy(out, zr); err != nil {
-		out.Close()
-		zr.Close()
-		os.Remove(plain)
-		return "", fmt.Errorf("decompress %s: %w", filepath.Base(path), err)
+
+	cmd := exec.CommandContext(ctx, varhubBin, "faidx", final)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return "", fmt.Errorf("faidx %s: %w: %s", filepath.Base(final), err,
+			strings.TrimSpace(string(out)))
 	}
-	zr.Close()
-	if err := out.Close(); err != nil {
-		os.Remove(plain)
-		return "", err
-	}
-	// The original is redundant once decompressed, and a reference is large
-	// enough that keeping both is a real cost rather than a tidy safety net.
-	_ = os.Remove(path)
-	return plain, nil
+	return final, nil
 }
 
-// isBGZF reports whether a gzip extra field carries the BGZF "BC" subfield.
-func isBGZF(extra []byte) bool {
-	for i := 0; i+3 < len(extra); {
-		si1, si2 := extra[i], extra[i+1]
-		slen := int(extra[i+2]) | int(extra[i+3])<<8
-		if si1 == 'B' && si2 == 'C' {
-			return true
-		}
-		i += 4 + slen
+// runBgzip pipes src into `varhub bgzip`, writing BGZF to dest.
+func runBgzip(ctx context.Context, varhubBin, dest string, src func(io.Writer) error) error {
+	out, err := os.Create(dest)
+	if err != nil {
+		return err
 	}
-	return false
+	defer out.Close()
+
+	cmd := exec.CommandContext(ctx, varhubBin, "bgzip")
+	cmd.Stdout = out
+	var errBuf bytes.Buffer
+	cmd.Stderr = &errBuf
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start bgzip: %w", err)
+	}
+	copyErr := src(in)
+	in.Close()
+	if err := cmd.Wait(); err != nil {
+		os.Remove(dest)
+		return fmt.Errorf("bgzip: %w: %s", err, strings.TrimSpace(errBuf.String()))
+	}
+	if copyErr != nil {
+		os.Remove(dest)
+		return fmt.Errorf("bgzip input: %w", copyErr)
+	}
+	return out.Close()
+}
+
+type fastaCompression int
+
+const (
+	fastaPlain fastaCompression = iota
+	fastaGzip
+	fastaBGZF
+)
+
+// fastaKind reports how a file is compressed. BGZF is gzip carrying a "BC"
+// extra subfield; plain gzip has no extra field at all.
+func fastaKind(path string) (fastaCompression, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+	hdr := make([]byte, 18)
+	n, err := io.ReadFull(f, hdr)
+	if err != nil && n < 2 {
+		return 0, fmt.Errorf("%s: %w", filepath.Base(path), err)
+	}
+	if hdr[0] != 0x1f || hdr[1] != 0x8b {
+		return fastaPlain, nil
+	}
+	if n >= 14 && hdr[3]&0x04 != 0 && hdr[12] == 'B' && hdr[13] == 'C' {
+		return fastaBGZF, nil
+	}
+	return fastaGzip, nil
+}
+
+// CopyTo writes a local file to a destination that may be a filesystem path or
+// an object locator.
+//
+// s3:// is delegated to varhub, which already speaks it — keeping object-store
+// access in one place rather than adding a second SDK and a second set of
+// credentials to reason about.
+func CopyTo(ctx context.Context, src, dst string) error {
+	if strings.HasPrefix(dst, "s3://") {
+		return fmt.Errorf("s3 durable copies are not wired up yet (%s)", dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	tmp := dst + ".part"
+	out, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, dst)
 }

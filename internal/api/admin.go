@@ -923,6 +923,10 @@ func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
 		Assembly string `json:"assembly"`
 		URI      string `json:"uri"`
 		Checksum string `json:"checksum"`
+		// StorageID is where the durable copy is kept. Optional: without it the
+		// worker's local copy is the only copy, which works but means every new
+		// worker re-fetches from the origin.
+		StorageID string `json:"storage_id"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
@@ -948,8 +952,25 @@ func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Resolved here so an unusable target is a 400 now, rather than a job that
+	// fetches most of a gigabyte and only then finds it cannot keep a copy.
+	var cacheDir string
+	if req.StorageID != "" {
+		loc, lErr := s.catalog.GetStorage(r.Context(), req.StorageID)
+		if lErr != nil {
+			writeError(w, http.StatusBadRequest, lErr.Error())
+			return
+		}
+		if !loc.Usable() {
+			writeError(w, http.StatusBadRequest, loc.UnusableReason())
+			return
+		}
+		cacheDir = loc.URI
+	}
+
 	if err := s.catalog.PutReference(r.Context(), catalog.Reference{
 		Assembly: req.Assembly, URI: req.URI, Checksum: req.Checksum,
+		StorageID: req.StorageID,
 	}); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
@@ -957,6 +978,7 @@ func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
 
 	body, err := json.Marshal(map[string]any{
 		"assembly": req.Assembly, "uri": req.URI, "checksum": req.Checksum,
+		"cache_dir": cacheDir,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

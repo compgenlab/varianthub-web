@@ -26,6 +26,12 @@ type Reference struct {
 	// live in an object store however much the source data does.
 	Path      string `json:"path,omitempty"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
+	// StorageID names where the durable copy is kept, and DurableURI is where it
+	// landed there. The local copy under data_dir is what a tool actually reads;
+	// this is what lets another worker restore rather than re-fetch.
+	StorageID  string `json:"storage_id,omitempty"`
+	DurableURI string `json:"durable_uri,omitempty"`
+
 	State     string `json:"state"`
 	Error     string `json:"error,omitempty"`
 	CreatedAt int64  `json:"created_at"`
@@ -39,12 +45,12 @@ const (
 	RefFailed     = "failed"
 )
 
-const refCols = `assembly, uri, checksum, path, size_bytes, state, error, created_at, updated_at`
+const refCols = `assembly, uri, checksum, path, size_bytes, storage_id, durable_uri, state, error, created_at, updated_at`
 
 func scanRef(row interface{ Scan(...any) error }) (Reference, error) {
 	var r Reference
 	err := row.Scan(&r.Assembly, &r.URI, &r.Checksum, &r.Path, &r.SizeBytes,
-		&r.State, &r.Error, &r.CreatedAt, &r.UpdatedAt)
+		&r.StorageID, &r.DurableURI, &r.State, &r.Error, &r.CreatedAt, &r.UpdatedAt)
 	return r, err
 }
 
@@ -64,29 +70,33 @@ func (s *Store) PutReference(ctx context.Context, r Reference) error {
 	}
 	now := s.nowFn()
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO reference (assembly, uri, checksum, path, size_bytes, state, error,
-		                       created_at, updated_at)
-		VALUES ($1,$2,$3,'',0,$4,'',$5,$5)
+		INSERT INTO reference (assembly, uri, checksum, path, size_bytes, storage_id,
+		                       durable_uri, state, error, created_at, updated_at)
+		VALUES ($1,$2,$3,'',0,$4,'',$5,'',$6,$6)
 		ON CONFLICT (assembly) DO UPDATE
-		   SET uri        = excluded.uri,
-		       checksum   = excluded.checksum,
-		       path       = '',
-		       size_bytes = 0,
-		       state      = excluded.state,
-		       error      = '',
-		       updated_at = excluded.updated_at`,
+		   SET uri         = excluded.uri,
+		       checksum    = excluded.checksum,
+		       path        = '',
+		       size_bytes  = 0,
+		       storage_id  = excluded.storage_id,
+		       durable_uri = '',
+		       state       = excluded.state,
+		       error       = '',
+		       updated_at  = excluded.updated_at`,
 		assembly, strings.TrimSpace(r.URI), strings.TrimSpace(r.Checksum),
-		RefInstalling, now)
+		strings.TrimSpace(r.StorageID), RefInstalling, now)
 	return err
 }
 
 // SetReferenceReady records where a fetched reference landed.
-func (s *Store) SetReferenceReady(ctx context.Context, assembly, path string, size int64) error {
+func (s *Store) SetReferenceReady(ctx context.Context, assembly, path string, size int64,
+	durableURI string) error {
+
 	_, err := s.pool.Exec(ctx, `
 		UPDATE reference
-		   SET path=$2, size_bytes=$3, state=$4, error='', updated_at=$5
+		   SET path=$2, size_bytes=$3, durable_uri=$4, state=$5, error='', updated_at=$6
 		 WHERE assembly=$1`,
-		assembly, path, size, RefReady, s.nowFn())
+		assembly, path, size, durableURI, RefReady, s.nowFn())
 	return err
 }
 

@@ -222,7 +222,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat, cfg.DataDir))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat, cfg.DataDir, cfg.VarhubBin))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -298,7 +298,7 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // it belongs to the queue rather than to either of the two types this bridges —
 // and it is written outside the Outcome because an Outcome is the job's result,
 // while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir string) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin string) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
@@ -306,7 +306,7 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir strin
 		case queue.KindCleanup:
 			return runCleanup(job, input)
 		case queue.KindReference:
-			return runReference(ctx, cat, cfgDataDir, job, input)
+			return runReference(ctx, cat, cfgDataDir, cfgVarhubBin, job, input)
 		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
@@ -551,13 +551,14 @@ always required.
 // The fetch is the CLI's, so an https:// or s3:// URI, a checksum, and resume
 // behaviour all work the same way they do for a source — there is no second
 // download implementation to keep honest.
-func runReference(ctx context.Context, cat *catalog.Store, dataDir string,
+func runReference(ctx context.Context, cat *catalog.Store, dataDir, varhubBin string,
 	job queue.Job, input []byte) (queue.Outcome, error) {
 
 	var req struct {
 		Assembly string `json:"assembly"`
 		URI      string `json:"uri"`
 		Checksum string `json:"checksum"`
+		CacheDir string `json:"cache_dir"` // durable copy destination; "" = local only
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return queue.Outcome{}, fmt.Errorf("reference job body: %w", err)
@@ -588,10 +589,11 @@ func runReference(ctx context.Context, cat *catalog.Store, dataDir string,
 		return fail(err)
 	}
 
-	// A tool indexes the FASTA with faidx, which accepts plain or bgzip and
-	// nothing else. Normalizing here means the failure — if any — happens in the
-	// job that chose the file, not later inside a container.
-	dest, err = runner.NormalizeFasta(dest)
+	// Recompress to BGZF if needed and build the .fai/.gzi a tool needs to
+	// random-access it. Done here so a failure lands in the job that chose the
+	// file, rather than inside a container hours later.
+	log.Printf("worker: reference %s: preparing (bgzip + faidx)", req.Assembly)
+	dest, err = runner.PrepareFasta(ctx, varhubBin, dest)
 	if err != nil {
 		return fail(err)
 	}
@@ -599,13 +601,50 @@ func runReference(ctx context.Context, cat *catalog.Store, dataDir string,
 		size = fi.Size()
 	}
 
+	if fi, sErr := os.Stat(dest); sErr == nil {
+		size = fi.Size()
+	}
+
+	// The durable copy, so a worker starting with an empty disk restores instead
+	// of re-fetching most of a gigabyte over someone else's FTP. Best effort:
+	// the reference is already usable here, and failing the job because the copy
+	// did not upload would throw away work that went right.
+	var durable string
+	if req.CacheDir != "" {
+		durable = strings.TrimSuffix(req.CacheDir, "/") + "/references/" + req.Assembly
+		if err := publishReference(ctx, dest, durable); err != nil {
+			log.Printf("worker: reference %s: durable copy failed: %v", req.Assembly, err)
+			durable = ""
+		}
+	}
+
 	if err := cat.SetReferenceReady(context.WithoutCancel(ctx),
-		req.Assembly, dest, size); err != nil {
+		req.Assembly, dest, size, durable); err != nil {
 		return queue.Outcome{}, err
 	}
 	log.Printf("worker: reference %s ready at %s (%d bytes)", req.Assembly, dest, size)
 	body, _ := json.Marshal(map[string]any{
 		"assembly": req.Assembly, "path": dest, "size_bytes": size,
+		"durable_uri": durable,
 	})
 	return queue.Outcome{Result: body, N: 1}, nil
+}
+
+// publishReference copies a prepared reference and its indexes to durable
+// storage, so another worker can restore rather than re-fetch.
+//
+// The indexes go too: rebuilding them is cheap but not free, and a copy that
+// restores to something a tool still has to index is only half a copy.
+func publishReference(ctx context.Context, local, destDir string) error {
+	for _, ext := range []string{"", ".fai", ".gzi"} {
+		src := local + ext
+		if _, err := os.Stat(src); err != nil {
+			continue // .gzi only exists for BGZF
+		}
+		dst := destDir + "/" + filepath.Base(src)
+		if err := runner.CopyTo(ctx, src, dst); err != nil {
+			return fmt.Errorf("%s: %w", filepath.Base(src), err)
+		}
+	}
+	return nil
 }
