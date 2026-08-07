@@ -45,25 +45,25 @@ const (
 
 // Source is one registered annotation source.
 type Source struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Title   string `json:"title,omitempty"`
-	Detail  string `json:"detail,omitempty"`
-	Kind    string `json:"kind"`
-	Build   string `json:"build,omitempty"`
+	ID      string `json:"id" doc:"Stable identifier, unique across the catalog."`
+	Name    string `json:"name" doc:"The manifest's name for the dataset, e.g. \"gencode\"."`
+	Version string `json:"version" doc:"The dataset's own version, e.g. \"48\". Pinned by snapshots so a run is reproducible."`
+	Title   string `json:"title,omitempty" doc:"A human-readable title, where the manifest gives one."`
+	Detail  string `json:"detail,omitempty" doc:"A one-line description, where the manifest gives one."`
+	Kind    string `json:"kind" doc:"builtin | vcf | bed | gtf | tab | genelist | tool | reference."`
+	Build   string `json:"build,omitempty" doc:"The genome assembly this source is for, matched exactly and never normalized: GRCh38 and hg38 are different builds here. Empty means assembly-agnostic, which is what the builtins are."`
 
-	// Stream is derived from the manifest on read rather than stored, like the
-	// annotation list: it is a projection of toml_text, and deriving it means a
-	// source registered before this existed needs no backfill.
-	Stream bool `json:"stream,omitempty"`
+	Stream bool `json:"stream,omitempty" doc:"Read from its origin over the network at query time rather than from storage this deployment controls, so a run depends on somebody else's server."`
 
-	Visibility  string `json:"visibility"`
-	IndexStatus string `json:"index_status"`
-	Origin      string `json:"origin,omitempty"`
-	TOML        string `json:"-"` // never serialized to API clients by default
-	CreatedAt   int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
+	Visibility  string `json:"visibility" doc:"public | private. A private source is absent entirely for a caller with no grant, rather than listed and refused."`
+	IndexStatus string `json:"index_status" doc:"Whether the source's data has been indexed."`
+	Origin      string `json:"origin,omitempty" doc:"The registry this manifest was adopted from, where it was."`
+
+	IsDefaultReference bool `json:"is_default_reference,omitempty" doc:"The reference an ad-hoc selection pins for this assembly. Meaningless on anything that is not a reference source."`
+
+	TOML      string `json:"-"`
+	CreatedAt int64  `json:"created_at" doc:"Unix seconds."`
+	UpdatedAt int64  `json:"updated_at" doc:"Unix seconds."`
 
 	// prefixOverride is this deployment's annotation prefix for the source,
 	// loaded with it by sourceCols. Unexported because it is not part of the
@@ -91,18 +91,18 @@ func (s Source) NeedsData() bool {
 
 // Snapshot is a versioned bundle of pinned sources.
 type Snapshot struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Build       string   `json:"build"`
-	State       string   `json:"state"`
-	Defaults    []string `json:"defaults,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	PublishedAt int64    `json:"published_at,omitempty"`
-	CreatedAt   int64    `json:"created_at"`
-	UpdatedAt   int64    `json:"updated_at"`
+	ID          string   `json:"id" doc:"Stable identifier, used to annotate against this snapshot."`
+	Title       string   `json:"title,omitempty" doc:"A human-readable title."`
+	Description string   `json:"description,omitempty" doc:"What this bundle is for."`
+	Build       string   `json:"build" doc:"The genome assembly. Every pinned source either declares this exact string or declares none."`
+	State       string   `json:"state" doc:"draft | published | adhoc. Drafts are not offered for annotation."`
+	Defaults    []string `json:"defaults,omitempty" doc:"Annotation fields selected when the caller asks for none."`
+	Tags        []string `json:"tags,omitempty" doc:"Free-form labels for grouping snapshots."`
+	PublishedAt int64    `json:"published_at,omitempty" doc:"Unix seconds."`
+	CreatedAt   int64    `json:"created_at" doc:"Unix seconds."`
+	UpdatedAt   int64    `json:"updated_at" doc:"Unix seconds."`
 
-	Sources []Source `json:"sources,omitempty"` // populated by Get, not List
+	Sources []Source `json:"sources,omitempty" doc:"The exact source versions pinned. Populated when fetching one snapshot, absent from listings."`
 }
 
 // ContainsRemote reports whether any pinned source is read from its origin
@@ -136,6 +136,9 @@ func (s Snapshot) ContainsPrivate() bool {
 type Store struct {
 	pool  *pgxpool.Pool
 	nowFn func() int64
+	// Where asset content lives when it is not inline. Nil keeps it in the
+	// database, which is what an installation with no storage configured does.
+	blobs AssetBlobs
 }
 
 // New wraps a pool.
@@ -170,7 +173,7 @@ func (s *Store) Pool() *pgxpool.Pool { return s.pool }
 // from those names fails at annotate time with "unknown annotation" — far from
 // the listing that invented them.
 const sourceCols = `id, name, version, title, detail, kind, build, visibility,
-	index_status, origin, toml_text, created_at, updated_at,
+	index_status, origin, toml_text, created_at, updated_at, is_default_reference,
 	COALESCE((SELECT annotation_prefix FROM source_settings st
 	          WHERE st.source_id = source.id), '')`
 
@@ -178,7 +181,7 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	var s Source
 	err := row.Scan(&s.ID, &s.Name, &s.Version, &s.Title, &s.Detail, &s.Kind,
 		&s.Build, &s.Visibility, &s.IndexStatus, &s.Origin, &s.TOML,
-		&s.CreatedAt, &s.UpdatedAt, &s.prefixOverride)
+		&s.CreatedAt, &s.UpdatedAt, &s.IsDefaultReference, &s.prefixOverride)
 	if err == nil {
 		s.Stream = streamFromTOML(s.TOML)
 	}
@@ -408,6 +411,16 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 	if err := s.checkBuilds(ctx, snap.Build, sourceIDs); err != nil {
 		return err
 	}
+	// At most one reference, and every source that needs one has it. Checked
+	// here for the same reason the assembly is: this is the single choke point
+	// every snapshot passes through, curated and ad-hoc alike.
+	pinned, err := s.sourcesByID(ctx, sourceIDs)
+	if err != nil {
+		return err
+	}
+	if err := checkReferences(pinned); err != nil {
+		return fmt.Errorf("snapshot %q: %w", snap.ID, err)
+	}
 	// A nil Go slice binds as SQL NULL, and a column DEFAULT does not apply when
 	// NULL is passed explicitly — so nil would violate the NOT NULL constraint
 	// rather than fall back to '{}'.
@@ -501,6 +514,16 @@ func (s *Store) EnsureAdhocSnapshot(ctx context.Context, build string, sourceIDs
 	if len(sourceIDs) == 0 {
 		return "", errors.New("select at least one source")
 	}
+	// An ad-hoc snapshot is assembled per job and has nobody to ask which
+	// reference to use, so it reaches for the assembly's default when something
+	// in the selection needs one. The snapshot still *pins* it, so re-running
+	// this later cannot drift onto a newer genome — the default is a choice made
+	// once, not an indirection resolved every time.
+	sourceIDs, err := s.withDefaultReference(ctx, build, sourceIDs)
+	if err != nil {
+		return "", err
+	}
+
 	id := AdhocID(build, sourceIDs)
 	if err := s.PutSnapshot(ctx, Snapshot{
 		ID:          id,
@@ -690,4 +713,71 @@ func (s *Store) GetSource(ctx context.Context, id string) (Source, error) {
 		return Source{}, fmt.Errorf("source %q: %w", id, ErrNotFound)
 	}
 	return src, err
+}
+
+// sourcesByID loads sources in one query, for the checks PutSnapshot runs.
+func (s *Store) sourcesByID(ctx context.Context, ids []string) ([]Source, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	rows, err := s.pool.Query(ctx, `SELECT `+sourceCols+` FROM source WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Source
+	for rows.Next() {
+		src, err := scanSource(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, src)
+	}
+	return out, rows.Err()
+}
+
+// withDefaultReference appends the assembly's default reference when the
+// selection needs one and has none.
+//
+// Returns the ids unchanged when nothing requires a reference: most annotation
+// needs no genome, and pinning one anyway would make every ad-hoc snapshot
+// depend on a file it never opens.
+func (s *Store) withDefaultReference(ctx context.Context, build string,
+	sourceIDs []string) ([]string, error) {
+
+	chosen, err := s.sourcesByID(ctx, sourceIDs)
+	if err != nil {
+		return nil, err
+	}
+	needs := false
+	for _, src := range chosen {
+		if src.IsReference() {
+			return sourceIDs, nil // already pinned explicitly
+		}
+		if src.RequiresReference() {
+			needs = true
+		}
+	}
+	if !needs {
+		return sourceIDs, nil
+	}
+
+	def, ok, err := s.DefaultReference(ctx, build)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		// Named plainly, because the fix is an administrator action rather than
+		// anything the caller can do differently.
+		var needy []string
+		for _, src := range chosen {
+			if src.RequiresReference() {
+				needy = append(needy, src.Ref())
+			}
+		}
+		return nil, fmt.Errorf("%v requires a reference genome, and %s has no default; "+
+			"register a reference source for %s and mark it default",
+			needy, build, build)
+	}
+	return append(slices.Clone(sourceIDs), def.ID), nil
 }

@@ -84,13 +84,13 @@ func kindOf(typ, format string) string {
 
 // Annotation is one field a source can contribute, derived from its manifest.
 type Annotation struct {
-	Name        string `json:"name"`
-	Field       string `json:"field,omitempty"` // source INFO id / column / GTF field
-	Type        string `json:"type,omitempty"`  // categorical|text|numeric|flag
-	Description string `json:"description,omitempty"`
-	Builtin     string `json:"builtin,omitempty"` // builtin annotator name, if any
-	Source      string `json:"source,omitempty"`  // populated by the caller
-	SourceRef   string `json:"source_ref,omitempty"`
+	Name        string `json:"name" doc:"The field name in results, and what to ask for when selecting annotations."`
+	Field       string `json:"field,omitempty" doc:"Where the value comes from in the source: an INFO id, a column, or a GTF field."`
+	Type        string `json:"type,omitempty" doc:"categorical | text | numeric | flag."`
+	Description string `json:"description,omitempty" doc:"What the value means."`
+	Builtin     string `json:"builtin,omitempty" doc:"The builtin annotator producing this, for fields computed from the variant itself."`
+	Source      string `json:"source,omitempty" doc:"The source that contributes this field."`
+	SourceRef   string `json:"source_ref,omitempty" doc:"\"name:version\" of the contributing source, so a value can be attributed to an exact dataset."`
 }
 
 // annotationFragment is the annotation half of a source manifest.

@@ -7,10 +7,11 @@ import { api, type Job } from "../api";
 /**
  * Polls a job until it reaches a terminal state, then goes to its results.
  *
- * The design shows a four-stage checklist with a percentage. The API has no
- * stage or percent yet — the job table carries status only — so this shows an
- * indeterminate state rather than inventing a fake progress bar that advances on
- * a timer. Wire the real stages in when the backend reports them.
+ * The design shows a four-stage checklist with a percentage. There is none, and
+ * there will not be: an annotation run is a single opaque pass through the CLI,
+ * so a percentage could only ever be a timer pretending to be progress. Status —
+ * queued, running, done, error, cancelled — is what is actually known, so that
+ * is what this shows, with an indeterminate indicator rather than a fake bar. Wire the real stages in when the backend reports them.
  */
 export default function Running() {
   const { jobId = "" } = useParams();

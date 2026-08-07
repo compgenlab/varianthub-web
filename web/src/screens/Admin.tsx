@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Check, Cloud, Globe, HardDrive, Plus, X } from "lucide-react";
+import { Check, Cloud, Globe, HardDrive, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
 import {
   api,
+  type Build,
   type Registry,
   type RegistryEntry,
   type Snapshot,
@@ -42,7 +43,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots";
+type Tab = "sources" | "snapshots" | "builds";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -114,7 +115,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots"] as Tab[]).map((t) => (
+        {(["sources", "snapshots", "builds"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -129,14 +130,16 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : "Snapshots"}
+            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "Genome builds"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "sources" ? (
+      {tab === "builds" ? (
+        <BuildList />
+      ) : tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
@@ -151,7 +154,6 @@ export default function Admin() {
             sources={sources}
             files={files}
             storage={storage}
-            onChange={load}
           />
         </>
       ) : (
@@ -176,16 +178,15 @@ export default function Admin() {
   );
 }
 
+// The list reports; it no longer acts, so it needs no way to refresh itself.
 function SourceTable({
   sources,
   files,
   storage,
-  onChange,
 }: {
   sources: Source[];
   files: SourceFile[];
   storage: StorageLocation[];
-  onChange: () => void;
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
@@ -266,7 +267,6 @@ function SourceTable({
             have={provisioned.get(s.id)}
             storage={storage}
             targets={targets}
-            onChange={onChange}
           />
           <span style={{ textAlign: "right" }}>
             <Link
@@ -320,86 +320,56 @@ function StoredAt({
 }
 
 /**
- * Shows a source's data footprint, or offers to fetch it.
+ * Where a source's data is, as a column in the list.
  *
- * A registered source is not usable until its data is downloaded — annotating
- * without it fails with "sources not downloaded". Putting the action on the row
- * means the gap and the fix are in the same place, rather than sending someone
- * to a different screen to work out which sources are missing.
+ * Reports only. Choosing a location, downloading and moving all live on the
+ * source's own page: they are decisions that need its current placement in
+ * view, and a dropdown plus two buttons on every row turned a list meant to
+ * answer "what exists and is it ready" into a control panel.
  */
 function ProvisionCell({
   source,
   have,
   storage,
   targets,
-  onChange,
 }: {
   source: Source;
   have?: Map<string, { bytes: number; count: number }>;
   storage: StorageLocation[];
   targets: StorageLocation[];
-  onChange: () => void;
 }) {
-  const [target, setTarget] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [err, setErr] = useState("");
+  const streamed = source.needs_data === false && source.stream;
 
-  // Already being fetched. No control while that is true: a second Download
-  // would queue a duplicate of work already running, and the useful thing to
-  // offer is the job rather than the button.
   if (source.state?.state === "installing") {
     return (
-      <span className="row gap-8" style={{ fontSize: 12.5 }}>
-        <i className="status-dot blink" style={{ background: "var(--vus-dot)" }} />
+      <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--vus-fg)" }}>
+        <i className="status-dot" style={{ background: "var(--vus-dot)" }} />
+        Downloading…
         {source.state.job ? (
-          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12.5 }}>
-            installing…
+          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12 }}>
+            view job
           </Link>
-        ) : (
-          "installing…"
-        )}
+        ) : null}
       </span>
     );
   }
 
-  // Nothing to fetch: a builtin computes from the variant, a streamed source is
-  // read from its url. Both are usable the moment they are registered, so say
-  // which rather than offering a control that would provision nothing.
   if (source.needs_data === false && !source.stream) {
-    return (
-      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>
-    );
+    return <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>;
   }
-
-  // A streamed source reads from its url, so it needs nothing — but a copy is
-  // worth having for whole-genome runs, or to pin results to bytes that cannot
-  // change upstream. Offered, not pressed: the default stays "no copy".
-  const streamed = source.needs_data === false && source.stream;
 
   if (source.state?.state === "failed") {
     return (
       <span style={{ display: "block" }}>
-        <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
-          <i className="status-dot" style={{ background: "var(--path-dot)" }} />
-          install failed
+        <span style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
+          Failed — {(source.state.error ?? "").split("\n")[0].slice(0, 70)}
         </span>
-        {/* The reason, trimmed: the row says what happened, the job page has
-            the run's whole output. */}
-        <span
-          className="mono"
-          style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}
+        <Link
+          to={`/admin/sources/${source.id}`}
+          style={{ fontSize: 12, display: "block", marginTop: 2 }}
         >
-          {(source.state.error ?? "").split("\n")[0].slice(0, 90)}
-        </span>
-        <button
-          className="btn secondary"
-          style={{ height: 26, padding: "0 9px", fontSize: 11.5, marginTop: 4 }}
-          disabled={busy || targets.length === 0}
-          onClick={provision}
-        >
-          Retry
-        </button>
+          retry…
+        </Link>
       </span>
     );
   }
@@ -421,46 +391,17 @@ function ProvisionCell({
     );
   }
 
-  if (msg) {
-    return (
-      <span style={{ fontSize: 12, color: "var(--accent-text)" }}>
-        {msg}
-      </span>
-    );
-  }
-
   if (targets.length === 0) {
     return (
-      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>
-        no usable storage configured
-      </span>
+      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>no usable storage configured</span>
     );
-  }
-
-  async function provision() {
-    setBusy(true);
-    setErr("");
-    try {
-      const r = await api.download({
-        sources: [source.id],
-        storage_id: target || targets[0].id,
-        include_streamed: streamed,
-      });
-      setMsg(`queued #${r.job_id.slice(0, 8)}`);
-      onChange();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
   }
 
   return (
-    <span>
+    <span style={{ display: "block" }}>
       {/* Without this a working remote source looks exactly like a broken
-          un-provisioned one — same dropdown, same Download button. It is
-          already usable; the copy is an optimisation, so say that before
-          offering the control rather than only in a tooltip. */}
+          un-provisioned one. It is already usable; the copy is an optimisation,
+          so say that rather than leaving it to a tooltip. */}
       {streamed && (
         <span
           className="row gap-8"
@@ -469,40 +410,9 @@ function ProvisionCell({
           <Globe size={11} /> reads from origin — copy optional
         </span>
       )}
-      <span className="row gap-8">
-        <select
-          className="select"
-          style={{ height: 30, fontSize: 12, padding: "0 8px", flex: 1, minWidth: 0 }}
-          value={target || targets[0].id}
-          onChange={(e) => setTarget(e.target.value)}
-          disabled={busy}
-          aria-label={`Storage location for ${source.name}`}
-        >
-          {targets.map((l) => (
-            <option key={l.id} value={l.id}>
-              {l.name}
-            </option>
-          ))}
-        </select>
-        <button
-          className="btn secondary"
-          style={{ height: 30, padding: "0 11px", fontSize: 12 }}
-          disabled={busy}
-          onClick={provision}
-          title={
-            streamed
-              ? "This source is read from its url. Download a copy anyway — useful for whole-genome runs, or to pin results to bytes that cannot change upstream."
-              : undefined
-          }
-        >
-          {busy ? "…" : streamed ? "Copy locally" : "Download"}
-        </button>
-      </span>
-      {err && (
-        <span className="err" style={{ fontSize: 11.5, display: "block", marginTop: 4 }}>
-          {err}
-        </span>
-      )}
+      <Link to={`/admin/sources/${source.id}`} style={{ fontSize: 12.5 }}>
+        {streamed ? "Copy locally…" : "Set up storage…"}
+      </Link>
     </span>
   );
 }
@@ -643,6 +553,11 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
   const [regErr, setRegErr] = useState("");
   const [loadingRef, setLoadingRef] = useState("");
   const [addingReg, setAddingReg] = useState(false);
+  // Bumped to re-run the dataset fetch. The server holds no cache — it re-reads
+  // the registry's manifest on every request — so what goes stale is this
+  // component's copy, taken when the page mounted. Refreshing genuinely
+  // re-reads the remote.
+  const [reload, setReload] = useState(0);
 
   async function loadRegistries(select?: string) {
     try {
@@ -677,7 +592,7 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
       .registryDatasets(regID)
       .then((d) => setEntries(d.sources ?? []))
       .catch((e) => setRegErr(e instanceof Error ? e.message : String(e)));
-  }, [regID]);
+  }, [regID, reload]);
 
   useEffect(() => {
     const t = window.setTimeout(() => {
@@ -824,7 +739,18 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
           )}
 
           <div className="card">
-            <div className="thead">Available datasets</div>
+            <div className="thead between">
+              <span>Available datasets</span>
+              <button
+                className="btn link"
+                style={{ fontSize: 12 }}
+                disabled={!regID || entries === null}
+                onClick={() => setReload((n) => n + 1)}
+                title="Re-read this registry's manifest"
+              >
+                <RefreshCw size={12} /> {entries === null ? "Refreshing…" : "Refresh"}
+              </button>
+            </div>
             {regErr && (
               <div className="empty err" style={{ padding: "16px 13px", fontSize: 12.5 }}>
                 {regErr}
@@ -1213,12 +1139,35 @@ function BuildSnapshot({
   const [id, setId] = useState("");
   const [title, setTitle] = useState("");
   const [build, setBuild] = useState("GRCh38");
+  const [builds, setBuilds] = useState<Build[]>([]);
   const [defaults, setDefaults] = useState("");
   const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  const chosen = sources.filter((s) => picked[s.id]).map((s) => s.id);
+  useEffect(() => {
+    api
+      .builds()
+      .then((r) => {
+        setBuilds(r.builds ?? []);
+        // Start on a build that exists rather than on a guess, so the first
+        // snapshot an operator builds is not rejected for an assembly this
+        // installation has never heard of.
+        if (r.builds?.length && !r.builds.some((b) => b.name === "GRCh38")) {
+          setBuild(r.builds[0].name);
+        }
+      })
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  // A snapshot may never mix assemblies — PutSnapshot rejects it outright — so
+  // only offer what can legally be pinned. Sources declaring no build are
+  // assembly-agnostic (the builtins compute from the variant itself) and belong
+  // in any snapshot. Matched exactly, never normalized: GRCh38 and hg38 are the
+  // same genome in real life but a false match here annotates against the wrong
+  // coordinates and says nothing about it.
+  const pinnable = sources.filter((s) => !s.build || s.build === build);
+  const chosen = sources.filter((s) => picked[s.id] && (!s.build || s.build === build)).map((s) => s.id);
 
   async function save(publish: boolean) {
     setBusy(true);
@@ -1274,17 +1223,25 @@ function BuildSnapshot({
         <div style={{ minWidth: 190 }}>
           <label className="label">Build</label>
           <select className="select mono" value={build} onChange={(e) => setBuild(e.target.value)}>
-            <option>GRCh38</option>
-            <option>GRCh37</option>
-            <option>T2T-CHM13v2.0</option>
-            <option>GRCm39</option>
+            {/* Whatever is selected stays listed even with no matching record,
+                so the control never silently shows a different build than the
+                one the snapshot would be saved with. */}
+            {!builds.some((b) => b.name === build) && <option key={build}>{build}</option>}
+            {builds.map((b) => (
+              <option key={b.name} value={b.name}>
+                {b.name}
+              </option>
+            ))}
           </select>
         </div>
       </div>
 
       <label className="label">Sources to pin</label>
       <div className="card">
-        {sources.map((s) => (
+        {pinnable.length === 0 && (
+          <div className="empty">No sources are registered for {build}.</div>
+        )}
+        {pinnable.map((s) => (
           <button
             key={s.id}
             className="trow rowgrid"
@@ -1352,5 +1309,177 @@ function BuildSnapshot({
   );
 }
 
+// Genome builds: which assemblies this installation offers.
+//
+// These used to be a hardcoded array in the annotation form, so there was no way
+// to add one — and, because the picker had no relationship to the catalog,
+// choosing a build did not narrow the source list either. Both follow from
+// making them records.
+function BuildList() {
+  const [builds, setBuilds] = useState<Build[] | null>(null);
+  // References are sources, so which one a build defaults to lives with the
+  // sources — but it is a fact about the build, and this is where someone comes
+  // looking for it.
+  const [refs, setRefs] = useState<Source[]>([]);
+  const [err, setErr] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
 
+  const load = () =>
+    Promise.all([api.builds(), api.sources()])
+      .then(([b, s]) => {
+        setBuilds(b.builds ?? []);
+        setRefs((s.sources ?? []).filter((x) => x.is_reference));
+      })
+      .catch((e) => setErr(e.message));
 
+  // Exact match, never normalized: a reference offered under the wrong assembly
+  // would annotate against coordinates that mean something else.
+  const refsFor = (build: string) => refs.filter((r) => r.build === build);
+
+  const setDefault = async (sourceID: string) => {
+    setErr("");
+    try {
+      await api.setDefaultReference(sourceID);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const add = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.putBuild({ name: name.trim(), label: label.trim() });
+      setName("");
+      setLabel("");
+      setAdding(false);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (b: Build) => {
+    if (!confirm(`Remove ${b.name}? Sources already registered against it are left alone.`)) {
+      return;
+    }
+    setErr("");
+    try {
+      await api.deleteBuild(b.name);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
+
+  return (
+    <>
+      <div className="between" style={{ marginBottom: 14 }}>
+        <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
+          The assemblies offered when starting an annotation. A build&apos;s name must
+          match the <code>build</code> a source manifest declares, exactly — <code>GRCh38</code>{" "}
+          and <code>hg38</code> are the same genome in real life but are not
+          interchangeable here.
+        </p>
+        <button className="btn sm" onClick={() => setAdding((v) => !v)}>
+          <Plus size={15} /> Add build
+        </button>
+      </div>
+
+      {err && <p className="err">{err}</p>}
+
+      {adding && (
+        <div className="card" style={{ padding: 14, marginBottom: 14 }}>
+          <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+            <input
+              className="input mono"
+              placeholder="GRCh38"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ width: 200 }}
+            />
+            <input
+              className="input"
+              placeholder="Human GRCh38 (optional label)"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              style={{ flex: 1, minWidth: 220 }}
+            />
+            <button className="btn sm" disabled={!name.trim() || busy} onClick={add}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="rowgrid thead" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
+          <span>Build</span>
+          <span>Label</span>
+          <span>Default reference</span>
+          <span>Sources</span>
+          <span />
+        </div>
+        {builds?.length === 0 && <div className="empty">No builds defined yet.</div>}
+        {builds?.map((b) => (
+          <div key={b.name} className="trow rowgrid" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
+            <span className="mono" style={{ fontWeight: 500 }}>
+              {b.name}
+            </span>
+            <span style={{ color: "var(--text-2)" }}>{b.label || "—"}</span>
+            <span>
+              {/* What an ad-hoc selection pins when something in it requires a
+                  genome. Only references for this build are offered, because a
+                  snapshot may not mix assemblies. */}
+              {refsFor(b.name).length === 0 ? (
+                <span style={{ fontSize: 12, color: "var(--text-3)" }}>
+                  no reference registered
+                </span>
+              ) : (
+                <select
+                  className="select sm mono"
+                  style={{ maxWidth: 240 }}
+                  value={refsFor(b.name).find((r) => r.is_default_reference)?.id ?? ""}
+                  onChange={(e) => e.target.value && setDefault(e.target.value)}
+                >
+                  {/* Present until one is chosen, and never selectable
+                      afterwards: clearing a default is not something this
+                      endpoint does, and offering it would fail silently. */}
+                  {!refsFor(b.name).some((r) => r.is_default_reference) && (
+                    <option value="">— none chosen —</option>
+                  )}
+                  {refsFor(b.name).map((r) => (
+                    <option key={r.id} value={r.id}>
+                      {r.name} {r.version}
+                    </option>
+                  ))}
+                </select>
+              )}
+            </span>
+            <span className="mono" style={{ fontSize: 12 }}>
+              {b.sources}
+            </span>
+            <span>
+              {/* Removal is refused server-side while anything declares the
+                  build, so this stays enabled and reports why rather than
+                  guessing at the reason from a count that could be stale. */}
+              <button className="btn sm ghost" onClick={() => remove(b)}>
+                <Trash2 size={14} /> Remove
+              </button>
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}

@@ -105,7 +105,9 @@ export default function SourceDetail() {
               ? "Read from its origin — nothing is stored here."
               : source.needs_data === false
                 ? "Computed from the variant; there is nothing to store."
-                : "Not downloaded yet. Provision it from the sources list."}
+                : source.kind === "tool"
+                  ? "Not installed yet. A tool downloads its image and runs a one-time setup; the result can be kept in a storage location so another worker unpacks it instead of repeating the install."
+                  : "Not downloaded yet — choose a location below."}
           </p>
         ) : (
           [...byLoc].map(([id, v]) => {
@@ -120,6 +122,12 @@ export default function SourceDetail() {
             );
           })
         )}
+        <StorageActions
+          source={source}
+          storage={storage}
+          have={byLoc}
+          onChange={load}
+        />
       </div>
 
       <SourceSettingsPanel source={source} />
@@ -423,5 +431,104 @@ function DeleteSource({ source, onDeleted }: { source: Source; onDeleted: () => 
         </span>
       )}
     </span>
+  );
+}
+
+
+/**
+ * Downloading a source, and moving it between storage locations.
+ *
+ * On the detail page rather than the list: both are decisions about one source
+ * that need its current placement in view, and a dropdown per row made the list
+ * a control panel rather than a summary.
+ */
+function StorageActions({
+  source,
+  storage,
+  have,
+  onChange,
+}: {
+  source: Source;
+  storage: StorageLocation[];
+  have: Map<string, { bytes: number; count: number }>;
+  onChange: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const [target, setTarget] = useState("");
+
+  // Nothing to place: a builtin computes from the variant, and a streamed source
+  // is read from its origin.
+  if (source.needs_data === false && !source.stream) return null;
+
+  const usable = storage.filter((l) => l.usable !== false);
+  const elsewhere = usable.filter((l) => !have.has(l.id));
+  const stored = have.size > 0;
+
+  async function run(fn: () => Promise<unknown>, note: string) {
+    setBusy(true);
+    setMsg("");
+    try {
+      await fn();
+      setMsg(note);
+      onChange();
+    } catch (e) {
+      setMsg(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div style={{ marginTop: stored ? 12 : 0, paddingTop: stored ? 12 : 0,
+                  borderTop: stored ? "1px solid var(--border)" : "none" }}>
+      <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+        <select
+          value={target}
+          disabled={busy || usable.length === 0}
+          onChange={(e) => setTarget(e.target.value)}
+          style={{ fontSize: 12.5, height: 28, padding: "0 6px", minWidth: 190 }}
+        >
+          <option value="">
+            {usable.length === 0 ? "no usable storage configured" : "choose a location…"}
+          </option>
+          {(stored ? elsewhere : usable).map((l) => (
+            <option key={l.id} value={l.id}>
+              {l.name} — {l.uri}
+            </option>
+          ))}
+        </select>
+
+        {stored ? (
+          <button
+            className="btn sm"
+            disabled={busy || !target}
+            onClick={() =>
+              // Copy, record, then delete: the source stays readable where it is
+              // until the new copy has landed, so this is safe to interrupt.
+              run(() => api.moveSource(source.id, target), "moving…")
+            }
+          >
+            Move
+          </button>
+        ) : (
+          <button
+            className="btn sm"
+            disabled={busy || !target}
+            onClick={() => run(() => api.download({ sources: [source.id], storage_id: target }), "downloading…")}
+          >
+            Copy locally
+          </button>
+        )}
+      </div>
+      {msg && (
+        <p style={{ fontSize: 12, color: "var(--accent-text)", margin: "8px 0 0" }}>{msg}</p>
+      )}
+      {stored && elsewhere.length === 0 && (
+        <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0" }}>
+          Stored in every configured location; there is nowhere to move it.
+        </p>
+      )}
+    </div>
   );
 }

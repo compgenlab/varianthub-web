@@ -135,10 +135,18 @@ type ExecRunner struct {
 	// attempt starts from nothing. 0 falls back to Timeout.
 	DownloadTimeout time.Duration
 
-	// OnProgress, if set, receives the CLI's progress lines as they arrive.
-	// varhub -v logs to stderr with a "varhub: " prefix; this is what will drive
-	// the job stage/percent the design's Running screen wants.
-	OnProgress func(line string)
+	// NoCache bypasses varhub's annotation cache, computing every value fresh
+	// and persisting nothing.
+	//
+	// For diagnosis. A cached value is indistinguishable from a freshly computed
+	// one in the result, so when a source starts returning nothing there is no
+	// way from the outside to tell "it was asked and had no answer" from "an
+	// older, emptier answer is being replayed" — including answers cached before
+	// the source was installed at all. Turning the cache off is what separates
+	// those, and without this the only way to do that was to run the CLI by hand.
+	//
+	// Off by default: the cache is what makes a repeated query cheap.
+	NoCache bool
 }
 
 var _ Runner = (*ExecRunner)(nil)
@@ -180,6 +188,9 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		args = append(args, "-snapshot", req.Snapshot)
 	}
 	args = append(args, "annotate", "--format", "json", "-v")
+	if r.NoCache {
+		args = append(args, "--no-cache")
+	}
 	switch strings.TrimSpace(req.Selection) {
 	case "":
 		// snapshot defaults
@@ -246,9 +257,6 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
-			if r.OnProgress != nil {
-				r.OnProgress(line)
-			}
 			mu.Lock()
 			tailLines = append(tailLines, line)
 			if len(tailLines) > 20 {
@@ -661,9 +669,6 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
-			if r.OnProgress != nil {
-				r.OnProgress(line)
-			}
 			mu.Lock()
 			lines = append(lines, line)
 			if len(lines) > 40 {
@@ -740,11 +745,60 @@ func rewriteCacheDir(home, cacheDir, dataDir string) error {
 			out = append(out, fmt.Sprintf("cache_dir        = %q", cacheDir))
 		case strings.HasPrefix(strings.TrimSpace(line), "data_dir") && dataDir != "":
 			out = append(out, fmt.Sprintf("data_dir         = %q", dataDir))
+		case strings.HasPrefix(strings.TrimSpace(line), "tool_dir") && dataDir != "":
+			// Moves with data_dir, never independently. The whole point of
+			// pinning it is that provisioning and annotation resolve a tool to
+			// the same directory; letting one drift restores the bug.
+			out = append(out, fmt.Sprintf("tool_dir         = %q", dataDir))
 		default:
 			out = append(out, line)
 		}
 	}
-	return os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600)
+	if err := os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600); err != nil {
+		return err
+	}
+	return rewriteToolCache(home, cacheDir)
+}
+
+// rewriteToolCache repoints the archive destination in every source overlay to
+// this job's storage target.
+//
+// For the same reason cache_dir is rewritten above: the materializer fills the
+// overlay from the catalog, where the destination is whichever storage is
+// default, while the job is being sent somewhere a caller chose. Leaving the
+// catalog's answer means archiving to the wrong place — or, when the default is
+// a filesystem path and the job is going to a bucket, not archiving at all,
+// since only an object store is an archive destination.
+//
+// That second case is not hypothetical: it is what silently produced no archive
+// after a 24-hour VEP install, with the setting showing as enabled throughout.
+func rewriteToolCache(home, cacheDir string) error {
+	overlays, err := filepath.Glob(filepath.Join(home,
+		"annotations", "sources", "*", "*", "*.locations.toml"))
+	if err != nil {
+		return err
+	}
+	for _, p := range overlays {
+		body, err := os.ReadFile(p)
+		if err != nil {
+			return fmt.Errorf("read overlay %s: %w", filepath.Base(p), err)
+		}
+		if !strings.Contains(string(body), "tool_cache") {
+			continue // nothing to repoint
+		}
+		var out []string
+		for _, line := range strings.Split(string(body), "\n") {
+			if strings.HasPrefix(strings.TrimSpace(line), "tool_cache") {
+				out = append(out, fmt.Sprintf("tool_cache = %q", cacheDir))
+				continue
+			}
+			out = append(out, line)
+		}
+		if err := os.WriteFile(p, []byte(strings.Join(out, "\n")), 0o600); err != nil {
+			return fmt.Errorf("write overlay %s: %w", filepath.Base(p), err)
+		}
+	}
+	return nil
 }
 
 // inventory walks a directory and reports every regular file, relative to root.

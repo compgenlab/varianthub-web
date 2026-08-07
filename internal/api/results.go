@@ -90,13 +90,20 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	if format == "" {
-		format = "json"
+		// A job submitted as a VCF defaults to a VCF: the caller had one, so
+		// giving rows back and making them ask for their own format again is a
+		// question with an obvious answer.
+		if job.Kind == queue.KindVCF {
+			format = "vcf"
+		} else {
+			format = "json"
+		}
 	}
 	switch format {
-	case "json", "tsv", "csv":
+	case "json", "tsv", "csv", "vcf":
 	default:
 		writeError(w, http.StatusBadRequest,
-			"unknown format "+format+" (want json, tsv or csv)")
+			"unknown format "+format+" (want json, tsv, csv or vcf)")
 		return
 	}
 
@@ -121,6 +128,16 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		s.exportDelimited(w, r, job, cols, qy, '\t')
 	case "csv":
 		s.exportDelimited(w, r, job, cols, qy, ',')
+	case "vcf":
+		// A submitted VCF is answered with its own file annotated, which keeps
+		// the ID, QUAL, FILTER, existing INFO, FORMAT and sample columns the
+		// caller sent. Falls back to rendering from rows when there is no
+		// stored input to merge onto — a job old enough to have been swept —
+		// so a download degrades rather than fails.
+		if job.Kind == queue.KindVCF && s.exportMergedVCF(w, r, job, cols, qy) {
+			return
+		}
+		s.exportVCF(w, r, job, cols, qy)
 	}
 }
 

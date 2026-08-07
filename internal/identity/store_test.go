@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -14,14 +16,23 @@ import (
 
 // A real Postgres, one schema per test — same shape as the catalog tests. The
 // auth tables reference `source`, so the catalog migrations come along too.
-var migrationFiles = []string{
-	"../../migrations/0001_job_queue.sql",
-	"../../migrations/0002_catalog.sql",
-	"../../migrations/0004_registry.sql",
-	"../../migrations/0005_adhoc_snapshot.sql",
-	"../../migrations/0006_storage.sql",
-	"../../migrations/0007_auth.sql",
-	"../../migrations/0008_default_private.sql",
+//
+// Globbed rather than listed. The list was written by hand and stopped at 0008
+// while the repo reached 0022, so these tests ran against a schema years out of
+// date and a new column read as "column does not exist" rather than as a
+// failing assertion. The queue, catalog and api harnesses had the same list and
+// the same drift; this one was missed when they were fixed.
+func allMigrations(t *testing.T) []string {
+	t.Helper()
+	files, err := filepath.Glob("../../migrations/*.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no migrations found; the glob or the layout has moved")
+	}
+	sort.Strings(files)
+	return files
 }
 
 func testStore(t *testing.T) *Store {
@@ -33,7 +44,7 @@ func testStore(t *testing.T) *Store {
 	ctx := context.Background()
 
 	var ddl strings.Builder
-	for _, f := range migrationFiles {
+	for _, f := range allMigrations(t) {
 		b, err := os.ReadFile(f)
 		if err != nil {
 			t.Fatalf("read %s: %v", f, err)
@@ -158,11 +169,11 @@ func TestTokensAreIndependent(t *testing.T) {
 	ctx := context.Background()
 	u := mustUser(t, s, "dev@example.com")
 
-	laptop, laptopSecret, err := s.CreateToken(ctx, u.ID, "laptop")
+	laptop, laptopSecret, err := s.CreateToken(ctx, u.ID, "laptop", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	cluster, clusterSecret, err := s.CreateToken(ctx, u.ID, "cluster")
+	cluster, clusterSecret, err := s.CreateToken(ctx, u.ID, "cluster", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,11 +218,12 @@ func TestTokensAreIndependent(t *testing.T) {
 	if len(list) != 2 {
 		t.Fatalf("listed %d tokens, want 2 (revoked ones stay visible)", len(list))
 	}
+	now := time.Now().Unix()
 	for _, tk := range list {
-		if strings.Contains(clusterSecret, tk.Prefix) && !tk.Active() {
+		if strings.Contains(clusterSecret, tk.Prefix) && !tk.Active(now) {
 			t.Error("the live token reports revoked")
 		}
-		if tk.ID == laptop.ID && tk.Active() {
+		if tk.ID == laptop.ID && tk.Active(now) {
 			t.Error("the revoked token reports active")
 		}
 		if tk.ID == cluster.ID && tk.LastUsedAt == 0 {
@@ -230,7 +242,7 @@ func TestTokenLastUsedAdvances(t *testing.T) {
 	now := int64(1000)
 	s.SetNow(func() int64 { return now })
 
-	tk, secret, err := s.CreateToken(ctx, u.ID, "t")
+	tk, secret, err := s.CreateToken(ctx, u.ID, "t", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -266,7 +278,7 @@ func TestPrefixDoesNotAuthenticate(t *testing.T) {
 	ctx := context.Background()
 	u := mustUser(t, s, "prefix@example.com")
 
-	tk, secret, err := s.CreateToken(ctx, u.ID, "t")
+	tk, secret, err := s.CreateToken(ctx, u.ID, "t", 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +414,7 @@ func TestResolve(t *testing.T) {
 	if err := s.AddMember(ctx, lab.ID, u.ID, TeamMember); err != nil {
 		t.Fatal(err)
 	}
-	_, secret, _ := s.CreateToken(ctx, u.ID, "t")
+	_, secret, _ := s.CreateToken(ctx, u.ID, "t", 1)
 	sess, _, _ := s.CreateSession(ctx, u.ID)
 
 	for _, tc := range []struct {
@@ -530,7 +542,7 @@ func TestChangePasswordEndsOtherSessions(t *testing.T) {
 	}
 	keep, _, _ := s.CreateSession(ctx, u.ID)
 	other, _, _ := s.CreateSession(ctx, u.ID)
-	_, tokenSecret, err := s.CreateToken(ctx, u.ID, "ci")
+	_, tokenSecret, err := s.CreateToken(ctx, u.ID, "ci", 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2,12 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowRight, Check, Lock, TriangleAlert, Globe } from "lucide-react";
 
-import { api, type Annotation, type Snapshot, type Source } from "../api";
+import { api, type Annotation, type Build, type Snapshot, type Source } from "../api";
 import { useFlow } from "../flow";
 
 type Mode = "snapshot" | "sources";
-
-const BUILDS = ["GRCh38", "GRCh37", "T2T-CHM13v2.0", "GRCm39"];
 
 export default function ChooseSources() {
   const nav = useNavigate();
@@ -15,6 +13,7 @@ export default function ChooseSources() {
   const [mode, setMode] = useState<Mode>("snapshot");
   const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
   const [sources, setSources] = useState<(Source & { annotations: Annotation[] })[] | null>(null);
+  const [builds, setBuilds] = useState<Build[] | null>(null);
   const [fields, setFields] = useState<Annotation[]>([]);
   const [err, setErr] = useState("");
 
@@ -27,7 +26,80 @@ export default function ChooseSources() {
       .sources()
       .then((r) => setSources(r.sources ?? []))
       .catch((e) => setErr(e.message));
+    // The builds come from the catalog rather than a constant in this file, so
+    // an administrator can add one and it appears here without a rebuild.
+    api
+      .builds()
+      .then((r) => {
+        setBuilds(r.builds ?? []);
+        // The flow starts on GRCh38 because something has to be selected before
+        // the list arrives. If this installation does not offer it, move to one
+        // it does — otherwise the form opens on a build with no sources and
+        // nothing says why.
+        if (r.builds?.length && !r.builds.some((b) => b.name === flow.build)) {
+          flow.setBuild(r.builds[0].name);
+        }
+      })
+      .catch((e) => setErr(e.message));
   }, []);
+
+  // A source belongs to the chosen build, or declares no build at all — the
+  // builtins compute from the variant itself and are correct against any
+  // assembly. Comparison is exact and deliberately not normalized: GRCh38 and
+  // hg38 are the same genome in real life but different strings here, and a
+  // false match would annotate against the wrong coordinates and say nothing
+  // about it.
+  const visible = useMemo(
+    () =>
+      (sources ?? []).filter(
+        // References are excluded rather than listed: they contribute no
+        // annotations, so offering one here invites picking it for something it
+        // cannot do. It is chosen below, and only when something needs it.
+        (s) => !s.is_reference && (!s.build || s.build === flow.build),
+      ),
+    [sources, flow.build],
+  );
+
+  const references = useMemo(
+    () => (sources ?? []).filter((s) => s.is_reference && s.build === flow.build),
+    [sources, flow.build],
+  );
+
+  // Only what is actually selected matters. A source that requires a genome and
+  // is not picked should not make anyone choose one.
+  const needsReference = useMemo(
+    () => visible.some((s) => flow.sources.includes(s.id) && s.requires_reference),
+    [visible, flow.sources],
+  );
+
+  // Selecting a build the current picks do not belong to would submit sources
+  // from another assembly, which PutSnapshot rejects — drop them as the build
+  // changes rather than failing at submit with a list the user can no longer see.
+  useEffect(() => {
+    if (!sources) {
+      return;
+    }
+    const ok = new Set(visible.map((s) => s.id));
+    const kept = flow.sources.filter((id) => ok.has(id));
+    if (kept.length !== flow.sources.length) {
+      flow.setSources(kept);
+    }
+  }, [visible, sources]);
+
+  // The reference belongs to the build for the same reason, and with exactly one
+  // to choose from there is no choice to make — so make it rather than asking.
+  useEffect(() => {
+    if (!sources) {
+      return;
+    }
+    if (flow.reference && !references.some((r) => r.id === flow.reference)) {
+      flow.setReference("");
+      return;
+    }
+    if (!flow.reference && references.length === 1) {
+      flow.setReference(references[0].id);
+    }
+  }, [references, sources, flow.reference]);
 
   // Snapshot mode: the fields come from the snapshot, along with which it
   // applies by default. Fetched on selection so the picker below is always the
@@ -82,7 +154,12 @@ export default function ChooseSources() {
   const isDraft = selectedSnapshot?.state === "draft";
   const ready =
     (mode === "snapshot" && !!flow.snapshot) ||
-    (mode === "sources" && flow.sources.length > 0 && !!flow.build);
+    (mode === "sources" &&
+      flow.sources.length > 0 &&
+      !!flow.build &&
+      // Submitting without one fails server-side in withDefaultReference, with a
+      // message about a default the person choosing sources cannot set.
+      (!needsReference || !!flow.reference));
 
   function toggleField(name: string) {
     flow.setAnnotations(
@@ -96,7 +173,13 @@ export default function ChooseSources() {
     const p = new URLSearchParams();
     if (mode === "snapshot") p.set("snapshot", flow.snapshot);
     else {
-      p.set("sources", flow.sources.join(","));
+      // Appended to the sources rather than sent separately: a reference is an
+      // ordinary pinned source to everything downstream, and pinning it
+      // explicitly is what stops the server picking the build's default.
+      const picked = needsReference && flow.reference
+        ? [...flow.sources, flow.reference]
+        : flow.sources;
+      p.set("sources", picked.join(","));
       p.set("build", flow.build);
     }
     if (flow.annotations.length) p.set("annotations", flow.annotations.join(","));
@@ -197,11 +280,64 @@ export default function ChooseSources() {
               value={flow.build}
               onChange={(e) => flow.setBuild(e.target.value)}
             >
-              {BUILDS.map((b) => (
-                <option key={b}>{b}</option>
+              {/* Whatever the flow already holds stays selectable even if no
+                  build record matches it, so a snapshot pinned to a build an
+                  administrator later removed still shows what it is set to. */}
+              {builds && !builds.some((b) => b.name === flow.build) && (
+                <option key={flow.build}>{flow.build}</option>
+              )}
+              {(builds ?? []).map((b) => (
+                <option key={b.name} value={b.name}>
+                  {b.label && b.label !== b.name ? `${b.label} (${b.name})` : b.name}
+                </option>
               ))}
             </select>
           </div>
+          {/* Only when the selection needs one. Most annotation opens no genome,
+              and asking every time would be a question with no consequence. */}
+          {needsReference && (
+            <div style={{ marginBottom: 14 }}>
+              <label className="label">Reference FASTA</label>
+              {references.length === 0 ? (
+                <p className="err" style={{ fontSize: 13, margin: "4px 0 0" }}>
+                  {visible
+                    .filter((s) => flow.sources.includes(s.id) && s.requires_reference)
+                    .map((s) => s.title || s.name)
+                    .join(", ")}{" "}
+                  needs a reference genome, and none is registered for {flow.build}.
+                  An administrator can add one from the sources page.
+                </p>
+              ) : (
+                <>
+                  <select
+                    className="select mono"
+                    value={flow.reference}
+                    onChange={(e) => flow.setReference(e.target.value)}
+                  >
+                    {/* Absent once one is chosen, so the control cannot be put
+                        back into a state the form will not accept. */}
+                    {!flow.reference && <option value="">— choose a reference —</option>}
+                    {references.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.name} {r.version}
+                        {r.is_default_reference ? " (default)" : ""}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="lede" style={{ fontSize: 12, margin: "6px 0 0" }}>
+                    Required by{" "}
+                    {visible
+                      .filter((s) => flow.sources.includes(s.id) && s.requires_reference)
+                      .map((s) => s.title || s.name)
+                      .join(", ")}
+                    . Only references for {flow.build} are offered — a snapshot cannot
+                    mix assemblies.
+                  </p>
+                </>
+              )}
+            </div>
+          )}
+
           <div className="card">
             <div className="rowgrid thead" style={{ gridTemplateColumns: "26px 1.7fr 1fr .8fr 1fr" }}>
               <span />
@@ -210,8 +346,14 @@ export default function ChooseSources() {
               <span>Kind</span>
               <span>Access</span>
             </div>
-            {sources?.length === 0 && <div className="empty">No sources registered yet.</div>}
-            {sources?.map((s) => {
+            {sources && visible.length === 0 && (
+              <div className="empty">
+                {sources.length === 0
+                  ? "No sources registered yet."
+                  : `No sources are registered for ${flow.build}.`}
+              </div>
+            )}
+            {visible.map((s) => {
               const on = flow.sources.includes(s.id);
               return (
                 <button

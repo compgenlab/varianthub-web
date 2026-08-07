@@ -100,10 +100,86 @@ func TestSettingsMaterializeIntoTheOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("no overlay written: %v", err)
 	}
-	for _, want := range []string{`annotation_prefix = "GENCODE_LATEST_"`, "cache_setup = true"} {
+	// tool_cache carries the destination, not a flag. This asserted
+	// `cache_setup = true` until 2026-08-06 — a key varhub has no field for, so
+	// it was ignored on parse and the setting did nothing. The test passed
+	// throughout, because it checked what we wrote rather than what varhub
+	// reads.
+	for _, want := range []string{
+		`annotation_prefix = "GENCODE_LATEST_"`,
+		`tool_cache = "/mnt/sources"`, // the job's storage target
+	} {
 		if !strings.Contains(string(body), want) {
 			t.Errorf("overlay missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(string(body), "cache_setup") {
+		t.Errorf("overlay still writes cache_setup, which varhub ignores:\n%s", body)
+	}
+}
+
+// overlayKeys are the top-level keys varhub's config.Locations declares. An
+// overlay key outside this set is not an error anywhere — TOML parsing ignores
+// what it has no field for — so writing one is silent and total: the setting
+// appears set and does nothing.
+//
+// That is exactly how tool archiving was broken. This list is the contract with
+// the CLI, and it has to be updated by hand when varhub's Locations struct
+// changes, which is the point: the update is where someone notices.
+var overlayKeys = map[string]bool{
+	"root": true, "gtf_index": true, "file": true,
+	"tool_cache": true, "annotation_prefix": true,
+}
+
+func TestOverlayWritesOnlyKeysVarhubReads(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Every setting on at once, so the overlay carries everything it can.
+	if err := s.PutSettings(ctx, "vep-113", SourceSettings{
+		AnnotationPrefix: "VEP_113_", CacheSetup: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "s3://bucket/prefix",
+	}
+	home, cleanup, err := m.HomeForSources(ctx, []string{"vep-113"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(home, "annotations", "sources", "vep", "113",
+		"vep-113.locations.toml"))
+	if err != nil {
+		t.Fatalf("no overlay written: %v", err)
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
+			continue
+		}
+		key, _, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		if key = strings.TrimSpace(key); !overlayKeys[key] {
+			t.Errorf("overlay writes %q, which varhub has no field for — it will be "+
+				"ignored on parse and the setting will silently do nothing:\n%s", key, body)
+		}
+	}
+	// And the archive destination is the job's storage target.
+	if !strings.Contains(string(body), `tool_cache = "s3://bucket/prefix"`) {
+		t.Errorf("tool_cache is not the job's storage target:\n%s", body)
 	}
 }
 
@@ -250,5 +326,199 @@ func TestPrefixChangeCarriesSnapshotDefaults(t *testing.T) {
 	}
 	if got.Defaults[0] != "auto_id" {
 		t.Errorf("clearing the prefix left %v", got.Defaults)
+	}
+}
+
+// A tool must resolve to the same directory whichever job is running.
+//
+// varhub defaults tool_dir to cache_dir when that is a local path, and to
+// data_dir only when it is remote. Jobs do not agree about cache_dir — a
+// download goes to whichever storage the caller picked, an annotation to
+// wherever its sources resolve — so leaving the default means the same tool has
+// two addresses. A download to a bucket wrote VEP's image under data_dir;
+// annotating against a filesystem-backed snapshot looked under that snapshot's
+// cache_dir, found nothing, and the tool died on a missing .sif with no
+// annotations produced.
+func TestToolDirIsPinnedToDataDir(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// A local cache_dir is the case that used to win over data_dir.
+	m := &Materializer{
+		Store: s, Root: t.TempDir(),
+		DataDir: "/var/lib/varianthub/data", CacheDir: "/mnt/storage",
+	}
+	home, cleanup, err := m.HomeForSources(ctx, []string{"vep-113"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+
+	body, err := os.ReadFile(filepath.Join(home, "config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `tool_dir         = "/var/lib/varianthub/data"`) {
+		t.Errorf("tool_dir is not pinned to data_dir, so a tool installed by a "+
+			"download will not be found when annotating:\n%s", body)
+	}
+}
+
+// refSrc registers a reference source for an assembly.
+func refSrc(t *testing.T, s *Store, ctx context.Context, id, name, build string) {
+	t.Helper()
+	if err := s.PutSource(ctx, Source{
+		ID: id, Name: name, Version: "1", Kind: "reference", Build: build,
+		TOML: "[[sources]]\ntype=\"reference\"\nname=\"" + name + "\"\nversion=\"1\"\n" +
+			"assembly=\"" + build + "\"\nurl=\"https://example.org/" + name + ".fa.gz\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The two snapshot rules, checked where every snapshot passes through.
+//
+// Unmet, varhub renders {ref} as nothing and the tool dies on a mangled command
+// line — VEP reported "Unexpected extra command-line parameter(s): 4" because
+// --fasta swallowed --fork. Nothing in that mentions a genome.
+func TestSnapshotReferenceRules(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	refSrc(t, s, ctx, "GRCh38.p13", "GRCh38.p13", "GRCh38")
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\n" +
+			"assembly=\"GRCh38\"\nrequires_reference=true\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Needs one, none pinned.
+	err := s.PutSnapshot(ctx, Snapshot{ID: "a", Build: "GRCh38"}, []string{"vep-113"})
+	if err == nil {
+		t.Error("a snapshot needing a reference was accepted without one")
+	} else if !strings.Contains(err.Error(), "requires a reference") {
+		t.Errorf("error does not name the cause: %v", err)
+	}
+
+	// Two references: {ref} would have no single answer.
+	err = s.PutSnapshot(ctx, Snapshot{ID: "b", Build: "GRCh38"},
+		[]string{"vep-113", "GRCh38.p14", "GRCh38.p13"})
+	if err == nil {
+		t.Error("a snapshot pinning two references was accepted")
+	} else if !strings.Contains(err.Error(), "one reference") {
+		t.Errorf("error does not name the cause: %v", err)
+	}
+
+	// One reference, requirement met.
+	if err = s.PutSnapshot(ctx, Snapshot{ID: "c", Build: "GRCh38"},
+		[]string{"vep-113", "GRCh38.p14"}); err != nil {
+		t.Fatalf("a well-formed snapshot was rejected: %v", err)
+	}
+}
+
+// An ad-hoc snapshot has nobody to ask which reference to use, so it takes the
+// assembly's default — and pins it, so re-running later cannot drift onto a
+// newer genome.
+func TestAdhocPinsTheDefaultReference(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	if err := s.PutSource(ctx, Source{
+		ID: "vep-113", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+		TOML: "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\n" +
+			"assembly=\"GRCh38\"\nrequires_reference=true\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSource(ctx, Source{
+		ID: "gencode-48", Name: "gencode", Version: "48", Kind: "gtf", Build: "GRCh38",
+		TOML: "[[sources]]\nname=\"gencode\"\nversion=\"48\"\nassembly=\"GRCh38\"\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// No default yet: the failure names the administrator action, not the caller's.
+	if _, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"vep-113"}, nil); err == nil {
+		t.Error("ad-hoc annotation with VEP succeeded without any reference")
+	} else if !strings.Contains(err.Error(), "no default") {
+		t.Errorf("error does not say what to do: %v", err)
+	}
+
+	if err := s.SetDefaultReference(ctx, "GRCh38.p14"); err != nil {
+		t.Fatal(err)
+	}
+	id, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"vep-113"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := s.GetSnapshot(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pinned bool
+	for _, src := range snap.Sources {
+		if src.ID == "GRCh38.p14" {
+			pinned = true
+		}
+	}
+	if !pinned {
+		t.Error("the ad-hoc snapshot did not pin the default reference")
+	}
+
+	// A selection needing no reference must not drag one in.
+	id2, err := s.EnsureAdhocSnapshot(ctx, "GRCh38", []string{"gencode-48"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap2, err := s.GetSnapshot(ctx, id2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range snap2.Sources {
+		if src.IsReference() {
+			t.Error("a selection needing no reference pinned one anyway")
+		}
+	}
+}
+
+// One default per assembly: two would make the ad-hoc choice arbitrary, and the
+// arbitrariness invisible.
+func TestOneDefaultReferencePerAssembly(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	refSrc(t, s, ctx, "GRCh38.p13", "GRCh38.p13", "GRCh38")
+	refSrc(t, s, ctx, "GRCh38.p14", "GRCh38.p14", "GRCh38")
+	refSrc(t, s, ctx, "GRCh37", "GRCh37", "GRCh37")
+
+	for _, id := range []string{"GRCh38.p13", "GRCh38.p14"} {
+		if err := s.SetDefaultReference(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetDefaultReference(ctx, "GRCh37"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := s.DefaultReference(ctx, "GRCh38")
+	if err != nil || !ok {
+		t.Fatalf("no default for GRCh38: ok=%v err=%v", ok, err)
+	}
+	if got.ID != "GRCh38.p14" {
+		t.Errorf("default = %s, want the most recently set (GRCh38.p14)", got.ID)
+	}
+	// A different assembly keeps its own.
+	if got, ok, _ = s.DefaultReference(ctx, "GRCh37"); !ok || got.ID != "GRCh37" {
+		t.Errorf("GRCh37 default = %+v", got)
 	}
 }

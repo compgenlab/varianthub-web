@@ -92,7 +92,7 @@ export default function JobResults() {
     setPage(1);
   }
 
-  async function download(format: "json" | "tsv" | "csv") {
+  async function download(format: "json" | "tsv" | "csv" | "vcf") {
     setMenu(false);
     setBusy(true);
     try {
@@ -171,7 +171,7 @@ export default function JobResults() {
                 >
                   Export {total} variants
                 </div>
-                {(["json", "tsv", "csv"] as const).map((f) => (
+                {(["json", "tsv", "csv", "vcf"] as const).map((f) => (
                   <button key={f} onClick={() => download(f)}>
                     <span className="mono" style={{ fontWeight: 500 }}>
                       variants.{f}

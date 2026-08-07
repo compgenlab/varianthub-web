@@ -8,6 +8,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
+	"github.com/compgenlab/varianthub-web/internal/assetblob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 )
@@ -33,8 +34,22 @@ func (l *stringList) Set(v string) error {
 	return nil
 }
 
+// openCatalog connects and attaches asset storage.
+//
+// Helper files are content-addressed objects in the same storage as the data
+// and tool caches, so every process that touches a source needs to reach them —
+// the API to store them at registration, the worker to write them into a job's
+// config tree.
+//
+// The blob store gets the unwrapped Store on purpose: it only asks where the
+// default storage location is, and passing the wrapped one would be a store
+// that reaches assets through itself.
 func openCatalog(ctx context.Context, cfg *config.Config) (*catalog.Store, error) {
-	return catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, err
+	}
+	return cat.WithAssetBlobs(assetblob.New(cat)), nil
 }
 
 // cmdSource handles `source add|list`.
@@ -213,5 +228,56 @@ func cmdSnapshot(ctx context.Context, cfg *config.Config, args []string) error {
 
 	default:
 		return fmt.Errorf("unknown snapshot subcommand %q (want add|list)", args[0])
+	}
+}
+
+// cmdAssets handles `assets list|backfill`.
+//
+// A subcommand rather than something the server does on startup: it moves the
+// only copy of a recipe's helper files, and doing that as a side effect of a
+// deploy would make it something nobody chose to run and nobody watched.
+func cmdAssets(ctx context.Context, cfg *config.Config, args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("usage: assets <list|backfill>")
+	}
+	cat, err := openCatalog(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer cat.Close()
+
+	switch args[0] {
+	case "list":
+		rows, err := cat.InlineAssets(ctx)
+		if err != nil {
+			return err
+		}
+		if len(rows) == 0 {
+			fmt.Println("(no assets are stored in the database)")
+			return nil
+		}
+		fmt.Printf("%d asset(s) still in Postgres:\n", len(rows))
+		for _, r := range rows {
+			fmt.Printf("  %-28s %-24s %d bytes\n", r.SourceID, r.Name, r.Bytes)
+		}
+		return nil
+
+	case "backfill":
+		moved, err := cat.BackfillAssets(ctx)
+		// Report progress even on failure: it stops at the first bad row, and
+		// which ones already moved is the thing you need to know next.
+		if moved > 0 {
+			fmt.Printf("moved %d asset(s) to storage\n", moved)
+		}
+		if err != nil {
+			return err
+		}
+		if moved == 0 {
+			fmt.Println("nothing to move")
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("usage: assets <list|backfill>")
 	}
 }

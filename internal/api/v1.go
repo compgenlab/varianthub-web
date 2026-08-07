@@ -72,14 +72,15 @@ func normalizeLocus(s string) string {
 }
 
 // sessionOf identifies the submitter for history scoping.
+//
+// The server-issued anonymous session, not the X-Varhub-Session header this
+// used to read. That header was a random id the browser generated for itself,
+// so it scoped a history but proved nothing — and being indistinguishable from
+// a value anyone could send is what let a bare curl look like a visitor.
+//
+// Empty for a signed-in caller, whose jobs scope by account instead.
 func sessionOf(r *http.Request) string {
-	if s := strings.TrimSpace(r.Header.Get("X-Varhub-Session")); s != "" {
-		return s
-	}
-	if c, err := r.Cookie("varhub_session"); err == nil {
-		return strings.TrimSpace(c.Value)
-	}
-	return ""
+	return callerOf(r).Scope()
 }
 
 // trustedCaller reports whether the caller may read *anyone's* jobs.
@@ -133,13 +134,7 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	type item struct {
-		catalog.Snapshot
-		SourceCount     int  `json:"source_count"`
-		ContainsPrivate bool `json:"contains_private"`
-		ContainsRemote  bool `json:"contains_remote"`
-	}
-	out := make([]item, 0, len(snaps))
+	out := make([]SnapshotSummary, 0, len(snaps))
 	for _, sn := range snaps {
 		// ListSnapshots does not populate Sources, and source_count /
 		// contains_private both need them. Snapshots number in the single digits,
@@ -155,14 +150,14 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 		if !vis.canSeeSnapshot(full) {
 			continue
 		}
-		out = append(out, item{
+		out = append(out, SnapshotSummary{
 			Snapshot:        sn,
 			SourceCount:     len(full.Sources),
 			ContainsPrivate: full.ContainsPrivate(),
 			ContainsRemote:  full.ContainsRemote(),
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"snapshots": out})
+	writeJSON(w, http.StatusOK, SnapshotsResponse{Snapshots: out})
 }
 
 // handleSnapshot resolves one snapshot to its pinned source versions.
@@ -192,11 +187,11 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "no such snapshot")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"snapshot":         snap,
-		"contains_private": snap.ContainsPrivate(),
-		"contains_remote":  snap.ContainsRemote(),
-		"annotations":      snapshotAnnotations(snap),
+	writeJSON(w, http.StatusOK, SnapshotResponse{
+		Snapshot:        snap,
+		ContainsPrivate: snap.ContainsPrivate(),
+		ContainsRemote:  snap.ContainsRemote(),
+		Annotations:     snapshotAnnotations(snap),
 	})
 }
 
@@ -224,7 +219,7 @@ func snapshotAnnotations(snap catalog.Snapshot) []annotationOption {
 
 type annotationOption struct {
 	catalog.Annotation
-	Default bool `json:"default"`
+	Default bool `json:"default" doc:"Selected when the caller asks for no annotations by name."`
 }
 
 // handleSources lists sources one row per (name, version).
@@ -250,21 +245,6 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 	}
 	srcs = vis.filterSources(srcs)
 
-	type item struct {
-		catalog.Source
-		Ref string `json:"ref"` // "name:version", how a snapshot manifest pins it
-		// Annotations lets the flow show which fields a source contributes before
-		// it is chosen, so picking sources and picking fields are one step.
-		Annotations []catalog.Annotation `json:"annotations"`
-		// NeedsData is false for builtins, which compute from the variant and have
-		// nothing to download.
-		NeedsData bool `json:"needs_data"`
-		// State is whether the source can actually be annotated with yet.
-		// Registering one and being able to use it are different things: a tool
-		// needs its image and setup, a build source needs its recipe to have
-		// run, and until then every annotation using it fails.
-		State catalog.SourceState `json:"state"`
-	}
 	states, err := s.catalog.SourceStates(r.Context())
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -280,7 +260,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	out := make([]item, 0, len(srcs))
+	out := make([]SourceItem, 0, len(srcs))
 	for _, src := range srcs {
 		anns := src.Annotations()
 		if anns == nil {
@@ -295,12 +275,13 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			// usable the moment it is registered.
 			st.State = catalog.StateReady
 		}
-		out = append(out, item{
+		out = append(out, SourceItem{
 			Source: src, Ref: src.Ref(), Annotations: anns,
 			NeedsData: src.NeedsData(), State: st,
+			RequiresReference: src.RequiresReference(), IsReference: src.IsReference(),
 		})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": out})
+	writeJSON(w, http.StatusOK, SourcesResponse{Sources: out})
 }
 
 // --- annotation ---
@@ -570,7 +551,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 
 	wait := s.waitFor(r)
 	if wait <= 0 {
-		writeJSON(w, http.StatusAccepted, map[string]any{"job_id": id})
+		writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id})
 		return
 	}
 	job, ok, err := s.queue.WaitFor(r.Context(), id, wait)
@@ -581,7 +562,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 	if !ok || !job.Terminal() {
 		// Still running when the window closed: 202 and the caller polls. This is
 		// not an error -- ?wait= is an optimization, not a guarantee.
-		writeJSON(w, http.StatusAccepted, map[string]any{"job_id": id, "status": job.Status})
+		writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id, Status: job.Status})
 		return
 	}
 	s.writeJobWithResult(w, r, job)
@@ -652,8 +633,8 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		} else if sess := sessionOf(r); sess != "" {
 			f.Session = sess
 		} else {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"jobs": []any{}, "limit": limit, "offset": offset, "scoped": true,
+			writeJSON(w, http.StatusOK, JobsResponse{
+				Jobs: []queue.Job{}, Limit: limit, Offset: offset, Scoped: true,
 			})
 			return
 		}
@@ -666,8 +647,8 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	if jobs == nil {
 		jobs = []queue.Job{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"jobs": jobs, "limit": limit, "offset": offset, "scoped": scoped,
+	writeJSON(w, http.StatusOK, JobsResponse{
+		Jobs: jobs, Limit: limit, Offset: offset, Scoped: scoped,
 	})
 }
 
@@ -733,9 +714,9 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, queue.ErrNotCancellable):
 		// Not an error worth a failure status: the caller wanted it stopped and
 		// it is stopped. Report the state so the UI can settle on it.
-		writeJSON(w, http.StatusOK, map[string]any{
-			"job": out, "cancelled": false,
-			"detail": "job had already finished",
+		writeJSON(w, http.StatusOK, CancelResponse{
+			Job: out, Cancelled: false,
+			Detail: "job had already finished",
 		})
 		return
 	case errors.Is(err, queue.ErrNoSuchJob):
@@ -746,7 +727,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("api: job %s cancelled by %s", job.ID, callerOf(r).Label())
-	writeJSON(w, http.StatusOK, map[string]any{"job": out, "cancelled": true})
+	writeJSON(w, http.StatusOK, CancelResponse{Job: out, Cancelled: true})
 }
 
 // handleJobLog serves what a job's run printed.
@@ -784,20 +765,20 @@ func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
 // writeJobWithResult returns the job object with its results embedded, which is
 // what ?wait= promises on completion within the window.
 func (s *Server) writeJobWithResult(w http.ResponseWriter, r *http.Request, job queue.Job) {
-	out := map[string]any{
-		"job_id": job.ID, "kind": job.Kind, "snapshot": job.Snapshot,
-		"status": job.Status, "n_variants": job.NVariants,
-		"created_at": job.CreatedAt, "started_at": job.StartedAt,
-		"finished_at": job.FinishedAt, "label": job.Label,
+	out := JobResultResponse{
+		JobID: job.ID, Kind: job.Kind, Snapshot: job.Snapshot,
+		Status: job.Status, NVariants: job.NVariants,
+		CreatedAt: job.CreatedAt, StartedAt: job.StartedAt,
+		FinishedAt: job.FinishedAt, Label: job.Label,
 	}
 	if job.Status == queue.StatusError {
-		out["error"] = job.Error
+		out.Error = job.Error
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
 	body, ok, err := s.queue.Result(r.Context(), job.ID)
 	if err == nil && ok && len(body) > 0 {
-		out["results"] = json.RawMessage(body)
+		out.Results = json.RawMessage(body)
 	}
 	writeJSON(w, http.StatusOK, out)
 }

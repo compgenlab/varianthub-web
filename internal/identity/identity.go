@@ -84,7 +84,50 @@ type Caller struct {
 	// administrator account does. It administers, because creating that account
 	// is administration; it stops working the moment the account exists.
 	Bootstrap bool
+	// ViaToken records that a personal API token authenticated this request,
+	// rather than a browser session.
+	//
+	// Not an authorization question — a token carries exactly its owner's
+	// rights. It decides which *surface* answers: the web app needs paginated
+	// tables, account management and the whole administration area, and none of
+	// that has to exist for a program driving annotations from a script. A
+	// smaller published surface is a smaller thing to keep working.
+	ViaToken bool
+	// AnonSession is a server-issued session for a visitor who has not signed
+	// in. It identifies nobody; it scopes which results are theirs.
+	//
+	// Its presence is what separates an anonymous visitor from an
+	// unauthenticated request. Before it existed the two were the same thing,
+	// so a bare curl could submit against the published API by looking exactly
+	// like somebody browsing the site.
+	AnonSession string
 }
+
+// External reports whether the request should see only the published REST API.
+//
+// A token means a program: somebody outside the web app, driving annotations
+// from a script. That is the only thing this asks.
+//
+// Deliberately not "has no session". Presenting nothing is a different problem
+// with a different answer — Credentialed reports that, and the routes require
+// it separately. Folding the two together made an expired session look like a
+// missing endpoint instead of a signed-out one, and 404'd the bootstrap flow,
+// which creates the first administrator with a bearer credential precisely
+// because no session can exist yet.
+func (c Caller) External() bool { return c.ViaToken }
+
+// Credentialed reports whether the request presented anything at all: an
+// account, a token, the bootstrap credential, or a session this server issued
+// to an anonymous visitor.
+//
+// The last is what makes anonymous browsing distinguishable from an
+// unauthenticated request. While anonymity was a header the client wrote for
+// itself the two were the same, which is how a bare curl could submit against
+// the published API by claiming to be somebody browsing the site.
+func (c Caller) Credentialed() bool { return !c.Anonymous() || c.AnonSession != "" }
+
+// Scope identifies whose results these are for a caller with no account.
+func (c Caller) Scope() string { return c.AnonSession }
 
 // Anonymous reports whether the request carried no credential at all.
 func (c Caller) Anonymous() bool { return c.User == nil && !c.Bootstrap }

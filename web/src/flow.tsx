@@ -14,6 +14,10 @@ export interface AnnotateState {
   /** Individual-source selection, used instead of a snapshot. */
   sources: string[];
   setSources: (s: string[]) => void;
+  /** Reference genome, chosen separately because it contributes no annotations.
+   *  Empty unless something in the selection requires one. */
+  reference: string;
+  setReference: (r: string) => void;
   /** Assembly, required when selecting individual sources. */
   build: string;
   setBuild: (b: string) => void;
@@ -31,6 +35,7 @@ const Ctx = createContext<AnnotateState | null>(null);
 export function AnnotateProvider({ children }: { children: React.ReactNode }) {
   const [snapshot, setSnapshot] = useState("");
   const [sources, setSources] = useState<string[]>([]);
+  const [reference, setReference] = useState("");
   const [build, setBuild] = useState("GRCh38");
   const [annotations, setAnnotations] = useState<string[]>([]);
   const [variants, setVariants] = useState<string[]>([]);
@@ -42,6 +47,8 @@ export function AnnotateProvider({ children }: { children: React.ReactNode }) {
       setSnapshot,
       sources,
       setSources,
+      reference,
+      setReference,
       build,
       setBuild,
       annotations,
@@ -51,7 +58,7 @@ export function AnnotateProvider({ children }: { children: React.ReactNode }) {
       file,
       setFile,
     }),
-    [snapshot, sources, build, annotations, variants, file],
+    [snapshot, sources, reference, build, annotations, variants, file],
   );
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>;
 }

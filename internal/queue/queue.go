@@ -57,6 +57,10 @@ const (
 	// KindCleanup reclaims a removed source's files, for the same reason
 	// downloads are jobs: only the worker mounts the storage.
 	KindCleanup = "cleanup"
+	// KindMove relocates a source's files between storage locations. A job
+	// because it moves the same volume of data a download does, and because
+	// only the worker can reach both ends.
+	KindMove = "move"
 )
 
 // Postgres NOTIFY channels.
@@ -71,28 +75,22 @@ const (
 
 // Job is one row of the job table (its metadata, without the input/result blobs).
 type Job struct {
-	ID        string `json:"job_id"`
-	Kind      string `json:"kind"`
-	Snapshot  string `json:"snapshot"`
-	Selection string `json:"selection"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
-	NVariants int64  `json:"n_variants"`
-	ClientIP  string `json:"client_ip,omitempty"`
-	Session   string `json:"session,omitempty"` // submitter's session id, for scoping history
-	// UserID is the owning account, when the submitter had one. Authoritative
-	// where Session is not: a session id is asserted by the client, while this
-	// is written from the credential the server verified.
-	UserID string `json:"user_id,omitempty"`
-	Label  string `json:"label,omitempty"` // short human label (the locus, or the VCF filename)
-	// Weight is how many slots of the worker pool this job occupies while it
-	// runs. An annotation is 1; provisioning is heavier, because it saturates
-	// disk and CPU for hours and two at once finish later than one after the
-	// other.
-	Weight     int   `json:"weight,omitempty"`
-	CreatedAt  int64 `json:"created_at"`
-	StartedAt  int64 `json:"started_at,omitempty"`
-	FinishedAt int64 `json:"finished_at,omitempty"`
+	ID        string `json:"job_id" doc:"Stable identifier. Poll and fetch results with it."`
+	Kind      string `json:"kind" doc:"locus | vcf for annotation; download | move for provisioning."`
+	Snapshot  string `json:"snapshot" doc:"The snapshot annotated against. An individual-source selection becomes a generated snapshot, which is what makes the run reproducible."`
+	Selection string `json:"selection" doc:"The annotation fields asked for, or empty for the snapshot's defaults."`
+	Status    string `json:"status" doc:"queued | running | done | error | cancelled."`
+	Error     string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+	NVariants int64  `json:"n_variants" doc:"How many variants were annotated."`
+	ClientIP  string `json:"client_ip,omitempty" doc:"The address the job was submitted from."`
+	Session   string `json:"session,omitempty" doc:"The submitter's session, which scopes an anonymous caller's own history."`
+	UserID    string `json:"user_id,omitempty" doc:"The owning account, when the submitter had one. Authoritative where session is not, being written from the credential the server verified."`
+	Label     string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
+
+	Weight     int   `json:"weight,omitempty" doc:"How many worker slots this job occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
+	CreatedAt  int64 `json:"created_at" doc:"Unix seconds."`
+	StartedAt  int64 `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
+	FinishedAt int64 `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 }
 
 // Terminal reports whether the job has reached a final status.
@@ -494,6 +492,23 @@ func (q *Queue) Get(ctx context.Context, id string) (Job, bool, error) {
 
 // Result returns a done job's result JSON (ok=false when the id is unknown or the
 // job has no stored result yet).
+// Input returns the body a job was submitted with.
+//
+// Retained rather than discarded once the job runs, which is what lets a VCF
+// submission be answered with its own file annotated instead of a synthesised
+// one carrying only the columns this server knows about.
+func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
+	var body []byte
+	err := q.pool.QueryRow(ctx, `SELECT body FROM job_input WHERE job_id=$1`, id).Scan(&body)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return body, true, nil
+}
+
 func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
 	var js string
 	err := q.pool.QueryRow(ctx, `SELECT json FROM job_result WHERE job_id=$1`, id).Scan(&js)

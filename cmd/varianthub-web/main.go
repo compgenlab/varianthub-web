@@ -11,11 +11,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/api"
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -69,6 +71,8 @@ func run(args []string) error {
 		return cmdSource(ctx, cfg, args[1:])
 	case "snapshot":
 		return cmdSnapshot(ctx, cfg, args[1:])
+	case "assets":
+		return cmdAssets(ctx, cfg, args[1:])
 	case "serve":
 		return serve(ctx, cfg)
 	case "worker":
@@ -94,7 +98,7 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	// a failure here is not survivable in practice -- but the server is still
 	// useful for submitting and polling, so report it rather than refusing to
 	// start, and let those endpoints answer 503.
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		log.Printf("serve: catalog unavailable, /api/v1/snapshots and /sources will 503: %v", err)
 	} else {
@@ -202,18 +206,25 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		Home:            home,
 		Timeout:         cfg.JobTimeout,
 		DownloadTimeout: cfg.DownloadTimeout,
+		NoCache:         cfg.NoCache,
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return err
 	}
 	defer cat.Close()
 
+	if cfg.NoCache {
+		// Loud, because it is a diagnostic mode with a real cost: every value is
+		// recomputed and nothing is kept, so a repeated query pays full price.
+		log.Printf("worker: annotation cache DISABLED (VHW_NO_CACHE) — every value " +
+			"recomputed, nothing persisted")
+	}
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat, cfg.DataDir, cfg.VarhubBin))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -232,7 +243,7 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 		log.Printf("worker: using fixed annotation home %s (catalog bypassed)", cfg.VarhubHome)
 		return runner.FixedHome(cfg.VarhubHome), nil
 	}
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +281,7 @@ func syncStorage(ctx context.Context, cfg *config.Config, cat *catalog.Store) er
 
 // seed populates an empty catalog with a starter snapshot.
 func seed(ctx context.Context, cfg *config.Config) error {
-	cat, err := catalog.Open(ctx, cfg.DatabaseURL)
+	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -289,13 +300,15 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // it belongs to the queue rather than to either of the two types this bridges —
 // and it is written outside the Outcome because an Outcome is the job's result,
 // while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin string) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
 			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
 			return runCleanup(job, input)
+		case queue.KindMove:
+			return runMove(ctx, cat, job, input)
 		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
@@ -521,6 +534,8 @@ catalog administration:
   snapshot add <name> --build B --source S [--publish]
                                      create/update a snapshot pinning sources
   snapshot list                      list snapshots
+  assets list                        show helper files still held in Postgres
+  assets backfill                    move them into the configured storage
   version   print the version
 
 Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
@@ -528,4 +543,86 @@ Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
 Copy varianthub-web.example.toml to start; see README.md. A database URL is
 always required.
 `, "\n"))
+}
+
+// runMove relocates a source's files from one storage location to another.
+//
+// Copy, verify, record, then delete. Never the other order: a move that removes
+// the original first turns a transient failure into data that has to be fetched
+// again from an upstream that may be slow, rate-limited, or gone. The catalog is
+// updated only once every file has arrived, so a half-finished move leaves the
+// source readable where it already was.
+func runMove(ctx context.Context, cat *catalog.Store, job queue.Job, input []byte) (queue.Outcome, error) {
+	var req struct {
+		SourceID string `json:"source_id"`
+		FromID   string `json:"from_storage"`
+		ToID     string `json:"to_storage"`
+		FromURI  string `json:"from_uri"`
+		ToURI    string `json:"to_uri"`
+	}
+	if err := json.Unmarshal(input, &req); err != nil {
+		return queue.Outcome{}, fmt.Errorf("malformed move job: %w", err)
+	}
+	if cat == nil {
+		return queue.Outcome{}, errors.New("catalog unavailable")
+	}
+
+	files, err := cat.SourceFiles(ctx, req.SourceID, req.FromID)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	if len(files) == 0 {
+		return queue.Outcome{}, fmt.Errorf("source %s has no files in %s", req.SourceID, req.FromID)
+	}
+
+	moved := make([]catalog.SourceFile, 0, len(files))
+	var bytes int64
+	for _, f := range files {
+		src := joinLoc(req.FromURI, f.Path)
+		dst := joinLoc(req.ToURI, f.Path)
+		log.Printf("worker: move %s: %s -> %s", req.SourceID, src, dst)
+		n, err := blob.Transfer(ctx, src, dst)
+		if err != nil {
+			// Nothing is deleted and the catalog is untouched, so the source is
+			// still readable where it was.
+			return queue.Outcome{}, fmt.Errorf("copy %s: %w", f.Path, err)
+		}
+		moved = append(moved, catalog.SourceFile{
+			Path: f.Path, SizeBytes: n, ModifiedAt: f.ModifiedAt,
+		})
+		bytes += n
+	}
+
+	// Record the new location before removing the old, so an interruption here
+	// leaves two copies rather than none.
+	if err := cat.ReplaceSourceFiles(ctx, req.SourceID, req.ToID, moved); err != nil {
+		return queue.Outcome{}, err
+	}
+	for _, f := range files {
+		if err := blob.Remove(ctx, joinLoc(req.FromURI, f.Path)); err != nil {
+			// The move succeeded; the leftovers are wasted space, not a failure.
+			log.Printf("worker: move %s: could not remove %s: %v", req.SourceID, f.Path, err)
+		}
+	}
+	if err := cat.ReplaceSourceFiles(ctx, req.SourceID, req.FromID, nil); err != nil {
+		return queue.Outcome{}, err
+	}
+
+	log.Printf("worker: move %s: %d file(s), %d bytes now in %s",
+		req.SourceID, len(moved), bytes, req.ToID)
+	body, _ := json.Marshal(map[string]any{
+		"source_id": req.SourceID, "files": len(moved), "size_bytes": bytes,
+		"storage_id": req.ToID,
+	})
+	return queue.Outcome{Result: body, N: len(moved)}, nil
+}
+
+// joinLoc appends a source-relative path to a storage root, for either a
+// filesystem path or an object locator.
+func joinLoc(root, rel string) string {
+	root = strings.TrimSuffix(root, "/")
+	if strings.HasPrefix(root, "s3://") {
+		return root + "/" + rel
+	}
+	return filepath.Join(root, rel)
 }

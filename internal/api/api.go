@@ -71,44 +71,64 @@ func (s *Server) Routes() http.Handler {
 	v1 := http.NewServeMux()
 	// Gated: ping is how a client checks that its credential works, which it
 	// cannot do if an invalid one answers the same as a valid one.
-	v1.Handle("GET /api/v1/ping", s.requireAuth(http.HandlerFunc(s.handlePing)))
+	// The published API is registered from a table, which the OpenAPI document
+	// is also generated from, so an endpoint cannot appear in one and not the
+	// other. See published.go.
+	s.registerPublished(v1)
+
+	// The document describing that table. Readable by anyone who can reach the
+	// API: it is the contract, and a contract nobody can fetch is documentation
+	// nobody has.
+	v1.Handle("GET /api/v1/openapi.json", s.requireAuth(http.HandlerFunc(s.handleOpenAPI)))
 
 	// Signing in has to work without being signed in, and the UI needs to know
 	// who it is talking to before it can render anything — including "this
 	// installation has no administrator yet".
-	v1.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	v1.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
-	v1.HandleFunc("GET /api/v1/auth/me", s.handleMe)
-	v1.Handle("POST /api/v1/auth/password", s.requireAuth(http.HandlerFunc(s.handleChangePassword)))
+	//
+	// All of it is web-only: a token is issued here, so a caller holding one has
+	// already been through this and has nothing left to ask. Signing a session
+	// in and out is the browser's business.
+	v1.Handle("POST /api/v1/auth/login", s.webOnly(http.HandlerFunc(s.handleLogin)))
+	v1.Handle("POST /api/v1/auth/logout", s.webOnly(http.HandlerFunc(s.handleLogout)))
+	v1.Handle("GET /api/v1/auth/me", s.webOnly(http.HandlerFunc(s.handleMe)))
+	v1.Handle("POST /api/v1/auth/password",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleChangePassword))))
 
 	// A caller's own API tokens. Gated on being someone, not on being an admin:
 	// every account issues its own, and each carries that account's role.
-	v1.Handle("GET /api/v1/auth/identities", s.requireAuth(http.HandlerFunc(s.handleListIdentities)))
-	v1.Handle("GET /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleListTokens)))
-	v1.Handle("POST /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleCreateToken)))
-	v1.Handle("DELETE /api/v1/auth/tokens/{id}", s.requireAuth(http.HandlerFunc(s.handleRevokeToken)))
+	v1.Handle("GET /api/v1/auth/identities",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleListIdentities))))
+	v1.Handle("GET /api/v1/auth/tokens",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleListTokens))))
+	v1.Handle("POST /api/v1/auth/tokens",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleCreateToken))))
+	v1.Handle("DELETE /api/v1/auth/tokens/{id}",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleRevokeToken))))
 
 	// Catalog: what can be annotated, and what a snapshot pins.
-	v1.Handle("GET /api/v1/snapshots", s.requireAuth(http.HandlerFunc(s.handleSnapshots)))
-	v1.Handle("GET /api/v1/snapshots/{id}", s.requireAuth(http.HandlerFunc(s.handleSnapshot)))
-	v1.Handle("GET /api/v1/sources", s.requireAuth(http.HandlerFunc(s.handleSources)))
+	// The annotation form needs the build list to populate its picker and filter
+	// sources, so it is readable by anyone who can annotate.
 
 	// Submission. Throttled per client IP, which the handler skips for a
 	// token-bearing service account -- see trustedCaller.
-	v1.Handle("POST /api/v1/annotate", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotate))))
-	v1.Handle("POST /api/v1/annotate/vcf", s.requireAuth(s.throttle(http.HandlerFunc(s.handleAnnotateVCF))))
 
 	// Jobs. Reads are ownership-enforced, not throttled.
-	v1.Handle("GET /api/v1/jobs", s.requireAuth(http.HandlerFunc(s.handleListJobs)))
-	v1.Handle("GET /api/v1/jobs/{id}", s.requireAuth(http.HandlerFunc(s.handleGetJob)))
-	v1.Handle("GET /api/v1/jobs/{id}/log", s.requireAuth(http.HandlerFunc(s.handleJobLog)))
-	v1.Handle("POST /api/v1/jobs/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelJob)))
-	v1.Handle("GET /api/v1/jobs/{id}/results", s.requireAuth(http.HandlerFunc(s.handleResults)))
-	v1.Handle("GET /api/v1/jobs/{id}/export", s.requireAuth(http.HandlerFunc(s.handleExport)))
+	v1.Handle("GET /api/v1/jobs/{id}/log",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleJobLog))))
+	// Web-only: this is the table feed, paged and sorted for a screen. An
+	// external caller wants the whole result, which is what export is.
+	v1.Handle("GET /api/v1/jobs/{id}/results",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleResults))))
+	// The published way to get results. Already the whole matching set in a
+	// chosen format, streamed — exactly what a client wants — so it serves both
+	// the browser's download button and the REST API.
 
 	// Administration is its own mux mounted behind one gate, so a route added
 	// here cannot be left unguarded by forgetting to wrap it.
-	v1.Handle("/api/v1/admin/", s.requireAdmin(s.adminRoutes()))
+	// Web-only as well: administration is done by a person in the web app, and
+	// publishing it would mean every registration, storage and account route
+	// became API surface to keep stable.
+	v1.Handle("/api/v1/admin/", s.webOnly(s.requireAdmin(s.adminRoutes())))
 
 	mux.Handle("/api/v1/", s.withCaller(v1))
 
@@ -116,7 +136,7 @@ func (s *Server) Routes() http.Handler {
 	// unknown /api path therefore 404s as JSON rather than returning the app
 	// shell, which would be a confusing thing to debug from a client.
 	if s.spa != nil {
-		mux.Handle("/", s.spa.Handler())
+		mux.Handle("/", s.issueAnonSession(s.spa.Handler()))
 	}
 
 	return s.withCORS(logRequests(mux))
@@ -150,6 +170,10 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)
 	m.HandleFunc("GET /api/v1/admin/files", s.handleFiles)
 	m.HandleFunc("POST /api/v1/admin/downloads", s.handleDownload)
+	m.HandleFunc("PUT /api/v1/admin/builds", s.handlePutBuild)
+	m.HandleFunc("DELETE /api/v1/admin/builds/{name}", s.handleDeleteBuild)
+	m.HandleFunc("POST /api/v1/admin/sources/{id}/move", s.handleMoveSource)
+	m.HandleFunc("POST /api/v1/admin/sources/{id}/default-reference", s.handleSetDefaultReference)
 	m.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)
 	m.HandleFunc("POST /api/v1/admin/registries", s.handleCreateRegistry)
 	m.HandleFunc("DELETE /api/v1/admin/registries/{id}", s.handleDeleteRegistry)
@@ -316,7 +340,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"pong": "ok"})
+	writeJSON(w, http.StatusOK, PingResponse{Pong: "ok"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

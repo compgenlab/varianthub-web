@@ -44,7 +44,14 @@ type sourceRequest struct {
 	// back from a registry fetch and are posted here with the manifest, so what
 	// gets stored is what was reviewed — the fetch does not import anything on
 	// its own.
-	Assets []catalog.Asset `json:"assets,omitempty"`
+	//
+	// A pointer, so "not mentioned" is distinct from "none". Re-registering a
+	// manifest to change one line used to arrive with no assets and replace the
+	// stored set with nothing, silently deleting the scripts a tool cannot run
+	// without — the failure then appears at the next annotation as a missing
+	// file, with nothing connecting it to the edit. Absent now means keep what
+	// is there; an explicit [] still clears.
+	Assets *[]catalog.Asset `json:"assets,omitempty"`
 	// Settings this deployment applies to the source, as opposed to what the
 	// manifest says about itself. Accepted at registration so a prefix can be
 	// chosen when a second version of something is added, which is when the
@@ -136,16 +143,27 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// Read before the write, so a re-registration that says nothing about assets
+	// keeps the ones already stored.
+	var existingAssets []catalog.Asset
+	if prev, err := s.catalog.Assets(r.Context(), src.ID); err == nil {
+		existingAssets = prev
+	}
+
 	if err := s.catalog.PutSource(r.Context(), src); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	// Written after the source, because the rows reference it. Replacing the
-	// set on every write keeps the stored files in step with the manifest that
-	// names them.
-	if err := s.catalog.PutAssets(r.Context(), src.ID, req.Assets); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
+	// Written after the source, because the rows reference it. Replacing the set
+	// keeps the stored files in step with the manifest that names them — but
+	// only when the caller said something about them.
+	assets := existingAssets
+	if req.Assets != nil {
+		assets = *req.Assets
+		if err := s.catalog.PutAssets(r.Context(), src.ID, assets); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	if req.Settings != nil {
 		if err := s.catalog.PutSettings(r.Context(), src.ID, *req.Settings); err != nil {
@@ -157,11 +175,11 @@ func (s *Server) handleCreateSource(w http.ResponseWriter, r *http.Request) {
 	// refused: a hand-written manifest is a legitimate way to register a source,
 	// and the files can be added later — but the caller should learn now, not
 	// from a download that fails at the first recipe step.
-	missing := catalog.MissingAssets(src.TOML, req.Assets)
+	missing := catalog.MissingAssets(src.TOML, assets)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"id": src.ID, "ref": src.Ref(), "kind": src.Kind,
-		"visibility": src.Visibility, "assets": len(req.Assets),
+		"visibility": src.Visibility, "assets": len(assets),
 		"missing_assets": missing,
 	})
 }
@@ -891,4 +909,155 @@ func (s *Server) handleSetSnapshotSources(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"snapshot": snap, "annotations": snapshotAnnotations(snap),
 	})
+}
+
+// handleSetDefaultReference marks a reference genome as the one ad-hoc
+// snapshots pin for its assembly.
+//
+// Ad-hoc annotation assembles a snapshot per job from whatever the caller
+// selected, so it has nobody to ask which genome to use. This is that answer.
+// The chosen source is still pinned into the snapshot, so the default is a
+// decision made once rather than an indirection resolved on every run.
+func (s *Server) handleSetDefaultReference(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.SetDefaultReference(r.Context(), r.PathValue("id")); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleMoveSource relocates a source's files to another storage location.
+//
+// Queued rather than done inline: it moves the same volume of data a download
+// does — tens of gigabytes for a large source — and only the worker can reach
+// both ends.
+func (s *Server) handleMoveSource(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil || s.queue == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req struct {
+		StorageID string `json:"storage_id"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	sourceID := r.PathValue("id")
+	src, err := s.catalog.GetSource(r.Context(), sourceID)
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	to, err := s.catalog.GetStorage(r.Context(), req.StorageID)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !to.Usable() {
+		writeError(w, http.StatusBadRequest, to.UnusableReason())
+		return
+	}
+
+	// Which location it is leaving is derived rather than asked for: a caller
+	// naming the wrong origin would move nothing and report success.
+	locs, err := s.catalog.StorageForSource(r.Context(), sourceID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	var from catalog.StorageLocation
+	for _, l := range locs {
+		if l.ID != req.StorageID {
+			from = l
+			break
+		}
+	}
+	if from.ID == "" {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"%s has no files to move (it is already in %s, or has not been downloaded)",
+			src.Ref(), to.Name))
+		return
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"source_id": sourceID, "from_storage": from.ID, "to_storage": to.ID,
+		"from_uri": from.URI, "to_uri": to.URI,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+		Kind:      queue.KindMove,
+		Session:   sessionOf(r),
+		UserID:    callerOf(r).UserID(),
+		Label:     "move " + src.Ref() + ": " + from.Name + " → " + to.Name,
+		Selection: sourceID,
+		// Same volume of data as fetching it, so the same cost to the pool.
+		Weight: s.cfg.DownloadWeight,
+		Body:   body,
+	})
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "enqueue: "+err.Error())
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id": id, "from": from.Name, "to": to.Name,
+	})
+}
+
+// handleListBuilds lists the genome builds this installation offers.
+//
+// Not admin-gated: the annotation form needs it to populate its picker and to
+// filter sources, and which assemblies exist is not sensitive — it is visible
+// from the source list either way.
+func (s *Server) handleListBuilds(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	builds, err := s.catalog.ListBuilds(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, BuildsResponse{Builds: builds})
+}
+
+// handlePutBuild adds or updates a build.
+func (s *Server) handlePutBuild(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var b catalog.Build
+	if err := decodeJSON(r, &b); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := s.catalog.PutBuild(r.Context(), b); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": strings.TrimSpace(b.Name)})
+}
+
+// handleDeleteBuild removes a build, refusing while it is still in use.
+func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.DeleteBuild(r.Context(), r.PathValue("name")); err != nil {
+		// 409: the request is well-formed and the caller may retry it after
+		// moving what depends on it, which is not a 400.
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }

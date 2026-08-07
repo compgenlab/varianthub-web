@@ -29,6 +29,12 @@ export interface Source {
   build?: string;
   visibility: string;
   index_status: string;
+  /** Set on the reference genome ad-hoc snapshots pin for this assembly. */
+  is_default_reference?: boolean;
+  /** A reference genome. Contributes no annotations, so it is picked separately. */
+  is_reference?: boolean;
+  /** The source cannot run without a reference genome for its build (VEP does). */
+  requires_reference?: boolean;
   origin?: string;
   stream?: boolean;
   /** Whether the source can be annotated with yet, and what is happening to it. */
@@ -141,6 +147,8 @@ export interface ApiToken {
   prefix: string;
   created_at: number;
   last_used_at?: number;
+  /** When it stops working. Absent means it never does (issued before lifetimes). */
+  expires_at?: number;
   revoked_at?: number;
 }
 
@@ -159,6 +167,19 @@ export interface Registry {
 }
 
 /** A helper file a build recipe or tool step needs, shipped with the source. */
+/** A genome assembly this installation offers. */
+export interface Build {
+  /** The assembly string itself, matched exactly against a source's build. */
+  name: string;
+  label?: string;
+  description?: string;
+  sort_order: number;
+  /** How many sources are registered against it. */
+  sources: number;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface SourceAsset {
   name: string;
   content: string;
@@ -265,7 +286,9 @@ export class ApiError extends Error {
 
 // The API base is per-deployment, never hardcoded: same-origin by default, or
 // VITE_API_BASE when the dev server runs separately from the API.
-const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
+/** The API's origin prefix. Exported for the API explorer, which builds its own
+ *  requests deliberately: it exists to show the wire call, not to wrap it. */
+export const BASE = (import.meta.env.VITE_API_BASE ?? "").replace(/\/$/, "");
 
 // A bearer token is held in sessionStorage rather than localStorage so it does
 // not outlive the browser tab. It is the *secondary* path: signing in with a
@@ -283,56 +306,10 @@ export function setToken(t: string) {
   else sessionStorage.removeItem(TOKEN_KEY);
 }
 
-// A per-browser id scoping an anonymous visitor's own job history.
-//
-// This is not a credential and grants nothing: the server treats it as a
-// self-asserted history scope, and a job that has a real account behind it
-// ignores it entirely. It exists because without one an anonymous caller can
-// submit a job and then get a 404 reading it back — there would be nothing to
-// scope the result to, and returning everyone's jobs instead is not an option.
-//
-// localStorage rather than sessionStorage so a reload or a new tab still finds
-// yesterday's results, which is the whole point of a history.
-const SESSION_KEY = "vh_history";
-
-function historyID(): string {
-  let id = localStorage.getItem(SESSION_KEY);
-  if (!id) {
-    id = randomID();
-    localStorage.setItem(SESSION_KEY, id);
-  }
-  return id;
-}
-
-/**
- * A random identifier that works outside a secure context.
- *
- * Deliberately not crypto.randomUUID(): that is secure-context-only, so it is
- * undefined over plain http on anything but localhost — and because this runs
- * inside headers(), a throw there fails *every* request, including the one the
- * app uses to find out who you are. The symptom is a login page on
- * http://host:18080 and none through an ssh tunnel to localhost, which looks
- * like a server problem and is not.
- *
- * getRandomValues has no such restriction. Math.random is the last resort: this
- * id scopes a history and is not a credential, so uniqueness is the only
- * requirement, and a browser too old for getRandomValues should still work.
- */
-function randomID(): string {
-  const bytes = new Uint8Array(16);
-  if (globalThis.crypto?.getRandomValues) {
-    globalThis.crypto.getRandomValues(bytes);
-  } else {
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
-}
-
 function headers(extra: Record<string, string> = {}): Record<string, string> {
   const h: Record<string, string> = { ...extra };
   const t = getToken();
   if (t) h.Authorization = `Bearer ${t}`;
-  h["X-Varhub-Session"] = historyID();
   return h;
 }
 
@@ -375,6 +352,7 @@ export const api = {
       `/snapshots/${encodeURIComponent(id)}`,
     ),
   sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
+  builds: () => req<{ builds: Build[] }>("/builds"),
 
   annotate: (body: {
     snapshot?: string;
@@ -456,7 +434,7 @@ export const api = {
    */
   downloadExport: async (
     id: string,
-    format: "json" | "tsv" | "csv",
+    format: "json" | "tsv" | "csv" | "vcf",
     p: { sort?: string; order?: string; q?: string } = {},
   ) => {
     const q = new URLSearchParams({ format });
@@ -613,11 +591,21 @@ export const api = {
 
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
 
-  createToken: (name: string) =>
+  /** The OpenAPI document describing the published REST API. */
+  openapi: () => req<{
+    info: { title: string; version: string; description?: string };
+    paths: Record<string, Record<string, never>>;
+  }>("/openapi.json"),
+
+  /** Lifetimes the server accepts. Mirrored from identity.TokenLifetimes; the
+   *  server rejects anything else, so this list only decides what is offered. */
+  tokenLifetimes: [1, 14, 30, 90, 180, 365] as const,
+
+  createToken: (name: string, days: number) =>
     req<{ token: ApiToken; secret: string }>("/auth/tokens", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, days }),
     }),
 
   revokeToken: (id: string) =>
@@ -707,6 +695,18 @@ export const api = {
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
 
+  moveSource: (id: string, storageID: string) =>
+    req<{ job_id: string; from: string; to: string }>(
+      `/admin/sources/${encodeURIComponent(id)}/move`,
+      { method: "POST", body: JSON.stringify({ storage_id: storageID }) },
+    ),
+
+  setDefaultReference: (id: string) =>
+    req<void>(`/admin/sources/${encodeURIComponent(id)}/default-reference`, {
+      method: "POST",
+    }),
+
+
   addStorage: (body: { name: string; kind: "s3"; uri: string }) =>
     req<{ id: string }>("/admin/storage", {
       method: "POST",
@@ -716,6 +716,19 @@ export const api = {
 
   deleteStorage: (id: string) =>
     req<void>(`/admin/storage/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  putBuild: (b: { name: string; label?: string; description?: string; sort_order?: number }) =>
+    req<{ name: string }>("/admin/builds", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b),
+    }),
+
+  // Refused with 409 while a source or snapshot still declares it, rather than
+  // cascading: those keep their assembly strings and keep working, so removing
+  // the build would only stop it being offered.
+  deleteBuild: (name: string) =>
+    req<void>(`/admin/builds/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
   files: (p: { source?: string; storage?: string } = {}) => {
     const q = new URLSearchParams();

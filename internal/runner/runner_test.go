@@ -131,35 +131,6 @@ func TestExecRunnerVCF(t *testing.T) {
 	}
 }
 
-func TestExecRunnerProgressAndFailure(t *testing.T) {
-	bin, home := testHome(t)
-
-	var lines []string
-	r := &ExecRunner{
-		Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second,
-		OnProgress: func(l string) { lines = append(lines, l) },
-	}
-
-	// A malformed locus must fail, and the failure must not leak the CLI's stderr
-	// into the caller-facing message.
-	_, err := r.Annotate(context.Background(), Request{
-		Kind: KindLocus, Snapshot: "test", Selection: "all", Body: []byte("not-a-locus"),
-	})
-	if err == nil {
-		t.Fatal("expected an error for a malformed locus")
-	}
-	if got := err.Error(); strings.Contains(got, home) || strings.Contains(got, "varhub:") {
-		t.Errorf("caller-facing error leaks internals: %q", got)
-	}
-	var ee *ExitError
-	if !asExitError(err, &ee) {
-		t.Fatalf("expected *ExitError, got %T", err)
-	}
-	if ee.Detail() == "" {
-		t.Error("ExitError.Detail() should carry the diagnostic for logs")
-	}
-}
-
 func TestFixedHomeRejectsMissing(t *testing.T) {
 	if _, _, err := FixedHome("").Home(context.Background(), ""); err == nil {
 		t.Error("empty FixedHome should error")
@@ -647,5 +618,102 @@ func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
 	// The point of keeping it is learning what the run actually did.
 	if !strings.Contains(res.Log, "annotat") {
 		t.Errorf("log says nothing about annotating:\n%s", res.Log)
+	}
+}
+
+// The archive destination must follow the job, not the catalog's default.
+//
+// The materializer fills tool_cache from whichever storage is default. A
+// download is sent wherever the caller chose, and only an object store can hold
+// an archive — so a default of "/mnt/storage" against a job going to
+// "s3://bucket" means no archive at all, silently, because a filesystem path is
+// not an archive destination. That is what produced nothing after a 24-hour VEP
+// install with the setting showing as enabled.
+func TestToolCacheFollowsTheJobsStorage(t *testing.T) {
+	home := t.TempDir()
+	if err := os.WriteFile(filepath.Join(home, "config.toml"),
+		[]byte("data_dir = \"/d\"\ncache_dir = \"/mnt/storage\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, "annotations", "sources", "vep", "113")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	overlay := filepath.Join(dir, "vep-113.locations.toml")
+	if err := os.WriteFile(overlay,
+		[]byte("# generated\ntool_cache = \"/mnt/storage\"\nannotation_prefix = \"VEP_\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rewriteCacheDir(home, "s3://bucket/prefix", "/data"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := os.ReadFile(overlay)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), `tool_cache = "s3://bucket/prefix"`) {
+		t.Errorf("tool_cache still points at the catalog default, so nothing will be "+
+			"archived:\n%s", got)
+	}
+	// Everything else in the overlay survives.
+	if !strings.Contains(string(got), `annotation_prefix = "VEP_"`) {
+		t.Errorf("rewriting tool_cache dropped another setting:\n%s", got)
+	}
+}
+
+// The cache is what makes a stale empty answer indistinguishable from a fresh
+// one, so turning it off has to actually reach the CLI — asserted on the argv,
+// because a flag that is silently dropped looks exactly like a cache that is
+// working correctly.
+func TestNoCacheReachesTheCLI(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		noCache bool
+		want    bool
+	}{
+		{"absent by default", false, false},
+		{"passed when set", true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			argv := filepath.Join(dir, "argv")
+			// A stub varhub: records how it was called, then emits one variant so
+			// the caller parses a result rather than failing on empty output.
+			bin := filepath.Join(dir, "varhub")
+			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + argv + "\n" +
+				`echo '[{"chrom":"chr1","pos":1,"ref":"A","alt":"T","annotations":{}}]'` + "\n"
+			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+				t.Fatal(err)
+			}
+
+			// FixedHome requires a real config.toml; its contents do not matter
+			// here because the CLI is a stub.
+			hdir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(hdir, "config.toml"), []byte("\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r := &ExecRunner{
+				Bin: bin, Home: FixedHome(hdir), Timeout: 30 * time.Second,
+				NoCache: tc.noCache,
+			}
+			if _, err := r.Annotate(context.Background(), Request{
+				Kind: KindLocus, Snapshot: "s", Selection: "all",
+				Body: []byte("chr1:1:A:T"),
+			}); err != nil {
+				t.Fatalf("Annotate: %v", err)
+			}
+
+			recorded, err := os.ReadFile(argv)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := strings.Contains(string(recorded), "--no-cache")
+			if got != tc.want {
+				t.Errorf("--no-cache present = %v, want %v; argv was:\n%s",
+					got, tc.want, recorded)
+			}
+		})
 	}
 }

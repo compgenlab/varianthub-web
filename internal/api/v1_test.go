@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"mime/multipart"
@@ -73,20 +74,30 @@ func TestWaitForClamping(t *testing.T) {
 	}
 }
 
+// History scoping reads the resolved caller, not the request.
+//
+// It used to read an X-Varhub-Session header the browser wrote for itself. That
+// scoped a history but proved nothing, and being indistinguishable from a value
+// anyone could send is what let a request with no credential look like a
+// visitor. A self-asserted value now scopes nothing at all.
 func TestSessionOf(t *testing.T) {
 	r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
 	if got := sessionOf(r); got != "" {
 		t.Fatalf("no session should be empty, got %q", got)
 	}
-	r.Header.Set("X-Varhub-Session", " abc ")
-	if got := sessionOf(r); got != "abc" {
-		t.Fatalf("header session = %q, want abc", got)
+
+	// The value the old contract honoured, now ignored.
+	r.Header.Set("X-Varhub-Session", "abc")
+	r.AddCookie(&http.Cookie{Name: "varhub_session", Value: "cookie-sess"})
+	if got := sessionOf(r); got != "" {
+		t.Fatalf("a self-asserted session still scopes results: %q", got)
 	}
 
-	r2 := httptest.NewRequest("GET", "/api/v1/jobs", nil)
-	r2.AddCookie(&http.Cookie{Name: "varhub_session", Value: "cookie-sess"})
-	if got := sessionOf(r2); got != "cookie-sess" {
-		t.Fatalf("cookie session = %q, want cookie-sess", got)
+	// Only what the server issued and resolved onto the caller counts.
+	withCaller := r.WithContext(context.WithValue(r.Context(), callerKey{},
+		identity.Caller{AnonSession: "server-issued"}))
+	if got := sessionOf(withCaller); got != "server-issued" {
+		t.Fatalf("resolved session = %q, want server-issued", got)
 	}
 }
 
