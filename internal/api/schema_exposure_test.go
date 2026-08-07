@@ -80,3 +80,57 @@ func TestSourceManifestStaysOffTheAPI(t *testing.T) {
 			"which is not part of the published API", f.Tag.Get("json"))
 	}
 }
+
+// Every published field carries a doc tag.
+//
+// The tags are what the OpenAPI schema's descriptions are built from, so an
+// undocumented field is a field the explorer shows as a bare name and type. The
+// prose deliberately lives here rather than in a comment beside the field: two
+// copies of the same sentence drift, and the published one would be the copy
+// nobody re-reads.
+//
+// Embedded structs are exempt — they carry no name of their own — and so is
+// json.RawMessage, whose contents are documented by the field that holds it.
+func TestPublishedFieldsAreDocumented(t *testing.T) {
+	var undocumented []string
+	seen := map[reflect.Type]bool{}
+
+	var walk func(t reflect.Type, path string)
+	walk = func(t reflect.Type, path string) {
+		for t.Kind() == reflect.Ptr || t.Kind() == reflect.Slice || t.Kind() == reflect.Array {
+			if t.String() == "json.RawMessage" {
+				return
+			}
+			t = t.Elem()
+		}
+		if t.Kind() != reflect.Struct || seen[t] {
+			return
+		}
+		seen[t] = true
+		for i := 0; i < t.NumField(); i++ {
+			f := t.Field(i)
+			if f.PkgPath != "" || f.Tag.Get("json") == "-" {
+				continue
+			}
+			if !f.Anonymous && f.Tag.Get("doc") == "" {
+				undocumented = append(undocumented, path+"."+f.Name)
+			}
+			walk(f.Type, path+"."+f.Name)
+		}
+	}
+
+	for _, v := range []any{
+		PingResponse{}, BuildsResponse{}, SourcesResponse{}, SnapshotsResponse{},
+		SnapshotResponse{}, JobsResponse{}, AcceptedResponse{},
+		JobResultResponse{}, CancelResponse{}, ErrorResponse{},
+	} {
+		rt := reflect.TypeOf(v)
+		walk(rt, rt.Name())
+	}
+
+	if len(undocumented) > 0 {
+		t.Errorf("these published fields have no doc tag, so the API schema will "+
+			"describe them as a bare name and type:\n  %s",
+			strings.Join(undocumented, "\n  "))
+	}
+}

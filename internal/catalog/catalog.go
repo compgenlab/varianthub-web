@@ -45,29 +45,25 @@ const (
 
 // Source is one registered annotation source.
 type Source struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	Version string `json:"version"`
-	Title   string `json:"title,omitempty"`
-	Detail  string `json:"detail,omitempty"`
-	Kind    string `json:"kind"`
-	Build   string `json:"build,omitempty"`
+	ID      string `json:"id" doc:"Stable identifier, unique across the catalog."`
+	Name    string `json:"name" doc:"The manifest's name for the dataset, e.g. \"gencode\"."`
+	Version string `json:"version" doc:"The dataset's own version, e.g. \"48\". Pinned by snapshots so a run is reproducible."`
+	Title   string `json:"title,omitempty" doc:"A human-readable title, where the manifest gives one."`
+	Detail  string `json:"detail,omitempty" doc:"A one-line description, where the manifest gives one."`
+	Kind    string `json:"kind" doc:"builtin | vcf | bed | gtf | tab | genelist | tool | reference."`
+	Build   string `json:"build,omitempty" doc:"The genome assembly this source is for, matched exactly and never normalized: GRCh38 and hg38 are different builds here. Empty means assembly-agnostic, which is what the builtins are."`
 
-	// Stream is derived from the manifest on read rather than stored, like the
-	// annotation list: it is a projection of toml_text, and deriving it means a
-	// source registered before this existed needs no backfill.
-	Stream bool `json:"stream,omitempty"`
+	Stream bool `json:"stream,omitempty" doc:"Read from its origin over the network at query time rather than from storage this deployment controls, so a run depends on somebody else's server."`
 
-	Visibility  string `json:"visibility"`
-	IndexStatus string `json:"index_status"`
-	Origin      string `json:"origin,omitempty"`
-	// IsDefaultReference marks the reference an ad-hoc snapshot pins for this
-	// assembly. Meaningless on anything that is not a reference source.
-	IsDefaultReference bool `json:"is_default_reference,omitempty"`
+	Visibility  string `json:"visibility" doc:"public | private. A private source is absent entirely for a caller with no grant, rather than listed and refused."`
+	IndexStatus string `json:"index_status" doc:"Whether the source's data has been indexed."`
+	Origin      string `json:"origin,omitempty" doc:"The registry this manifest was adopted from, where it was."`
 
-	TOML      string `json:"-"` // never serialized to API clients by default
-	CreatedAt int64  `json:"created_at"`
-	UpdatedAt int64  `json:"updated_at"`
+	IsDefaultReference bool `json:"is_default_reference,omitempty" doc:"The reference an ad-hoc selection pins for this assembly. Meaningless on anything that is not a reference source."`
+
+	TOML      string `json:"-"`
+	CreatedAt int64  `json:"created_at" doc:"Unix seconds."`
+	UpdatedAt int64  `json:"updated_at" doc:"Unix seconds."`
 
 	// prefixOverride is this deployment's annotation prefix for the source,
 	// loaded with it by sourceCols. Unexported because it is not part of the
@@ -95,18 +91,18 @@ func (s Source) NeedsData() bool {
 
 // Snapshot is a versioned bundle of pinned sources.
 type Snapshot struct {
-	ID          string   `json:"id"`
-	Title       string   `json:"title,omitempty"`
-	Description string   `json:"description,omitempty"`
-	Build       string   `json:"build"`
-	State       string   `json:"state"`
-	Defaults    []string `json:"defaults,omitempty"`
-	Tags        []string `json:"tags,omitempty"`
-	PublishedAt int64    `json:"published_at,omitempty"`
-	CreatedAt   int64    `json:"created_at"`
-	UpdatedAt   int64    `json:"updated_at"`
+	ID          string   `json:"id" doc:"Stable identifier, used to annotate against this snapshot."`
+	Title       string   `json:"title,omitempty" doc:"A human-readable title."`
+	Description string   `json:"description,omitempty" doc:"What this bundle is for."`
+	Build       string   `json:"build" doc:"The genome assembly. Every pinned source either declares this exact string or declares none."`
+	State       string   `json:"state" doc:"draft | published | adhoc. Drafts are not offered for annotation."`
+	Defaults    []string `json:"defaults,omitempty" doc:"Annotation fields selected when the caller asks for none."`
+	Tags        []string `json:"tags,omitempty" doc:"Free-form labels for grouping snapshots."`
+	PublishedAt int64    `json:"published_at,omitempty" doc:"Unix seconds."`
+	CreatedAt   int64    `json:"created_at" doc:"Unix seconds."`
+	UpdatedAt   int64    `json:"updated_at" doc:"Unix seconds."`
 
-	Sources []Source `json:"sources,omitempty"` // populated by Get, not List
+	Sources []Source `json:"sources,omitempty" doc:"The exact source versions pinned. Populated when fetching one snapshot, absent from listings."`
 }
 
 // ContainsRemote reports whether any pinned source is read from its origin

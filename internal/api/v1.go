@@ -219,7 +219,7 @@ func snapshotAnnotations(snap catalog.Snapshot) []annotationOption {
 
 type annotationOption struct {
 	catalog.Annotation
-	Default bool `json:"default"`
+	Default bool `json:"default" doc:"Selected when the caller asks for no annotations by name."`
 }
 
 // handleSources lists sources one row per (name, version).

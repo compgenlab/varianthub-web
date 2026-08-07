@@ -13,17 +13,17 @@ import (
 // reference is chosen per assembly. Adding a surrogate id would create a second
 // identity for the same thing and an opportunity for them to disagree.
 type Build struct {
-	Name        string `json:"name"`
-	Label       string `json:"label,omitempty"`
-	Description string `json:"description,omitempty"`
-	SortOrder   int    `json:"sort_order"`
-	CreatedAt   int64  `json:"created_at"`
-	UpdatedAt   int64  `json:"updated_at"`
+	Name        string `json:"name" doc:"The assembly string itself, matched exactly against a source's build. GRCh38 and hg38 are different builds here and are never treated as equivalent."`
+	Label       string `json:"label,omitempty" doc:"What to show someone choosing one. The name is an identifier; this can say \"Human GRCh38 (hg38)\" without that ever being used to match."`
+	Description string `json:"description,omitempty" doc:"Free-form notes about this build."`
+	SortOrder   int    `json:"sort_order" doc:"Ordering in a picker, lowest first; ties broken by name."`
+	CreatedAt   int64  `json:"created_at" doc:"Unix seconds."`
+	UpdatedAt   int64  `json:"updated_at" doc:"Unix seconds."`
 
 	// Sources counts what is registered against this build. Populated by
 	// ListBuilds so the admin view can say what removing one would orphan, and
 	// so the annotation form can skip a build with nothing behind it.
-	Sources int `json:"sources"`
+	Sources int `json:"sources" doc:"How many sources are registered against this build."`
 }
 
 // ListBuilds returns every build, in picker order, with a count of the sources

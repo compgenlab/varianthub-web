@@ -14,11 +14,10 @@ const (
 
 // SourceState is whether a source can be annotated with yet.
 type SourceState struct {
-	State     string `json:"state"`
-	Error     string `json:"error,omitempty"`
-	UpdatedAt int64  `json:"updated_at,omitempty"`
-	// Job is the download currently working on it, when one is.
-	Job string `json:"job,omitempty"`
+	State     string `json:"state" doc:"installing | ready | failed. Annotating with a source that is not ready fails."`
+	Error     string `json:"error,omitempty" doc:"Why provisioning failed, when it did."`
+	UpdatedAt int64  `json:"updated_at,omitempty" doc:"Unix seconds."`
+	Job       string `json:"job,omitempty" doc:"The download currently working on it, when one is."`
 }
 
 // Ready reports whether annotation with this source would work.

@@ -75,28 +75,22 @@ const (
 
 // Job is one row of the job table (its metadata, without the input/result blobs).
 type Job struct {
-	ID        string `json:"job_id"`
-	Kind      string `json:"kind"`
-	Snapshot  string `json:"snapshot"`
-	Selection string `json:"selection"`
-	Status    string `json:"status"`
-	Error     string `json:"error,omitempty"`
-	NVariants int64  `json:"n_variants"`
-	ClientIP  string `json:"client_ip,omitempty"`
-	Session   string `json:"session,omitempty"` // submitter's session id, for scoping history
-	// UserID is the owning account, when the submitter had one. Authoritative
-	// where Session is not: a session id is asserted by the client, while this
-	// is written from the credential the server verified.
-	UserID string `json:"user_id,omitempty"`
-	Label  string `json:"label,omitempty"` // short human label (the locus, or the VCF filename)
-	// Weight is how many slots of the worker pool this job occupies while it
-	// runs. An annotation is 1; provisioning is heavier, because it saturates
-	// disk and CPU for hours and two at once finish later than one after the
-	// other.
-	Weight     int   `json:"weight,omitempty"`
-	CreatedAt  int64 `json:"created_at"`
-	StartedAt  int64 `json:"started_at,omitempty"`
-	FinishedAt int64 `json:"finished_at,omitempty"`
+	ID        string `json:"job_id" doc:"Stable identifier. Poll and fetch results with it."`
+	Kind      string `json:"kind" doc:"locus | vcf for annotation; download | move for provisioning."`
+	Snapshot  string `json:"snapshot" doc:"The snapshot annotated against. An individual-source selection becomes a generated snapshot, which is what makes the run reproducible."`
+	Selection string `json:"selection" doc:"The annotation fields asked for, or empty for the snapshot's defaults."`
+	Status    string `json:"status" doc:"queued | running | done | error | cancelled."`
+	Error     string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+	NVariants int64  `json:"n_variants" doc:"How many variants were annotated."`
+	ClientIP  string `json:"client_ip,omitempty" doc:"The address the job was submitted from."`
+	Session   string `json:"session,omitempty" doc:"The submitter's session, which scopes an anonymous caller's own history."`
+	UserID    string `json:"user_id,omitempty" doc:"The owning account, when the submitter had one. Authoritative where session is not, being written from the credential the server verified."`
+	Label     string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
+
+	Weight     int   `json:"weight,omitempty" doc:"How many worker slots this job occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
+	CreatedAt  int64 `json:"created_at" doc:"Unix seconds."`
+	StartedAt  int64 `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
+	FinishedAt int64 `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 }
 
 // Terminal reports whether the job has reached a final status.
