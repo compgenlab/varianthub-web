@@ -1,9 +1,10 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
-import { Check, Cloud, Globe, HardDrive, Plus, X } from "lucide-react";
+import { Check, Cloud, Globe, HardDrive, Plus, Trash2, X } from "lucide-react";
 
 import {
   api,
+  type Build,
   type Registry,
   type RegistryEntry,
   type Snapshot,
@@ -42,7 +43,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots";
+type Tab = "sources" | "snapshots" | "builds";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -114,7 +115,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots"] as Tab[]).map((t) => (
+        {(["sources", "snapshots", "builds"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -129,14 +130,16 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : "Snapshots"}
+            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "Genome builds"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "sources" ? (
+      {tab === "builds" ? (
+        <BuildList />
+      ) : tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
@@ -1120,12 +1123,35 @@ function BuildSnapshot({
   const [id, setId] = useState("");
   const [title, setTitle] = useState("");
   const [build, setBuild] = useState("GRCh38");
+  const [builds, setBuilds] = useState<Build[]>([]);
   const [defaults, setDefaults] = useState("");
   const [picked, setPicked] = useState<Record<string, boolean>>({});
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
-  const chosen = sources.filter((s) => picked[s.id]).map((s) => s.id);
+  useEffect(() => {
+    api
+      .builds()
+      .then((r) => {
+        setBuilds(r.builds ?? []);
+        // Start on a build that exists rather than on a guess, so the first
+        // snapshot an operator builds is not rejected for an assembly this
+        // installation has never heard of.
+        if (r.builds?.length && !r.builds.some((b) => b.name === "GRCh38")) {
+          setBuild(r.builds[0].name);
+        }
+      })
+      .catch((e) => setErr(e instanceof Error ? e.message : String(e)));
+  }, []);
+
+  // A snapshot may never mix assemblies — PutSnapshot rejects it outright — so
+  // only offer what can legally be pinned. Sources declaring no build are
+  // assembly-agnostic (the builtins compute from the variant itself) and belong
+  // in any snapshot. Matched exactly, never normalized: GRCh38 and hg38 are the
+  // same genome in real life but a false match here annotates against the wrong
+  // coordinates and says nothing about it.
+  const pinnable = sources.filter((s) => !s.build || s.build === build);
+  const chosen = sources.filter((s) => picked[s.id] && (!s.build || s.build === build)).map((s) => s.id);
 
   async function save(publish: boolean) {
     setBusy(true);
@@ -1181,17 +1207,25 @@ function BuildSnapshot({
         <div style={{ minWidth: 190 }}>
           <label className="label">Build</label>
           <select className="select mono" value={build} onChange={(e) => setBuild(e.target.value)}>
-            <option>GRCh38</option>
-            <option>GRCh37</option>
-            <option>T2T-CHM13v2.0</option>
-            <option>GRCm39</option>
+            {/* Whatever is selected stays listed even with no matching record,
+                so the control never silently shows a different build than the
+                one the snapshot would be saved with. */}
+            {!builds.some((b) => b.name === build) && <option key={build}>{build}</option>}
+            {builds.map((b) => (
+              <option key={b.name} value={b.name}>
+                {b.name}
+              </option>
+            ))}
           </select>
         </div>
       </div>
 
       <label className="label">Sources to pin</label>
       <div className="card">
-        {sources.map((s) => (
+        {pinnable.length === 0 && (
+          <div className="empty">No sources are registered for {build}.</div>
+        )}
+        {pinnable.map((s) => (
           <button
             key={s.id}
             className="trow rowgrid"
@@ -1256,5 +1290,130 @@ function BuildSnapshot({
         </div>
       </div>
     </div>
+  );
+}
+
+// Genome builds: which assemblies this installation offers.
+//
+// These used to be a hardcoded array in the annotation form, so there was no way
+// to add one — and, because the picker had no relationship to the catalog,
+// choosing a build did not narrow the source list either. Both follow from
+// making them records.
+function BuildList() {
+  const [builds, setBuilds] = useState<Build[] | null>(null);
+  const [err, setErr] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [name, setName] = useState("");
+  const [label, setLabel] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const load = () =>
+    api
+      .builds()
+      .then((r) => setBuilds(r.builds ?? []))
+      .catch((e) => setErr(e.message));
+
+  useEffect(() => {
+    load();
+  }, []);
+
+  const add = async () => {
+    setBusy(true);
+    setErr("");
+    try {
+      await api.putBuild({ name: name.trim(), label: label.trim() });
+      setName("");
+      setLabel("");
+      setAdding(false);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const remove = async (b: Build) => {
+    if (!confirm(`Remove ${b.name}? Sources already registered against it are left alone.`)) {
+      return;
+    }
+    setErr("");
+    try {
+      await api.deleteBuild(b.name);
+      await load();
+    } catch (e) {
+      setErr((e as Error).message);
+    }
+  };
+
+  return (
+    <>
+      <div className="between" style={{ marginBottom: 14 }}>
+        <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
+          The assemblies offered when starting an annotation. A build&apos;s name must
+          match the <code>build</code> a source manifest declares, exactly — <code>GRCh38</code>{" "}
+          and <code>hg38</code> are the same genome in real life but are not
+          interchangeable here.
+        </p>
+        <button className="btn sm" onClick={() => setAdding((v) => !v)}>
+          <Plus size={15} /> Add build
+        </button>
+      </div>
+
+      {err && <p className="err">{err}</p>}
+
+      {adding && (
+        <div className="card" style={{ padding: 14, marginBottom: 14 }}>
+          <div className="row gap-8" style={{ flexWrap: "wrap" }}>
+            <input
+              className="input mono"
+              placeholder="GRCh38"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              style={{ width: 200 }}
+            />
+            <input
+              className="input"
+              placeholder="Human GRCh38 (optional label)"
+              value={label}
+              onChange={(e) => setLabel(e.target.value)}
+              style={{ flex: 1, minWidth: 220 }}
+            />
+            <button className="btn sm" disabled={!name.trim() || busy} onClick={add}>
+              {busy ? "Saving…" : "Save"}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="card">
+        <div className="rowgrid thead" style={{ gridTemplateColumns: "1.2fr 1.6fr .6fr 90px" }}>
+          <span>Build</span>
+          <span>Label</span>
+          <span>Sources</span>
+          <span />
+        </div>
+        {builds?.length === 0 && <div className="empty">No builds defined yet.</div>}
+        {builds?.map((b) => (
+          <div key={b.name} className="trow rowgrid" style={{ gridTemplateColumns: "1.2fr 1.6fr .6fr 90px" }}>
+            <span className="mono" style={{ fontWeight: 500 }}>
+              {b.name}
+            </span>
+            <span style={{ color: "var(--text-2)" }}>{b.label || "—"}</span>
+            <span className="mono" style={{ fontSize: 12 }}>
+              {b.sources}
+            </span>
+            <span>
+              {/* Removal is refused server-side while anything declares the
+                  build, so this stays enabled and reports why rather than
+                  guessing at the reason from a count that could be stale. */}
+              <button className="btn sm ghost" onClick={() => remove(b)}>
+                <Trash2 size={14} /> Remove
+              </button>
+            </span>
+          </div>
+        ))}
+      </div>
+    </>
   );
 }

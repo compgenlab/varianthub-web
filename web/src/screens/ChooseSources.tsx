@@ -2,12 +2,10 @@ import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { ArrowRight, Check, Lock, TriangleAlert, Globe } from "lucide-react";
 
-import { api, type Annotation, type Snapshot, type Source } from "../api";
+import { api, type Annotation, type Build, type Snapshot, type Source } from "../api";
 import { useFlow } from "../flow";
 
 type Mode = "snapshot" | "sources";
-
-const BUILDS = ["GRCh38", "GRCh37", "T2T-CHM13v2.0", "GRCm39"];
 
 export default function ChooseSources() {
   const nav = useNavigate();
@@ -15,6 +13,7 @@ export default function ChooseSources() {
   const [mode, setMode] = useState<Mode>("snapshot");
   const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
   const [sources, setSources] = useState<(Source & { annotations: Annotation[] })[] | null>(null);
+  const [builds, setBuilds] = useState<Build[] | null>(null);
   const [fields, setFields] = useState<Annotation[]>([]);
   const [err, setErr] = useState("");
 
@@ -27,7 +26,47 @@ export default function ChooseSources() {
       .sources()
       .then((r) => setSources(r.sources ?? []))
       .catch((e) => setErr(e.message));
+    // The builds come from the catalog rather than a constant in this file, so
+    // an administrator can add one and it appears here without a rebuild.
+    api
+      .builds()
+      .then((r) => {
+        setBuilds(r.builds ?? []);
+        // The flow starts on GRCh38 because something has to be selected before
+        // the list arrives. If this installation does not offer it, move to one
+        // it does — otherwise the form opens on a build with no sources and
+        // nothing says why.
+        if (r.builds?.length && !r.builds.some((b) => b.name === flow.build)) {
+          flow.setBuild(r.builds[0].name);
+        }
+      })
+      .catch((e) => setErr(e.message));
   }, []);
+
+  // A source belongs to the chosen build, or declares no build at all — the
+  // builtins compute from the variant itself and are correct against any
+  // assembly. Comparison is exact and deliberately not normalized: GRCh38 and
+  // hg38 are the same genome in real life but different strings here, and a
+  // false match would annotate against the wrong coordinates and say nothing
+  // about it.
+  const visible = useMemo(
+    () => (sources ?? []).filter((s) => !s.build || s.build === flow.build),
+    [sources, flow.build],
+  );
+
+  // Selecting a build the current picks do not belong to would submit sources
+  // from another assembly, which PutSnapshot rejects — drop them as the build
+  // changes rather than failing at submit with a list the user can no longer see.
+  useEffect(() => {
+    if (!sources) {
+      return;
+    }
+    const ok = new Set(visible.map((s) => s.id));
+    const kept = flow.sources.filter((id) => ok.has(id));
+    if (kept.length !== flow.sources.length) {
+      flow.setSources(kept);
+    }
+  }, [visible, sources]);
 
   // Snapshot mode: the fields come from the snapshot, along with which it
   // applies by default. Fetched on selection so the picker below is always the
@@ -197,8 +236,16 @@ export default function ChooseSources() {
               value={flow.build}
               onChange={(e) => flow.setBuild(e.target.value)}
             >
-              {BUILDS.map((b) => (
-                <option key={b}>{b}</option>
+              {/* Whatever the flow already holds stays selectable even if no
+                  build record matches it, so a snapshot pinned to a build an
+                  administrator later removed still shows what it is set to. */}
+              {builds && !builds.some((b) => b.name === flow.build) && (
+                <option key={flow.build}>{flow.build}</option>
+              )}
+              {(builds ?? []).map((b) => (
+                <option key={b.name} value={b.name}>
+                  {b.label && b.label !== b.name ? `${b.label} (${b.name})` : b.name}
+                </option>
               ))}
             </select>
           </div>
@@ -210,8 +257,14 @@ export default function ChooseSources() {
               <span>Kind</span>
               <span>Access</span>
             </div>
-            {sources?.length === 0 && <div className="empty">No sources registered yet.</div>}
-            {sources?.map((s) => {
+            {sources && visible.length === 0 && (
+              <div className="empty">
+                {sources.length === 0
+                  ? "No sources registered yet."
+                  : `No sources are registered for ${flow.build}.`}
+              </div>
+            )}
+            {visible.map((s) => {
               const on = flow.sources.includes(s.id);
               return (
                 <button

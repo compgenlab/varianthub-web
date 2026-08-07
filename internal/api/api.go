@@ -91,6 +91,9 @@ func (s *Server) Routes() http.Handler {
 	// Catalog: what can be annotated, and what a snapshot pins.
 	v1.Handle("GET /api/v1/snapshots", s.requireAuth(http.HandlerFunc(s.handleSnapshots)))
 	v1.Handle("GET /api/v1/snapshots/{id}", s.requireAuth(http.HandlerFunc(s.handleSnapshot)))
+	// The annotation form needs the build list to populate its picker and filter
+	// sources, so it is readable by anyone who can annotate.
+	v1.Handle("GET /api/v1/builds", s.requireAuth(http.HandlerFunc(s.handleListBuilds)))
 	v1.Handle("GET /api/v1/sources", s.requireAuth(http.HandlerFunc(s.handleSources)))
 
 	// Submission. Throttled per client IP, which the handler skips for a
@@ -150,6 +153,8 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("DELETE /api/v1/admin/storage/{id}", s.handleDeleteStorage)
 	m.HandleFunc("GET /api/v1/admin/files", s.handleFiles)
 	m.HandleFunc("POST /api/v1/admin/downloads", s.handleDownload)
+	m.HandleFunc("PUT /api/v1/admin/builds", s.handlePutBuild)
+	m.HandleFunc("DELETE /api/v1/admin/builds/{name}", s.handleDeleteBuild)
 	m.HandleFunc("POST /api/v1/admin/sources/{id}/move", s.handleMoveSource)
 	m.HandleFunc("POST /api/v1/admin/sources/{id}/default-reference", s.handleSetDefaultReference)
 	m.HandleFunc("GET /api/v1/admin/registries", s.handleListRegistries)

@@ -161,6 +161,19 @@ export interface Registry {
 }
 
 /** A helper file a build recipe or tool step needs, shipped with the source. */
+/** A genome assembly this installation offers. */
+export interface Build {
+  /** The assembly string itself, matched exactly against a source's build. */
+  name: string;
+  label?: string;
+  description?: string;
+  sort_order: number;
+  /** How many sources are registered against it. */
+  sources: number;
+  created_at: number;
+  updated_at: number;
+}
+
 export interface SourceAsset {
   name: string;
   content: string;
@@ -377,6 +390,7 @@ export const api = {
       `/snapshots/${encodeURIComponent(id)}`,
     ),
   sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
+  builds: () => req<{ builds: Build[] }>("/builds"),
 
   annotate: (body: {
     snapshot?: string;
@@ -730,6 +744,19 @@ export const api = {
 
   deleteStorage: (id: string) =>
     req<void>(`/admin/storage/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  putBuild: (b: { name: string; label?: string; description?: string; sort_order?: number }) =>
+    req<{ name: string }>("/admin/builds", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(b),
+    }),
+
+  // Refused with 409 while a source or snapshot still declares it, rather than
+  // cascading: those keep their assembly strings and keep working, so removing
+  // the build would only stop it being offered.
+  deleteBuild: (name: string) =>
+    req<void>(`/admin/builds/${encodeURIComponent(name)}`, { method: "DELETE" }),
 
   files: (p: { source?: string; storage?: string } = {}) => {
     const q = new URLSearchParams();

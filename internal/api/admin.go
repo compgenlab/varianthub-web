@@ -1010,3 +1010,54 @@ func (s *Server) handleMoveSource(w http.ResponseWriter, r *http.Request) {
 		"job_id": id, "from": from.Name, "to": to.Name,
 	})
 }
+
+// handleListBuilds lists the genome builds this installation offers.
+//
+// Not admin-gated: the annotation form needs it to populate its picker and to
+// filter sources, and which assemblies exist is not sensitive — it is visible
+// from the source list either way.
+func (s *Server) handleListBuilds(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	builds, err := s.catalog.ListBuilds(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"builds": builds})
+}
+
+// handlePutBuild adds or updates a build.
+func (s *Server) handlePutBuild(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var b catalog.Build
+	if err := decodeJSON(r, &b); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	if err := s.catalog.PutBuild(r.Context(), b); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"name": strings.TrimSpace(b.Name)})
+}
+
+// handleDeleteBuild removes a build, refusing while it is still in use.
+func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	if err := s.catalog.DeleteBuild(r.Context(), r.PathValue("name")); err != nil {
+		// 409: the request is well-formed and the caller may retry it after
+		// moving what depends on it, which is not a 400.
+		writeError(w, http.StatusConflict, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
