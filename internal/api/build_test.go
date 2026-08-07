@@ -14,8 +14,10 @@ import (
 // tokens, so routing, requireAdmin and the handler are all covered.
 func TestBuildRoutesRequireAnAdmin(t *testing.T) {
 	h := newHarness(t)
-	_, adminTok := h.admin(t)
-	_, memberTok := h.member(t, "member@example.com")
+	admin, adminTok := h.admin(t)
+	member, _ := h.member(t, "member@example.com")
+	adminSess := h.sessionFor(t, admin.ID)
+	memberSess := h.sessionFor(t, member.ID)
 
 	cases := []struct {
 		method, path string
@@ -25,20 +27,26 @@ func TestBuildRoutesRequireAnAdmin(t *testing.T) {
 		{"DELETE", "/api/v1/admin/builds/GRCm39", nil},
 	}
 	for _, tc := range cases {
-		if w := h.do(tc.method, tc.path, "", tc.body); w.Code != http.StatusUnauthorized {
+		if w := h.doSession(tc.method, tc.path, "", tc.body); w.Code != http.StatusUnauthorized {
 			t.Errorf("anonymous %s %s = %d, want 401", tc.method, tc.path, w.Code)
 		}
-		if w := h.do(tc.method, tc.path, memberTok, tc.body); w.Code != http.StatusForbidden {
+		if w := h.doSession(tc.method, tc.path, memberSess, tc.body); w.Code != http.StatusForbidden {
 			t.Errorf("member %s %s = %d, want 403", tc.method, tc.path, w.Code)
+		}
+		// Administration is not published API, so a token does not reach it even
+		// when its owner is an administrator — which is a different answer from
+		// the member's 403, and deliberately so.
+		if w := h.do(tc.method, tc.path, adminTok, tc.body); w.Code != http.StatusNotFound {
+			t.Errorf("admin token %s %s = %d, want 404", tc.method, tc.path, w.Code)
 		}
 	}
 
 	// The administrator's round trip, in order: create, then remove.
-	if w := h.do("PUT", "/api/v1/admin/builds", adminTok,
+	if w := h.doSession("PUT", "/api/v1/admin/builds", adminSess,
 		map[string]any{"name": "GRCm39", "label": "Mouse", "sort_order": 2}); w.Code != http.StatusOK {
 		t.Fatalf("admin PUT = %d, body %s", w.Code, w.Body.String())
 	}
-	if w := h.do("DELETE", "/api/v1/admin/builds/GRCm39", adminTok, nil); w.Code != http.StatusNoContent {
+	if w := h.doSession("DELETE", "/api/v1/admin/builds/GRCm39", adminSess, nil); w.Code != http.StatusNoContent {
 		t.Fatalf("admin DELETE = %d, body %s", w.Code, w.Body.String())
 	}
 }
@@ -48,8 +56,9 @@ func TestBuildRoutesRequireAnAdmin(t *testing.T) {
 // requireAdmin. A member who cannot read it cannot start an annotation.
 func TestListBuildsIsReadableByAnyUser(t *testing.T) {
 	h := newHarness(t)
-	_, adminTok := h.admin(t)
+	admin, _ := h.admin(t)
 	_, memberTok := h.member(t, "member@example.com")
+	adminSess := h.sessionFor(t, admin.ID)
 	ctx := context.Background()
 
 	if err := h.cat.PutBuild(ctx, catalog.Build{Name: "GRCh38", Label: "Human"}); err != nil {
@@ -82,7 +91,7 @@ func TestListBuildsIsReadableByAnyUser(t *testing.T) {
 	// Removing it is refused with 409, not 400: the request is well-formed and
 	// becomes valid once the sources move, which is a different thing to tell a
 	// client than "you sent nonsense".
-	if w := h.do("DELETE", "/api/v1/admin/builds/GRCh38", adminTok, nil); w.Code != http.StatusConflict {
+	if w := h.doSession("DELETE", "/api/v1/admin/builds/GRCh38", adminSess, nil); w.Code != http.StatusConflict {
 		t.Fatalf("DELETE of a build in use = %d, want 409; body %s", w.Code, w.Body.String())
 	}
 }

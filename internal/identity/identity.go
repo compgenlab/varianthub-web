@@ -84,7 +84,20 @@ type Caller struct {
 	// administrator account does. It administers, because creating that account
 	// is administration; it stops working the moment the account exists.
 	Bootstrap bool
+	// ViaToken records that a personal API token authenticated this request,
+	// rather than a browser session.
+	//
+	// Not an authorization question — a token carries exactly its owner's
+	// rights. It decides which *surface* answers: the web app needs paginated
+	// tables, account management and the whole administration area, and none of
+	// that has to exist for a program driving annotations from a script. A
+	// smaller published surface is a smaller thing to keep working.
+	ViaToken bool
 }
+
+// External reports whether the request came from outside the web app, and so
+// should see only the published REST API.
+func (c Caller) External() bool { return c.ViaToken }
 
 // Anonymous reports whether the request carried no credential at all.
 func (c Caller) Anonymous() bool { return c.User == nil && !c.Bootstrap }

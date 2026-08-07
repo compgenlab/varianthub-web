@@ -180,9 +180,11 @@ func (s *Store) Resolve(ctx context.Context, bearer, sessionID string) (Caller, 
 
 	var u User
 	var err error
+	viaToken := false
 	switch {
 	case strings.HasPrefix(bearer, TokenPrefix):
 		u, err = s.UserByToken(ctx, bearer)
+		viaToken = true
 	case sessionID != "":
 		u, err = s.UserBySession(ctx, sessionID)
 	default:
@@ -198,5 +200,5 @@ func (s *Store) Resolve(ctx context.Context, bearer, sessionID string) (Caller, 
 	if err != nil {
 		return Caller{}, err
 	}
-	return Caller{User: &u, TeamIDs: teams}, nil
+	return Caller{User: &u, TeamIDs: teams, ViaToken: viaToken}, nil
 }

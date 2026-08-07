@@ -326,3 +326,31 @@ func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(http.StatusNoContent)
 }
+
+// webOnly hides a route from the published REST API.
+//
+// The external API is a curated subset, not everything the server happens to
+// answer. A program driving annotations from a script needs to submit, poll and
+// download; it does not need paginated tables, session management, token
+// issuance or the administration area. Those exist for the web app, which
+// authenticates with a session cookie, so the credential is what tells the two
+// apart — a token means somebody outside.
+//
+// This is not authorization. A token carries exactly its owner's rights, and an
+// administrator's token is still an administrator's. It is about how much
+// surface is published: everything reachable with a token is something callers
+// will depend on and we then have to keep working.
+//
+// 404 rather than 403, because on this surface the route genuinely is not there.
+// 403 would advertise an endpoint and invite someone to go looking for the
+// permission that unlocks it, which no token has.
+func (s *Server) webOnly(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if callerOf(r).External() {
+			writeError(w, http.StatusNotFound,
+				"not part of the REST API; this endpoint serves the web application")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
+}

@@ -76,17 +76,26 @@ func (s *Server) Routes() http.Handler {
 	// Signing in has to work without being signed in, and the UI needs to know
 	// who it is talking to before it can render anything — including "this
 	// installation has no administrator yet".
-	v1.HandleFunc("POST /api/v1/auth/login", s.handleLogin)
-	v1.HandleFunc("POST /api/v1/auth/logout", s.handleLogout)
-	v1.HandleFunc("GET /api/v1/auth/me", s.handleMe)
-	v1.Handle("POST /api/v1/auth/password", s.requireAuth(http.HandlerFunc(s.handleChangePassword)))
+	//
+	// All of it is web-only: a token is issued here, so a caller holding one has
+	// already been through this and has nothing left to ask. Signing a session
+	// in and out is the browser's business.
+	v1.Handle("POST /api/v1/auth/login", s.webOnly(http.HandlerFunc(s.handleLogin)))
+	v1.Handle("POST /api/v1/auth/logout", s.webOnly(http.HandlerFunc(s.handleLogout)))
+	v1.Handle("GET /api/v1/auth/me", s.webOnly(http.HandlerFunc(s.handleMe)))
+	v1.Handle("POST /api/v1/auth/password",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleChangePassword))))
 
 	// A caller's own API tokens. Gated on being someone, not on being an admin:
 	// every account issues its own, and each carries that account's role.
-	v1.Handle("GET /api/v1/auth/identities", s.requireAuth(http.HandlerFunc(s.handleListIdentities)))
-	v1.Handle("GET /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleListTokens)))
-	v1.Handle("POST /api/v1/auth/tokens", s.requireAuth(http.HandlerFunc(s.handleCreateToken)))
-	v1.Handle("DELETE /api/v1/auth/tokens/{id}", s.requireAuth(http.HandlerFunc(s.handleRevokeToken)))
+	v1.Handle("GET /api/v1/auth/identities",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleListIdentities))))
+	v1.Handle("GET /api/v1/auth/tokens",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleListTokens))))
+	v1.Handle("POST /api/v1/auth/tokens",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleCreateToken))))
+	v1.Handle("DELETE /api/v1/auth/tokens/{id}",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleRevokeToken))))
 
 	// Catalog: what can be annotated, and what a snapshot pins.
 	v1.Handle("GET /api/v1/snapshots", s.requireAuth(http.HandlerFunc(s.handleSnapshots)))
@@ -104,14 +113,24 @@ func (s *Server) Routes() http.Handler {
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.Handle("GET /api/v1/jobs", s.requireAuth(http.HandlerFunc(s.handleListJobs)))
 	v1.Handle("GET /api/v1/jobs/{id}", s.requireAuth(http.HandlerFunc(s.handleGetJob)))
-	v1.Handle("GET /api/v1/jobs/{id}/log", s.requireAuth(http.HandlerFunc(s.handleJobLog)))
+	v1.Handle("GET /api/v1/jobs/{id}/log",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleJobLog))))
 	v1.Handle("POST /api/v1/jobs/{id}/cancel", s.requireAuth(http.HandlerFunc(s.handleCancelJob)))
-	v1.Handle("GET /api/v1/jobs/{id}/results", s.requireAuth(http.HandlerFunc(s.handleResults)))
+	// Web-only: this is the table feed, paged and sorted for a screen. An
+	// external caller wants the whole result, which is what export is.
+	v1.Handle("GET /api/v1/jobs/{id}/results",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleResults))))
+	// The published way to get results. Already the whole matching set in a
+	// chosen format, streamed — exactly what a client wants — so it serves both
+	// the browser's download button and the REST API.
 	v1.Handle("GET /api/v1/jobs/{id}/export", s.requireAuth(http.HandlerFunc(s.handleExport)))
 
 	// Administration is its own mux mounted behind one gate, so a route added
 	// here cannot be left unguarded by forgetting to wrap it.
-	v1.Handle("/api/v1/admin/", s.requireAdmin(s.adminRoutes()))
+	// Web-only as well: administration is done by a person in the web app, and
+	// publishing it would mean every registration, storage and account route
+	// became API surface to keep stable.
+	v1.Handle("/api/v1/admin/", s.webOnly(s.requireAdmin(s.adminRoutes())))
 
 	mux.Handle("/api/v1/", s.withCaller(v1))
 

@@ -122,6 +122,46 @@ func (h *harness) withQueue(t *testing.T) {
 	h.http = h.server.Routes()
 }
 
+// session creates a fresh admin account and returns a browser session for it.
+//
+// The web-app surface takes the credential a browser actually sends, so a test
+// of those routes has to use one — a token now gets 404 there by design.
+func (h *harness) session(t *testing.T) string {
+	t.Helper()
+	u, err := h.ids.CreateUser(context.Background(), "web@example.com", "Web",
+		identity.RoleAdmin, "password123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h.sessionFor(t, u.ID)
+}
+
+// sessionFor returns a browser session for an account that already exists, so a
+// test can hold both a token and a session for the same person.
+func (h *harness) sessionFor(t *testing.T, userID string) string {
+	t.Helper()
+	id, _, err := h.ids.CreateSession(context.Background(), userID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func (h *harness) doSession(method, path, session string, body any) *httptest.ResponseRecorder {
+	var r *http.Request
+	if body != nil {
+		b, _ := json.Marshal(body)
+		r = httptest.NewRequest(method, path, bytes.NewReader(b))
+		r.Header.Set("Content-Type", "application/json")
+	} else {
+		r = httptest.NewRequest(method, path, nil)
+	}
+	r.AddCookie(&http.Cookie{Name: SessionCookie, Value: session})
+	w := httptest.NewRecorder()
+	h.http.ServeHTTP(w, r)
+	return w
+}
+
 // do issues a request, optionally as a bearer credential.
 func (h *harness) do(method, path, bearer string, body any) *httptest.ResponseRecorder {
 	var r *http.Request
@@ -172,40 +212,50 @@ func (h *harness) member(t *testing.T, email string) (identity.User, string) {
 // and a token administers only because its owner does.
 func TestAdminRoutesRequireAnAdminAccount(t *testing.T) {
 	h := newHarness(t)
-	_, adminTok := h.admin(t)
-	member, memberTok := h.member(t, "member@example.com")
+	admin, adminTok := h.admin(t)
+	member, _ := h.member(t, "member@example.com")
+	adminSess := h.sessionFor(t, admin.ID)
+	memberSess := h.sessionFor(t, member.ID)
 
 	for _, tc := range []struct {
-		name   string
-		bearer string
-		want   int
+		name    string
+		session string
+		want    int
 	}{
-		{"administrator", adminTok, http.StatusOK},
-		{"ordinary member", memberTok, http.StatusForbidden},
+		{"administrator", adminSess, http.StatusOK},
+		{"ordinary member", memberSess, http.StatusForbidden},
 		{"nobody", "", http.StatusUnauthorized},
-		{"garbage", identity.TokenPrefix + "notreal", http.StatusUnauthorized},
+		{"garbage", "notarealsession", http.StatusUnauthorized},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := h.do("GET", "/api/v1/admin/users", tc.bearer, nil); got.Code != tc.want {
+			got := h.doSession("GET", "/api/v1/admin/users", tc.session, nil)
+			if got.Code != tc.want {
 				t.Errorf("GET /admin/users = %d, want %d (%s)", got.Code, tc.want, got.Body.String())
 			}
 		})
 	}
 
-	// Promotion takes effect on the token already issued: the role is read from
-	// the account at each request, so there is nothing to reissue.
+	// Administration is web-app surface, so an API token does not reach it at
+	// all — not even an administrator's. That is about how much API is
+	// published, not about rights, which is why the same person's session works.
+	if got := h.do("GET", "/api/v1/admin/users", adminTok, nil); got.Code != http.StatusNotFound {
+		t.Errorf("an admin token reached an admin route: %d", got.Code)
+	}
+
+	// Promotion takes effect on the session already issued: the role is read
+	// from the account at each request, so there is nothing to reissue.
 	if err := h.ids.SetRole(context.Background(), member.ID, identity.RoleAdmin); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.do("GET", "/api/v1/admin/users", memberTok, nil); got.Code != http.StatusOK {
+	if got := h.doSession("GET", "/api/v1/admin/users", memberSess, nil); got.Code != http.StatusOK {
 		t.Errorf("after promotion = %d, want 200", got.Code)
 	}
-	// ...and so does demotion, which is what makes "only admins hold admin
-	// tokens" true continuously rather than only at issue time.
+	// ...and so does demotion, which is what makes "only admins administer" true
+	// continuously rather than only at sign-in.
 	if err := h.ids.SetRole(context.Background(), member.ID, identity.RoleMember); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.do("GET", "/api/v1/admin/users", memberTok, nil); got.Code != http.StatusForbidden {
+	if got := h.doSession("GET", "/api/v1/admin/users", memberSess, nil); got.Code != http.StatusForbidden {
 		t.Errorf("after demotion = %d, want 403", got.Code)
 	}
 }
@@ -218,13 +268,15 @@ func TestRevokedTokenLosesAccess(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := h.do("GET", "/api/v1/admin/users", secret, nil); got.Code != http.StatusOK {
+	// Probed on a published route: this is about the credential, and admin
+	// routes are no longer reachable with one whatever its state.
+	if got := h.do("GET", "/api/v1/sources", secret, nil); got.Code != http.StatusOK {
 		t.Fatalf("fresh token = %d, want 200", got.Code)
 	}
 	if err := h.ids.RevokeToken(context.Background(), u.ID, tok.ID); err != nil {
 		t.Fatal(err)
 	}
-	if got := h.do("GET", "/api/v1/admin/users", secret, nil); got.Code != http.StatusUnauthorized {
+	if got := h.do("GET", "/api/v1/sources", secret, nil); got.Code != http.StatusUnauthorized {
 		t.Errorf("revoked token = %d, want 401", got.Code)
 	}
 }
@@ -315,8 +367,11 @@ func TestBootstrapDiesWhenAnAdminExists(t *testing.T) {
 func TestPrivateSourcesNeedAGrant(t *testing.T) {
 	h := newHarness(t)
 	ctx := context.Background()
-	_, adminTok := h.admin(t)
+	admin, adminTok := h.admin(t)
 	member, memberTok := h.member(t, "member@example.com")
+	// Granting is administration, which the web app does with a session. The
+	// token stays for the source listing below, which is published API.
+	adminSess := h.sessionFor(t, admin.ID)
 
 	put := func(id, vis string) {
 		t.Helper()
@@ -371,7 +426,7 @@ func TestPrivateSourcesNeedAGrant(t *testing.T) {
 	if err := h.ids.AddMember(ctx, team.ID, member.ID, identity.TeamMember); err != nil {
 		t.Fatal(err)
 	}
-	if w := h.do("POST", "/api/v1/admin/sources/secret/grants", adminTok,
+	if w := h.doSession("POST", "/api/v1/admin/sources/secret/grants", adminSess,
 		map[string]string{"team_id": team.ID}); w.Code != http.StatusNoContent {
 		t.Fatalf("grant = %d (%s)", w.Code, w.Body.String())
 	}
@@ -380,7 +435,7 @@ func TestPrivateSourcesNeedAGrant(t *testing.T) {
 	}
 
 	// Revoking takes it away again.
-	if w := h.do("DELETE", "/api/v1/admin/sources/secret/grants/"+team.ID, adminTok, nil); w.Code != http.StatusNoContent {
+	if w := h.doSession("DELETE", "/api/v1/admin/sources/secret/grants/"+team.ID, adminSess, nil); w.Code != http.StatusNoContent {
 		t.Fatalf("revoke = %d (%s)", w.Code, w.Body.String())
 	}
 	if got := names(memberTok); got["secret"] {
@@ -530,10 +585,9 @@ func TestChangePasswordEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, secret, err := h.ids.CreateToken(ctx, u.ID, "t")
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Account management is web-app surface — a session, not a token, which is
+	// what the browser sends anyway.
+	sess := h.sessionFor(t, u.ID)
 
 	// /auth/me tells the UI whether to render the form at all.
 	var me struct {
@@ -542,7 +596,7 @@ func TestChangePasswordEndpoint(t *testing.T) {
 			SSO bool `json:"sso"`
 		} `json:"user"`
 	}
-	w := h.do("GET", "/api/v1/auth/me", secret, nil)
+	w := h.doSession("GET", "/api/v1/auth/me", sess, nil)
 	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
 		t.Fatal(err)
 	}
@@ -551,12 +605,12 @@ func TestChangePasswordEndpoint(t *testing.T) {
 			me.CanChangePassword, me.User.SSO)
 	}
 
-	if w := h.do("POST", "/api/v1/auth/password", secret, map[string]string{
+	if w := h.doSession("POST", "/api/v1/auth/password", sess, map[string]string{
 		"current_password": "wrong", "new_password": "new-password",
 	}); w.Code != http.StatusBadRequest {
 		t.Errorf("wrong current password = %d, want 400", w.Code)
 	}
-	if w := h.do("POST", "/api/v1/auth/password", secret, map[string]string{
+	if w := h.doSession("POST", "/api/v1/auth/password", sess, map[string]string{
 		"current_password": "old-password", "new_password": "new-password",
 	}); w.Code != http.StatusNoContent {
 		t.Fatalf("change = %d, want 204 (%s)", w.Code, w.Body.String())
@@ -570,11 +624,8 @@ func TestChangePasswordEndpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, ssoTok, err := h.ids.CreateToken(ctx, sso.ID, "t")
-	if err != nil {
-		t.Fatal(err)
-	}
-	w = h.do("GET", "/api/v1/auth/me", ssoTok, nil)
+	ssoSess := h.sessionFor(t, sso.ID)
+	w = h.doSession("GET", "/api/v1/auth/me", ssoSess, nil)
 	me.CanChangePassword = true
 	if err := json.Unmarshal(w.Body.Bytes(), &me); err != nil {
 		t.Fatal(err)
@@ -583,7 +634,7 @@ func TestChangePasswordEndpoint(t *testing.T) {
 		t.Errorf("an SSO account reports can_change_password=%v sso=%v",
 			me.CanChangePassword, me.User.SSO)
 	}
-	if w := h.do("POST", "/api/v1/auth/password", ssoTok, map[string]string{
+	if w := h.doSession("POST", "/api/v1/auth/password", ssoSess, map[string]string{
 		"current_password": "x", "new_password": "new-password",
 	}); w.Code != http.StatusConflict {
 		t.Errorf("SSO change = %d, want 409 (%s)", w.Code, w.Body.String())
@@ -695,7 +746,8 @@ func TestAnonymousJobHistoryIsScoped(t *testing.T) {
 // tell a source that is ready to use from one that still needs fetching.
 func TestValidateReportsWhetherDataIsNeeded(t *testing.T) {
 	h := newHarness(t)
-	_, adminTok := h.admin(t)
+	admin, _ := h.admin(t)
+	adminSess := h.sessionFor(t, admin.ID)
 
 	for _, tc := range []struct {
 		name      string
@@ -722,7 +774,7 @@ func TestValidateReportsWhetherDataIsNeeded(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			w := h.do("POST", "/api/v1/admin/sources/validate", adminTok,
+			w := h.doSession("POST", "/api/v1/admin/sources/validate", adminSess,
 				map[string]string{"toml": tc.toml})
 			if w.Code != http.StatusOK {
 				t.Fatalf("validate = %d (%s)", w.Code, w.Body.String())
@@ -754,7 +806,8 @@ func TestValidateReportsWhetherDataIsNeeded(t *testing.T) {
 // to the edit. This destroyed VEP's two scripts in the dev stack.
 func TestReRegisteringKeepsAssets(t *testing.T) {
 	h := newHarness(t)
-	_, tok := h.admin(t)
+	admin, _ := h.admin(t)
+	sess := h.sessionFor(t, admin.ID)
 
 	manifest := "[[sources]]\ntype=\"tool\"\nname=\"vep\"\nversion=\"113\"\nassembly=\"GRCh38\"\n" +
 		"  [[sources.steps]]\n  run=\"python3 {workdir}/helper.py\"\n"
@@ -764,13 +817,13 @@ func TestReRegisteringKeepsAssets(t *testing.T) {
 			{"name": "helper.py", "content": "print('hi')\n"},
 		},
 	}
-	if rec := h.do("POST", "/api/v1/admin/sources", tok, body); rec.Code != 200 {
+	if rec := h.doSession("POST", "/api/v1/admin/sources", sess, body); rec.Code != 200 {
 		t.Fatalf("register = %d: %s", rec.Code, rec.Body.String())
 	}
 
 	// The same manifest with one line changed, and nothing said about assets.
 	body2 := map[string]any{"toml": manifest + "  # a comment\n"}
-	rec := h.do("POST", "/api/v1/admin/sources", tok, body2)
+	rec := h.doSession("POST", "/api/v1/admin/sources", sess, body2)
 	if rec.Code != 200 {
 		t.Fatalf("re-register = %d: %s", rec.Code, rec.Body.String())
 	}
@@ -781,7 +834,7 @@ func TestReRegisteringKeepsAssets(t *testing.T) {
 
 	// An explicit empty list still clears, so "remove them" remains expressible.
 	body3 := map[string]any{"toml": manifest, "assets": []map[string]string{}}
-	if rec = h.do("POST", "/api/v1/admin/sources", tok, body3); rec.Code != 200 {
+	if rec = h.doSession("POST", "/api/v1/admin/sources", sess, body3); rec.Code != 200 {
 		t.Fatalf("clear = %d: %s", rec.Code, rec.Body.String())
 	}
 	if !strings.Contains(rec.Body.String(), `"assets":0`) {
