@@ -1026,7 +1026,7 @@ func (s *Server) handleListBuilds(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"builds": builds})
+	writeJSON(w, http.StatusOK, BuildsResponse{Builds: builds})
 }
 
 // handlePutBuild adds or updates a build.

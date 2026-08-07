@@ -342,7 +342,7 @@ func (s *Server) handleVersion(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handlePing(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"pong": "ok"})
+	writeJSON(w, http.StatusOK, PingResponse{Pong: "ok"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
