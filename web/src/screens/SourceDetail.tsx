@@ -105,7 +105,9 @@ export default function SourceDetail() {
               ? "Read from its origin — nothing is stored here."
               : source.needs_data === false
                 ? "Computed from the variant; there is nothing to store."
-                : "Not downloaded yet. Provision it from the sources list."}
+                : source.kind === "tool"
+                  ? "Not installed yet. A tool downloads its image and runs a one-time setup; the result can be kept in a storage location so another worker unpacks it instead of repeating the install."
+                  : "Not downloaded yet — choose a location below."}
           </p>
         ) : (
           [...byLoc].map(([id, v]) => {
