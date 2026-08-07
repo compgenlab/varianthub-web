@@ -952,6 +952,13 @@ func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Read before PutReference resets it: a durable copy of this assembly is
+	// worth restoring rather than re-fetching.
+	var existingDurable string
+	if prev, ok, _ := s.catalog.Reference(r.Context(), req.Assembly); ok && prev.URI == req.URI {
+		existingDurable = prev.DurableURI
+	}
+
 	// Resolved here so an unusable target is a 400 now, rather than a job that
 	// fetches most of a gigabyte and only then finds it cannot keep a copy.
 	var cacheDir string
@@ -976,9 +983,12 @@ func (s *Server) handlePutReference(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// If this assembly already has a durable copy, hand it to the job: restoring
+	// it beats re-fetching and re-indexing, and is the whole reason for keeping
+	// one. PutReference above cleared the column, so it is read first.
 	body, err := json.Marshal(map[string]any{
 		"assembly": req.Assembly, "uri": req.URI, "checksum": req.Checksum,
-		"cache_dir": cacheDir,
+		"cache_dir": cacheDir, "durable_uri": existingDurable,
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

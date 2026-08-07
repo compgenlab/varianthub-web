@@ -559,6 +559,9 @@ func runReference(ctx context.Context, cat *catalog.Store, dataDir, varhubBin st
 		URI      string `json:"uri"`
 		Checksum string `json:"checksum"`
 		CacheDir string `json:"cache_dir"` // durable copy destination; "" = local only
+		// DurableURI, when set, is tried before the source: a copy another
+		// worker already prepared.
+		DurableURI string `json:"durable_uri"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
 		return queue.Outcome{}, fmt.Errorf("reference job body: %w", err)
@@ -581,8 +584,34 @@ func runReference(ctx context.Context, cat *catalog.Store, dataDir, varhubBin st
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fail(err)
 	}
-	dest := filepath.Join(dir, path.Base(strings.TrimSuffix(req.URI, "/")))
 
+	// Restore from the durable copy when there is one: another worker has
+	// already fetched, recompressed and indexed this, and repeating that is most
+	// of a gigabyte over someone else's FTP plus a bgzip pass. Falling through to
+	// a fresh fetch is slower but always correct, so a failure here is not fatal.
+	if req.DurableURI != "" {
+		if local, ok := runner.RestoreFrom(ctx, req.DurableURI, dir); ok {
+			fi, sErr := os.Stat(local)
+			var size int64
+			if sErr == nil {
+				size = fi.Size()
+			}
+			if err := cat.SetReferenceReady(context.WithoutCancel(ctx),
+				req.Assembly, local, size, req.DurableURI); err != nil {
+				return queue.Outcome{}, err
+			}
+			log.Printf("worker: reference %s restored from %s", req.Assembly, req.DurableURI)
+			body, _ := json.Marshal(map[string]any{
+				"assembly": req.Assembly, "path": local, "size_bytes": size,
+				"durable_uri": req.DurableURI, "restored": true,
+			})
+			return queue.Outcome{Result: body, N: 1}, nil
+		}
+		log.Printf("worker: reference %s: no durable copy at %s; fetching from source",
+			req.Assembly, req.DurableURI)
+	}
+
+	dest := filepath.Join(dir, path.Base(strings.TrimSuffix(req.URI, "/")))
 	log.Printf("worker: reference %s: fetching %s", req.Assembly, req.URI)
 	size, err := runner.FetchFile(ctx, req.URI, dest, req.Checksum)
 	if err != nil {

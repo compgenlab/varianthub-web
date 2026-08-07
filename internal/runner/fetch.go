@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -25,13 +26,10 @@ import (
 // all: an unverified reference is worse than a missing one, because a tool will
 // happily annotate against the wrong genome and say nothing.
 //
-// http(s) only. s3:// needs either an SDK dependency here or a fetch subcommand
-// in varhub, which already speaks it — the latter is the better answer and
-// belongs with the scratch-space work, where S3 is the intended home.
+// http(s) and s3:// both work; the digest is verified the same way for each.
 func FetchFile(ctx context.Context, uri, dest, checksum string) (int64, error) {
 	if strings.HasPrefix(uri, "s3://") {
-		return 0, fmt.Errorf("s3:// references are not supported yet; " +
-			"publish the file over https, or wait for scratch-space staging")
+		return fetchS3(ctx, uri, dest, checksum)
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri, nil)
 	if err != nil {
@@ -227,13 +225,9 @@ func fastaKind(path string) (fastaCompression, error) {
 
 // CopyTo writes a local file to a destination that may be a filesystem path or
 // an object locator.
-//
-// s3:// is delegated to varhub, which already speaks it — keeping object-store
-// access in one place rather than adding a second SDK and a second set of
-// credentials to reason about.
 func CopyTo(ctx context.Context, src, dst string) error {
 	if strings.HasPrefix(dst, "s3://") {
-		return fmt.Errorf("s3 durable copies are not wired up yet (%s)", dst)
+		return s3Put(ctx, src, dst)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
@@ -258,4 +252,100 @@ func CopyTo(ctx context.Context, src, dst string) error {
 		return err
 	}
 	return os.Rename(tmp, dst)
+}
+
+// fetchS3 downloads an object, verifying a digest the same way FetchFile does
+// for http.
+func fetchS3(ctx context.Context, uri, dest, checksum string) (int64, error) {
+	tmp := dest + ".part"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return 0, err
+	}
+	defer os.Remove(tmp)
+
+	h, want, err := hasherFor(checksum)
+	if err != nil {
+		f.Close()
+		return 0, err
+	}
+	var w io.Writer = f
+	if h != nil {
+		w = io.MultiWriter(f, h)
+	}
+	n, err := s3Get(ctx, uri, w)
+	if err != nil {
+		f.Close()
+		return 0, err
+	}
+	if err := f.Close(); err != nil {
+		return 0, err
+	}
+	if h != nil {
+		if got := hex.EncodeToString(h.Sum(nil)); got != want {
+			return 0, fmt.Errorf("%s: checksum mismatch: got %s, want %s", uri, got, want)
+		}
+	}
+	if err := os.Rename(tmp, dest); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// RestoreFrom copies a durable reference and its indexes back to a local
+// directory, reporting whether it did.
+//
+// This is what the durable copy is for: a worker with an empty disk unpacks
+// what another already fetched and indexed, instead of pulling most of a
+// gigabyte over someone else's FTP and recompressing it. Best effort — falling
+// back to a fresh fetch is slower but always correct.
+func RestoreFrom(ctx context.Context, durableURI, destDir string) (string, bool) {
+	if durableURI == "" {
+		return "", false
+	}
+	base := path.Base(durableURI)
+	local := filepath.Join(destDir, base)
+	if err := os.MkdirAll(destDir, 0o755); err != nil {
+		return "", false
+	}
+	for i, ext := range []string{"", ".fai", ".gzi"} {
+		src, dst := durableURI+ext, local+ext
+		if strings.HasPrefix(durableURI, "s3://") {
+			if !s3Exists(ctx, src) {
+				if i == 0 {
+					return "", false // no data object: nothing to restore
+				}
+				continue // .gzi only exists for BGZF
+			}
+			if _, err := FetchFile(ctx, src, dst, ""); err != nil {
+				return "", false
+			}
+			continue
+		}
+		if _, err := os.Stat(src); err != nil {
+			if i == 0 {
+				return "", false
+			}
+			continue
+		}
+		if err := CopyTo(ctx, src, dst); err != nil {
+			return "", false
+		}
+	}
+	return local, true
+}
+
+// hasherFor returns a hash for a "<algo>:<hex>" spec, or nil when empty.
+func hasherFor(spec string) (hash.Hash, string, error) {
+	algo, value, ok := strings.Cut(spec, ":")
+	if !ok {
+		return nil, "", nil
+	}
+	switch strings.ToLower(algo) {
+	case "md5":
+		return md5.New(), strings.ToLower(value), nil
+	case "sha256":
+		return sha256.New(), strings.ToLower(value), nil
+	}
+	return nil, "", fmt.Errorf("unsupported checksum algorithm %q (want md5 or sha256)", algo)
 }
