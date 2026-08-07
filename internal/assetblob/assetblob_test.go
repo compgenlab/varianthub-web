@@ -68,7 +68,7 @@ func TestLocationPrefersObjectStorage(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := Location(tc.in)
+			got, ok := catalog.AssetStorage(tc.in)
 			if !ok {
 				t.Fatalf("no location chosen from %+v", tc.in)
 			}
@@ -78,10 +78,10 @@ func TestLocationPrefersObjectStorage(t *testing.T) {
 		})
 	}
 
-	if _, ok := Location(nil); ok {
+	if _, ok := catalog.AssetStorage(nil); ok {
 		t.Error("a location was chosen with none configured")
 	}
-	if _, ok := Location([]catalog.StorageLocation{broken}); ok {
+	if _, ok := catalog.AssetStorage([]catalog.StorageLocation{broken}); ok {
 		t.Error("an unusable location was chosen")
 	}
 }

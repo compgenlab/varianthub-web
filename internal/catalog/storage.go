@@ -253,7 +253,17 @@ func (s *Store) SourceFiles(ctx context.Context, sourceID, storageID string) ([]
 		}
 		out = append(out, f)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// Helper files are objects in storage too, and the same rule applies to
+	// them as to a tool's cache: bytes this installation is holding should be
+	// visible where someone looks for what is stored.
+	assets, err := s.AssetFiles(ctx, sourceID, storageID)
+	if err != nil {
+		return nil, err
+	}
+	return append(out, assets...), nil
 }
 
 // StorageRootsForSources reports where each source's files live, keyed by

@@ -260,3 +260,112 @@ func TestBackfillKeepsContentWhenStorageLosesIt(t *testing.T) {
 type losingBlobs struct{ *fakeBlobs }
 
 func (l *losingBlobs) PutAsset(context.Context, string, []byte) error { return nil }
+
+// Assets are objects in storage, so they belong in the list of what is stored —
+// and they must survive a download recording its own files, which replaces
+// source_file wholesale for that (source, location) pair.
+func TestAssetsAppearInTheFileListing(t *testing.T) {
+	blobs := newFakeBlobs()
+	base := testStore(t)
+	s := base.WithAssetBlobs(blobs)
+	ctx := context.Background()
+
+	if err := s.PutStorage(ctx, StorageLocation{
+		ID: "s3", Name: "bucket", Kind: StorageS3, URI: "s3://vh", IsDefault: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSource(ctx, Source{
+		ID: "revel", Name: "revel", Version: "1.3", Kind: "tab", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	const script = "#!/usr/bin/env python3\n"
+	if err := s.PutAssets(ctx, "revel", []Asset{{Name: "convert.py", Content: script}}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := AssetPrefix + "/" + AssetDigest([]byte(script))
+	files, err := s.SourceFiles(ctx, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := func(fs []SourceFile, path string) *SourceFile {
+		for i := range fs {
+			if fs[i].Path == path {
+				return &fs[i]
+			}
+		}
+		return nil
+	}
+	got := found(files, want)
+	if got == nil {
+		t.Fatalf("the asset object is not listed; got %+v", files)
+	}
+	if got.StorageID != "s3" {
+		t.Errorf("attributed to %q, want the asset location s3", got.StorageID)
+	}
+	if got.SizeBytes != int64(len(script)) {
+		t.Errorf("size %d, want %d", got.SizeBytes, len(script))
+	}
+
+	// A download recording its files replaces source_file for that pair. The
+	// asset is derived, not recorded, so it cannot be collateral.
+	if err := s.ReplaceSourceFiles(ctx, "revel", "s3", []SourceFile{
+		{Path: "revel/1.3/revel.tsv.gz", SizeBytes: 999},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	files, err = s.SourceFiles(ctx, "revel", "s3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found(files, want) == nil {
+		t.Errorf("the asset vanished when the download recorded its files: %+v", files)
+	}
+	if found(files, "revel/1.3/revel.tsv.gz") == nil {
+		t.Errorf("the downloaded file is missing: %+v", files)
+	}
+
+	// Narrowing to another location must not report it there.
+	if err := s.PutStorage(ctx, StorageLocation{
+		ID: "local", Name: "local", Kind: StoragePath, URI: "/mnt/storage",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	files, err = s.SourceFiles(ctx, "", "local")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found(files, want) != nil {
+		t.Errorf("the asset was reported under a location it is not in: %+v", files)
+	}
+}
+
+// An asset still held inline has no object, so listing one would be reporting
+// storage that is not occupied.
+func TestInlineAssetsAreNotListedAsFiles(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+
+	if err := s.PutStorage(ctx, StorageLocation{
+		ID: "s3", Name: "bucket", Kind: StorageS3, URI: "s3://vh", IsDefault: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutSource(ctx, Source{
+		ID: "revel", Name: "revel", Version: "1.3", Kind: "tab", TOML: "[[sources]]\n",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.PutAssets(ctx, "revel", []Asset{{Name: "c.py", Content: "inline\n"}}); err != nil {
+		t.Fatal(err)
+	}
+	files, err := s.SourceFiles(ctx, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Errorf("an inline asset was listed as a stored file: %+v", files)
+	}
+}

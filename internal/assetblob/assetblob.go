@@ -16,11 +16,7 @@ import (
 )
 
 // Prefix is where assets live under a storage location.
-//
-// Shared across sources rather than nested under each, because the name is a
-// content digest: the same conversion script pinned by two versions of a source
-// is one object, and a re-registration that changes nothing writes nothing.
-const Prefix = "assets/sha256"
+const Prefix = catalog.AssetPrefix
 
 // Store resolves the storage location at use, not at construction.
 //
@@ -33,42 +29,6 @@ type Store struct {
 // New returns a Store that reads its destination from the catalog.
 func New(cat *catalog.Store) *Store { return &Store{cat: cat} }
 
-// Location picks where assets live, preferring object storage.
-//
-// Not simply the default location. Every worker materializing a job has to read
-// every asset its sources declare, so assets have to sit somewhere all of them
-// can reach. A path location may be a shared mount or may be local to one pod,
-// and nothing in the catalog distinguishes the two — so a path default would
-// work on a single-node deployment and fail on the second replica, which is the
-// failure this whole move to object storage exists to avoid.
-//
-// A bucket is reachable from every replica by construction, so when one is
-// configured it wins. With no bucket at all the default location is the only
-// answer available, and a single-node deployment is exactly where that is fine.
-func Location(locs []catalog.StorageLocation) (catalog.StorageLocation, bool) {
-	var fallback catalog.StorageLocation
-	var haveFallback bool
-	for _, l := range locs {
-		if !l.Usable() {
-			continue
-		}
-		if l.Kind == catalog.StorageS3 {
-			// Among buckets, honour the deployment's own choice.
-			if l.IsDefault {
-				return l, true
-			}
-			if fallback.Kind != catalog.StorageS3 {
-				fallback, haveFallback = l, true
-			}
-			continue
-		}
-		if !haveFallback || (l.IsDefault && fallback.Kind != catalog.StorageS3) {
-			fallback, haveFallback = l, true
-		}
-	}
-	return fallback, haveFallback
-}
-
 // uriFor composes the locator for a digest under the asset location.
 func (s *Store) uriFor(ctx context.Context, digest string) (string, error) {
 	if err := validDigest(digest); err != nil {
@@ -78,11 +38,11 @@ func (s *Store) uriFor(ctx context.Context, digest string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	loc, ok := Location(locs)
+	loc, ok := catalog.AssetStorage(locs)
 	if !ok {
 		return "", errors.New("no usable storage location is configured")
 	}
-	return strings.TrimRight(loc.URI, "/") + "/" + Prefix + "/" + digest, nil
+	return strings.TrimRight(loc.URI, "/") + "/" + catalog.AssetPrefix + "/" + digest, nil
 }
 
 // validDigest rejects anything that is not a plain lowercase SHA-256.
