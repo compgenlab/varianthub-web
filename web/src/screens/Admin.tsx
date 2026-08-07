@@ -151,7 +151,6 @@ export default function Admin() {
             sources={sources}
             files={files}
             storage={storage}
-            onChange={load}
           />
         </>
       ) : (
@@ -176,16 +175,15 @@ export default function Admin() {
   );
 }
 
+// The list reports; it no longer acts, so it needs no way to refresh itself.
 function SourceTable({
   sources,
   files,
   storage,
-  onChange,
 }: {
   sources: Source[];
   files: SourceFile[];
   storage: StorageLocation[];
-  onChange: () => void;
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
@@ -266,7 +264,6 @@ function SourceTable({
             have={provisioned.get(s.id)}
             storage={storage}
             targets={targets}
-            onChange={onChange}
           />
           <span style={{ textAlign: "right" }}>
             <Link
@@ -320,133 +317,66 @@ function StoredAt({
 }
 
 /**
- * Shows a source's data footprint, or offers to fetch it.
+ * Where a source's data is, as a column in the list.
  *
- * A registered source is not usable until its data is downloaded — annotating
- * without it fails with "sources not downloaded". Putting the action on the row
- * means the gap and the fix are in the same place, rather than sending someone
- * to a different screen to work out which sources are missing.
+ * Reports only. Choosing a location, downloading and moving all live on the
+ * source's own page: they are decisions that need its current placement in
+ * view, and a dropdown plus two buttons on every row turned a list meant to
+ * answer "what exists and is it ready" into a control panel.
  */
 function ProvisionCell({
   source,
   have,
   storage,
   targets,
-  onChange,
 }: {
   source: Source;
   have?: Map<string, { bytes: number; count: number }>;
   storage: StorageLocation[];
   targets: StorageLocation[];
-  onChange: () => void;
 }) {
-  const [target, setTarget] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState("");
-  const [err, setErr] = useState("");
+  const streamed = source.needs_data === false && source.stream;
 
-  // Already being fetched. No control while that is true: a second Download
-  // would queue a duplicate of work already running, and the useful thing to
-  // offer is the job rather than the button.
   if (source.state?.state === "installing") {
     return (
-      <span className="row gap-8" style={{ fontSize: 12.5 }}>
-        <i className="status-dot blink" style={{ background: "var(--vus-dot)" }} />
+      <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--vus-fg)" }}>
+        <i className="status-dot" style={{ background: "var(--vus-dot)" }} />
+        Downloading…
         {source.state.job ? (
-          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12.5 }}>
-            installing…
+          <Link to={`/admin/jobs/${source.state.job}`} style={{ fontSize: 12 }}>
+            view job
           </Link>
-        ) : (
-          "installing…"
-        )}
+        ) : null}
       </span>
     );
   }
 
-  // Nothing to fetch: a builtin computes from the variant, a streamed source is
-  // read from its url. Both are usable the moment they are registered, so say
-  // which rather than offering a control that would provision nothing.
   if (source.needs_data === false && !source.stream) {
-    return (
-      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>
-    );
+    return <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>;
   }
-
-  // A streamed source reads from its url, so it needs nothing — but a copy is
-  // worth having for whole-genome runs, or to pin results to bytes that cannot
-  // change upstream. Offered, not pressed: the default stays "no copy".
-  const streamed = source.needs_data === false && source.stream;
 
   if (source.state?.state === "failed") {
     return (
       <span style={{ display: "block" }}>
-        <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
-          <i className="status-dot" style={{ background: "var(--path-dot)" }} />
-          install failed
+        <span style={{ fontSize: 12.5, color: "var(--path-fg)" }}>
+          Failed — {(source.state.error ?? "").split("\n")[0].slice(0, 70)}
         </span>
-        {/* The reason, trimmed: the row says what happened, the job page has
-            the run's whole output. */}
-        <span
-          className="mono"
-          style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}
+        <Link
+          to={`/admin/sources/${source.id}`}
+          style={{ fontSize: 12, display: "block", marginTop: 2 }}
         >
-          {(source.state.error ?? "").split("\n")[0].slice(0, 90)}
-        </span>
-        <button
-          className="btn secondary"
-          style={{ height: 26, padding: "0 9px", fontSize: 11.5, marginTop: 4 }}
-          disabled={busy || targets.length === 0}
-          onClick={provision}
-        >
-          Retry
-        </button>
+          retry…
+        </Link>
       </span>
     );
   }
 
   if (have && have.size > 0) {
-    // Somewhere else it could go. Offered only when there is an alternative,
-    // because a single-location deployment has no move to make.
-    const elsewhere = storage.filter((l) => !have.has(l.id) && l.usable !== false);
     return (
       <span style={{ display: "block" }}>
         {[...have].map(([id, v]) => (
           <StoredAt key={id} location={storage.find((l) => l.id === id)} {...v} />
         ))}
-        {elsewhere.length > 0 && (
-          <span className="row gap-8" style={{ marginTop: 3 }}>
-            <span style={{ fontSize: 11, color: "var(--text-3)" }}>move to</span>
-            <select
-              value=""
-              disabled={busy}
-              onChange={async (e) => {
-                const to = e.target.value;
-                if (!to) return;
-                setBusy(true);
-                try {
-                  // The files are copied, recorded, and only then deleted, so
-                  // this is safe to interrupt — the source stays readable where
-                  // it is until the copy has landed.
-                  await api.moveSource(source.id, to);
-                  setMsg("moving…");
-                  onChange?.();
-                } catch (err) {
-                  setMsg(String(err));
-                } finally {
-                  setBusy(false);
-                }
-              }}
-              style={{ fontSize: 11.5, height: 22, padding: "0 4px" }}
-            >
-              <option value="">choose…</option>
-              {elsewhere.map((l) => (
-                <option key={l.id} value={l.id}>
-                  {l.name}
-                </option>
-              ))}
-            </select>
-          </span>
-        )}
         {/* A streamed source that also has a copy: say so, or the copy looks
             like the only way it is read. */}
         {streamed && (
@@ -458,46 +388,17 @@ function ProvisionCell({
     );
   }
 
-  if (msg) {
-    return (
-      <span style={{ fontSize: 12, color: "var(--accent-text)" }}>
-        {msg}
-      </span>
-    );
-  }
-
   if (targets.length === 0) {
     return (
-      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>
-        no usable storage configured
-      </span>
+      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>no usable storage configured</span>
     );
-  }
-
-  async function provision() {
-    setBusy(true);
-    setErr("");
-    try {
-      const r = await api.download({
-        sources: [source.id],
-        storage_id: target || targets[0].id,
-        include_streamed: streamed,
-      });
-      setMsg(`queued #${r.job_id.slice(0, 8)}`);
-      onChange();
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setBusy(false);
-    }
   }
 
   return (
-    <span>
+    <span style={{ display: "block" }}>
       {/* Without this a working remote source looks exactly like a broken
-          un-provisioned one — same dropdown, same Download button. It is
-          already usable; the copy is an optimisation, so say that before
-          offering the control rather than only in a tooltip. */}
+          un-provisioned one. It is already usable; the copy is an optimisation,
+          so say that rather than leaving it to a tooltip. */}
       {streamed && (
         <span
           className="row gap-8"
@@ -506,40 +407,9 @@ function ProvisionCell({
           <Globe size={11} /> reads from origin — copy optional
         </span>
       )}
-      <span className="row gap-8">
-        <select
-          className="select"
-          style={{ height: 30, fontSize: 12, padding: "0 8px", flex: 1, minWidth: 0 }}
-          value={target || targets[0].id}
-          onChange={(e) => setTarget(e.target.value)}
-          disabled={busy}
-          aria-label={`Storage location for ${source.name}`}
-        >
-          {targets.map((l) => (
-            <option key={l.id} value={l.id}>
-              {l.name}
-            </option>
-          ))}
-        </select>
-        <button
-          className="btn secondary"
-          style={{ height: 30, padding: "0 11px", fontSize: 12 }}
-          disabled={busy}
-          onClick={provision}
-          title={
-            streamed
-              ? "This source is read from its url. Download a copy anyway — useful for whole-genome runs, or to pin results to bytes that cannot change upstream."
-              : undefined
-          }
-        >
-          {busy ? "…" : streamed ? "Copy locally" : "Download"}
-        </button>
-      </span>
-      {err && (
-        <span className="err" style={{ fontSize: 11.5, display: "block", marginTop: 4 }}>
-          {err}
-        </span>
-      )}
+      <Link to={`/admin/sources/${source.id}`} style={{ fontSize: 12.5 }}>
+        {streamed ? "Copy locally…" : "Set up storage…"}
+      </Link>
     </span>
   );
 }
