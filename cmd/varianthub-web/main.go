@@ -11,8 +11,6 @@ import (
 	"log"
 	"os"
 	"os/signal"
-	"path"
-	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -305,8 +303,6 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
 			return runCleanup(job, input)
-		case queue.KindReference:
-			return runReference(ctx, cat, cfgDataDir, cfgVarhubBin, job, input)
 		}
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind:      job.Kind,
@@ -539,141 +535,4 @@ Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
 Copy varianthub-web.example.toml to start; see README.md. A database URL is
 always required.
 `, "\n"))
-}
-
-// runReference fetches a reference genome onto the worker's filesystem.
-//
-// Local disk, not a storage location: a tool step binds the FASTA's directory
-// into a container, so this is the one artifact that cannot be read from a
-// bucket however much the source data is. It lands under <data_dir>/references/
-// <assembly>/, beside the tool data that uses it.
-//
-// The fetch is the CLI's, so an https:// or s3:// URI, a checksum, and resume
-// behaviour all work the same way they do for a source — there is no second
-// download implementation to keep honest.
-func runReference(ctx context.Context, cat *catalog.Store, dataDir, varhubBin string,
-	job queue.Job, input []byte) (queue.Outcome, error) {
-
-	var req struct {
-		Assembly string `json:"assembly"`
-		URI      string `json:"uri"`
-		Checksum string `json:"checksum"`
-		CacheDir string `json:"cache_dir"` // durable copy destination; "" = local only
-		// DurableURI, when set, is tried before the source: a copy another
-		// worker already prepared.
-		DurableURI string `json:"durable_uri"`
-	}
-	if err := json.Unmarshal(input, &req); err != nil {
-		return queue.Outcome{}, fmt.Errorf("reference job body: %w", err)
-	}
-	if cat == nil {
-		return queue.Outcome{}, errors.New("catalog unavailable")
-	}
-
-	fail := func(err error) (queue.Outcome, error) {
-		// WithoutCancel: a cancelled or timed-out fetch still has to leave the
-		// reference describing itself accurately, and its context is dead.
-		if sErr := cat.SetReferenceFailed(context.WithoutCancel(ctx),
-			req.Assembly, err.Error()); sErr != nil {
-			log.Printf("worker: reference %s: mark failed: %v", req.Assembly, sErr)
-		}
-		return queue.Outcome{}, err
-	}
-
-	dir := filepath.Join(dataDir, "references", req.Assembly)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return fail(err)
-	}
-
-	// Restore from the durable copy when there is one: another worker has
-	// already fetched, recompressed and indexed this, and repeating that is most
-	// of a gigabyte over someone else's FTP plus a bgzip pass. Falling through to
-	// a fresh fetch is slower but always correct, so a failure here is not fatal.
-	if req.DurableURI != "" {
-		if local, ok := runner.RestoreFrom(ctx, req.DurableURI, dir); ok {
-			fi, sErr := os.Stat(local)
-			var size int64
-			if sErr == nil {
-				size = fi.Size()
-			}
-			if err := cat.SetReferenceReady(context.WithoutCancel(ctx),
-				req.Assembly, local, size, req.DurableURI); err != nil {
-				return queue.Outcome{}, err
-			}
-			log.Printf("worker: reference %s restored from %s", req.Assembly, req.DurableURI)
-			body, _ := json.Marshal(map[string]any{
-				"assembly": req.Assembly, "path": local, "size_bytes": size,
-				"durable_uri": req.DurableURI, "restored": true,
-			})
-			return queue.Outcome{Result: body, N: 1}, nil
-		}
-		log.Printf("worker: reference %s: no durable copy at %s; fetching from source",
-			req.Assembly, req.DurableURI)
-	}
-
-	dest := filepath.Join(dir, path.Base(strings.TrimSuffix(req.URI, "/")))
-	log.Printf("worker: reference %s: fetching %s", req.Assembly, req.URI)
-	size, err := runner.FetchFile(ctx, req.URI, dest, req.Checksum)
-	if err != nil {
-		return fail(err)
-	}
-
-	// Recompress to BGZF if needed and build the .fai/.gzi a tool needs to
-	// random-access it. Done here so a failure lands in the job that chose the
-	// file, rather than inside a container hours later.
-	log.Printf("worker: reference %s: preparing (bgzip + faidx)", req.Assembly)
-	dest, err = runner.PrepareFasta(ctx, varhubBin, dest)
-	if err != nil {
-		return fail(err)
-	}
-	if fi, sErr := os.Stat(dest); sErr == nil {
-		size = fi.Size()
-	}
-
-	if fi, sErr := os.Stat(dest); sErr == nil {
-		size = fi.Size()
-	}
-
-	// The durable copy, so a worker starting with an empty disk restores instead
-	// of re-fetching most of a gigabyte over someone else's FTP. Best effort:
-	// the reference is already usable here, and failing the job because the copy
-	// did not upload would throw away work that went right.
-	var durable string
-	if req.CacheDir != "" {
-		durable = strings.TrimSuffix(req.CacheDir, "/") + "/references/" + req.Assembly
-		if err := publishReference(ctx, dest, durable); err != nil {
-			log.Printf("worker: reference %s: durable copy failed: %v", req.Assembly, err)
-			durable = ""
-		}
-	}
-
-	if err := cat.SetReferenceReady(context.WithoutCancel(ctx),
-		req.Assembly, dest, size, durable); err != nil {
-		return queue.Outcome{}, err
-	}
-	log.Printf("worker: reference %s ready at %s (%d bytes)", req.Assembly, dest, size)
-	body, _ := json.Marshal(map[string]any{
-		"assembly": req.Assembly, "path": dest, "size_bytes": size,
-		"durable_uri": durable,
-	})
-	return queue.Outcome{Result: body, N: 1}, nil
-}
-
-// publishReference copies a prepared reference and its indexes to durable
-// storage, so another worker can restore rather than re-fetch.
-//
-// The indexes go too: rebuilding them is cheap but not free, and a copy that
-// restores to something a tool still has to index is only half a copy.
-func publishReference(ctx context.Context, local, destDir string) error {
-	for _, ext := range []string{"", ".fai", ".gzi"} {
-		src := local + ext
-		if _, err := os.Stat(src); err != nil {
-			continue // .gzi only exists for BGZF
-		}
-		dst := destDir + "/" + filepath.Base(src)
-		if err := runner.CopyTo(ctx, src, dst); err != nil {
-			return fmt.Errorf("%s: %w", filepath.Base(src), err)
-		}
-	}
-	return nil
 }

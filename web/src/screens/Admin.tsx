@@ -1,10 +1,9 @@
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Check, Cloud, Globe, HardDrive, Plus, X } from "lucide-react";
 
 import {
   api,
-  type Reference,
   type Registry,
   type RegistryEntry,
   type Snapshot,
@@ -43,7 +42,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots" | "references";
+type Tab = "sources" | "snapshots";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -115,7 +114,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots", "references"] as Tab[]).map((t) => (
+        {(["sources", "snapshots"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -130,16 +129,14 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "References"}
+            {t === "sources" ? "Sources" : "Snapshots"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "references" ? (
-        <ReferenceList />
-      ) : tab === "sources" ? (
+      {tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
@@ -1352,239 +1349,5 @@ function BuildSnapshot({
         </div>
       </div>
     </div>
-  );
-}
-
-
-
-
-/**
- * Reference genomes, one per assembly.
- *
- * Keyed by assembly because that is what a lookup asks: a tool step rendering
- * {ref} wants "the FASTA for GRCh38". A second FASTA for the same assembly would
- * make that question ambiguous rather than richer, so adding one replaces it.
- */
-function ReferenceList() {
-  const [refs, setRefs] = useState<Reference[]>([]);
-  const [storage, setStorage] = useState<StorageLocation[]>([]);
-  const [err, setErr] = useState("");
-  const [adding, setAdding] = useState(false);
-  const [assembly, setAssembly] = useState("");
-  const [uri, setUri] = useState("");
-  const [checksum, setChecksum] = useState("");
-  const [storageId, setStorageId] = useState("");
-  const [busy, setBusy] = useState(false);
-
-  const load = useCallback(async () => {
-    try {
-      const [r, s] = await Promise.all([api.references(), api.storage()]);
-      setRefs(r.references ?? []);
-      setStorage((s.storage ?? []).filter((l) => l.usable !== false));
-      setErr("");
-    } catch (e) {
-      setErr(String(e));
-    }
-  }, []);
-
-  useEffect(() => {
-    load();
-    // A fetch runs for minutes, so the list has to move on its own or it reads
-    // as stuck.
-    const t = setInterval(load, 5000);
-    return () => clearInterval(t);
-  }, [load]);
-
-  async function submit() {
-    setBusy(true);
-    try {
-      await api.putReference({
-        assembly: assembly.trim(),
-        uri: uri.trim(),
-        checksum: checksum.trim() || undefined,
-        storage_id: storageId || undefined,
-      });
-      setAdding(false);
-      setAssembly("");
-      setUri("");
-      setChecksum("");
-      await load();
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <>
-      <div className="between" style={{ marginBottom: 14 }}>
-        <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
-          One FASTA per assembly, used by tool sources that need one — VEP's{" "}
-          <span className="mono">--fasta</span>, for instance. A snapshot picks up
-          the reference for the assembly it declares; there is nothing to set on
-          the snapshot itself.
-        </p>
-        <button className="btn sm" onClick={() => setAdding(true)}>
-          <Plus size={15} /> Add reference
-        </button>
-      </div>
-
-      {err && <p className="err">{err}</p>}
-
-      {adding && (
-        <div className="card" style={{ padding: 16, marginBottom: 16 }}>
-          <div className="label" style={{ marginBottom: 6 }}>
-            Assembly
-          </div>
-          <input
-            value={assembly}
-            onChange={(e) => setAssembly(e.target.value)}
-            placeholder="GRCh38"
-            style={{ width: 220, marginBottom: 4 }}
-          />
-          {/* Names are matched exactly and never normalized: GRCh38 and hg38 are
-              different keys, because a false match annotates against the wrong
-              coordinates and says nothing. */}
-          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "0 0 12px" }}>
-            Matched exactly against the snapshot's assembly — <span className="mono">GRCh38</span>,
-            not <span className="mono">hg38</span>.
-          </p>
-
-          <div className="label" style={{ marginBottom: 6 }}>
-            Source URL
-          </div>
-          <input
-            value={uri}
-            onChange={(e) => setUri(e.target.value)}
-            placeholder="https://ftp.ensembl.org/.../Homo_sapiens.GRCh38.dna.primary_assembly.fa.gz"
-            style={{ width: "100%", marginBottom: 4 }}
-          />
-          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "0 0 12px" }}>
-            Recompressed to BGZF and indexed on arrival, so a plain-gzip FASTA is
-            fine.
-          </p>
-
-          <div className="label" style={{ marginBottom: 6 }}>
-            Checksum <span style={{ fontWeight: 400, color: "var(--text-3)" }}>(optional)</span>
-          </div>
-          <input
-            value={checksum}
-            onChange={(e) => setChecksum(e.target.value)}
-            placeholder="md5:… or sha256:…"
-            style={{ width: 380, marginBottom: 12 }}
-          />
-
-          <div className="label" style={{ marginBottom: 6 }}>
-            Keep a copy in{" "}
-            <span style={{ fontWeight: 400, color: "var(--text-3)" }}>(optional)</span>
-          </div>
-          <select
-            value={storageId}
-            onChange={(e) => setStorageId(e.target.value)}
-            style={{ width: 320, marginBottom: 4 }}
-          >
-            <option value="">nowhere — this worker only</option>
-            {storage.map((l) => (
-              <option key={l.id} value={l.id}>
-                {l.name} ({l.uri})
-              </option>
-            ))}
-          </select>
-          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "0 0 14px" }}>
-            A tool reads the FASTA from local disk, so a copy always lands there.
-            This is where the durable copy is kept, so another worker restores it
-            instead of downloading it again.
-          </p>
-
-          <div className="row gap-8">
-            <button
-              className="btn"
-              disabled={busy || !assembly.trim() || !uri.trim()}
-              onClick={submit}
-            >
-              {busy ? "Queueing…" : "Add and fetch"}
-            </button>
-            <button className="btn secondary" disabled={busy} onClick={() => setAdding(false)}>
-              Cancel
-            </button>
-          </div>
-        </div>
-      )}
-
-      {refs.length === 0 ? (
-        <p style={{ fontSize: 13, color: "var(--text-3)" }}>
-          No references yet. Tool sources that need one will fail until an
-          assembly has a FASTA.
-        </p>
-      ) : (
-        <table className="table">
-          <thead>
-            <tr>
-              <th>Assembly</th>
-              <th>State</th>
-              <th>Size</th>
-              <th>Source</th>
-              <th />
-            </tr>
-          </thead>
-          <tbody>
-            {refs.map((r) => (
-              <tr key={r.assembly}>
-                <td className="mono" style={{ fontWeight: 600 }}>
-                  {r.assembly}
-                </td>
-                <td>
-                  <ReferenceState r={r} />
-                </td>
-                <td className="mono" style={{ fontSize: 12 }}>
-                  {r.size_bytes ? humanSize(r.size_bytes) : "—"}
-                </td>
-                <td
-                  className="mono"
-                  style={{ fontSize: 11.5, color: "var(--text-3)", wordBreak: "break-all" }}
-                >
-                  {r.uri}
-                </td>
-                <td style={{ textAlign: "right" }}>
-                  <button
-                    className="btn link"
-                    style={{ fontSize: 12.5 }}
-                    onClick={async () => {
-                      await api.deleteReference(r.assembly);
-                      await load();
-                    }}
-                  >
-                    Remove
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-    </>
-  );
-}
-
-function ReferenceState({ r }: { r: Reference }) {
-  if (r.state === "installing") {
-    return (
-      <span style={{ fontSize: 12.5, color: "var(--vus-fg)" }}>
-        Fetching and indexing…
-      </span>
-    );
-  }
-  if (r.state === "failed") {
-    return (
-      <span style={{ fontSize: 12.5, color: "var(--path-fg)" }} title={r.error}>
-        Failed — {(r.error ?? "").split("\n")[0].slice(0, 70)}
-      </span>
-    );
-  }
-  return (
-    <span style={{ fontSize: 12.5, color: "var(--benign-fg)" }}>
-      Ready{r.durable_uri ? " (copy kept)" : ""}
-    </span>
   );
 }

@@ -57,11 +57,6 @@ const (
 	// KindCleanup reclaims a removed source's files, for the same reason
 	// downloads are jobs: only the worker mounts the storage.
 	KindCleanup = "cleanup"
-	// KindReference fetches a reference genome onto the worker's filesystem.
-	// Its own kind rather than a download: it is not a source, has no manifest,
-	// and lands on local disk rather than in a storage location, because a tool
-	// step binds the FASTA's directory into a container.
-	KindReference = "reference"
 )
 
 // Postgres NOTIFY channels.

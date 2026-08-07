@@ -43,30 +43,6 @@ type Materializer struct {
 	References map[string]string
 }
 
-// referencesFor merges configured references with provisioned ones, the catalog
-// winning on a conflict.
-//
-// The catalog wins because it is the one an administrator can act on: if both
-// name a FASTA for an assembly, the one they added through the application is
-// the one they meant, and a stale config entry should not quietly outrank it.
-func (m *Materializer) referencesFor(ctx context.Context) map[string]string {
-	out := map[string]string{}
-	for k, v := range m.References {
-		out[k] = v
-	}
-	if m.Store != nil {
-		if fromCatalog, err := m.Store.ReadyReferences(ctx); err == nil {
-			for k, v := range fromCatalog {
-				out[k] = v
-			}
-		}
-		// A catalog read that fails is not fatal: the job can still run, and
-		// every source that does not use {ref} is unaffected. One that does will
-		// fail in the tool with a message naming the missing file.
-	}
-	return out
-}
-
 // Home materializes the snapshot's config tree into a fresh directory and
 // returns it. cleanup removes the tree; the shared data and cache dirs are
 // untouched.
@@ -131,7 +107,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
 	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
-		m.referencesFor(ctx)); err != nil {
+		m.References); err != nil {
 		cleanup()
 		return "", nil, err
 	}
@@ -397,7 +373,7 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
-		m.referencesFor(ctx)); err != nil {
+		m.References); err != nil {
 		cleanup()
 		return "", nil, err
 	}
