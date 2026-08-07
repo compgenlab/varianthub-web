@@ -129,6 +129,14 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	case "csv":
 		s.exportDelimited(w, r, job, cols, qy, ',')
 	case "vcf":
+		// A submitted VCF is answered with its own file annotated, which keeps
+		// the ID, QUAL, FILTER, existing INFO, FORMAT and sample columns the
+		// caller sent. Falls back to rendering from rows when there is no
+		// stored input to merge onto — a job old enough to have been swept —
+		// so a download degrades rather than fails.
+		if job.Kind == queue.KindVCF && s.exportMergedVCF(w, r, job, cols, qy) {
+			return
+		}
 		s.exportVCF(w, r, job, cols, qy)
 	}
 }

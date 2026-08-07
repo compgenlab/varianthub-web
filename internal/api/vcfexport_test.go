@@ -167,3 +167,18 @@ func TestVCFJobDefaultsToVCFOutput(t *testing.T) {
 		t.Errorf("a locus job did not default to JSON: %.60s", w.Body.String())
 	}
 }
+
+// storeJobInput records the body a job was submitted with.
+func storeJobInput(t *testing.T, h *harness, id, body string) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, h.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO job_input (job_id, body) VALUES ($1,$2)`, id, []byte(body)); err != nil {
+		t.Fatal(err)
+	}
+}

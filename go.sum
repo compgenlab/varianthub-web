@@ -38,6 +38,8 @@ github.com/aws/aws-sdk-go-v2/service/sts v1.45.4 h1:w/AryDYMjSUANSQ2uoZxJovUsMTw
 github.com/aws/aws-sdk-go-v2/service/sts v1.45.4/go.mod h1:WeBiAa67azG7Su9Vf+ChGDBLiAozJCXzdjXiPBUwtbc=
 github.com/aws/smithy-go v1.27.6 h1:0zjT8jgK3jbrTT7JJ3EE6JsMhX8JTrZ+f1sEndYDXrA=
 github.com/aws/smithy-go v1.27.6/go.mod h1:YE2RhdIuDbA5E5bTdciG9KrW3+TiEONeUWCqxX9i1Fc=
+github.com/compgenlab/cghts v0.10.4 h1:k+z35gWF4TI5SBO/5C/YfwE65sraGx+LNP6frsJ+avs=
+github.com/compgenlab/cghts v0.10.4/go.mod h1:uGhwCm/cVAgUH5fXhKDcfSMa0XkO1N3/L1G4opci63M=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

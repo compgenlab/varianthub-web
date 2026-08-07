@@ -492,6 +492,23 @@ func (q *Queue) Get(ctx context.Context, id string) (Job, bool, error) {
 
 // Result returns a done job's result JSON (ok=false when the id is unknown or the
 // job has no stored result yet).
+// Input returns the body a job was submitted with.
+//
+// Retained rather than discarded once the job runs, which is what lets a VCF
+// submission be answered with its own file annotated instead of a synthesised
+// one carrying only the columns this server knows about.
+func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
+	var body []byte
+	err := q.pool.QueryRow(ctx, `SELECT body FROM job_input WHERE job_id=$1`, id).Scan(&body)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return body, true, nil
+}
+
 func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
 	var js string
 	err := q.pool.QueryRow(ctx, `SELECT json FROM job_result WHERE job_id=$1`, id).Scan(&js)
