@@ -115,6 +115,10 @@ a { color: var(--accent-text); }
 }
 .usermenu > button:hover { background: var(--neutral-fill); color: var(--text); }
 .usermenu .menu { right: 0; left: auto; top: calc(100% + 4px); min-width: 172px; }
+/* The shared .menu rule is space-between, which suits the results menu where a
+   label and a trailing marker sit at opposite ends. Here each item is just an
+   icon and its label, so that only pushed the two apart. Centre the pair. */
+.usermenu .menu button { justify-content: center; gap: 8px; text-align: center; }
 
 .sidebar {
   width: var(--sidebar);
