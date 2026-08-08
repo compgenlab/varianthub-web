@@ -9,7 +9,9 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
@@ -1060,4 +1062,50 @@ func (s *Server) handleDeleteBuild(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleCheckStorage probes every storage location and reports which answer.
+//
+// Exists because the alternative is finding out from a job. An object store
+// that stopped listening surfaced as a provisioning failure whose message was an
+// SDK retry trace, hours into a run — while the page that lists storage had no
+// opinion about whether any of it was reachable.
+//
+// Probed on request rather than polled: the check costs a round trip per
+// location, and an operator asking "is the store up?" is the moment the answer
+// needs to be current rather than cached.
+func (s *Server) handleCheckStorage(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	locs, err := s.catalog.ListStorage(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	type result struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+		Kind string `json:"kind"`
+		URI  string `json:"uri"`
+		blob.Health
+	}
+	// Concurrently: an unreachable endpoint costs the full timeout, and several
+	// of those in series is a page that appears to hang.
+	out := make([]result, len(locs))
+	var wg sync.WaitGroup
+	for i, l := range locs {
+		wg.Add(1)
+		go func(i int, l catalog.StorageLocation) {
+			defer wg.Done()
+			out[i] = result{
+				ID: l.ID, Name: l.Name, Kind: string(l.Kind), URI: l.URI,
+				Health: blob.Check(r.Context(), l.URI),
+			}
+		}(i, l)
+	}
+	wg.Wait()
+	writeJSON(w, http.StatusOK, map[string]any{"locations": out})
 }

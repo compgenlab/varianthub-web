@@ -1,8 +1,8 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { HardDrive, Trash2, TriangleAlert } from "lucide-react";
+import { CircleCheck, CircleX, HardDrive, Loader, Trash2, TriangleAlert } from "lucide-react";
 
-import { api, type SourceFile, type StorageLocation } from "../api";
+import { api, type SourceFile, type StorageHealth, type StorageLocation } from "../api";
 
 export function humanSize(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -23,6 +23,27 @@ export default function Files() {
 
   const [err, setErr] = useState("");
   const [addingS3, setAddingS3] = useState(false);
+
+  // Reachability, keyed by location id. Not loaded with the page: each probe
+  // costs a round trip, and an unreachable endpoint costs the full timeout, so
+  // checking is something you ask for rather than something the page does on
+  // every refresh.
+  const [health, setHealth] = useState<Record<string, StorageHealth>>({});
+  const [checking, setChecking] = useState(false);
+
+  async function check() {
+    setChecking(true);
+    try {
+      const r = await api.storageCheck();
+      const byID: Record<string, StorageHealth> = {};
+      for (const h of r.locations ?? []) byID[h.id] = h;
+      setHealth(byID);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChecking(false);
+    }
+  }
 
   async function load() {
     try {
@@ -68,9 +89,14 @@ export default function Files() {
         <span className="label" style={{ margin: 0 }}>
           Storage locations
         </span>
-        <button className="btn link" style={{ fontSize: 12.5 }} onClick={() => setAddingS3(!addingS3)}>
-          {addingS3 ? "Cancel" : "+ Add S3 bucket"}
-        </button>
+        <div className="row gap-14">
+          <button className="btn link" style={{ fontSize: 12.5 }} onClick={check} disabled={checking}>
+            {checking ? "Checking…" : "Check endpoints"}
+          </button>
+          <button className="btn link" style={{ fontSize: 12.5 }} onClick={() => setAddingS3(!addingS3)}>
+            {addingS3 ? "Cancel" : "+ Add S3 bucket"}
+          </button>
+        </div>
       </div>
       {addingS3 && <AddS3 onDone={() => { setAddingS3(false); load(); }} />}
       <div className="card" style={{ marginBottom: 22 }}>
@@ -87,7 +113,28 @@ export default function Files() {
                 <span className="tag">{l.kind}</span>
                 {l.is_default && <span className="tag">default</span>}
                 {l.from_config && <span className="tag">from config</span>}
+                {checking && !health[l.id] && <Loader size={12} color="var(--text-3)" />}
+                {health[l.id]?.ok && (
+                  <span className="row gap-8" style={{ fontSize: 11.5, color: "var(--ok-fg, var(--text-3))" }}>
+                    <CircleCheck size={12} /> {health[l.id].latency_ms} ms
+                  </span>
+                )}
+                {health[l.id] && !health[l.id].ok && (
+                  <span className="row gap-8" style={{ fontSize: 11.5, color: "var(--path-fg, var(--text-3))" }}>
+                    <CircleX size={12} /> unreachable
+                  </span>
+                )}
               </div>
+              {health[l.id] && !health[l.id].ok && (
+                <div style={{ fontSize: 11.5, color: "var(--path-fg, var(--text-3))", marginTop: 3 }}>
+                  {/* The hint first: it is the part that decides what to do
+                      next, and the raw error is long enough to bury it. */}
+                  {health[l.id].hint && <div>{health[l.id].hint}</div>}
+                  <div className="mono" style={{ color: "var(--text-3)", marginTop: 2, wordBreak: "break-word" }}>
+                    {health[l.id].error}
+                  </div>
+                </div>
+              )}
               <div className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
                 {l.uri}
               </div>

@@ -215,6 +215,24 @@ export interface Annotation {
   default?: boolean;
 }
 
+/** One storage location's reachability, from /admin/storage/check. */
+export interface StorageHealth {
+  id: string;
+  name: string;
+  kind: string;
+  uri: string;
+  ok: boolean;
+  latency_ms: number;
+  error?: string;
+  /**
+   * Which kind of failure this is, when the server can tell. "Connection
+   * refused" and "signature does not match" arrive as the same shape of error
+   * and mean entirely different things — somebody else's outage, or our
+   * credential.
+   */
+  hint?: string;
+}
+
 export interface StorageLocation {
   id: string;
   name: string;
@@ -694,6 +712,14 @@ export const api = {
   metrics: () => req<Metrics>("/admin/metrics"),
 
   storage: () => req<{ storage: StorageLocation[] }>("/admin/storage"),
+  /**
+   * Probe every storage location and report which answer.
+   *
+   * On request rather than polled: an unreachable endpoint costs the full
+   * timeout, and the moment someone asks is the moment the answer has to be
+   * current rather than cached.
+   */
+  storageCheck: () => req<{ locations: StorageHealth[] }>("/admin/storage/check"),
 
   moveSource: (id: string, storageID: string) =>
     req<{ job_id: string; from: string; to: string }>(
