@@ -46,6 +46,38 @@ RUN --mount=type=cache,target=/go/pkg/mod go mod download
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 go build -ldflags "-s -w" -o /out/varhub ./cmd/varhub
 
+# cgkit, fetched from its GitHub release rather than built.
+#
+# Build recipes call it — RefSeq sorts and indexes its GTF with `cgkit tab-sort
+# -p gff` — and a recipe naming a tool the image lacks fails at step 1 with
+# "command not found" and exit 127, which reads as a broken recipe rather than a
+# missing binary.
+#
+# Downloaded, not compiled: cgkit publishes per-platform binaries, and building
+# it here would add a third Go toolchain stage and a third source context to
+# keep in step for a tool this image only ever invokes.
+#
+# The repository is public, so this needs no credential.
+FROM alpine:3.20 AS cgkit-fetch
+ARG TARGETARCH
+# Defaults to the latest release. Pin with --build-arg CGKIT_VERSION=v0.6.1 when
+# a reproducible image matters more than being current.
+ARG CGKIT_VERSION=latest
+RUN apk add --no-cache curl
+RUN set -eu; \
+    arch="${TARGETARCH:-amd64}"; \
+    case "${CGKIT_VERSION}" in \
+      latest) url="https://github.com/compgenlab/cgkit/releases/latest/download/cgkit.linux_${arch}" ;; \
+      *)      url="https://github.com/compgenlab/cgkit/releases/download/${CGKIT_VERSION}/cgkit.linux_${arch}" ;; \
+    esac; \
+    echo "fetching ${url}"; \
+    mkdir -p /out; \
+    curl -fsSL --retry 3 -o /out/cgkit "${url}"; \
+    chmod +x /out/cgkit; \
+    # A release asset that 404s would otherwise arrive as an HTML error page
+    # with a 0 exit; -f catches that, and a size check catches the rest.
+    test -s /out/cgkit
+
 FROM alpine:3.20
 # bash, python3 and curl are here for build-recipe sources, not for the service.
 #
@@ -94,6 +126,8 @@ RUN apk add --no-cache \
 RUN ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 COPY --from=web-build    /out/varianthub-web /usr/local/bin/varianthub-web
 COPY --from=varhub-build /out/varhub         /usr/local/bin/varhub
+# Invoked by build recipes, never by the service.
+COPY --from=cgkit-fetch  /out/cgkit          /usr/local/bin/cgkit
 
 # Shared, persistent storage for downloaded source files and built indexes. The
 # per-job annotation config is materialized into a temp dir instead, so there is
