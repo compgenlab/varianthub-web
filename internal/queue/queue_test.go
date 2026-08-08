@@ -625,3 +625,93 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 		t.Errorf("claimed_by = %q after reclaim, want NULL", *claimed)
 	}
 }
+
+// A job whose worker keeps dying must eventually stop coming back.
+//
+// Requeueing an abandoned job is right — the work is unfinished and another
+// worker can do it. Without a limit it is not: one provisioning job took a
+// 492 GB volume to full by being requeued after every kill, each attempt
+// leaving behind the scratch only a live process cleans up, and the
+// disk-pressure evictions that followed requeued it again.
+func TestAbandonedJobStopsBeingRetried(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Claim, then abandon by expiring the lease, MaxAttempts times over.
+	for i := 1; i <= MaxAttempts; i++ {
+		job, _, ok, cErr := q.claimNext(ctx)
+		if cErr != nil {
+			t.Fatalf("attempt %d: claim: %v", i, cErr)
+		}
+		if !ok {
+			t.Fatalf("attempt %d: nothing claimable, but the job should still be queued", i)
+		}
+		if job.ID != id {
+			t.Fatalf("claimed %s, want %s", job.ID, id)
+		}
+		if _, err := q.pool.Exec(ctx, `UPDATE job SET lease_until=1 WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+		n, rErr := q.ReclaimExpired(ctx)
+		if rErr != nil {
+			t.Fatalf("attempt %d: reclaim: %v", i, rErr)
+		}
+		if i < MaxAttempts && n != 1 {
+			t.Fatalf("attempt %d: reclaimed %d, want 1 — an abandoned job should requeue", i, n)
+		}
+		if i == MaxAttempts && n != 0 {
+			t.Fatalf("attempt %d: reclaimed %d, want 0 — the job should be failed, not requeued", i, n)
+		}
+	}
+
+	got, _, err := q.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusError {
+		t.Fatalf("status = %q, want %q — the job is still being retried", got.Status, StatusError)
+	}
+	if got.Error == "" {
+		t.Error("no error recorded; the job failed with nothing said about why")
+	}
+	// And it must not be claimable again.
+	if _, _, ok, err := q.claimNext(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("a failed job was claimed again")
+	}
+}
+
+// One kill is not three: a rolling restart must not cost a job its place.
+func TestOneAbandonmentStillRequeues(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, cErr := q.claimNext(ctx); cErr != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", cErr, ok)
+	}
+	if _, err := q.pool.Exec(ctx, `UPDATE job SET lease_until=1 WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := q.ReclaimExpired(ctx); err != nil {
+		t.Fatal(err)
+	} else if n != 1 {
+		t.Fatalf("reclaimed %d, want 1", n)
+	}
+	got, _, err := q.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusQueued {
+		t.Fatalf("status = %q, want %q", got.Status, StatusQueued)
+	}
+}

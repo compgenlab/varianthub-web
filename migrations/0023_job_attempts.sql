@@ -1,0 +1,13 @@
+-- How many times a job has been handed to a worker.
+--
+-- Requeueing a job whose holder died is right: the work is unfinished and
+-- another worker can do it. Doing so without limit is not. A job that dies
+-- every time it runs came back forever, and each attempt cost whatever the last
+-- one had done — for a source build, gigabytes of scratch that only a live
+-- process cleans up. One provisioning job took a 492 GB volume to full that
+-- way, and the disk-pressure evictions that followed requeued it again.
+--
+-- Counted at claim rather than at failure, so a worker killed without reporting
+-- anything is still counted. That is the case this exists for: a job that fails
+-- cleanly already stops, since a reported failure is terminal.
+ALTER TABLE job ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;

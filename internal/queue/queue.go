@@ -273,9 +273,25 @@ type Queue struct {
 // needed costs one tiny UPDATE, while expiring a lease a live worker still holds
 // takes a job away mid-run and lets a second worker start it again.
 const (
-	defaultLeaseTTL   = 2 * time.Minute
-	defaultLeaseRenew = 20 * time.Second
+	// Sized for the longest thing a worker actually does, not for the shortest.
+	//
+	// Two minutes was too tight. A provisioning job runs for hours doing heavy
+	// I/O, and a node under disk pressure can starve the process past that —
+	// after which the holder is still working while a peer reclaims the job and
+	// starts it again, both writing to one destination. Renewal is cheap and
+	// frequent, so the margin here is a dozen missed renewals rather than six.
+	defaultLeaseTTL   = 15 * time.Minute
+	defaultLeaseRenew = 30 * time.Second
 )
+
+// MaxAttempts is how many times a job may be handed to a worker before it is
+// failed instead of requeued.
+//
+// Only reached by jobs whose worker died without reporting anything: a job that
+// fails cleanly is already terminal. Three is enough to ride out a rolling
+// restart or a one-off eviction, and few enough that a job which kills its
+// worker every time stops rather than doing so forever.
+const MaxAttempts = 3
 
 // Open connects to Postgres and prepares the queue.
 //
@@ -334,11 +350,31 @@ func (q *Queue) SetLease(ttl, renew time.Duration) {
 // A NULL lease is expired: rows claimed before leases existed have nobody
 // renewing them either, so they are abandoned by the same definition.
 func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
+	// Past MaxAttempts the job is failed rather than requeued. Without this a
+	// job that kills its worker every run came back forever, and each attempt
+	// cost whatever the previous one had produced — the scratch of a killed
+	// build is only cleaned up by the process that made it.
+	//
+	// The error text says what happened, because "attempt 3 of 3" is the part
+	// an operator needs and the raw truth ("no worker ever reported on this")
+	// is not otherwise visible anywhere.
+	if _, err := q.pool.Exec(ctx, `
+		UPDATE job
+		   SET status=$1, claimed_by=NULL, lease_until=NULL, finished_at=$4,
+		       error=$5
+		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
+		   AND attempts >= $6`,
+		StatusError, StatusRunning, q.nowFn(), q.nowFn(),
+		fmt.Sprintf("abandoned %d times without completing; not retried again", MaxAttempts),
+		MaxAttempts); err != nil {
+		return 0, fmt.Errorf("fail exhausted jobs: %w", err)
+	}
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE job
 		   SET status=$1, started_at=NULL, claimed_by=NULL, lease_until=NULL
-		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3`,
-		StatusQueued, StatusRunning, q.nowFn())
+		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
+		   AND attempts < $4`,
+		StatusQueued, StatusRunning, q.nowFn(), MaxAttempts)
 	if err != nil {
 		return 0, fmt.Errorf("reclaim expired jobs: %w", err)
 	}
@@ -716,7 +752,8 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 // there to stop jobs overlapping, not to make them unrunnable — one too big for
 // the pool should run alone, which is what an empty pool already guarantees.
 const claimQuery = `
-UPDATE job SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7
+UPDATE job SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7,
+               attempts = job.attempts + 1
 WHERE id = (
   SELECT j.id
   FROM job j
