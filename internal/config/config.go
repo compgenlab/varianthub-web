@@ -326,8 +326,26 @@ func envDurInto(k string, dst *time.Duration) {
 	}
 }
 
+// envListInto sets a list from a comma-separated variable.
+//
+// Unlike the scalar helpers this uses LookupEnv directly, so a variable that is
+// present and empty means an empty list rather than "not set". A list needs that
+// and a string does not: some defaulted lists have no other way to be emptied.
+// storage.paths is the case that forced it — there is a built-in
+// default=/var/lib/varianthub/sources unless it is set, the config file cannot
+// clear it (setList reads an empty TOML list as "not stated", since absent and
+// empty are indistinguishable there), and so a deployment that stores sources
+// only in an object store had no way to say so. It got a second storage
+// location it never asked for, also flagged default, and which of the two a
+// download targeted was then a coin toss between a bucket and a path inside a
+// container.
+//
+// The risk the scalar rule guards against — an accidentally-blank variable
+// silently erasing a configured value — is smaller here: setting a list
+// variable to empty is a deliberate act, and the failure it prevents is a
+// deployment that cannot express its own storage.
 func envListInto(k string, dst *[]string) {
-	v, ok := lookup(k)
+	v, ok := os.LookupEnv(k)
 	if !ok {
 		return
 	}

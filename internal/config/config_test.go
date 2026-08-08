@@ -365,3 +365,63 @@ func TestPoolDefaults(t *testing.T) {
 			c.DownloadWeight, c.JobSlots)
 	}
 }
+
+// A list variable that is present and empty means an empty list.
+//
+// storage.paths has a built-in default, and the config file cannot clear it —
+// setList reads an empty TOML list as "not stated". So this is the only way a
+// deployment that keeps sources in an object store can say it has no filesystem
+// targets. Without it the built-in path survives, becomes a second storage
+// location also flagged default, and competes with the S3 site for downloads.
+func TestEmptyEnvListClearsADefaultedList(t *testing.T) {
+	t.Setenv("VHW_DATABASE_URL", "postgres://x/db")
+	t.Setenv("VHW_STORAGE_PATHS", "")
+	t.Setenv("VHW_STORAGE_S3", "objects=s3://bucket/prefix")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.StoragePaths) != 0 {
+		t.Fatalf("StoragePaths = %v, want empty — an empty variable did not clear the default", c.StoragePaths)
+	}
+
+	locs, err := c.StorageLocations()
+	if err != nil {
+		t.Fatalf("StorageLocations: %v", err)
+	}
+	if len(locs) != 1 {
+		for _, l := range locs {
+			t.Logf("  %s %s %s default=%v", l.ID, l.Kind, l.Path, l.Default)
+		}
+		t.Fatalf("got %d locations, want 1 — the built-in path was not cleared", len(locs))
+	}
+	if locs[0].Kind != "s3" {
+		t.Errorf("location kind = %q, want s3", locs[0].Kind)
+	}
+	// Exactly one default: two is what made a download's destination ambiguous.
+	n := 0
+	for _, l := range locs {
+		if l.Default {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("%d locations flagged default, want exactly 1", n)
+	}
+}
+
+// An unset variable still leaves the default alone — the change is about
+// present-and-empty, not about ignoring defaults.
+func TestUnsetEnvListLeavesTheDefault(t *testing.T) {
+	t.Setenv("VHW_DATABASE_URL", "postgres://x/db")
+	os.Unsetenv("VHW_STORAGE_PATHS")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(c.StoragePaths) == 0 {
+		t.Fatal("StoragePaths is empty with the variable unset; the default was lost")
+	}
+}
