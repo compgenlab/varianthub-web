@@ -191,11 +191,24 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	} else if n > 0 {
 		log.Printf("worker: reclaimed %d abandoned job(s)", n)
 	}
-	// The same reclaim, for what those jobs left on disk. A job abandoned by a
-	// killed worker is requeued above; its workdir was not reclaimed by anything
-	// until now. varhub removes its own scratch on every path it can return
-	// from, and on none where it is killed — which is what a rolling restart
-	// does to a build in progress.
+	// The same reclaim, for what those jobs left on disk. varhub removes its own
+	// scratch on every path it can return from, and on none where it is killed —
+	// which is what an OOM and a rolling restart both do to a build in progress.
+	//
+	// Job-scoped scratch first, and exactly: the queue says which jobs are
+	// running, so a directory named after one that is not can go immediately.
+	// This is the case age could never handle — a job OOM-killed thirty seconds
+	// ago leaves a workdir that is both very recent and certainly dead.
+	if live, lErr := q.RunningIDs(ctx); lErr != nil {
+		log.Printf("worker: could not list running jobs, skipping scratch sweep: %v", lErr)
+	} else if n, freed, sErr := runner.SweepJobScratch(os.TempDir(), live, log.Printf); sErr != nil {
+		log.Printf("worker: could not sweep job scratch: %v", sErr)
+	} else if n > 0 {
+		log.Printf("worker: reclaimed scratch for %d finished job(s), %.1f GB", n, float64(freed)/(1<<30))
+	}
+	// Then the age-based sweep, which is now only a backstop: it catches work
+	// staged outside a job's own directory, and anything left by a version that
+	// did not name its scratch.
 	if n, freed, sErr := runner.SweepScratch(os.TempDir(), runner.ScratchMaxAge, log.Printf); sErr != nil {
 		log.Printf("worker: could not sweep scratch: %v", sErr)
 	} else if n > 0 {
@@ -428,6 +441,7 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 	}
 
 	res, err := exec.Download(ctx, runner.DownloadRequest{
+		JobID:    job.ID,
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
 		Force:    req.Force,

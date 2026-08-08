@@ -567,6 +567,18 @@ type SourceHomeProvider interface {
 
 // DownloadRequest provisions a set of sources into a storage location.
 type DownloadRequest struct {
+	// JobID scopes this run's scratch, so what it leaves behind can be
+	// attributed. varhub stages into TMPDIR and removes what it made on the way
+	// out — on every path it can return from, and none where it is killed. A
+	// job that OOMs or is caught by a rolling restart orphans gigabytes, and
+	// without a name on them the only way to judge them later is by age, which
+	// cannot tell a peer's live build from this pod's dead one.
+	//
+	// Named after the job instead: the queue knows which jobs are running, so a
+	// directory belonging to one that is not is safe to remove, immediately and
+	// without guessing.
+	JobID string
+
 	Sources  []string // catalog source ids to fetch
 	CacheDir string   // where the files land — the storage location's path
 	DataDir  string   // varhub's data dir (tool images, reference files)
@@ -665,6 +677,19 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	// way.
 	cmd.Env = append(os.Environ(), "VARHUB_HOME="+home)
 	cmd.Env = append(cmd.Env, r.ExtraEnv...)
+
+	// Point varhub's scratch at a directory named after this job, and remove it
+	// on the way out. The removal covers the ordinary paths; the naming covers
+	// the rest, since a directory named after a job the queue no longer has
+	// running can be reclaimed by any worker without guessing at its age.
+	if req.JobID != "" {
+		scratch := JobScratchDir(req.JobID)
+		if err := os.MkdirAll(scratch, 0o755); err != nil {
+			return DownloadResult{}, fmt.Errorf("scratch %s: %w", scratch, err)
+		}
+		defer os.RemoveAll(scratch)
+		cmd.Env = append(cmd.Env, "TMPDIR="+scratch)
+	}
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	stderrPipe, err := cmd.StderrPipe()

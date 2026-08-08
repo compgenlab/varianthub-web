@@ -934,3 +934,25 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 	}
 	q.wake(id)
 }
+
+// RunningIDs returns the ids of jobs currently claimed and running.
+//
+// The queue is authoritative about what is in flight, which is what lets a
+// worker reclaim another's leftovers without guessing: scratch named after a job
+// not in this set belongs to nobody.
+func (q *Queue) RunningIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := q.pool.Query(ctx, `SELECT id FROM job WHERE status=$1`, StatusRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	live := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		live[id] = true
+	}
+	return live, rows.Err()
+}
