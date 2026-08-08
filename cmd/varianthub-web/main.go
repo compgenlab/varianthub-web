@@ -191,6 +191,16 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	} else if n > 0 {
 		log.Printf("worker: reclaimed %d abandoned job(s)", n)
 	}
+	// The same reclaim, for what those jobs left on disk. A job abandoned by a
+	// killed worker is requeued above; its workdir was not reclaimed by anything
+	// until now. varhub removes its own scratch on every path it can return
+	// from, and on none where it is killed — which is what a rolling restart
+	// does to a build in progress.
+	if n, freed, sErr := runner.SweepScratch(os.TempDir(), runner.ScratchMaxAge, log.Printf); sErr != nil {
+		log.Printf("worker: could not sweep scratch: %v", sErr)
+	} else if n > 0 {
+		log.Printf("worker: reclaimed %d abandoned workdir(s), %.1f GB", n, float64(freed)/(1<<30))
+	}
 	// Keep this worker's own claims alive, and keep watching for others going
 	// quiet: a peer can die at any point, not only before we start.
 	q.StartLeaseKeeper(ctx)

@@ -209,9 +209,29 @@ func (s *Store) ReplaceSourceFiles(ctx context.Context, sourceID, storageID stri
 	}
 	now := s.nowFn()
 	for _, f := range files {
+		// Upsert rather than a plain insert. The key is
+		// (source_id, storage_id, path) and the delete above cleared that pair,
+		// so the only way to collide is the same path appearing twice in one
+		// call — which a download inventory does produce, because it reports
+		// events rather than files: an index that is reused and then uploaded
+		// is mentioned twice for one file on disk.
+		//
+		// Recording it twice is not worth failing a finished download over. The
+		// second mention describes the same file, and the whole provisioning
+		// run — hours, for a large source, with its bytes already safely in the
+		// bucket — was being reported as failed by:
+		//
+		//   record files for RefSeq:2024_08: ERROR: duplicate key value
+		//   violates unique constraint "source_file_pkey" (SQLSTATE 23505)
+		//
+		// which names a constraint rather than anything an operator can act on.
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO source_file (source_id,storage_id,path,size_bytes,modified_at,recorded_at)
-			VALUES ($1,$2,$3,$4,$5,$6)`,
+			VALUES ($1,$2,$3,$4,$5,$6)
+			ON CONFLICT (source_id,storage_id,path) DO UPDATE SET
+			  size_bytes  = EXCLUDED.size_bytes,
+			  modified_at = EXCLUDED.modified_at,
+			  recorded_at = EXCLUDED.recorded_at`,
 			sourceID, storageID, f.Path, f.SizeBytes, f.ModifiedAt, now); err != nil {
 			return err
 		}
