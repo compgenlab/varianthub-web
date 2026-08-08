@@ -58,6 +58,8 @@ func run(args []string) error {
 		return err
 	}
 	cfg.Version = version
+	// Before any storage is touched, in whichever subcommand this is.
+	registerS3Sites(cfg)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -207,6 +209,8 @@ func worker(ctx context.Context, cfg *config.Config) error {
 		Timeout:         cfg.JobTimeout,
 		DownloadTimeout: cfg.DownloadTimeout,
 		NoCache:         cfg.NoCache,
+		// The declared site's credentials, for the CLI this execs.
+		ExtraEnv: blob.DefaultEnv(),
 	}
 
 	// The download path records what it fetched, so it needs the catalog too.
@@ -255,6 +259,26 @@ func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider,
 		CacheDir:   cfg.CacheDir,
 		References: cfg.References,
 	}, nil
+}
+
+// registerS3Sites hands the declared [[s3]] blocks to the blob layer.
+//
+// Before anything can reach a bucket, and in every process that might: the API
+// stores assets at registration and the worker reads them back, so a site known
+// to one and not the other is a credential error in whichever was missed.
+func registerS3Sites(cfg *config.Config) {
+	if len(cfg.S3Sites) == 0 {
+		return
+	}
+	sites := make([]blob.Site, 0, len(cfg.S3Sites))
+	for _, s := range cfg.S3Sites {
+		sites = append(sites, blob.Site{
+			Name: s.Name, URI: s.URI, Endpoint: s.Endpoint, Region: s.Region,
+			AccessKey: s.AccessKey, SecretKey: s.SecretKey, Default: s.Default,
+		})
+	}
+	blob.RegisterSites(sites)
+	log.Printf("config: %d S3 site(s) declared with their own credentials", len(sites))
 }
 
 // syncStorage reconciles the deployment's declared locations into the catalog,

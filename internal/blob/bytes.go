@@ -38,7 +38,7 @@ func PutBytes(ctx context.Context, uri string, data []byte) error {
 	if err != nil {
 		return err
 	}
-	c, err := client(ctx)
+	c, err := clientFor(ctx, uri)
 	if err != nil {
 		return err
 	}

@@ -96,7 +96,7 @@ func Get(ctx context.Context, uri string, w io.Writer) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	c, err := client(ctx)
+	c, err := clientFor(ctx, uri)
 	if err != nil {
 		return 0, err
 	}
@@ -118,7 +118,7 @@ func Put(ctx context.Context, localPath, uri string) error {
 	if err != nil {
 		return err
 	}
-	c, err := client(ctx)
+	c, err := clientFor(ctx, uri)
 	if err != nil {
 		return err
 	}
@@ -148,7 +148,7 @@ func Exists(ctx context.Context, uri string) bool {
 	if err != nil {
 		return false
 	}
-	c, err := client(ctx)
+	c, err := clientFor(ctx, uri)
 	if err != nil {
 		return false
 	}
@@ -246,7 +246,7 @@ func Remove(ctx context.Context, loc string) error {
 	if err != nil {
 		return err
 	}
-	c, err := client(ctx)
+	c, err := clientFor(ctx, loc)
 	if err != nil {
 		return err
 	}

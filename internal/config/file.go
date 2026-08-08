@@ -76,6 +76,14 @@ type fileConfig struct {
 		S3    []string `toml:"s3"`
 	} `toml:"storage"`
 
+	// S3 sites, each with its own endpoint and credentials.
+	//
+	// [storage] s3 names locations and takes credentials from the process
+	// environment, which is one set for everything. That cannot express two
+	// targets with different credentials — a gateway on the cluster and a
+	// bucket at a provider, say — so a site carries its own here.
+	S3Sites []S3Site `toml:"s3"`
+
 	Limits struct {
 		RatePerMin     *int   `toml:"rate_per_min"`
 		RateBurst      *int   `toml:"rate_burst"`
@@ -169,6 +177,9 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	}
 	setList(&c.StoragePaths, f.Storage.Paths)
 	setList(&c.StorageS3, f.Storage.S3)
+	if len(f.S3Sites) > 0 {
+		c.S3Sites = f.S3Sites
+	}
 
 	setInt(&c.RatePerMin, f.Limits.RatePerMin)
 	setInt(&c.RateBurst, f.Limits.RateBurst)
@@ -275,4 +286,26 @@ func redactDSN(dsn string) string {
 		return dsn // a user with no password: nothing to hide
 	}
 	return dsn[:scheme+3] + creds[:colon] + ":***" + rest[at:]
+}
+
+// S3Site is one object-storage target: where it is, and what to present to it.
+//
+// Credentials are optional. Without them the AWS SDK's own chain applies —
+// environment, shared config, instance role — which is what a deployment using
+// a role rather than keys wants, and is the only form that does not put a
+// secret in a file.
+type S3Site struct {
+	// Name is the storage location id this site provides, matching the name
+	// used in a source's cache_dir.
+	Name string `toml:"name"`
+	// URI is the bucket and prefix, e.g. "s3://varianthub-sources/annotations".
+	URI string `toml:"uri"`
+	// Endpoint is an S3-compatible gateway. Empty means AWS itself.
+	Endpoint string `toml:"endpoint"`
+	Region   string `toml:"region"`
+	// AccessKey and SecretKey are presented when both are set.
+	AccessKey string `toml:"access_key"`
+	SecretKey string `toml:"secret_key"`
+	// Default marks the location downloads target when none is named.
+	Default bool `toml:"default"`
 }
