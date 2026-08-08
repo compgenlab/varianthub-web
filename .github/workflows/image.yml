@@ -86,6 +86,13 @@ jobs:
           context: web
           file: web/deploy/compose/Dockerfile
           build-contexts: varhub-src=cli
+          # Without this the Dockerfile's `ARG VERSION=dev` stands, and every
+          # image — tagged releases included — reports itself as "dev" in the UI
+          # and at /version. metadata-action's `version` output is the primary
+          # tag it worked out: "0.2.4" for a tag push, the branch name for a
+          # branch push, so what a pod reports matches what was pulled.
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
