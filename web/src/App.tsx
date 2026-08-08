@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   BrowserRouter,
+  Link,
   NavLink,
   useNavigate,
   Navigate,
@@ -18,6 +19,7 @@ import Running from "./screens/Running";
 import ApiExplorer from "./screens/ApiExplorer";
 import JobsList from "./screens/JobsList";
 import JobResults from "./screens/JobResults";
+import Landing from "./screens/Landing";
 import SignIn from "./screens/SignIn";
 import Account from "./screens/Account";
 import Groups from "./screens/Groups";
@@ -87,10 +89,13 @@ function Shell({
   return (
     <div className="app">
       <header className="appbar">
-        <div className="wordmark">
+        {/* Home from anywhere. For a signed-in user "/" is the app; for an
+            anonymous one it is the landing page — the same link either way,
+            which is what makes it predictable. */}
+        <Link to="/" className="wordmark" style={{ textDecoration: "none", color: "inherit" }}>
           <span className="mark" />
           VariantHub
-        </div>
+        </Link>
         <UserMenu me={me} onSignIn={onSignIn} />
       </header>
 
@@ -211,7 +216,8 @@ export default function App() {
   const [me, setMe] = useState<Me | null>(null);
   const [ready, setReady] = useState(false);
   // Set when an anonymous visitor asks to sign in, so the wall can be reached
-  // deliberately on an open instance rather than only by being turned away.
+  // deliberately — from the landing page, or on an open instance where nothing
+  // would otherwise turn them away.
   const [signIn, setSignIn] = useState(false);
 
   useEffect(() => {
@@ -228,13 +234,21 @@ export default function App() {
   // in agreement — a UI that gates on its own opinion would show a login screen
   // for endpoints that would have answered.
   const anon = !me || me.anonymous;
+  const fallbackMe: Me = { anonymous: true, admin: false, label: "anonymous", bootstrap: false };
   if (anon && !(me?.allow_anonymous && !signIn)) {
-    return (
-      <SignIn
-        me={me ?? { anonymous: true, admin: false, label: "anonymous", bootstrap: false }}
-        onDone={() => location.reload()}
-      />
-    );
+    // The wall only once it has been asked for. An anonymous visitor arriving
+    // at a closed installation used to get a password box and nothing else —
+    // no statement of what this is, what an account would give them, or that
+    // they could run their own copy. The landing page says those, and sign-in
+    // is a button on it rather than a gate in front of it.
+    //
+    // needs_bootstrap is the exception: an installation with no administrator
+    // has one thing to do, and putting a marketing page in front of it would
+    // hide the only action available.
+    if (!signIn && !me?.needs_bootstrap) {
+      return <Landing me={me ?? fallbackMe} onSignIn={() => setSignIn(true)} />;
+    }
+    return <SignIn me={me ?? fallbackMe} onDone={() => location.reload()} />;
   }
 
   return (
@@ -243,6 +257,14 @@ export default function App() {
         <Shell me={me ?? anonymousMe} onSignIn={() => setSignIn(true)}>
           <Routes>
             <Route path="/" element={<Navigate to="/annotate/sources" replace />} />
+            {/* Reachable with or without an account. An open installation sends
+                an anonymous visitor straight to the app, so without this route
+                the page explaining what the app is would exist only for people
+                who were turned away from it. */}
+            <Route
+              path="/welcome"
+              element={<Landing me={me ?? anonymousMe} onSignIn={() => setSignIn(true)} />}
+            />
             <Route path="/annotate/sources" element={<ChooseSources />} />
             <Route path="/annotate/variants" element={<EnterVariants />} />
             <Route path="/annotate/running/:jobId" element={<Running />} />
