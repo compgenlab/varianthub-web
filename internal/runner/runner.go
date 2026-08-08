@@ -147,6 +147,15 @@ type ExecRunner struct {
 	//
 	// Off by default: the cache is what makes a repeated query cheap.
 	NoCache bool
+
+	// ExtraEnv is added to the environment of every CLI invocation.
+	//
+	// S3 credentials arrive this way because varhub is a separate program that
+	// reads its own: a site's keys have to be handed over, and the environment
+	// is the only channel. Passed in rather than looked up, so this package
+	// keeps knowing nothing about storage configuration — which is the point of
+	// the seam.
+	ExtraEnv []string
 }
 
 var _ Runner = (*ExecRunner)(nil)
@@ -229,7 +238,12 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// One credential set reaches the whole run, so a job spanning two sites with
+	// different keys is not expressible — the environment has room for one. A
+	// real limit rather than an oversight: lifting it needs per-source
+	// credentials inside varhub.
 	cmd.Env = append(os.Environ(), "VARHUB_HOME="+home)
+	cmd.Env = append(cmd.Env, r.ExtraEnv...)
 	cmd.Dir = work
 
 	var stdout bytes.Buffer
@@ -646,7 +660,11 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
+	// varhub reads S3 credentials from the environment — it is a separate
+	// program with its own SDK — so a site's keys have to be handed over that
+	// way.
 	cmd.Env = append(os.Environ(), "VARHUB_HOME="+home)
+	cmd.Env = append(cmd.Env, r.ExtraEnv...)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	stderrPipe, err := cmd.StderrPipe()

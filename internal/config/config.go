@@ -82,6 +82,11 @@ type Config struct {
 	// are validated differently and because a deployment usually has one of
 	// each, not a mixed list.
 	StorageS3 []string
+
+	// S3Sites are object-storage targets that carry their own endpoint and
+	// credentials, declared as [[s3]] blocks. A site is a storage location too,
+	// so it appears in StorageLocations alongside storage.paths and storage.s3.
+	S3Sites []S3Site
 	// References maps an assembly to a reference FASTA on the worker's
 	// filesystem, e.g. {"GRCh38": "/mnt/ref/GRCh38.fa"}.
 	//
@@ -389,6 +394,33 @@ func (c *Config) StorageLocations() ([]struct {
 			return nil, err
 		}
 	}
+	// [[s3]] sites: a location and the credentials to reach it, together.
+	for i, site := range c.S3Sites {
+		name := strings.TrimSpace(site.Name)
+		uri := strings.TrimSpace(site.URI)
+		if name == "" || uri == "" {
+			return nil, fmt.Errorf("[[s3]] entry %d: both name and uri are required", i+1)
+		}
+		if !strings.HasPrefix(uri, "s3://") {
+			return nil, fmt.Errorf("[[s3]] %q: uri must be an s3:// URI", name)
+		}
+		id := "cfg-" + strings.ToLower(name)
+		if seen[id] {
+			// "default" is the likely collision: a filesystem location of that
+			// name exists unless storage.paths is set, so an [[s3]] called
+			// default clashes with a built-in nobody wrote.
+			return nil, fmt.Errorf("storage location %q is declared twice — "+
+				"[[s3]] %q collides with a storage.paths entry (there is a "+
+				"built-in %q path unless storage.paths is set); give the site "+
+				"another name, or set storage.paths yourself", name, name, name)
+		}
+		seen[id] = true
+		out = append(out, loc{
+			ID: id, Name: name, Path: uri, Kind: "s3",
+			Default: site.Default || (len(c.StoragePaths) == 0 && len(c.StorageS3) == 0 && i == 0),
+		})
+	}
+
 	for i, raw := range c.StorageS3 {
 		if err := add(raw, "storage.s3", "s3", len(c.StoragePaths) == 0 && i == 0, func(p string) error {
 			if !strings.HasPrefix(p, "s3://") {
