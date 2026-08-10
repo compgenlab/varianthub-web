@@ -144,13 +144,13 @@ func Defaults() *Config {
 		DownloadTimeout: 12 * time.Hour,
 		// Results are the thing a user comes back for, and a day is shorter
 		// than the gap between someone running an annotation and being asked
-		// about it. Fourteen days is long enough to be useful and short enough
-		// that a busy installation is not storing every result it ever made.
+		// about it. A week covers that without storing every result an
+		// installation ever produced.
 		//
 		// The cost is real and worth knowing: a result is stored twice, once as
 		// the JSON blob that backs export and once as rows that back paging and
-		// sorting, so this multiplies the larger of those by fourteen.
-		JobTTL:          14 * 24 * time.Hour,
+		// sorting, so this multiplies the larger of those by seven.
+		JobTTL:          7 * 24 * time.Hour,
 		SubmitWaitCap:   10 * time.Second,
 		MaxUploadBytes:  64 << 20,
 		RatePerMin:      30,

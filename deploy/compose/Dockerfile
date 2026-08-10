@@ -96,7 +96,19 @@ FROM alpine:3.20
 # The rest covers the common denominator, not everything: a recipe may require a
 # tool nobody anticipated, and the honest answer there is the preflight error
 # naming it rather than an image that tries to contain every possibility.
-RUN apk add --no-cache ca-certificates tzdata bash python3 curl \
+# coreutils is not a convenience. Alpine's sort is BusyBox's, which holds its
+# entire input in memory — it has no external merge, no -T, and no -S. A build
+# recipe that sorts a whole source is then bounded by RAM rather than by disk,
+# and REVEL's does exactly that:
+#
+#   python3 convert_csv_to_tab.py segments/*.csv | sort -k1,1 -k2,2n | varhub bgzip
+#
+# 175 segments of REVEL through that pipeline exceeded an 8 GiB container limit
+# and was OOM-killed three times, which reads as "the worker needs more memory"
+# and is not — no limit is enough for a sort that will not spill. GNU sort
+# merges through temporary files in TMPDIR, which the worker already points at
+# the job's scratch on the data volume.
+RUN apk add --no-cache ca-certificates tzdata bash python3 curl coreutils \
  && adduser -D -u 10001 varianthub
 
 # Apptainer, for tool sources that run in a container (VEP, ANNOVAR).
