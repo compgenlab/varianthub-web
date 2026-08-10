@@ -264,8 +264,6 @@ func TestV1RoutesRequireAnIdentity(t *testing.T) {
 		{"POST", "/api/v1/annotate"},
 		{"POST", "/api/v1/annotate/vcf"},
 		{"GET", "/api/v1/jobs"},
-		{"GET", "/api/v1/jobs/x"},
-		{"GET", "/api/v1/jobs/x/export"},
 	}
 	for _, p := range paths {
 		r := httptest.NewRequest(p.method, p.path, nil)
@@ -273,6 +271,26 @@ func TestV1RoutesRequireAnIdentity(t *testing.T) {
 		h.ServeHTTP(w, r)
 		if w.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s status = %d, want 401 when anonymous", p.method, p.path, w.Code)
+		}
+	}
+
+	// Reading one job by id is deliberately not on that list. An anonymous
+	// result's link is its credential, so these routes carry no blanket
+	// requirement and authorize against the job itself — which for a job that
+	// does not exist, or one belonging to an account, is a 404 rather than a
+	// 401. The distinction matters: 401 says "identify yourself and try again",
+	// and for a link that is either wrong or not yours, there is nothing to
+	// try.
+	for _, p := range []struct{ method, path string }{
+		{"GET", "/api/v1/jobs/x"},
+		{"GET", "/api/v1/jobs/x/export"},
+	} {
+		r := httptest.NewRequest(p.method, p.path, nil)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code == http.StatusUnauthorized {
+			t.Errorf("%s %s = 401; a shared link must not need a second credential",
+				p.method, p.path)
 		}
 	}
 }

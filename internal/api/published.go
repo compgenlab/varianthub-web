@@ -20,6 +20,20 @@ type publishedRoute struct {
 	Handler http.HandlerFunc
 	// Throttled applies the per-IP submission rate.
 	Throttled bool
+	// Public skips the credential check, leaving authorization entirely to the
+	// handler's own check on the object.
+	//
+	// For reads of a single job by id. An anonymous result's link IS its
+	// credential, so requiring a second one defeats the sharing it exists for:
+	// a link works in a browser only because the app hands every visitor a
+	// session on page load, and the same link handed to curl was refused before
+	// anyone asked whose job it was.
+	//
+	// Safe because the handler still decides. An unauthenticated caller reading
+	// a signed-in user's job gets the same 404 it always did — canView says no,
+	// and nothing about skipping requireAuth changes that. Enumeration is not a
+	// concern at 128 random bits.
+	Public bool
 	// Request is a zero value of the request body type, or nil for a body-less
 	// endpoint. RequestSchema overrides it where reflection cannot express the
 	// shape.
@@ -120,6 +134,7 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		},
 		{
 			Method: "GET", Path: "/api/v1/jobs/{id}", OpID: "getJob",
+			Public:   true,
 			Summary:  "Fetch a job's status, and its results once it has finished.",
 			Handler:  s.handleGetJob,
 			Response: JobResultResponse{},
@@ -140,6 +155,7 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		},
 		{
 			Method: "GET", Path: "/api/v1/jobs/{id}/export", OpID: "exportResults",
+			Public:  true,
 			Summary: "Download a finished job's results, whole, in a chosen format.",
 			Handler: s.handleExport,
 			// Streamed in four formats, so the body is not one JSON schema.
@@ -181,6 +197,9 @@ func (s *Server) registerPublished(mux *http.ServeMux) {
 		if rt.Throttled {
 			h = s.throttle(h)
 		}
-		mux.Handle(rt.Method+" "+rt.Path, s.requireAuth(h))
+		if !rt.Public {
+			h = s.requireAuth(h)
+		}
+		mux.Handle(rt.Method+" "+rt.Path, h)
 	}
 }

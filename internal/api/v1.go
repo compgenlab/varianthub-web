@@ -652,12 +652,17 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// job loads a job and enforces ownership, writing the error response itself.
-//
-// Knowing a job id is not authorization: ids are handed out to whoever submitted
-// and could be logged or shared. An untrusted caller must own the job — by
-// account where it has one, and only otherwise by the session that created it.
-func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+// lookupJob loads a job by id, writing the error response itself. It enforces
+// nothing — the caller decides which permission applies.
+func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+	// Guarded like the catalog handlers are. This was unreachable while every
+	// job route required a credential first: the 401 came before anything
+	// touched the queue. Reading a shared link needs no credential, so an
+	// installation without a queue would have answered with a panic.
+	if s.queue == nil {
+		writeError(w, http.StatusServiceUnavailable, "job queue unavailable")
+		return queue.Job{}, false
+	}
 	id := r.PathValue("id")
 	job, ok, err := s.queue.Get(r.Context(), id)
 	if err != nil {
@@ -668,7 +673,19 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 		writeError(w, http.StatusNotFound, "no such job")
 		return queue.Job{}, false
 	}
-	if !s.trustedCaller(r) && !s.owns(r, job) {
+	return job, true
+}
+
+// job loads a job the caller may read, writing the error response itself.
+//
+// Reading, not changing: an anonymous job's id is enough to read it, and not
+// enough to cancel it. See canView and owns.
+func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+	job, ok := s.lookupJob(w, r)
+	if !ok {
+		return queue.Job{}, false
+	}
+	if !s.trustedCaller(r) && !s.canView(r, job) {
 		// 404 rather than 403: confirming a job exists is itself a small leak.
 		writeError(w, http.StatusNotFound, "no such job")
 		return queue.Job{}, false
@@ -676,11 +693,32 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	return job, true
 }
 
-// owns reports whether the caller submitted this job.
+// canView reports whether the caller may read this job and its results.
 //
-// A job with an owning account is readable only by that account: the session id
-// on it is client-asserted, so honouring it as well would let anyone who learned
-// the string read a signed-in user's results.
+// A job with an account is private to that account. A job without one is
+// readable by anyone holding its id: there is no account to attach it to, the
+// id is 128 unguessable bits, and so the link is the credential. That is what
+// makes an anonymous result shareable — it can be sent to a colleague or
+// reopened on another machine, for work that was anonymous to begin with and
+// has no account to protect.
+func (s *Server) canView(r *http.Request, job queue.Job) bool {
+	if job.UserID == "" {
+		return true
+	}
+	return s.owns(r, job)
+}
+
+// owns reports whether the caller submitted this job. It is the stricter of the
+// two checks, and gates changing a job rather than reading one.
+//
+// The split matters for anonymous jobs: the link is enough to read a result,
+// and deliberately not enough to cancel the run behind it. Forwarding a link so
+// someone can look at the output should not also hand them the ability to stop
+// it — reading is why the link was shared, and stopping is not.
+//
+// For a job with an account, the account is the whole answer: the session id on
+// it is client-asserted, so honouring that as well would let anyone who learned
+// the string act as a signed-in user.
 func (s *Server) owns(r *http.Request, job queue.Job) bool {
 	if job.UserID != "" {
 		return callerOf(r).UserID() == job.UserID
@@ -704,8 +742,25 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 // can start work can already occupy a worker, and letting them stop it again
 // frees the slot they are holding rather than taking anything from anyone else.
 // An administrator can cancel anything, which is what the system jobs view uses.
+// ownedJob is job, for the things only the submitter may do.
+//
+// Separate from job because the two genuinely differ for anonymous work: its
+// link is readable by anyone holding it, and cancellation is not.
+func (s *Server) ownedJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+	job, ok := s.lookupJob(w, r)
+	if !ok {
+		return queue.Job{}, false
+	}
+	if !s.trustedCaller(r) && !s.owns(r, job) {
+		writeError(w, http.StatusNotFound, "no such job")
+		return queue.Job{}, false
+	}
+	return job, true
+}
+
 func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.job(w, r)
+	// ownedJob, not job: a shared link reads a result, it does not stop the run.
+	job, ok := s.ownedJob(w, r)
 	if !ok {
 		return
 	}

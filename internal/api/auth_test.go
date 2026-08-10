@@ -774,16 +774,37 @@ func TestAnonymousJobHistoryIsScoped(t *testing.T) {
 	if got := read(mine, browserA); got != http.StatusOK {
 		t.Errorf("reading my own job = %d, want 200", got)
 	}
-	// Someone else's browser, and no scope at all, both get a 404 rather than
-	// a 403 — confirming the job exists is itself a small leak.
-	if got := read(mine, browserB); got != http.StatusNotFound {
-		t.Errorf("another browser reading it = %d, want 404", got)
+	// Another browser CAN read it, holding the id. An anonymous job has no
+	// account to be private to, so its link is the credential and sharing the
+	// link is how a result gets shared. What stays scoped is the history
+	// listing, asserted below: holding one link does not enumerate the rest.
+	if got := read(mine, browserB); got != http.StatusOK {
+		t.Errorf("another browser reading a shared anonymous link = %d, want 200", got)
 	}
-	// No credential at all is now refused before ownership is considered: it is
-	// not an anonymous visitor reading somebody else's job, it is a request that
-	// presented nothing. 401 says which, and says it is fixable.
-	if got := read(mine, ""); got != http.StatusUnauthorized {
-		t.Errorf("an unscoped read = %d, want 401", got)
+	// And with no credential at all — curl with a URL and nothing else. This
+	// used to be a 401, refused before anyone asked whose job it was, which
+	// made a "shareable" link unusable by anything but a browser that had been
+	// handed a session on page load.
+	if got := read(mine, ""); got != http.StatusOK {
+		t.Errorf("a bare read with no credential = %d, want 200", got)
+	}
+
+	// The listing stays scoped, and this is what carries the privacy now that a
+	// link is readable: browserB can open a link it was given, and still cannot
+	// discover what else browserA has run. Sharing one result shares one result.
+	list := func(session string) string {
+		t.Helper()
+		r := httptest.NewRequest("GET", "/api/v1/jobs", nil)
+		r.AddCookie(&http.Cookie{Name: AnonCookie, Value: session})
+		w := httptest.NewRecorder()
+		h.http.ServeHTTP(w, r)
+		return w.Body.String()
+	}
+	if strings.Contains(list(browserB), mine) {
+		t.Error("another browser's job history included a job it did not submit")
+	}
+	if !strings.Contains(list(browserA), mine) {
+		t.Error("the submitting browser's own history did not include its job")
 	}
 }
 

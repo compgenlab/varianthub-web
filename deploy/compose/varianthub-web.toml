@@ -79,7 +79,7 @@
   # before it was installed. Turn back off once the source is trusted; the cache
   # is what makes a repeated query cheap.
   no_cache = true                                   # VHW_NO_CACHE
-  job_ttl = "24h"                                   # VHW_JOB_TTL
+  job_ttl = "336h"                                  # VHW_JOB_TTL — 14 days
 
 # Where downloaded source data goes. Filesystem entries come first and the first
 # of those is the default target. Both take "name=<target>" entries.
