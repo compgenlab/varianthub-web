@@ -27,6 +27,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -262,6 +263,10 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	if err != nil {
 		return Result{}, err
 	}
+	if req.Sink != nil {
+		req.Sink("··· exec: " + bin + " " + strings.Join(args, " "))
+		req.Sink("··· VARHUB_HOME=" + home)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return Result{}, fmt.Errorf("start %s: %w", bin, err)
@@ -302,6 +307,20 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	mu.Unlock()
 
 	if runErr != nil {
+		if req.Sink != nil {
+			req.Sink("··· " + describeExit(runErr))
+			// A bounded head of stdout, not the whole of it: on this path
+			// stdout is the result, which can be hundreds of megabytes. But a
+			// failed run's stdout is usually empty or a few lines of something
+			// that went to the wrong stream, and that is worth seeing.
+			if out := strings.TrimSpace(stdout.String()); out != "" {
+				const keep = 4096
+				if len(out) > keep {
+					out = out[:keep] + fmt.Sprintf("\n··· (stdout truncated at %d bytes of %d)", keep, stdout.Len())
+				}
+				req.Sink("··· stdout: " + out)
+			}
+		}
 		if ctx.Err() != nil {
 			return Result{}, fmt.Errorf("annotation cancelled: %w", ctx.Err())
 		}
@@ -714,6 +733,19 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	if err != nil {
 		return DownloadResult{}, err
 	}
+	// What was run, recorded before it runs.
+	//
+	// A log that starts mid-download cannot be reproduced: the arguments decide
+	// which sources, which cache, whether --force was set, and none of that is
+	// recoverable from the output. Cheap to write once, and the first thing
+	// wanted when a run has to be repeated by hand.
+	if req.Sink != nil {
+		req.Sink("··· exec: " + bin + " " + strings.Join(args, " "))
+		req.Sink("··· VARHUB_HOME=" + home)
+		if req.JobID != "" {
+			req.Sink("··· TMPDIR=" + JobScratchDir(req.JobID))
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		return DownloadResult{}, fmt.Errorf("start %s: %w", bin, err)
 	}
@@ -750,6 +782,16 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	mu.Unlock()
 
 	if runErr != nil {
+		if req.Sink != nil {
+			req.Sink("··· " + describeExit(runErr))
+			// stdout is the JSON report, and a run that failed may have written
+			// a partial one — or an error the CLI sent to the wrong stream.
+			// Small enough to keep whole, and worth having when the failure is
+			// not in stderr at all.
+			if out := strings.TrimSpace(stdout.String()); out != "" {
+				req.Sink("··· stdout: " + out)
+			}
+		}
 		if ctx.Err() != nil {
 			return DownloadResult{}, fmt.Errorf("download cancelled: %w", ctx.Err())
 		}
@@ -758,6 +800,12 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 
 	files, err := parseDownloadReport(stdout.Bytes())
 	if err != nil {
+		// The report is what this step exists to read, so when it cannot be
+		// read, keep it: a truncated or unexpected report is the evidence.
+		if req.Sink != nil {
+			req.Sink("··· the download report could not be read; it was:")
+			req.Sink(stdout.String())
+		}
 		return DownloadResult{}, fmt.Errorf("reading the download report: %w (stderr: %s)", err, tail)
 	}
 	return DownloadResult{Files: files, Log: tail}, nil
@@ -953,4 +1001,34 @@ func Cleanup(req CleanupRequest) (freed int64, err error) {
 	// Drop the now-empty parent, so a removed source leaves no stub directory.
 	_ = os.Remove(filepath.Join(root, req.Name))
 	return freed, nil
+}
+
+// describeExit turns a process's exit into something an operator can act on.
+//
+// "exit status 1" is the tool failing and saying why somewhere above. A signal
+// is something else entirely: nothing above it is an explanation, because the
+// process was stopped rather than given the chance to finish. SIGKILL in a
+// container almost always means the cgroup's memory limit — and the difference
+// between "the tool failed" and "the tool was killed" decides whether you read
+// the log or raise the limit.
+func describeExit(err error) string {
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) {
+		return "run failed: " + err.Error()
+	}
+	st, ok := ee.Sys().(syscall.WaitStatus)
+	if !ok {
+		return "exited: " + ee.Error()
+	}
+	if st.Signaled() {
+		sig := st.Signal()
+		s := fmt.Sprintf("killed by signal %d (%s) — the process was stopped, not "+
+			"a failure it reported, so nothing above this line explains it", int(sig), sig)
+		if sig == syscall.SIGKILL {
+			s += ". In a container SIGKILL is usually the memory limit; check the " +
+				"pod's lastState for OOMKilled"
+		}
+		return s
+	}
+	return fmt.Sprintf("exited with status %d", st.ExitStatus())
 }
