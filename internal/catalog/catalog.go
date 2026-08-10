@@ -781,3 +781,94 @@ func (s *Store) withDefaultReference(ctx context.Context, build string,
 	}
 	return append(slices.Clone(sourceIDs), def.ID), nil
 }
+
+// SourceInUse returns the named snapshots pinning a source — drafts and
+// published ones, never ad-hoc.
+//
+// Ad-hoc snapshots are excluded deliberately, on the same reasoning DeleteSource
+// uses: they are regenerable, the same selection produces the same id, and past
+// results are self-contained because they carry their own column model. Counting
+// them would make a source uneditable the moment anyone annotated with it, which
+// is every source that has ever been useful.
+func (s *Store) SourceInUse(ctx context.Context, id string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT sn.id FROM snapshot sn
+		  JOIN snapshot_source ss ON ss.snapshot_id = sn.id
+		 WHERE ss.source_id = $1 AND sn.state <> $2
+		 ORDER BY sn.id`, id, StateAdhoc)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
+}
+
+// UpdateSourceTOML replaces a source's manifest in place.
+//
+// The point is to fix a manifest without re-fetching what it describes. A
+// missing requires_reference, a wrong annotation name, a changed prefix — none
+// of those are reasons to download a source again, and for something like VEP
+// that is hours.
+//
+// So the download state is carried over rather than taken from the new manifest:
+// index_status stays as it was, and the rows recording which files are stored
+// where are untouched. is_default_reference is not in the upsert at all, so it
+// survives on its own.
+//
+// Refused when a named snapshot pins the source. A published snapshot is a
+// promise about what an annotation ran against, and rewriting the manifest under
+// it would change the meaning of results already returned. Ad-hoc snapshots
+// pinning it are dropped instead of blocking, exactly as DeleteSource does.
+//
+// Identity may not change. A source's files are stored under its name and
+// version, so a manifest that renames it describes something else — and the
+// stored files would silently belong to neither.
+func (s *Store) UpdateSourceTOML(ctx context.Context, id string, next Source) (Source, error) {
+	if next.ID != id {
+		return Source{}, fmt.Errorf("this manifest describes %s, not %s: "+
+			"a source's files are stored under its name and version, so changing "+
+			"either makes it a different source — register that one instead", next.ID, id)
+	}
+	inUse, err := s.SourceInUse(ctx, id)
+	if err != nil {
+		return Source{}, err
+	}
+	if len(inUse) > 0 {
+		return Source{}, fmt.Errorf("%s is pinned by %v; a snapshot is a promise about "+
+			"what an annotation ran against, so its sources cannot be rewritten underneath "+
+			"it — remove it from those snapshots, or register a new version", id, inUse)
+	}
+
+	prev := s.pool.QueryRow(ctx, `SELECT `+sourceCols+` FROM source WHERE id=$1`, id)
+	existing, err := scanSource(prev)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Source{}, fmt.Errorf("source %q: %w", id, ErrNotFound)
+	}
+	if err != nil {
+		return Source{}, err
+	}
+	// What the deployment learned by provisioning, which the manifest does not
+	// know and must not overwrite.
+	next.IndexStatus = existing.IndexStatus
+
+	// Regenerable, and now describing a manifest that no longer exists.
+	if _, err := s.pool.Exec(ctx, `
+		DELETE FROM snapshot
+		 WHERE state = $1
+		   AND id IN (SELECT snapshot_id FROM snapshot_source WHERE source_id = $2)`,
+		StateAdhoc, id); err != nil {
+		return Source{}, err
+	}
+	if err := s.PutSource(ctx, next); err != nil {
+		return Source{}, err
+	}
+	return next, nil
+}

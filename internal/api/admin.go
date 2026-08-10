@@ -1109,3 +1109,41 @@ func (s *Server) handleCheckStorage(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 	writeJSON(w, http.StatusOK, map[string]any{"locations": out})
 }
+
+// handleUpdateSource replaces a source's manifest without re-provisioning it.
+//
+// Registering again through POST would work for the manifest itself, but takes
+// index_status from the new draft — so a correction to one line would mark a
+// source as not downloaded and cost a re-fetch. For VEP that is hours, for a
+// missing requires_reference it is absurd.
+func (s *Server) handleUpdateSource(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	var req sourceRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	next, err := req.derive()
+	if err != nil {
+		// A manifest that does not parse is the common case here — this is a
+		// text box — so it is a 400 with the parser's own words.
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	updated, err := s.catalog.UpdateSourceTOML(r.Context(), r.PathValue("id"), next)
+	if err != nil {
+		switch {
+		case errors.Is(err, catalog.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		default:
+			// Pinned by a snapshot, or renamed: both are the caller's to fix and
+			// both are explained in the message.
+			writeError(w, http.StatusConflict, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"source": updated})
+}

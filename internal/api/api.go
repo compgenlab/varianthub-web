@@ -152,6 +152,7 @@ func (s *Server) adminRoutes() http.Handler {
 
 	m.HandleFunc("POST /api/v1/admin/sources/validate", s.handleValidateSource)
 	m.HandleFunc("POST /api/v1/admin/sources", s.handleCreateSource)
+	m.HandleFunc("PUT /api/v1/admin/sources/{id}", s.handleUpdateSource)
 	m.HandleFunc("DELETE /api/v1/admin/sources/{id}", s.handleDeleteSource)
 	m.HandleFunc("GET /api/v1/admin/sources/{id}/config", s.handleSourceConfig)
 	m.HandleFunc("GET /api/v1/admin/sources/{id}/settings", s.handleSourceSettings)

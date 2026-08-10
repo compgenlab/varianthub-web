@@ -148,35 +148,120 @@ function SourceConfig({ id }: { id: string }) {
   const [toml, setToml] = useState("");
   const [err, setErr] = useState("");
 
-  useEffect(() => {
-    let live = true;
+  // Editing is opt-in. The manifest is read far more often than it is changed,
+  // and a textarea that is always live invites edits nobody meant to make.
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+
+  function load() {
     api
       .sourceConfig(id)
-      .then((r) => live && setToml(r.config))
-      .catch((e) => live && setErr(String(e.message ?? e)));
-    return () => {
-      live = false;
-    };
-  }, [id]);
+      .then((r) => {
+        setToml(r.config);
+        setErr("");
+      })
+      .catch((e) => setErr(String(e.message ?? e)));
+  }
+  useEffect(load, [id]);
+
+  async function save() {
+    setSaving(true);
+    setErr("");
+    try {
+      await api.updateSource(id, draft);
+      setToml(draft);
+      setEditing(false);
+      setSaved(true);
+      window.setTimeout(() => setSaved(false), 4000);
+    } catch (e) {
+      // The server's message is the useful one here: it names the snapshot
+      // holding the source, or what the manifest renamed it to.
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const box: React.CSSProperties = {
+    margin: 0,
+    padding: 12,
+    fontSize: 12,
+    lineHeight: 1.5,
+    background: "var(--surface-2)",
+    border: "1px solid var(--hairline)",
+    borderRadius: 6,
+    overflowX: "auto",
+    whiteSpace: "pre",
+    width: "100%",
+  };
 
   return (
-    <pre
-      className="mono"
-      style={{
-        margin: "0 0 22px",
-        padding: 12,
-        fontSize: 12,
-        lineHeight: 1.5,
-        background: "var(--surface-2)",
-        border: "1px solid var(--hairline)",
-        borderRadius: 6,
-        overflowX: "auto",
-        whiteSpace: "pre",
-        color: err ? "var(--danger)" : "var(--text-1)",
-      }}
-    >
-      {err || toml || "Loading…"}
-    </pre>
+    <div style={{ marginBottom: 22 }}>
+      <div className="between" style={{ marginBottom: 8 }}>
+        <span className="label" style={{ margin: 0 }}>
+          Manifest
+        </span>
+        {!editing ? (
+          <button
+            className="btn link"
+            style={{ fontSize: 12.5 }}
+            onClick={() => {
+              setDraft(toml);
+              setEditing(true);
+            }}
+            disabled={!toml}
+          >
+            Edit
+          </button>
+        ) : (
+          <div className="row gap-14">
+            <button className="btn link" style={{ fontSize: 12.5 }}
+              onClick={() => { setEditing(false); setErr(""); }} disabled={saving}>
+              Cancel
+            </button>
+            <button className="btn link" style={{ fontSize: 12.5 }}
+              onClick={save} disabled={saving || draft === toml}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          </div>
+        )}
+      </div>
+
+      {editing ? (
+        <>
+          <textarea
+            className="mono"
+            spellCheck={false}
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            style={{ ...box, minHeight: 320, resize: "vertical", color: "var(--text-1)" }}
+          />
+          {/* Said before saving rather than discovered after: editing the
+              manifest does not re-fetch anything, and the two things that can
+              refuse the save are worth knowing up front. */}
+          <p style={{ fontSize: 11.5, color: "var(--text-3)", marginTop: 6 }}>
+            Saving replaces the manifest without re-downloading the data. A source
+            pinned by a named snapshot cannot be edited, and the name and version
+            cannot change — the stored files are kept under them.
+          </p>
+        </>
+      ) : (
+        <pre className="mono" style={{ ...box, color: err ? "var(--danger)" : "var(--text-1)" }}>
+          {err || toml || "Loading…"}
+        </pre>
+      )}
+
+      {editing && err && (
+        <p className="err" style={{ fontSize: 12.5, marginTop: 8 }}>{err}</p>
+      )}
+      {saved && (
+        <p style={{ fontSize: 12.5, color: "var(--text-3)", marginTop: 8 }}>
+          Manifest saved. Annotations using it pick up the change on their next run.
+        </p>
+      )}
+    </div>
   );
 }
 

@@ -562,6 +562,18 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /**
+   * Replace a source's manifest in place.
+   *
+   * Distinct from createSource, which re-registers and takes the download state
+   * from the new draft — a one-line correction would then mark the source as
+   * not downloaded and cost a re-fetch. This keeps what provisioning learned.
+   */
+  updateSource: (id: string, toml: string) =>
+    req<{ source: Source }>(`/admin/sources/${encodeURIComponent(id)}`, {
+      method: "PUT",
+      body: JSON.stringify({ toml }),
+    }),
   sourceConfig: (id: string) =>
     req<{ id: string; ref: string; format: string; config: string }>(
       `/admin/sources/${encodeURIComponent(id)}/config`,
