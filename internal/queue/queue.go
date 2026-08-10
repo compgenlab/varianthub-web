@@ -365,10 +365,30 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
 		   AND attempts >= $6`,
 		StatusError, StatusRunning, q.nowFn(), q.nowFn(),
-		fmt.Sprintf("abandoned %d times without completing; not retried again", MaxAttempts),
+		fmt.Sprintf("abandoned %d times without completing — its worker was killed "+
+			"each time rather than reporting a failure; see the job log for what it "+
+			"was doing", MaxAttempts),
 		MaxAttempts); err != nil {
 		return 0, fmt.Errorf("fail exhausted jobs: %w", err)
 	}
+	// Which jobs are about to be reclaimed, so each can be told in its own log
+	// that this happened. Without it an abandoned job carries no record of the
+	// abandonment: the worker died without writing anything, and "abandoned 3
+	// times" arrives with no times, no workers, and no output.
+	var reclaiming []string
+	if rows, qErr := q.pool.Query(ctx, `
+		SELECT id FROM job
+		 WHERE status=$1 AND COALESCE(lease_until, 0) < $2 AND attempts < $3`,
+		StatusRunning, q.nowFn(), MaxAttempts); qErr == nil {
+		for rows.Next() {
+			var id string
+			if rows.Scan(&id) == nil {
+				reclaiming = append(reclaiming, id)
+			}
+		}
+		rows.Close()
+	}
+
 	tag, err := q.pool.Exec(ctx, `
 		UPDATE job
 		   SET status=$1, started_at=NULL, claimed_by=NULL, lease_until=NULL
@@ -377,6 +397,11 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		StatusQueued, StatusRunning, q.nowFn(), MaxAttempts)
 	if err != nil {
 		return 0, fmt.Errorf("reclaim expired jobs: %w", err)
+	}
+	for _, id := range reclaiming {
+		_ = q.AppendLog(ctx, id, "··· its worker stopped renewing the lease; "+
+			"requeued for another attempt. The process was killed rather than "+
+			"failing, so nothing above this line is its explanation.\n")
 	}
 	n := int(tag.RowsAffected())
 	if n > 0 {
@@ -933,6 +958,23 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		return
 	}
 	q.wake(id)
+}
+
+// WorkerID identifies this process in the claims it holds, for logs that need
+// to say which worker did something.
+func (q *Queue) WorkerID() string { return q.workerID }
+
+// AppendLog adds to a job's recorded output without reading it back first.
+//
+// Concatenated in SQL rather than read-modify-written, so two writers — the
+// worker streaming its run, and a peer noting that the job was abandoned —
+// cannot lose each other's lines.
+func (q *Queue) AppendLog(ctx context.Context, id, s string) error {
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO job_log (job_id, output) VALUES ($1,$2)
+		ON CONFLICT (job_id) DO UPDATE SET output = job_log.output || EXCLUDED.output`,
+		id, s)
+	return err
 }
 
 // RunningIDs returns the ids of jobs currently claimed and running.

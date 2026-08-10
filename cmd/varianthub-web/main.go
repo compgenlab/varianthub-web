@@ -357,7 +357,15 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 		case queue.KindMove:
 			return runMove(ctx, cat, job, input)
 		}
+		// Same streaming as provisioning. An annotation is usually short enough
+		// that the log written at the end is sufficient — but the ones that are
+		// not are exactly the ones that get killed, and those wrote nothing.
+		alw := queue.NewLogWriter(ctx, q, job.ID)
+		defer alw.Close(context.WithoutCancel(ctx))
+		alw.Note("starting on worker " + q.WorkerID())
+
 		res, err := r.Annotate(ctx, runner.Request{
+			Sink:      alw.Line,
 			Kind:      job.Kind,
 			Snapshot:  job.Snapshot,
 			Selection: job.Selection,
@@ -440,8 +448,20 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		}
 	}
 
+	// Stream this run's output into the job log as it happens.
+	//
+	// storeLog at the end covers a run that returns. Provisioning is dominated
+	// by runs that do not: an OOM or a rolling restart kills the process, the
+	// buffered output goes with it, and the job is left saying it was abandoned
+	// with nothing about what it was doing. Flushed every few seconds, the log
+	// holds everything up to the moment it died.
+	lw := queue.NewLogWriter(ctx, q, job.ID)
+	defer lw.Close(context.WithoutCancel(ctx))
+	lw.Note("starting on worker " + q.WorkerID())
+
 	res, err := exec.Download(ctx, runner.DownloadRequest{
 		JobID:    job.ID,
+		Sink:     lw.Line,
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
 		Force:    req.Force,

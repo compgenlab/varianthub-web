@@ -715,3 +715,92 @@ func TestOneAbandonmentStillRequeues(t *testing.T) {
 		t.Fatalf("status = %q, want %q", got.Status, StatusQueued)
 	}
 }
+
+// The output of a run that never returns.
+//
+// storeLog runs after a job finishes, so a worker killed mid-run wrote nothing
+// and the job reported being abandoned with no account of what it was doing.
+// A periodic flush is the whole point: whatever reached the database before the
+// kill is all there will ever be, so there has to be something there.
+func TestLogSurvivesAWorkerThatNeverReturns(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := NewLogWriter(ctx, q, id)
+	w.Note("starting on worker abc")
+	w.Line("downloading 1 input file(s)")
+	w.Line("  ↓ GRCh38_latest_genomic.gtf.gz")
+	// No Close: the process died here.
+	w.flush(ctx)
+
+	out, found, err := q.Log(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("nothing was recorded for a job that printed output")
+	}
+	for _, want := range []string{"starting on worker abc", "downloading 1 input file"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log is missing %q; got:\n%s", want, out)
+		}
+	}
+}
+
+// An abandoned job says so in its own log, so "abandoned N times" has times,
+// workers, and output behind it rather than being the whole story.
+func TestAbandonmentIsRecordedInTheJobLog(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, ok, cErr := q.claimNext(ctx); cErr != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", cErr, ok)
+	}
+	if _, err := q.pool.Exec(ctx, `UPDATE job SET lease_until=1 WHERE id=$1`, id); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ReclaimExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	out, found, err := q.Log(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found || !strings.Contains(out, "stopped renewing the lease") {
+		t.Fatalf("the reclaim left no note in the job log; got found=%v out=%q", found, out)
+	}
+}
+
+// Two writers must not lose each other's lines: the worker streams its run while
+// a peer notes that the job was abandoned.
+func TestAppendLogDoesNotClobber(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AppendLog(ctx, id, "first\n"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.AppendLog(ctx, id, "second\n"); err != nil {
+		t.Fatal(err)
+	}
+	out, _, err := q.Log(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "first") || !strings.Contains(out, "second") {
+		t.Fatalf("append lost a line: %q", out)
+	}
+}

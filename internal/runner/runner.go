@@ -38,6 +38,16 @@ const (
 
 // Request is one annotation job's input.
 type Request struct {
+	// Sink receives every line the CLI writes to stderr, as it is written.
+	//
+	// Streamed rather than returned, because the runs worth diagnosing are the
+	// ones that never return: a worker killed by an OOM or a restart takes its
+	// buffered output with it, and the job is left reporting that it was
+	// abandoned without a word about what it was doing at the time.
+	//
+	// Optional. A nil Sink keeps the previous behaviour.
+	Sink func(line string)
+
 	Kind      string // KindLocus | KindVCF
 	Snapshot  string // snapshot name; "" uses the config default
 	Selection string // "" (snapshot defaults) | "all" | "a,b,c"
@@ -271,6 +281,9 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
+			if req.Sink != nil {
+				req.Sink(line)
+			}
 			mu.Lock()
 			tailLines = append(tailLines, line)
 			if len(tailLines) > 20 {
@@ -579,6 +592,11 @@ type DownloadRequest struct {
 	// without guessing.
 	JobID string
 
+	// Sink receives every line varhub writes to stderr, as it is written. See
+	// Request.Sink — provisioning is where this matters most, since those runs
+	// are the long ones and the ones that get killed.
+	Sink func(line string)
+
 	Sources  []string // catalog source ids to fetch
 	CacheDir string   // where the files land — the storage location's path
 	DataDir  string   // varhub's data dir (tool images, reference files)
@@ -712,6 +730,9 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 		for sc.Scan() {
 			line := sc.Text()
+			if req.Sink != nil {
+				req.Sink(line)
+			}
 			mu.Lock()
 			lines = append(lines, line)
 			if len(lines) > 40 {
