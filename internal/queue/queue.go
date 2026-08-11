@@ -86,10 +86,11 @@ type Job struct {
 	UserID    string `json:"user_id,omitempty" doc:"The owning account, when the submitter had one. Authoritative where session is not, being written from the credential the server verified."`
 	Label     string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
 
-	Weight     int   `json:"weight,omitempty" doc:"How many worker slots this job occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
-	CreatedAt  int64 `json:"created_at" doc:"Unix seconds."`
-	StartedAt  int64 `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
-	FinishedAt int64 `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
+	Weight     int    `json:"weight,omitempty" doc:"How many worker slots this job occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
+	Origin     string `json:"origin,omitempty" doc:"How the job was submitted: \"web\" from a browser session, \"api\" from a personal access token. Absent for jobs recorded before this was tracked."`
+	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
+	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
+	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 }
 
 // Terminal reports whether the job has reached a final status.
@@ -108,8 +109,27 @@ type NewJob struct {
 	Label     string
 	// Weight is how much of the pool this job occupies; 0 means 1.
 	Weight int
+	// MaxConcurrent caps how many of this submitter's jobs may run at once. 0
+	// falls back to the deployment's per-IP cap, which is what anonymous work
+	// and anything submitted before tiers existed gets.
+	//
+	// Recorded on the row rather than read from the account at dispatch: the
+	// claim query stays one statement over one table, a job keeps the terms it
+	// was admitted under, and an anonymous job has no account to read from.
+	MaxConcurrent int
+	// Origin is how the job arrived: OriginWeb, OriginAPI, or empty when
+	// unrecorded. Reporting only — it decides nothing.
+	Origin string
 	Body   []byte
 }
+
+// How a job was submitted. Empty is a third state, not a default: rows written
+// before this was recorded genuinely do not say, and counting them as either
+// would put a number on a distinction nobody captured.
+const (
+	OriginWeb = "web"
+	OriginAPI = "api"
+)
 
 // weightOf normalizes a job's weight. 0 means the caller did not care, which is
 // one slot — the same as an annotation.
@@ -125,12 +145,14 @@ func weightOf(w int) int {
 // and then threw the validity flag away, which amounts to the same thing with
 // more ceremony.
 const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
-	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, created_at, ` +
+	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
+	`COALESCE(origin,''), created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
-	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, j.created_at, ` +
+	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
+	`COALESCE(j.origin,''), j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a job has already finished.
@@ -228,7 +250,6 @@ type Runner func(ctx context.Context, job Job, input []byte) (Outcome, error)
 // Queue is the job queue and its worker pool.
 type Queue struct {
 	pool  *pgxpool.Pool
-	dsn   string // retained so callers can open a second connection to the same database
 	nowFn func() int64
 
 	maxJobsPerIP int // per-IP concurrent running-job cap (<=0 = unlimited)
@@ -289,12 +310,32 @@ const (
 // worker every time stops rather than doing so forever.
 const MaxAttempts = 3
 
-// Open connects to Postgres and prepares the queue.
+// New wraps an existing pool, matching how the catalog and the annotation cache
+// are built. The queue used to keep the DSN it was opened with, so a caller
+// could open a second connection to the same database; nothing has needed that
+// since the notification listener started borrowing from the pool instead.
 //
 // Jobs left running by a crashed worker are not touched here: see
 // ReclaimExpired, and the comment on it for why recovering on open was wrong.
 //
-// The caller must have applied migrations/ first; Open does not create schema.
+// The caller must have applied migrations/ first; nothing here creates schema.
+func New(pool *pgxpool.Pool) (*Queue, error) {
+	id, err := newID()
+	if err != nil {
+		return nil, fmt.Errorf("worker id: %w", err)
+	}
+	return &Queue{
+		pool:       pool,
+		nowFn:      func() int64 { return time.Now().Unix() },
+		queued:     make(chan struct{}, 1),
+		running:    map[string]*runningJob{},
+		workerID:   id,
+		leaseTTL:   defaultLeaseTTL,
+		leaseRenew: defaultLeaseRenew,
+	}, nil
+}
+
+// Open connects to Postgres and returns a queue owning that pool.
 func Open(ctx context.Context, dsn string) (*Queue, error) {
 	pool, err := pgxpool.New(ctx, dsn)
 	if err != nil {
@@ -304,20 +345,10 @@ func Open(ctx context.Context, dsn string) (*Queue, error) {
 		pool.Close()
 		return nil, fmt.Errorf("ping postgres: %w", err)
 	}
-	id, err := newID()
+	q, err := New(pool)
 	if err != nil {
 		pool.Close()
-		return nil, fmt.Errorf("worker id: %w", err)
-	}
-	q := &Queue{
-		pool:       pool,
-		dsn:        dsn,
-		nowFn:      func() int64 { return time.Now().Unix() },
-		queued:     make(chan struct{}, 1),
-		running:    map[string]*runningJob{},
-		workerID:   id,
-		leaseTTL:   defaultLeaseTTL,
-		leaseRenew: defaultLeaseRenew,
+		return nil, err
 	}
 	return q, nil
 }
@@ -502,10 +533,12 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,weight,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
+		                  weight,max_concurrent,origin,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
-		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight), q.nowFn()); err != nil {
+		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
+		j.MaxConcurrent, j.Origin, q.nowFn()); err != nil {
 		return "", err
 	}
 	if _, err := tx.Exec(ctx,
@@ -583,7 +616,7 @@ func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
+		&j.Origin, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Job{}, err
 	}
 	return j, nil
@@ -778,12 +811,15 @@ WHERE id = (
   SELECT j.id
   FROM job j
   LEFT JOIN (
-    SELECT client_ip, COUNT(*) AS c FROM job WHERE status = $1 GROUP BY client_ip
-  ) r ON r.client_ip = j.client_ip
+    SELECT COALESCE(NULLIF(user_id,''), client_ip) AS who, COUNT(*) AS c
+      FROM job WHERE status = $1
+     GROUP BY COALESCE(NULLIF(user_id,''), client_ip)
+  ) r ON r.who = COALESCE(NULLIF(j.user_id,''), j.client_ip)
   CROSS JOIN (
     SELECT COALESCE(SUM(weight),0) AS used FROM job WHERE status = $1
   ) p
-  WHERE j.status = $3 AND COALESCE(r.c, 0) < $4
+  WHERE j.status = $3
+    AND COALESCE(r.c, 0) < (CASE WHEN j.max_concurrent > 0 THEN j.max_concurrent ELSE $4 END)
     AND (p.used = 0 OR p.used + j.weight <= $5)
   ORDER BY COALESCE(r.c, 0) ASC, j.created_at ASC, j.id ASC
   FOR UPDATE OF j SKIP LOCKED

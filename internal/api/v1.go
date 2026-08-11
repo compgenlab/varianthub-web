@@ -548,6 +548,18 @@ func anyOf(s string) any {
 // each of status, results and cancellation is its own call.
 func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
+
+	// Stamped at submit, not read at dispatch. The limit a job runs under is the
+	// one that applied when it was accepted, so raising somebody's tier does not
+	// retroactively change what is already queued — and the dispatcher stays a
+	// single statement over one table rather than joining the identity schema.
+	c := callerOf(r)
+	_, lim := s.callerLimits(r, nj.ClientIP)
+	nj.MaxConcurrent = lim.Concurrent
+	nj.Origin = queue.OriginWeb
+	if c.ViaToken {
+		nj.Origin = queue.OriginAPI
+	}
 	id, err := s.queue.Enqueue(r.Context(), nj)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

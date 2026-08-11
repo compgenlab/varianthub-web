@@ -31,6 +31,14 @@ type Site struct {
 	CacheMaxAge time.Duration `json:"-"`
 	// CacheMaxAgeText is CacheMaxAge as written ("2160h"), for the API and form.
 	CacheMaxAgeText string `json:"cache_max_age"`
+
+	// Service limits, per tier. Rates are per hour; see Limits.
+	AnonConcurrent     int `json:"anon_concurrent"`
+	AnonPerHour        int `json:"anon_per_hour"`
+	StandardConcurrent int `json:"standard_concurrent"`
+	StandardPerHour    int `json:"standard_per_hour"`
+	ElevatedConcurrent int `json:"elevated_concurrent"`
+	ElevatedPerHour    int `json:"elevated_per_hour"`
 }
 
 // SiteFromConfig is the deployment as configured, before any stored override.
@@ -44,6 +52,13 @@ func SiteFromConfig(cfg *config.Config) Site {
 		AllowAnonymous:  cfg.AllowAnonymous,
 		CacheEnabled:    cfg.CacheEnabled,
 		CacheMaxEntries: cfg.CacheMaxEntries,
+
+		AnonConcurrent:     cfg.AnonConcurrent,
+		AnonPerHour:        cfg.AnonPerHour,
+		StandardConcurrent: cfg.StandardConcurrent,
+		StandardPerHour:    cfg.StandardPerHour,
+		ElevatedConcurrent: cfg.ElevatedConcurrent,
+		ElevatedPerHour:    cfg.ElevatedPerHour,
 	}
 	// Through the same parser the overrides use, so "2160h" cannot mean one thing
 	// in the file and another in the form.
@@ -58,7 +73,82 @@ const (
 	KeyCacheEnabled    = "cache_enabled"
 	KeyCacheMaxEntries = "cache_max_entries"
 	KeyCacheMaxAge     = "cache_max_age"
+
+	KeyAnonConcurrent     = "anon_concurrent"
+	KeyAnonPerHour        = "anon_per_hour"
+	KeyStandardConcurrent = "standard_concurrent"
+	KeyStandardPerHour    = "standard_per_hour"
+	KeyElevatedConcurrent = "elevated_concurrent"
+	KeyElevatedPerHour    = "elevated_per_hour"
 )
+
+// Service tiers: how much of the pool an account may occupy.
+//
+// Deliberately not the same axis as role. Role is permission — what you may
+// administer — and this is capacity. Sharing one field would mean raising
+// someone's limits by making them an administrator.
+const (
+	TierStandard  = "standard"
+	TierElevated  = "elevated"
+	TierUnlimited = "unlimited"
+)
+
+// Tiers is every assignable tier, for a form that should not keep its own list.
+var Tiers = []string{TierStandard, TierElevated, TierUnlimited}
+
+// ValidTier reports whether a tier is one this server knows.
+//
+// An unknown tier resolves to the standard limits rather than to none, so a
+// hand-edited row cannot promote an account by misspelling it.
+func ValidTier(t string) bool {
+	for _, k := range Tiers {
+		if k == t {
+			return true
+		}
+	}
+	return false
+}
+
+// Limits are what one caller may ask of the service.
+//
+// Rates are per hour, where the per-IP submit rate in config is per minute. The
+// unit differs because the question does: an anonymous visitor should be able
+// to run something every few minutes, which per-minute integers cannot say at
+// all. Zero means unbounded, the same convention CacheMaxEntries uses.
+type Limits struct {
+	// Concurrent caps running jobs for one caller. Enforced at dispatch, so an
+	// over-limit job waits rather than being refused.
+	Concurrent int
+	// PerHour caps submissions. Enforced at the door, because a request that
+	// will be refused should not become a row first.
+	PerHour int
+}
+
+// Unlimited reports whether nothing is capped.
+func (l Limits) Unlimited() bool { return l.Concurrent <= 0 && l.PerHour <= 0 }
+
+// LimitsFor resolves what a tier allows. An unrecognized tier gets the standard
+// limits — the safe direction, since the alternative is that a typo grants more
+// than any tier was meant to.
+func (s Site) LimitsFor(tier string) Limits {
+	switch tier {
+	case TierUnlimited:
+		return Limits{}
+	case TierElevated:
+		return Limits{Concurrent: s.ElevatedConcurrent, PerHour: s.ElevatedPerHour}
+	default:
+		return Limits{Concurrent: s.StandardConcurrent, PerHour: s.StandardPerHour}
+	}
+}
+
+// AnonLimits are what a visitor who has not signed in may ask for.
+//
+// Lower than any account's, and separate from the tier list because anonymity
+// is not a tier an administrator assigns — there is nobody to assign it to. It
+// is what the absence of an account gets.
+func (s Site) AnonLimits() Limits {
+	return Limits{Concurrent: s.AnonConcurrent, PerHour: s.AnonPerHour}
+}
 
 // SettingKeys is every overridable key, in the order a form should show them.
 //
@@ -67,6 +157,9 @@ const (
 // form saves it, the reader never looks, and the setting appears not to work.
 var SettingKeys = []string{
 	KeyAllowAnonymous, KeyCacheEnabled, KeyCacheMaxEntries, KeyCacheMaxAge,
+	KeyAnonConcurrent, KeyAnonPerHour,
+	KeyStandardConcurrent, KeyStandardPerHour,
+	KeyElevatedConcurrent, KeyElevatedPerHour,
 }
 
 // Values renders a Site as the override map, the inverse of apply.
@@ -76,6 +169,13 @@ func (s Site) Values() map[string]string {
 		KeyCacheEnabled:    strconv.FormatBool(s.CacheEnabled),
 		KeyCacheMaxEntries: strconv.FormatInt(s.CacheMaxEntries, 10),
 		KeyCacheMaxAge:     s.CacheMaxAgeText,
+
+		KeyAnonConcurrent:     strconv.Itoa(s.AnonConcurrent),
+		KeyAnonPerHour:        strconv.Itoa(s.AnonPerHour),
+		KeyStandardConcurrent: strconv.Itoa(s.StandardConcurrent),
+		KeyStandardPerHour:    strconv.Itoa(s.StandardPerHour),
+		KeyElevatedConcurrent: strconv.Itoa(s.ElevatedConcurrent),
+		KeyElevatedPerHour:    strconv.Itoa(s.ElevatedPerHour),
 	}
 }
 
@@ -106,6 +206,32 @@ func (s *Site) ApplySetting(key, value string) error {
 			return fmt.Errorf("%s: %q is not a non-negative whole number", key, value)
 		}
 		s.CacheMaxEntries = n
+	case KeyAnonConcurrent, KeyAnonPerHour,
+		KeyStandardConcurrent, KeyStandardPerHour,
+		KeyElevatedConcurrent, KeyElevatedPerHour:
+		// 0 is unbounded rather than "refuse everything", so an operator cannot
+		// take the service down by clearing a field.
+		n, err := strconv.Atoi(value)
+		if value == "" {
+			n, err = 0, nil
+		}
+		if err != nil || n < 0 {
+			return fmt.Errorf("%s: %q is not a non-negative whole number", key, value)
+		}
+		switch key {
+		case KeyAnonConcurrent:
+			s.AnonConcurrent = n
+		case KeyAnonPerHour:
+			s.AnonPerHour = n
+		case KeyStandardConcurrent:
+			s.StandardConcurrent = n
+		case KeyStandardPerHour:
+			s.StandardPerHour = n
+		case KeyElevatedConcurrent:
+			s.ElevatedConcurrent = n
+		case KeyElevatedPerHour:
+			s.ElevatedPerHour = n
+		}
 	case KeyCacheMaxAge:
 		if value == "" {
 			s.CacheMaxAge, s.CacheMaxAgeText = 0, ""

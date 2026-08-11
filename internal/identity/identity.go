@@ -46,6 +46,9 @@ type User struct {
 	Email    string `json:"email"`
 	Name     string `json:"name,omitempty"`
 	Role     string `json:"role"`
+	// Tier is how much of the service this account may use, as opposed to what
+	// it may administer. See catalog.Tiers.
+	Tier     string `json:"tier"`
 	Disabled bool   `json:"disabled,omitempty"`
 	// SSO means no password is stored here: the account authenticates through
 	// an identity provider. Such an account has no password to change, and
