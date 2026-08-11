@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -260,6 +261,12 @@ func (s *Store) touch(ctx context.Context, assembly string, chrom []string, pos 
 // A unit is replaced, not merged. It is the source's whole answer for that
 // variant, so merging would leave a field the source has stopped emitting beside
 // the ones it still does.
+//
+// Two batches rather than a statement at a time. A VCF job writes one unit per
+// variant per source — hundreds of thousands for a real file — and a round trip
+// each would put the network, not Postgres, in charge of how long an annotation
+// takes. Batching pipelines them into two flushes; the parents go first because
+// the values need the ids they return.
 func (s *Store) Put(ctx context.Context, assembly string, units []Unit) error {
 	if len(units) == 0 {
 		return nil
@@ -271,29 +278,40 @@ func (s *Store) Put(ctx context.Context, assembly string, units []Unit) error {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	now := hourOf(s.nowFn())
+	parents := &pgx.Batch{}
 	for _, u := range units {
-		var id int64
-		if err := tx.QueryRow(ctx, `
+		parents.Queue(`
 			INSERT INTO cache_variant_source (assembly,chrom,pos,ref,alt,source,last_used)
 			VALUES ($1,$2,$3,$4,$5,$6,$7)
 			ON CONFLICT (assembly,chrom,pos,ref,alt,source)
 			  DO UPDATE SET last_used = excluded.last_used
 			RETURNING id`,
-			assembly, u.Locus.Chrom, u.Locus.Pos, u.Locus.Ref, u.Locus.Alt,
-			u.Source, now).Scan(&id); err != nil {
+			assembly, u.Locus.Chrom, u.Locus.Pos, u.Locus.Ref, u.Locus.Alt, u.Source, now)
+	}
+	ids := make([]int64, len(units))
+	res := tx.SendBatch(ctx, parents)
+	for i := range units {
+		if err := res.QueryRow().Scan(&ids[i]); err != nil {
+			res.Close() //nolint:errcheck // the scan error is the one worth reporting
 			return fmt.Errorf("anncache: put: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `DELETE FROM cache_entry WHERE vs_id=$1`, id); err != nil {
-			return fmt.Errorf("anncache: put: %w", err)
-		}
+	}
+	if err := res.Close(); err != nil {
+		return fmt.Errorf("anncache: put: %w", err)
+	}
+
+	values := &pgx.Batch{}
+	for i, u := range units {
+		values.Queue(`DELETE FROM cache_entry WHERE vs_id=$1`, ids[i])
 		for k, v := range u.Entries {
 			text, num := split(v)
-			if _, err := tx.Exec(ctx,
+			values.Queue(
 				`INSERT INTO cache_entry (vs_id,key,value_text,value_num) VALUES ($1,$2,$3,$4)`,
-				id, k, text, num); err != nil {
-				return fmt.Errorf("anncache: put: %w", err)
-			}
+				ids[i], k, text, num)
 		}
+	}
+	if err := tx.SendBatch(ctx, values).Close(); err != nil {
+		return fmt.Errorf("anncache: put: %w", err)
 	}
 	return tx.Commit(ctx)
 }

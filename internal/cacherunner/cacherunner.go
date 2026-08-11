@@ -109,7 +109,7 @@ func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work 
 
 	sub := req
 	sub.Selection = strings.Join(work.ask, ",")
-	sub.Body = []byte(strings.Join(work.args, " "))
+	sub.Body = requestBody(req.Kind, work.loci)
 	res, err := r.Inner.Annotate(ctx, sub)
 	if err != nil {
 		return nil, runner.Result{}, err
@@ -237,13 +237,11 @@ func (r *Runner) plan(ctx context.Context, req runner.Request) (*plan, bool) {
 	if !r.Site(ctx).CacheEnabled {
 		return nil, false
 	}
-	// The VCF path needs multi-allelic records split up front and the two halves
-	// recombined afterwards; until that lands it runs uncached.
-	if req.Kind != runner.KindLocus || req.Snapshot == "" {
+	if req.Snapshot == "" {
 		return nil, false
 	}
 
-	loci, ok := parseLoci(string(req.Body))
+	loci, ok := parseInput(req)
 	if !ok {
 		return nil, false
 	}
@@ -363,7 +361,6 @@ func (p *plan) classify(fields []catalog.Field) bool {
 // engine, what to ask it for, and which sources it need not consult.
 type remainder struct {
 	loci    []anncache.Locus
-	args    []string // the loci as the engine's own argv
 	ask     []string // effective names to select
 	skipped map[string]bool
 	// bail asks the caller to run the original request untouched. Distinct from
@@ -385,7 +382,6 @@ func (p *plan) remaining(hits anncache.Hits) remainder {
 			continue
 		}
 		work.loci = append(work.loci, l)
-		work.args = append(work.args, l.Arg())
 	}
 	if len(work.loci) == 0 {
 		return work
@@ -457,7 +453,22 @@ func variantOnlyBuiltin(name string) bool {
 	return false
 }
 
-// parseLoci reads the job's input, normalizing exactly as varhub does.
+// parseInput reads a job's variants, in the order the engine will report them.
+//
+// The two input kinds differ only in how the same four fields are written down.
+// Order matters in both, because the caller pairs results with what it submitted
+// by position.
+func parseInput(req runner.Request) ([]anncache.Locus, bool) {
+	switch req.Kind {
+	case runner.KindLocus:
+		return parseLoci(string(req.Body))
+	case runner.KindVCF:
+		return parseVCF(req.Body)
+	}
+	return nil, false
+}
+
+// parseLoci reads a locus list, normalizing exactly as varhub does.
 //
 // Ref and alt are upper-cased because the engine upper-cases them, and the
 // coordinates it echoes back are the normalized ones. Keying the cache off the
@@ -487,6 +498,72 @@ func parseLoci(body string) ([]anncache.Locus, bool) {
 		})
 	}
 	return out, true
+}
+
+// parseVCF reads a VCF the way varhub's own reader does, and has to keep doing
+// so: a variant this splits differently than the engine does is a cached value
+// filed under a key the engine never asks about, and a row of the answer built
+// from the wrong one.
+//
+// The engine reads VCFs sites-only — CHROM, POS, REF, ALT, and nothing else. GT,
+// FORMAT and INFO are dropped on the way in, which is a privacy boundary rather
+// than an oversight, and it is also what makes this path cacheable at all: with
+// no sample data reaching the engine, no value it computes can depend on one.
+//
+// Multi-allelic ALTs become one locus per allele, so a cache key and a variant
+// are one to one and Number=A never arises.
+func parseVCF(body []byte) ([]anncache.Locus, bool) {
+	var out []anncache.Locus
+	for _, text := range strings.Split(string(body), "\n") {
+		text = strings.TrimSuffix(text, "\r")
+		if text == "" || strings.HasPrefix(text, "#") {
+			continue
+		}
+		fields := strings.Split(text, "\t")
+		if len(fields) < 5 {
+			return nil, false // the engine rejects this outright; let it say so
+		}
+		pos, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			return nil, false
+		}
+		ref := strings.ToUpper(fields[3])
+		for _, alt := range strings.Split(fields[4], ",") {
+			alt = strings.ToUpper(strings.TrimSpace(alt))
+			if alt == "" || alt == "." {
+				continue
+			}
+			out = append(out, anncache.Locus{Chrom: fields[0], Pos: pos, Ref: ref, Alt: alt})
+		}
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// requestBody writes the surviving variants back in the form the job arrived in.
+//
+// A VCF stays a VCF rather than becoming a locus list, because that is the point
+// of the VCF path: a file holds a hundred thousand variants that argv cannot.
+// The records are sites-only, which loses nothing — the engine discards
+// everything past ALT anyway — and they are already one allele per record, so
+// dropping a cached variant is dropping a line.
+func requestBody(kind string, loci []anncache.Locus) []byte {
+	if kind == runner.KindLocus {
+		args := make([]string, 0, len(loci))
+		for _, l := range loci {
+			args = append(args, l.Arg())
+		}
+		return []byte(strings.Join(args, " "))
+	}
+	var b strings.Builder
+	b.WriteString("##fileformat=VCFv4.2\n")
+	b.WriteString("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+	for _, l := range loci {
+		fmt.Fprintf(&b, "%s\t%d\t.\t%s\t%s\t.\t.\t.\n", l.Chrom, l.Pos, l.Ref, l.Alt)
+	}
+	return []byte(b.String())
 }
 
 // resolveSelection turns a request's selection into the names it asks for.

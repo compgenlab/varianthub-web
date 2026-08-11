@@ -40,14 +40,10 @@ func (f *fakeEngine) Annotate(_ context.Context, req runner.Request) (runner.Res
 
 	names := strings.Split(req.Selection, ",")
 	var out []variant
-	var args []string
-	if req.Kind == runner.KindLocus {
-		args = strings.Fields(string(req.Body))
-	}
-	for _, a := range args {
-		parts := strings.Split(a, ":")
-		pos, _ := strconv.ParseInt(parts[1], 10, 64)
-		l := anncache.Locus{Chrom: parts[0], Pos: pos, Ref: parts[2], Alt: parts[3]}
+	// Through the same reader the decorator uses, which is how the fake stands in
+	// for an engine that splits multi-allelic records the same way.
+	loci, _ := parseInput(req)
+	for _, l := range loci {
 		ann := map[string]any{}
 		for _, n := range names {
 			ann[n] = f.values[l.Key()][n]
@@ -617,18 +613,122 @@ func TestCacheOffPassesTheRequestThroughUntouched(t *testing.T) {
 	}
 }
 
-// The VCF path needs multi-allelic records split up front and recombined after,
-// so until that lands it must run uncached rather than half-cached.
-func TestVCFInputPassesThrough(t *testing.T) {
-	h := newHarness(t, vals(map[string]map[string]any{}), "gnomad")
-	if _, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind: runner.KindVCF, Snapshot: "snap", Selection: "af", Body: []byte("##fileformat=VCFv4.2\n"),
-	}); err != nil {
-		t.Fatal(err)
+const twoAllelic = "##fileformat=VCFv4.2\n" +
+	"#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\tFORMAT\tS1\n" +
+	"chr1\t100\t.\tA\tT,G\t.\tPASS\tDP=30\tGT\t0/1\n" +
+	"chr1\t200\t.\tG\tC\t.\tPASS\tDP=12\tGT\t1/1\n"
+
+func (h *harness) runVCF(selection, body string) []variant {
+	h.t.Helper()
+	res, err := h.r.Annotate(context.Background(), runner.Request{
+		Kind: runner.KindVCF, Snapshot: "snap", Selection: selection, Body: []byte(body),
+	})
+	if err != nil {
+		h.t.Fatalf("Annotate: %v", err)
 	}
+	var out []variant
+	if err := json.Unmarshal(res.Variants, &out); err != nil {
+		h.t.Fatalf("bad result JSON: %v\n%s", err, res.Variants)
+	}
+	return out
+}
+
+// A multi-allelic record is one variant per allele, which is how the engine reads
+// it and therefore how the cache has to key it.
+func TestVCFInputIsCachedPerAllele(t *testing.T) {
+	h := newHarness(t, vals(map[string]map[string]any{
+		"chr1:100:A:T": {"af": 0.25, "ac": 4.0},
+		"chr1:100:A:G": {"af": 0.05, "ac": 1.0},
+		"chr1:200:G:C": {"af": 0.10, "ac": 2.0},
+	}), "gnomad")
+
+	first := h.runVCF("af", twoAllelic)
+	if len(first) != 3 {
+		t.Fatalf("got %d rows from a 2-record, 3-allele VCF, want 3", len(first))
+	}
+	if first[0].Alt != "T" || first[1].Alt != "G" || first[2].Alt != "C" {
+		t.Errorf("allele order not preserved: %s %s %s", first[0].Alt, first[1].Alt, first[2].Alt)
+	}
+	if first[1].Annotations["af"] != 0.05 {
+		t.Errorf("the second allele got %v, want 0.05 — alleles were not kept apart",
+			first[1].Annotations["af"])
+	}
+	h.engine.reset()
+
+	second := h.runVCF("af", twoAllelic)
+	if n := len(h.engine.took()); n != 0 {
+		t.Errorf("the same VCF twice made %d engine call(s), want 0", n)
+	}
+	for i := range second {
+		if second[i].Annotations["af"] != first[i].Annotations["af"] {
+			t.Errorf("row %d changed between runs: %v then %v",
+				i, first[i].Annotations["af"], second[i].Annotations["af"])
+		}
+	}
+}
+
+// The reduced request stays a VCF: that path exists because a file holds more
+// variants than argv can, and answering half of them must not undo that.
+func TestAReducedVCFRequestIsStillAVCF(t *testing.T) {
+	h := newHarness(t, vals(map[string]map[string]any{
+		"chr1:100:A:T": {"af": 0.25, "ac": 4.0},
+		"chr1:100:A:G": {"af": 0.05, "ac": 1.0},
+		"chr1:200:G:C": {"af": 0.10, "ac": 2.0},
+	}), "gnomad")
+
+	// Cache the first record's two alleles only.
+	h.runVCF("af", "##fileformat=VCFv4.2\nchr1\t100\t.\tA\tT,G\t.\t.\t.\n")
+	h.engine.reset()
+
+	got := h.runVCF("af", twoAllelic)
 	calls := h.engine.took()
-	if len(calls) != 1 || calls[0].Kind != runner.KindVCF || string(calls[0].Body) != "##fileformat=VCFv4.2\n" {
-		t.Errorf("the VCF request was not passed through verbatim: %+v", calls)
+	if len(calls) != 1 {
+		t.Fatalf("made %d engine call(s), want 1", len(calls))
+	}
+	if calls[0].Kind != runner.KindVCF {
+		t.Errorf("Kind = %q, want the request to stay a VCF", calls[0].Kind)
+	}
+	sent, ok := parseVCF(calls[0].Body)
+	if !ok {
+		t.Fatalf("the reduced body is not a VCF the engine could read:\n%s", calls[0].Body)
+	}
+	if len(sent) != 1 || sent[0].Key() != "chr1:200:G:C" {
+		t.Errorf("engine was sent %v, want only the uncached allele", sent)
+	}
+	// And the answer still covers everything the caller submitted.
+	if len(got) != 3 {
+		t.Fatalf("got %d rows, want 3", len(got))
+	}
+	for i, v := range got {
+		if v.Annotations["af"] == nil {
+			t.Errorf("row %d lost its value", i)
+		}
+	}
+}
+
+func TestParseVCFMatchesTheEnginesReader(t *testing.T) {
+	got, ok := parseVCF([]byte(twoAllelic))
+	if !ok {
+		t.Fatal("parseVCF refused a valid VCF")
+	}
+	want := []string{"chr1:100:A:T", "chr1:100:A:G", "chr1:200:G:C"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d loci, want %d", len(got), len(want))
+	}
+	for i, l := range got {
+		if l.Key() != want[i] {
+			t.Errorf("locus %d = %q, want %q", i, l.Key(), want[i])
+		}
+	}
+	// A "." alt is no allele, and a short line is something the engine rejects
+	// outright — better to stand aside and let it say so than to key a guess.
+	if got, _ := parseVCF([]byte("chr1\t100\t.\tA\t.\t.\t.\t.\n")); len(got) != 0 {
+		t.Errorf("a missing ALT produced %v", got)
+	}
+	for _, bad := range []string{"", "##only=headers\n", "chr1\t100\t.\tA\n", "chr1\tx\t.\tA\tT\n"} {
+		if _, ok := parseVCF([]byte(bad)); ok {
+			t.Errorf("parseVCF(%q) accepted an input it cannot key", bad)
+		}
 	}
 }
 
