@@ -115,6 +115,42 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"user": u})
 }
 
+// --- the waitlist ---
+//
+// Somebody who authenticated through the provider and has no account here. The
+// callback records the request; these are how an administrator answers it.
+
+func (s *Server) handleListAccessRequests(w http.ResponseWriter, r *http.Request) {
+	reqs, err := s.identity.ListAccessRequests(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"requests": reqs})
+}
+
+func (s *Server) handleApproveAccess(w http.ResponseWriter, r *http.Request) {
+	// Role is not taken from the request body. Approving somebody from a
+	// waitlist is agreeing they may use the service, and an administrator is a
+	// separate decision made deliberately on the users screen.
+	u, err := s.identity.ApproveAccessRequest(
+		r.Context(), r.PathValue("id"), callerOf(r).UserID(), identity.RoleMember)
+	if err != nil {
+		writeError(w, statusForIdentity(err), err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"user": u})
+}
+
+func (s *Server) handleDeclineAccess(w http.ResponseWriter, r *http.Request) {
+	if err := s.identity.DeclineAccessRequest(
+		r.Context(), r.PathValue("id"), callerOf(r).UserID()); err != nil {
+		writeError(w, statusForIdentity(err), err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 // --- teams ---
 
 func (s *Server) handleListTeams(w http.ResponseWriter, r *http.Request) {

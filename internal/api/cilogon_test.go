@@ -146,21 +146,35 @@ func TestCILogonLinksToAnInvitedAccount(t *testing.T) {
 }
 
 // CILogon federates thousands of institutions, so authenticating there is not a
-// reason to have an account here. Invite-only is the default.
-func TestCILogonRefusesUnknownIdentityByDefault(t *testing.T) {
+// reason to have an account here. Invite-only is the default — but a stranger
+// is now queued for review rather than turned away with nothing to do.
+func TestCILogonWaitlistsAnUnknownIdentity(t *testing.T) {
 	h := newHarness(t)
 	h.withOIDC(t, oidcClaims{Sub: "sub-stranger", Email: "stranger@example.org"})
+	ctx := context.Background()
 
 	w := h.signIn(t)
+	// The two that matter: authenticating is not being admitted.
 	if got := sessionFrom(w); got != "" {
 		t.Fatal("a stranger was issued a session")
 	}
-	if loc := w.Header().Get("Location"); !strings.Contains(loc, "sso_no_account") {
-		t.Errorf("redirect = %q, want an sso_no_account error", loc)
-	}
-	users, _ := h.ids.ListUsers(context.Background())
+	users, _ := h.ids.ListUsers(ctx)
 	if len(users) != 0 {
 		t.Errorf("an account was created anyway: %+v", users)
+	}
+
+	if loc := w.Header().Get("Location"); !strings.Contains(loc, "sso_waitlisted") {
+		t.Errorf("redirect = %q, want the waitlist notice", loc)
+	}
+	reqs, err := h.ids.ListAccessRequests(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(reqs) != 1 {
+		t.Fatalf("got %d access requests, want 1", len(reqs))
+	}
+	if reqs[0].Email != "stranger@example.org" || reqs[0].Status != identity.RequestPending {
+		t.Errorf("request = %+v, want a pending one for the verified address", reqs[0])
 	}
 }
 

@@ -35,6 +35,13 @@ export default function SignIn({
 const SSO_ERRORS: Record<string, string> = {
   sso_no_account:
     "That login worked, but there is no VariantHub account for it. Ask an administrator to add you.",
+  // Not a failure, and deliberately phrased as one thing having happened rather
+  // than another having gone wrong: the person did everything right, and what
+  // is left is somebody else's decision.
+  sso_waitlisted:
+    "Thanks — you are on the list. Your institution is not one this installation " +
+    "admits automatically, so an administrator will review your request. You do " +
+    "not need to do anything else; sign in again once you hear back.",
   sso_disabled: "That account has been disabled.",
   sso_denied: "The sign-in was cancelled at your institution.",
   sso_state: "The sign-in took too long or was interrupted. Please try again.",
@@ -85,6 +92,12 @@ function Password({
     const code = new URLSearchParams(location.search).get("error");
     return code ? (SSO_ERRORS[code] ?? "Sign-in failed.") : "";
   });
+  // Being put on the waitlist arrives down the same channel as a failure, and
+  // is not one. Read once at mount, from the URL rather than from the message,
+  // so rewording the copy cannot turn it red.
+  const [waitlisted] = useState(
+    () => new URLSearchParams(location.search).get("error") === "sso_waitlisted",
+  );
   const [busy, setBusy] = useState(false);
   // Both default closed: the institutional button is the answer for nearly
   // everyone, and anything shown beside it competes with it.
@@ -114,7 +127,23 @@ function Password({
   // form is collapsed by default, which would make "there is no account for
   // that login" invisible to the person it is addressed to.
   const banner = err ? (
-    <p className="err" style={{ fontSize: 12.5, margin: "0 0 16px" }}>
+    <p
+      className={waitlisted ? undefined : "err"}
+      style={{
+        fontSize: 12.5,
+        margin: "0 0 16px",
+        lineHeight: 1.5,
+        ...(waitlisted
+          ? {
+              color: "var(--text-1)",
+              background: "var(--accent-tint-alt)",
+              border: "1px solid var(--border)",
+              borderRadius: 8,
+              padding: "10px 12px",
+            }
+          : {}),
+      }}
+    >
       {err}
     </p>
   ) : null;

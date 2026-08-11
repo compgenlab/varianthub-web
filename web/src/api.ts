@@ -234,6 +234,19 @@ export type SiteSettings = {
   elevated_per_hour: number;
 };
 
+/** Somebody who authenticated through a provider and has no account here yet. */
+export interface AccessRequest {
+  id: string;
+  email: string;
+  name?: string;
+  provider: string;
+  status: string;
+  decided_by?: string;
+  decided_at?: number;
+  created_at: number;
+  last_seen_at: number;
+}
+
 /** A count split by how the work arrived. */
 export interface Split {
   web: number;
@@ -707,6 +720,16 @@ export const api = {
     }>("/admin/settings"),
 
   usage: () => req<Usage>("/admin/usage"),
+
+  accessRequests: () => req<{ requests: AccessRequest[] }>("/admin/access-requests"),
+  approveAccess: (id: string) =>
+    req<{ user: User }>(`/admin/access-requests/${encodeURIComponent(id)}/approve`, {
+      method: "POST",
+    }),
+  declineAccess: (id: string) =>
+    req<void>(`/admin/access-requests/${encodeURIComponent(id)}/decline`, {
+      method: "POST",
+    }),
 
   saveSettings: (values: Record<string, string>) =>
     req<{ effective: SiteSettings }>("/admin/settings", {
