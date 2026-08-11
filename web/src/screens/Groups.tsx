@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { ShieldCheck, Trash2, UserPlus, Users } from "lucide-react";
 
-import { api, type Me, type Team, type User } from "../api";
+import { api, type AccessRequest, type Me, type Team, type User } from "../api";
 
 /**
  * Users and groups.
@@ -22,14 +22,20 @@ const TIERS = ["standard", "elevated", "unlimited"];
 export default function Groups({ me }: { me: Me }) {
   const [users, setUsers] = useState<User[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
+  const [requests, setRequests] = useState<AccessRequest[]>([]);
   const [err, setErr] = useState("");
   const [adding, setAdding] = useState(false);
 
   async function load() {
     try {
-      const [u, t] = await Promise.all([api.users(), api.teams()]);
+      const [u, t, a] = await Promise.all([
+        api.users(),
+        api.teams(),
+        api.accessRequests(),
+      ]);
       setUsers(u.users ?? []);
       setTeams(t.teams ?? []);
+      setRequests(a.requests ?? []);
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -61,6 +67,8 @@ export default function Groups({ me }: { me: Me }) {
           {err}
         </p>
       )}
+
+      <Waitlist requests={requests} act={act} />
 
       <div className="between" style={{ marginBottom: 10 }}>
         <span className="label" style={{ margin: 0 }}>
@@ -306,5 +314,117 @@ function NewTeam({ onDone, onError }: { onDone: () => void; onError: (s: string)
         Create
       </button>
     </form>
+  );
+}
+
+/**
+ * People who authenticated and have no account here.
+ *
+ * Everything shown was verified by the identity provider — there is no form for
+ * them to fill in and nothing here they typed. Approving is agreeing that a
+ * verified address should have an account, not taking somebody's word for who
+ * they are.
+ */
+function Waitlist({
+  requests,
+  act,
+}: {
+  requests: AccessRequest[];
+  act: <T>(fn: () => Promise<T>) => Promise<void>;
+}) {
+  const [showDecided, setShowDecided] = useState(false);
+  const pending = requests.filter((r) => r.status === "pending");
+  const decided = requests.filter((r) => r.status !== "pending");
+
+  // Nothing waiting and nothing ever decided: say nothing at all rather than
+  // showing an empty table for a queue this installation may never use.
+  if (requests.length === 0) return null;
+
+  const shown = showDecided ? requests : pending;
+
+  return (
+    <div style={{ marginBottom: 26 }}>
+      <div className="between" style={{ marginBottom: 10 }}>
+        <span className="label" style={{ margin: 0 }}>
+          Access requests
+          {pending.length > 0 && (
+            <span
+              style={{
+                marginLeft: 8,
+                fontSize: 11,
+                padding: "1px 7px",
+                borderRadius: 10,
+                background: "var(--accent)",
+                color: "#fff",
+              }}
+            >
+              {pending.length}
+            </span>
+          )}
+        </span>
+        {decided.length > 0 && (
+          <button
+            className="btn link"
+            style={{ fontSize: 12.5 }}
+            onClick={() => setShowDecided(!showDecided)}
+          >
+            {showDecided ? "Pending only" : `Show decided (${decided.length})`}
+          </button>
+        )}
+      </div>
+
+      {shown.length === 0 ? (
+        <div className="card empty">Nothing waiting.</div>
+      ) : (
+        <div className="card">
+          <div className="thead rowgrid request-row">
+            <span>Verified address</span>
+            <span>Name</span>
+            <span>Via</span>
+            <span>Asked</span>
+            <span />
+          </div>
+          {shown.map((r) => (
+            <div key={r.id} className="trow rowgrid request-row">
+              <span style={{ fontWeight: 500 }}>{r.email}</span>
+              <span style={{ fontSize: 13, color: "var(--text-2)" }}>{r.name || "—"}</span>
+              <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>{r.provider}</span>
+              <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>
+                {new Date(r.created_at * 1000).toLocaleDateString()}
+                {/* Still trying, versus gave up in March. */}
+                {r.last_seen_at > r.created_at && (
+                  <span style={{ color: "var(--text-3)" }}>
+                    {" "}
+                    · back {new Date(r.last_seen_at * 1000).toLocaleDateString()}
+                  </span>
+                )}
+              </span>
+              <span style={{ textAlign: "right" }}>
+                {r.status === "pending" ? (
+                  <>
+                    <button
+                      className="btn link"
+                      style={{ fontSize: 12.5 }}
+                      onClick={() => act(() => api.approveAccess(r.id))}
+                    >
+                      Approve
+                    </button>
+                    <button
+                      className="btn link"
+                      style={{ fontSize: 12.5, marginLeft: 12, color: "var(--path-fg)" }}
+                      onClick={() => act(() => api.declineAccess(r.id))}
+                    >
+                      Decline
+                    </button>
+                  </>
+                ) : (
+                  <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>{r.status}</span>
+                )}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

@@ -167,9 +167,23 @@ func (s *Server) handleOIDCCallback(w http.ResponseWriter, r *http.Request) {
 	switch {
 	case errors.Is(err, errNoAccount):
 		// Named separately from a failure: the person authenticated fine and
-		// simply has no account here, which an administrator fixes.
+		// simply has no account here. Rather than leaving them at a dead end
+		// with an address to go and find, put them in the queue — everything
+		// needed to decide has just been verified, so there is nothing for them
+		// to fill in.
+		//
+		// Recorded even when it fails to record: the redirect is the same
+		// either way, because "we could not write your request down" is not
+		// something the person can act on, and the sign-in has still not
+		// produced an account.
 		log.Printf("api: %s sign-in by %q has no account here", s.oidc.name, claims.Email)
-		http.Redirect(w, r, "/?error=sso_no_account", http.StatusSeeOther)
+		if _, rErr := s.identity.RecordAccessRequest(
+			r.Context(), s.oidc.name, claims.Sub, claims.Email, claims.Name); rErr != nil {
+			log.Printf("api: recording access request for %q: %v", claims.Email, rErr)
+			http.Redirect(w, r, "/?error=sso_no_account", http.StatusSeeOther)
+			return
+		}
+		http.Redirect(w, r, "/?error=sso_waitlisted", http.StatusSeeOther)
 		return
 	case errors.Is(err, errAccountDisabled):
 		http.Redirect(w, r, "/?error=sso_disabled", http.StatusSeeOther)
