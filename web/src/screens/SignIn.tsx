@@ -12,11 +12,23 @@ import { api, setToken, type Me } from "../api";
  * startup and this screen takes it — and then immediately asks for the account
  * to create, because the token's only purpose is to make that account.
  */
-export default function SignIn({ me, onDone }: { me: Me; onDone: () => void }) {
+export default function SignIn({
+  me,
+  onDone,
+  onCancel,
+}: {
+  me: Me;
+  onDone: () => void;
+  onCancel?: () => void;
+}) {
   // Bootstrapping wins: an installation with no administrator has no account to
   // sign in to, however you would otherwise authenticate.
+  //
+  // No way out of it either: there is exactly one thing to do with a fresh
+  // installation, and offering to leave would put a marketing page in front of
+  // the only action available.
   if (me.needs_bootstrap) return <Bootstrap onDone={onDone} />;
-  return <Password onDone={onDone} sso={!!me.sso_enabled} />;
+  return <Password onDone={onDone} sso={!!me.sso_enabled} onCancel={onCancel} />;
 }
 
 /** The error codes the CILogon callback redirects back with. */
@@ -56,7 +68,15 @@ function Card({ children }: { children: React.ReactNode }) {
   );
 }
 
-function Password({ onDone, sso }: { onDone: () => void; sso: boolean }) {
+function Password({
+  onDone,
+  sso,
+  onCancel,
+}: {
+  onDone: () => void;
+  sso: boolean;
+  onCancel?: () => void;
+}) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   // The callback redirects back to "/?error=..." rather than rendering its own
@@ -97,6 +117,18 @@ function Password({ onDone, sso }: { onDone: () => void; sso: boolean }) {
     <p className="err" style={{ fontSize: 12.5, margin: "0 0 16px" }}>
       {err}
     </p>
+  ) : null;
+
+  // Signing in is a choice made on the landing page, so it has to be one that
+  // can be unmade. Without this the only ways back are the browser's back
+  // button and editing the URL — and neither is obvious to someone who clicked
+  // "Sign in" to see what it did.
+  const escape = onCancel ? (
+    <div style={{ textAlign: "center", marginTop: 18 }}>
+      <button type="button" className="btn link" style={{ fontSize: 12.5 }} onClick={onCancel}>
+        ← Back to VariantHub
+      </button>
+    </div>
   ) : null;
 
   const localForm = (
@@ -152,6 +184,7 @@ function Password({ onDone, sso }: { onDone: () => void; sso: boolean }) {
         </p>
         {banner}
         {localForm}
+        {escape}
       </Card>
     );
   }
@@ -230,6 +263,8 @@ function Password({ onDone, sso }: { onDone: () => void; sso: boolean }) {
           {localForm}
         </div>
       )}
+
+      {escape}
 
       {showInfo && <CILogonInfo onClose={() => setShowInfo(false)} />}
     </Card>

@@ -255,7 +255,21 @@ export default function App() {
     if (!signIn && !me?.needs_bootstrap) {
       return <Landing me={me ?? fallbackMe} onSignIn={() => setSignIn(true)} />;
     }
-    return <SignIn me={me ?? fallbackMe} onDone={() => location.reload()} />;
+    return (
+      <SignIn
+        me={me ?? fallbackMe}
+        onDone={() => location.reload()}
+        onCancel={() => {
+          // Drop the ?error= as well as closing the screen. Left in place it
+          // reopens sign-in on the next reload, so the way out would not stay
+          // out.
+          if (location.search) {
+            history.replaceState(null, "", location.pathname);
+          }
+          setSignIn(false);
+        }}
+      />
+    );
   }
 
   return (
