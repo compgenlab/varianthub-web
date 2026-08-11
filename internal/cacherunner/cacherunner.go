@@ -44,6 +44,9 @@ type Runner struct {
 	// administrator turning the cache off takes effect on the next job rather
 	// than on the next restart.
 	Site func(ctx context.Context) catalog.Site
+	// MaxRuns caps how many engine invocations one job may be split into. Zero
+	// means defaultMaxRuns.
+	MaxRuns int
 }
 
 var _ runner.Runner = (*Runner)(nil)
@@ -61,12 +64,12 @@ func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Resul
 		return r.Inner.Annotate(ctx, req)
 	}
 
-	work := p.remaining(hits)
+	work := p.remaining(hits, r.MaxRuns)
 	if work.bail {
 		return r.Inner.Annotate(ctx, req)
 	}
-	note(req, fmt.Sprintf("··· cache: %d/%d variant(s) served whole, %d source(s) skipped, asking varhub for %d",
-		len(p.loci)-len(work.loci), len(p.loci), len(work.skipped), len(work.loci)))
+	note(req, fmt.Sprintf("··· cache: %d/%d variant(s) served whole, %d source(s) skipped, %d varhub run(s) for %d",
+		len(p.loci)-len(work.loci), len(p.loci), len(work.skipped), len(work.groups), len(work.loci)))
 
 	fresh, res, err := r.compute(ctx, req, p, work)
 	if err != nil {
@@ -100,25 +103,49 @@ func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Resul
 // home, no source reads. It still owes the caller a column model, which the
 // inner runner can supply without annotating.
 func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work remainder) (map[string]map[string]any, runner.Result, error) {
-	if len(work.loci) == 0 || len(work.ask) == 0 {
+	if len(work.groups) == 0 {
 		note(req, "··· cache: answered entirely from cache; varhub not invoked")
 		return nil, runner.Result{
 			Log: "every variant answered from the shared annotation cache",
 		}, nil
 	}
 
-	sub := req
-	sub.Selection = strings.Join(work.ask, ",")
-	sub.Body = requestBody(req.Kind, work.loci)
-	res, err := r.Inner.Annotate(ctx, sub)
-	if err != nil {
-		return nil, runner.Result{}, err
+	fresh := map[string]map[string]any{}
+	var out runner.Result
+	for i, g := range work.groups {
+		note(req, fmt.Sprintf("··· cache: run %d/%d — %d variant(s), %d annotation(s)",
+			i+1, len(work.groups), len(g.loci), len(g.ask)))
+		sub := req
+		sub.Selection = strings.Join(g.ask, ",")
+		sub.Body = requestBody(req.Kind, g.loci)
+		res, err := r.Inner.Annotate(ctx, sub)
+		if err != nil {
+			return nil, runner.Result{}, err
+		}
+		values, err := decodeVariants(res.Variants)
+		if err != nil {
+			return nil, runner.Result{}, err
+		}
+		// No group asks about a name another group asked about — each source
+		// belongs to exactly one — so merging cannot overwrite a real value with
+		// another run's null.
+		for key, ann := range values {
+			if have, ok := fresh[key]; ok {
+				for name, v := range ann {
+					have[name] = v
+				}
+				continue
+			}
+			fresh[key] = ann
+		}
+		if i == 0 {
+			out = res
+			continue
+		}
+		out.Columns = append(out.Columns, res.Columns...)
+		out.Log += "\n" + res.Log
 	}
-	fresh, err := decodeVariants(res.Variants)
-	if err != nil {
-		return nil, runner.Result{}, err
-	}
-	return fresh, res, nil
+	return fresh, out, nil
 }
 
 // store writes back what the engine just computed, for the sources that may be
@@ -360,21 +387,46 @@ func (p *plan) classify(fields []catalog.Field) bool {
 // remainder is the work the cache could not do: which loci still need the
 // engine, what to ask it for, and which sources it need not consult.
 type remainder struct {
-	loci    []anncache.Locus
-	ask     []string // effective names to select
+	// loci are every survivor, across all groups, in input order.
+	loci []anncache.Locus
+	// groups are the engine invocations to make. More than one only when
+	// splitting spares an expensive source work it has already done.
+	groups  []group
 	skipped map[string]bool
 	// bail asks the caller to run the original request untouched. Distinct from
-	// an empty ask, which means the opposite — that there is nothing left to run.
+	// an empty group list, which means the opposite — nothing left to run.
 	bail bool
 }
+
+// group is one invocation: some variants, and the names to ask about them.
+type group struct {
+	loci []anncache.Locus
+	ask  []string
+}
+
+// owed pairs a source with the survivors it has not answered for.
+type owed struct {
+	sp   *sourcePlan
+	loci []anncache.Locus
+}
+
+// defaultMaxRuns caps how many engine invocations one job may become.
+//
+// Each is a process, a materialized home and a fresh read of the manifests, so
+// splitting has to buy more than it costs. Three allows the shared group plus
+// the two most worthwhile expensive sources — past that, the loci spared stop
+// being worth the processes spent sparing them.
+const defaultMaxRuns = 3
 
 // remaining works out the reduced request, in the order the wins matter.
 //
 // First drop variants nothing is missing for: those cost nothing at all. Then,
-// across whatever is left, drop the sources that are cached for every one of
-// them — which is the case of a source added to an existing snapshot, answered
-// in a single invocation rather than one per source.
-func (p *plan) remaining(hits anncache.Hits) remainder {
+// across whatever is left, drop the sources cached for every one of them — the
+// case of a source added to an existing snapshot, answered in a single
+// invocation rather than one per source. Then, and only where it pays, split
+// what remains so an expensive source is not asked about variants it already
+// knows.
+func (p *plan) remaining(hits anncache.Hits, maxRuns int) remainder {
 	work := remainder{skipped: map[string]bool{}}
 
 	for _, l := range p.loci {
@@ -387,34 +439,116 @@ func (p *plan) remaining(hits anncache.Hits) remainder {
 		return work
 	}
 
-	ask := append([]string{}, p.passthrough...)
+	// Which survivors each source still owes an answer for. A source owing
+	// nothing is skipped outright.
+	var pending []owed
 	for _, sp := range p.cacheable {
-		missing := false
+		var miss []anncache.Locus
 		for _, l := range work.loci {
 			if _, ok := hits.Get(l.Key(), sp.ref); !ok {
-				missing = true
-				break
+				miss = append(miss, l)
 			}
 		}
-		if !missing {
+		if len(miss) == 0 {
 			work.skipped[sp.ref] = true
 			continue
 		}
-		for name := range sp.fields {
+		pending = append(pending, owed{sp: sp, loci: miss})
+	}
+
+	// A source gets an invocation of its own when it is expensive and owed for
+	// only some of the survivors. Expensive means a network round trip or a
+	// container start per query, so asking it about a variant it already answered
+	// is the costliest thing this can get wrong — and splitting is only worth an
+	// extra process when there is a real subset to spare it.
+	//
+	// Cheap sources never split. They are a local read, and a second varhub
+	// invocation costs more than reading a few extra loci from disk.
+	own, shared := []owed{}, []owed{}
+	for _, o := range pending {
+		if o.sp.expensive && len(o.loci) < len(work.loci) {
+			own = append(own, o)
+			continue
+		}
+		shared = append(shared, o)
+	}
+	// Fewest loci first: that is the largest saving per process spent.
+	sort.SliceStable(own, func(i, j int) bool { return len(own[i].loci) < len(own[j].loci) })
+	if maxRuns < 1 {
+		maxRuns = defaultMaxRuns
+	}
+	// One run is reserved for the shared group whenever it has anything to ask.
+	budget := maxRuns - 1
+	if len(shared) == 0 && len(p.passthrough) == 0 {
+		budget = maxRuns
+	}
+	if len(own) > budget {
+		// Folded back rather than dropped: a capped split still answers
+		// everything, it just asks a wider question than it had to.
+		shared = append(shared, own[budget:]...)
+		own = own[:budget]
+	}
+
+	// The shared group covers whatever its own members are owed for — or every
+	// survivor, when a passthrough name means the engine has to see them all.
+	if len(shared) > 0 || len(p.passthrough) > 0 {
+		ask := append([]string{}, p.passthrough...)
+		for _, o := range shared {
+			for name := range o.sp.fields {
+				ask = append(ask, name)
+			}
+		}
+		loci := work.loci
+		if len(p.passthrough) == 0 {
+			loci = unionLoci(work.loci, shared)
+		}
+		work.groups = append(work.groups, group{loci: loci, ask: sortedSet(ask)})
+	}
+	for _, o := range own {
+		var ask []string
+		for name := range o.sp.fields {
 			ask = append(ask, name)
 		}
+		work.groups = append(work.groups, group{loci: o.loci, ask: sortedSet(ask)})
 	}
-	sort.Strings(ask)
-	work.ask = dedup(ask)
 
 	// One argv entry has a limit, and a selection expanded past it is not worth
 	// failing over: hand the original request back instead, which is always
-	// correct and merely uncached. Deliberately not an empty ask — that means
-	// there is nothing left to run, which is the opposite instruction.
-	if len(strings.Join(work.ask, ",")) > maxSelectionArg {
-		return remainder{bail: true}
+	// correct and merely uncached. Deliberately not an empty group list — that
+	// means there is nothing left to run, which is the opposite instruction.
+	for _, g := range work.groups {
+		if len(strings.Join(g.ask, ",")) > maxSelectionArg {
+			return remainder{bail: true}
+		}
 	}
 	return work
+}
+
+// unionLoci keeps the loci at least one of these sources is owed for, in the
+// original order.
+//
+// Order preserved because the engine reports results in the order it was given
+// them, and because it is the input's order — a caller reading a VCF's rows back
+// expects the file's order however the work was divided.
+func unionLoci(all []anncache.Locus, owe []owed) []anncache.Locus {
+	want := map[string]bool{}
+	for _, o := range owe {
+		for _, l := range o.loci {
+			want[l.Key()] = true
+		}
+	}
+	out := make([]anncache.Locus, 0, len(want))
+	for _, l := range all {
+		if want[l.Key()] {
+			out = append(out, l)
+		}
+	}
+	return out
+}
+
+func sortedSet(in []string) []string {
+	sort.Strings(in)
+	return dedup(in)
 }
 
 func (p *plan) allCached(hits anncache.Hits, key string) bool {

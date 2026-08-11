@@ -145,6 +145,18 @@ const clinvarTOML = `[[sources]]
     field = "CLNSIG"
 `
 
+// A tool: every query is a container start, which is what makes sparing it work
+// worth an extra process.
+const vepTOML = `[[sources]]
+  type    = "tool"
+  name    = "vep"
+  version = "113"
+
+  [[sources.annotations]]
+    name  = "consequence"
+    field = "Consequence"
+`
+
 type harness struct {
 	t      *testing.T
 	engine *fakeEngine
@@ -169,6 +181,8 @@ func newHarness(t *testing.T, values map[string]map[string]any, sources ...strin
 			Visibility: catalog.VisibilityPublic, TOML: gnomadTOML},
 		"clinvar": {ID: "clinvar", Name: "clinvar", Version: "2026-01", Kind: "vcf", Build: "GRCh38",
 			Visibility: catalog.VisibilityPublic, TOML: clinvarTOML},
+		"vep": {ID: "vep", Name: "vep", Version: "113", Kind: "tool", Build: "GRCh38",
+			Visibility: catalog.VisibilityPublic, TOML: vepTOML},
 	}
 	if len(sources) == 0 {
 		sources = []string{"vbuiltins", "sbuiltins", "gnomad", "clinvar"}
@@ -758,6 +772,100 @@ func TestParseLociNormalizesTheWayTheEngineDoes(t *testing.T) {
 	for _, bad := range []string{"", "rs123", "chr1:100:A", "chr1:x:A:T", "chr1:100:A:T:extra"} {
 		if _, ok := parseLoci(bad); ok {
 			t.Errorf("parseLoci(%q) accepted an input it cannot key", bad)
+		}
+	}
+}
+
+// Asking a tool about variants it has already answered is the costliest thing
+// this can get wrong: every one of them is a container start. So when it is owed
+// for only some of the survivors, it gets an invocation of its own over exactly
+// those.
+func TestAnExpensiveSourceIsNotAskedAboutWhatItAlreadyKnows(t *testing.T) {
+	h := newHarness(t, vals(map[string]map[string]any{
+		"chr1:100:A:T": {"auto_id": "id1", "tstv": "ts", "consequence": "missense", "af": 0.25, "ac": 4.0},
+		"chr1:200:G:C": {"auto_id": "id2", "tstv": "ts", "consequence": "synonymous", "af": 0.10, "ac": 2.0},
+		"chr1:300:T:A": {"auto_id": "id3", "tstv": "tv", "consequence": "stop_gained", "af": 0.05, "ac": 1.0},
+	}), "vbuiltins", "gnomad", "vep")
+
+	// The tool has answered for the first two variants and nothing else has.
+	h.run("consequence", "chr1:100:A:T", "chr1:200:G:C")
+	h.engine.reset()
+
+	got := h.run("auto_id,consequence,af", "chr1:100:A:T", "chr1:200:G:C", "chr1:300:T:A")
+	calls := h.engine.took()
+	if len(calls) != 2 {
+		t.Fatalf("made %d engine call(s), want 2 — the tool was not given its own run", len(calls))
+	}
+
+	var toolRun, sharedRun *runner.Request
+	for i := range calls {
+		if contains(strings.Split(calls[i].Selection, ","), "consequence") {
+			toolRun = &calls[i]
+		} else {
+			sharedRun = &calls[i]
+		}
+	}
+	if toolRun == nil || sharedRun == nil {
+		t.Fatalf("expected one tool run and one shared run, got %q and %q",
+			calls[0].Selection, calls[1].Selection)
+	}
+	if body := strings.Fields(string(toolRun.Body)); len(body) != 1 || body[0] != "chr1:300:T:A" {
+		t.Errorf("the tool was asked about %v, want only the variant it had not answered", body)
+	}
+	// The cheap sources are not split off; a second process costs more than
+	// reading a few extra loci from local disk.
+	if n := len(strings.Fields(string(sharedRun.Body))); n != 3 {
+		t.Errorf("the shared run covered %d variant(s), want 3", n)
+	}
+	// And the answer is whole.
+	for i, v := range got {
+		for _, name := range []string{"auto_id", "consequence", "af"} {
+			if v.Annotations[name] == nil {
+				t.Errorf("row %d lost %s: %v", i, name, v.Annotations)
+			}
+		}
+	}
+}
+
+// Splitting is only worth an extra process when there is a subset to spare. A
+// source owed for every survivor has nothing to skip, so it rides along.
+func TestASourceOwedForEverythingIsNotSplitOff(t *testing.T) {
+	h := newHarness(t, vals(map[string]map[string]any{
+		"chr1:100:A:T": {"auto_id": "id1", "consequence": "missense"},
+		"chr1:200:G:C": {"auto_id": "id2", "consequence": "synonymous"},
+	}), "vbuiltins", "vep")
+
+	h.run("auto_id,consequence", "chr1:100:A:T", "chr1:200:G:C")
+	if n := len(h.engine.took()); n != 1 {
+		t.Errorf("a cold job made %d engine call(s), want 1", n)
+	}
+}
+
+// A capped split still answers everything; it just asks a wider question than it
+// had to. Dropping the excess would silently lose values.
+func TestTheRunCapFoldsBackRatherThanDropping(t *testing.T) {
+	h := newHarness(t, vals(map[string]map[string]any{
+		"chr1:100:A:T": {"auto_id": "id1", "consequence": "missense", "af": 0.25, "ac": 4.0, "clnsig": "Pathogenic"},
+		"chr1:200:G:C": {"auto_id": "id2", "consequence": "synonymous", "af": 0.10, "ac": 2.0, "clnsig": "Benign"},
+		"chr1:300:T:A": {"auto_id": "id3", "consequence": "stop_gained", "af": 0.05, "ac": 1.0, "clnsig": "VUS"},
+	}), "vbuiltins", "gnomad", "clinvar", "vep")
+	h.r.MaxRuns = 1 // no budget for any split at all
+
+	// Give each expensive source a different subset to be owed for.
+	h.run("consequence", "chr1:100:A:T", "chr1:200:G:C")
+	h.run("af", "chr1:100:A:T")
+	h.engine.reset()
+
+	got := h.run("auto_id,consequence,af,clnsig",
+		"chr1:100:A:T", "chr1:200:G:C", "chr1:300:T:A")
+	if n := len(h.engine.took()); n != 1 {
+		t.Errorf("made %d engine call(s), want 1 under a cap of 1", n)
+	}
+	for i, v := range got {
+		for _, name := range []string{"auto_id", "consequence", "af", "clnsig"} {
+			if v.Annotations[name] == nil {
+				t.Errorf("row %d lost %s under the cap: %v", i, name, v.Annotations)
+			}
 		}
 	}
 }
