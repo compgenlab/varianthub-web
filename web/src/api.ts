@@ -215,6 +215,15 @@ export interface Annotation {
   default?: boolean;
 }
 
+/** The deployment's own settings, from /admin/settings. */
+export type SiteSettings = {
+  allow_anonymous: boolean;
+  cache_enabled: boolean;
+  cache_max_entries: number;
+  /** A Go duration string ("2160h"); empty means unbounded. */
+  cache_max_age: string;
+};
+
 /** One storage location's reachability, from /admin/storage/check. */
 export interface StorageHealth {
   id: string;
@@ -640,6 +649,29 @@ export const api = {
 
   revokeToken: (id: string) =>
     req<void>(`/auth/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // --- deployment settings ---
+  //
+  // Three views of each setting: what the file says, what an administrator has
+  // overridden, and what actually applies. The form needs all three to show a
+  // value as inherited or overridden, and "revert" is sending an empty string.
+  settings: () =>
+    req<{
+      defaults: SiteSettings;
+      overrides: Record<string, string>;
+      effective: SiteSettings;
+      keys: string[];
+      cache_available: boolean;
+    }>("/admin/settings"),
+
+  saveSettings: (values: Record<string, string>) =>
+    req<{ effective: SiteSettings }>("/admin/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    }),
+
+  clearCache: () => req<{ cleared: boolean }>("/admin/cache/clear", { method: "POST" }),
 
   users: () => req<{ users: User[] }>("/admin/users"),
 

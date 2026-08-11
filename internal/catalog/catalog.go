@@ -139,11 +139,19 @@ type Store struct {
 	// Where asset content lives when it is not inline. Nil keeps it in the
 	// database, which is what an installation with no storage configured does.
 	blobs AssetBlobs
+	// Deployment settings, cached briefly: see site.go. A pointer so a derived
+	// store (WithAssetBlobs) shares one cache rather than copying a mutex — and
+	// so both see a change the moment either writes one.
+	site *siteCache
 }
 
 // New wraps a pool.
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool, nowFn: func() int64 { return time.Now().Unix() }}
+	return &Store{
+		pool:  pool,
+		nowFn: func() int64 { return time.Now().Unix() },
+		site:  &siteCache{},
+	}
 }
 
 // Open connects to Postgres and returns a Store. The caller must Close it.

@@ -114,7 +114,7 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if s.cfg.AllowAnonymous && c.Credentialed() {
+		if s.allowAnonymous(r) && c.Credentialed() {
 			h.ServeHTTP(w, r)
 			return
 		}
@@ -122,11 +122,11 @@ func (s *Server) requireAuth(h http.Handler) http.Handler {
 		// requiring one would turn AllowAnonymous into "allow nobody". A
 		// deployment without accounts is the one case where anonymous really
 		// does mean "no credential".
-		if s.cfg.AllowAnonymous && s.identity == nil {
+		if s.allowAnonymous(r) && s.identity == nil {
 			h.ServeHTTP(w, r)
 			return
 		}
-		if s.cfg.AllowAnonymous {
+		if s.allowAnonymous(r) {
 			// Distinguished from "sign in": there is nothing to sign in to, and
 			// the fix is to use a token or to load the site in a browser.
 			writeError(w, http.StatusUnauthorized,
@@ -240,7 +240,7 @@ func (s *Server) handleMe(w http.ResponseWriter, r *http.Request) {
 		// needs this to decide between showing the app and showing a login
 		// wall — without it the two disagree, and a server that permits
 		// anonymous use still looks closed from the browser.
-		"allow_anonymous": s.cfg.AllowAnonymous,
+		"allow_anonymous": s.site(r.Context()).AllowAnonymous,
 	}
 	if c.User != nil {
 		out["user"] = c.User
@@ -431,7 +431,7 @@ func (s *Server) webOnly(h http.Handler) http.Handler {
 // bookkeeping for nothing.
 func (s *Server) issueAnonSession(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.identity == nil || !s.cfg.AllowAnonymous {
+		if s.identity == nil || !s.allowAnonymous(r) {
 			h.ServeHTTP(w, r)
 			return
 		}

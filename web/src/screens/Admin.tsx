@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import SiteSettingsTab from "./SiteSettings";
 import { Link } from "react-router-dom";
 import { Check, Cloud, Globe, HardDrive, Plus, RefreshCw, Trash2, X } from "lucide-react";
 
@@ -43,7 +44,7 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots" | "builds";
+type Tab = "sources" | "snapshots" | "builds" | "settings";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -115,7 +116,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots", "builds"] as Tab[]).map((t) => (
+        {(["sources", "snapshots", "builds", "settings"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -130,14 +131,22 @@ export default function Admin() {
               color: tab === t ? "var(--text)" : "var(--text-2)",
             }}
           >
-            {t === "sources" ? "Sources" : t === "snapshots" ? "Snapshots" : "Genome builds"}
+            {t === "sources"
+              ? "Sources"
+              : t === "snapshots"
+                ? "Snapshots"
+                : t === "builds"
+                  ? "Genome builds"
+                  : "Settings"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "builds" ? (
+      {tab === "settings" ? (
+        <SiteSettingsTab />
+      ) : tab === "builds" ? (
         <BuildList />
       ) : tab === "sources" ? (
         <>

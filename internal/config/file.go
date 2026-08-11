@@ -41,6 +41,12 @@ type fileConfig struct {
 		URL string `toml:"url"`
 	} `toml:"database"`
 
+	Cache struct {
+		Enabled    *bool  `toml:"enabled"`
+		MaxEntries *int64 `toml:"max_entries"`
+		MaxAge     string `toml:"max_age"`
+	} `toml:"cache"`
+
 	Auth struct {
 		AllowAnonymous *bool `toml:"allow_anonymous"`
 		CILogon        struct {
@@ -159,6 +165,15 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setStr(&c.VarhubHome, f.Worker.VarhubHome)
 	setStr(&c.DataDir, f.Worker.DataDir)
 	setStr(&c.CacheDir, f.Worker.CacheDir)
+	if f.Cache.Enabled != nil {
+		c.CacheEnabled = *f.Cache.Enabled
+	}
+	if f.Cache.MaxEntries != nil {
+		c.CacheMaxEntries = *f.Cache.MaxEntries
+	}
+	if f.Cache.MaxAge != "" {
+		c.CacheMaxAge = f.Cache.MaxAge
+	}
 	if f.Worker.NoCache != nil {
 		c.NoCache = *f.Worker.NoCache
 	}

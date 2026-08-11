@@ -106,7 +106,7 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
 
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
+	if err := m.writeWithCache(ctx, dir, snap, cacheDir, roots, assets, settings,
 		m.References); err != nil {
 		cleanup()
 		return "", nil, err
@@ -114,11 +114,11 @@ func (m *Materializer) Home(ctx context.Context, snapshot string) (string, func(
 	return dir, cleanup, nil
 }
 
-func (m *Materializer) write(dir string, snap Snapshot) error {
-	return m.writeWithCache(dir, snap, m.CacheDir, nil, nil, nil, m.References)
+func (m *Materializer) write(ctx context.Context, dir string, snap Snapshot) error {
+	return m.writeWithCache(ctx, dir, snap, m.CacheDir, nil, nil, nil, m.References)
 }
 
-func (m *Materializer) writeWithCache(dir string, snap Snapshot, cacheDir string,
+func (m *Materializer) writeWithCache(ctx context.Context, dir string, snap Snapshot, cacheDir string,
 	roots map[string]string, assets map[string][]Asset,
 	settings map[string]SourceSettings, references map[string]string) error {
 
@@ -372,7 +372,7 @@ func (m *Materializer) HomeForSources(ctx context.Context, sourceIDs []string) (
 		return "", nil, fmt.Errorf("create provisioning home: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(dir) }
-	if err := m.writeWithCache(dir, snap, cacheDir, roots, assets, settings,
+	if err := m.writeWithCache(ctx, dir, snap, cacheDir, roots, assets, settings,
 		m.References); err != nil {
 		cleanup()
 		return "", nil, err
