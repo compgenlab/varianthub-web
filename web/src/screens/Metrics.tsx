@@ -14,6 +14,7 @@ import {
 
 import { api, type Metrics as MetricsData } from "../api";
 import { humanSize } from "./Files";
+import Usage from "./Usage";
 
 function humanCount(n: number): string {
   return n.toLocaleString();
@@ -91,7 +92,7 @@ export default function Metrics() {
   if (err) {
     return (
       <div className="page page-wide" style={{ paddingTop: 30 }}>
-        <h1 className="title">Metrics</h1>
+        <h1 className="title">Usage &amp; Metrics</h1>
         <p className="err" style={{ marginTop: 16, fontSize: 13 }}>
           {err}
         </p>
@@ -101,7 +102,7 @@ export default function Metrics() {
   if (!m) {
     return (
       <div className="page page-wide" style={{ paddingTop: 30 }}>
-        <h1 className="title">Metrics</h1>
+        <h1 className="title">Usage &amp; Metrics</h1>
         <p className="lede" style={{ marginTop: 16 }}>
           Loading…
         </p>
@@ -121,7 +122,16 @@ export default function Metrics() {
 
   return (
     <div className="page page-wide" style={{ paddingTop: 30 }}>
-      <h1 className="title">Metrics</h1>
+      <h1 className="title">Usage &amp; Metrics</h1>
+
+      {/* Who has been asking, then what the machine did about it. People first:
+          "is anyone using this" is the question somebody opens this page with,
+          and queue depth only means something once you know. */}
+      <Usage />
+
+      <h2 className="subtitle" style={{ marginTop: 34 }}>
+        Service
+      </h2>
       <p className="lede" style={{ fontSize: 13.5, margin: "6px 0 20px" }}>
         Annotation throughput, what the queue is doing right now, and where source
         data lives.

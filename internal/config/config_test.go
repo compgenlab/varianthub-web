@@ -245,6 +245,30 @@ func TestExampleFileIsValid(t *testing.T) {
 	if len(c.TrustedProxy) != len(d.TrustedProxy) {
 		t.Errorf("trusted_proxies: example %v, defaults %v", c.TrustedProxy, d.TrustedProxy)
 	}
+	// The service limits, field by field. A setting the example omits still
+	// loads — it just falls back to the default and reads as documented when it
+	// is not, which is the drift this whole test exists to catch. Naming each
+	// one means adding a tier to the code and not to the file fails here rather
+	// than in somebody's deployment.
+	for _, f := range []struct {
+		key             string
+		example, actual int
+	}{
+		{"anon_concurrent", c.AnonConcurrent, d.AnonConcurrent},
+		{"anon_per_hour", c.AnonPerHour, d.AnonPerHour},
+		{"standard_concurrent", c.StandardConcurrent, d.StandardConcurrent},
+		{"standard_per_hour", c.StandardPerHour, d.StandardPerHour},
+		{"elevated_concurrent", c.ElevatedConcurrent, d.ElevatedConcurrent},
+		{"elevated_per_hour", c.ElevatedPerHour, d.ElevatedPerHour},
+	} {
+		if f.example != f.actual {
+			t.Errorf("%s: example says %d, Defaults() says %d", f.key, f.example, f.actual)
+		}
+	}
+	if c.CacheEnabled != d.CacheEnabled || c.CacheMaxEntries != d.CacheMaxEntries {
+		t.Errorf("cache: example %v/%d, defaults %v/%d",
+			c.CacheEnabled, c.CacheMaxEntries, d.CacheEnabled, d.CacheMaxEntries)
+	}
 }
 
 // redactDSN decides whether a file holds a secret, so getting it wrong either

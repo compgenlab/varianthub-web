@@ -184,6 +184,19 @@ func Defaults() *Config {
 		RateBurst:      10,
 		MaxJobsPerIP:   2,
 
+		// The cache on, with a budget. It was absent here, so the zero value
+		// applied and a fresh installation cached nothing at all — while both
+		// example files said enabled = true under a heading promising to
+		// describe the defaults. One of the two had to move, and an annotation
+		// service whose cache is off until somebody notices is the wrong one.
+		//
+		// 50M (variant, source) units is roughly ten sources over a whole
+		// genome. It is the disk a deployment is willing to spend, not a tuning
+		// parameter: being wrong costs recomputation, never correctness.
+		CacheEnabled:    true,
+		CacheMaxEntries: 50_000_000,
+		CacheMaxAge:     "2160h",
+
 		// An anonymous visitor gets one job at a time and one every five
 		// minutes: enough to try the service, not enough to occupy it. An
 		// account gets one at a time and one a minute, which is what a public

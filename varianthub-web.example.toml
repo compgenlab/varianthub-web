@@ -126,10 +126,39 @@ max_entries = 50000000
 max_age     = "2160h"
 
 [limits]
-  # The submit rate applies to anonymous callers only; an account is
-  # accountable, and throttling a signed-in bulk load would make it throttle
-  # itself. The concurrency cap below applies to everyone.
+  # Per-IP, and only for anonymous callers. It is a second line under the
+  # per-account limits below rather than the main one: an account is only
+  # accountable after the fact, and a flood is a problem during it.
   rate_per_min = 30                                 # VHW_RATE_PER_MIN
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
   max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+
+  # What one caller may ask of the service, by tier.
+  #
+  # Two limits enforced in two places. Concurrent jobs are enforced when work is
+  # picked up, so an over-limit job waits rather than being refused; submissions
+  # are enforced at the door and answer 429, because a request that will be
+  # refused should not become a row first.
+  #
+  # Rates are per hour, unlike rate_per_min above — "one job every five minutes"
+  # is what a signed-out visitor should get, and per-minute integers cannot say
+  # it. 0 is unlimited throughout.
+  #
+  # Overridable from Administration → Settings without a redeploy, and a tier is
+  # assigned per account under Users & groups; this file describes a fresh
+  # installation.
+
+  # Signed out. Deliberately the worst: enough to try the service, not enough to
+  # occupy it.
+  anon_concurrent = 1                               # VHW_ANON_CONCURRENT
+  anon_per_hour = 12                                # VHW_ANON_PER_HOUR
+
+  # Every account, unless an administrator moves it.
+  standard_concurrent = 1                           # VHW_STANDARD_CONCURRENT
+  standard_per_hour = 60                            # VHW_STANDARD_PER_HOUR
+
+  # For bulk work, assigned deliberately. There is also an "unlimited" tier,
+  # which has no numbers to set.
+  elevated_concurrent = 5                           # VHW_ELEVATED_CONCURRENT
+  elevated_per_hour = 600                           # VHW_ELEVATED_PER_HOUR
