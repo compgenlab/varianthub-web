@@ -139,3 +139,33 @@ func TestABadFieldSavesNothing(t *testing.T) {
 		t.Error("the valid half of a rejected form was written anyway")
 	}
 }
+
+// A settings read that fails must still hand back something usable.
+//
+// A rollout applies the new deployments before the migration job runs, so a
+// process on a new release routinely starts against a schema a minute behind it
+// — and on a fresh cluster, against no site_setting table at all. The worker
+// carries on with the configured defaults in that window; if this returned a
+// zero Site instead, it would silently come up with the cache off and every
+// other setting at its zero value, which is a far worse outcome than a late
+// start.
+func TestEffectiveSiteFallsBackWhenSettingsCannotBeRead(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	if _, err := s.pool.Exec(ctx, `DROP TABLE site_setting`); err != nil {
+		t.Fatalf("drop site_setting: %v", err)
+	}
+
+	defaults := Site{
+		AllowAnonymous: true, CacheEnabled: true,
+		CacheMaxEntries: 5_000_000, CacheMaxAgeText: "2160h",
+	}
+	got, err := s.EffectiveSite(ctx, defaults)
+	if err == nil {
+		t.Error("EffectiveSite reported no error for a missing table; the caller " +
+			"has no way to say why it is using defaults")
+	}
+	if got != defaults {
+		t.Errorf("Site = %+v, want the defaults %+v", got, defaults)
+	}
+}

@@ -286,9 +286,22 @@ func withCache(ctx context.Context, cfg *config.Config, cat *catalog.Store,
 		return exec, noop, nil
 	}
 
-	site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
-	if err != nil {
-		return nil, nil, fmt.Errorf("read site settings: %w", err)
+	// Settings that cannot be read are not a reason to refuse to start. A rollout
+	// applies the new deployments before the migration job runs, so a worker on a
+	// new release routinely comes up against a schema that is a minute behind it
+	// — and on a fresh cluster, against no schema at all. Failing here turns that
+	// window into CrashLoopBackOff, which reads as a broken image rather than as
+	// a migration that has not finished yet.
+	//
+	// The configured defaults are the right thing to fall back on, and the per-job
+	// read below picks the stored values up as soon as they exist, without a
+	// restart.
+	site := catalog.SiteFromConfig(cfg)
+	if stored, err := cat.EffectiveSite(ctx, site); err != nil {
+		log.Printf("worker: site settings unavailable, using the configured defaults "+
+			"(migrations may not have run yet): %v", err)
+	} else {
+		site = stored
 	}
 	if !site.CacheEnabled {
 		log.Printf("worker: annotation cache off by setting; jobs will compute every value")
