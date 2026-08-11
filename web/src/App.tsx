@@ -9,7 +9,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
+import { ChartColumn, ChevronDown, FilePlus2, Github, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
 
 import { api, setToken, type Me } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -185,8 +185,12 @@ function Shell({
         </nav>
         {/* Which build this is, out of the way but not hidden: "what version are
             you running" is the first question when something behaves oddly, and
-            the answer should not require a shell. */}
+            the answer should not require a shell.
+ 
+            The source sits beside it because the two are asked together: knowing
+            the version is only useful if you can go and read what is in it. */}
         <div
+          className="between"
           style={{
             marginTop: "auto",
             padding: "12px 18px",
@@ -194,9 +198,22 @@ function Shell({
             fontSize: 11.5,
             color: "var(--text-3)",
           }}
-          className="mono"
         >
-          {version || "—"}
+          <span className="mono">{version || "—"}</span>
+          <a
+            href="https://github.com/compgenlab/varianthub-web"
+            target="_blank"
+            // noreferrer as well as noopener: the tab this opens has no business
+            // knowing which page sent it, and on an installation reachable from
+            // outside that page may be somebody's results.
+            rel="noopener noreferrer"
+            title="Source on GitHub"
+            className="row gap-8"
+            style={{ color: "inherit", textDecoration: "none" }}
+          >
+            <Github size={13} />
+            <span>Source</span>
+          </a>
         </div>
       </aside>
 
