@@ -109,6 +109,8 @@ export interface User {
   email: string;
   name?: string;
   role: string;
+  /** How much of the service this account may use, as opposed to what it may administer. */
+  tier?: string;
   disabled?: boolean;
   /** No password is stored here — the account signs in through an identity provider. */
   sso?: boolean;
@@ -222,7 +224,51 @@ export type SiteSettings = {
   cache_max_entries: number;
   /** A Go duration string ("2160h"); empty means unbounded. */
   cache_max_age: string;
+
+  /** Service limits per tier. Rates are per hour; 0 is unlimited. */
+  anon_concurrent: number;
+  anon_per_hour: number;
+  standard_concurrent: number;
+  standard_per_hour: number;
+  elevated_concurrent: number;
+  elevated_per_hour: number;
 };
+
+/** A count split by how the work arrived. */
+export interface Split {
+  web: number;
+  api: number;
+  /** Recorded before the origin was tracked. Never folded into the other two. */
+  unknown: number;
+  total: number;
+}
+
+export interface WindowUsage {
+  days: number;
+  jobs: Split;
+  variants: Split;
+  /** Accounts that submitted at least one job. */
+  accounts: number;
+  /** Anonymous sessions that did — browsers, not people. */
+  anonymous: number;
+}
+
+export interface UserUsage {
+  user_id: string;
+  email: string;
+  tier: string;
+  jobs: Split;
+  variants: Split;
+  /** Unix seconds; 0 for an account that never has. */
+  last_submitted: number;
+}
+
+export interface Usage {
+  accounts: number;
+  disabled: number;
+  windows: WindowUsage[];
+  users: UserUsage[];
+}
 
 /** One storage location's reachability, from /admin/storage/check. */
 export interface StorageHealth {
@@ -660,6 +706,8 @@ export const api = {
       cache_available: boolean;
     }>("/admin/settings"),
 
+  usage: () => req<Usage>("/admin/usage"),
+
   saveSettings: (values: Record<string, string>) =>
     req<{ effective: SiteSettings }>("/admin/settings", {
       method: "PUT",
@@ -678,7 +726,10 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
-  updateUser: (id: string, body: { role?: string; disabled?: boolean; password?: string }) =>
+  updateUser: (
+    id: string,
+    body: { role?: string; tier?: string; disabled?: boolean; password?: string },
+  ) =>
     req<{ user: User }>(`/admin/users/${encodeURIComponent(id)}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },

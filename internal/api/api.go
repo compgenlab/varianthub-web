@@ -176,6 +176,7 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("PUT /api/v1/admin/settings", s.handleSetSiteSettings)
 	m.HandleFunc("POST /api/v1/admin/cache/clear", s.handleClearCache)
 	m.HandleFunc("GET /api/v1/admin/metrics", s.handleMetrics)
+	m.HandleFunc("GET /api/v1/admin/usage", s.handleUsage)
 	m.HandleFunc("GET /api/v1/admin/storage", s.handleListStorage)
 	m.HandleFunc("GET /api/v1/admin/storage/check", s.handleCheckStorage)
 	m.HandleFunc("POST /api/v1/admin/storage", s.handleCreateStorage)

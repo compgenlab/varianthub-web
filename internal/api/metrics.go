@@ -179,6 +179,24 @@ type metricsResponse struct {
 	GeneratedAt    int64 `json:"generated_at"`
 }
 
+// handleUsage reports who has been using the installation and how much.
+//
+// Its own endpoint rather than a section of metrics: that one is about the
+// machine — queue depth, bytes on disk — and this is about people. They are read
+// at different times by different people, and one of them scans the job table.
+func (s *Server) handleUsage(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "no catalog configured")
+		return
+	}
+	u, err := s.catalog.Usage(r.Context(), time.Now().Unix())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, u)
+}
+
 // handleMetrics reports queue throughput and storage usage.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()

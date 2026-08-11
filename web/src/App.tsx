@@ -9,7 +9,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
+import { Activity, ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
 
 import { api, setToken, type Me } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -25,6 +25,7 @@ import Account from "./screens/Account";
 import Groups from "./screens/Groups";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
+import Usage from "./screens/Usage";
 import SourceDetail from "./screens/SourceDetail";
 import SnapshotDetail from "./screens/SnapshotDetail";
 import JobDetail from "./screens/JobDetail";
@@ -177,6 +178,9 @@ function Shell({
           <NavLink to="/admin/metrics">
             <ChartColumn /> Metrics
           </NavLink>
+          <NavLink to="/admin/usage">
+            <Activity /> Usage
+          </NavLink>
           <NavLink to="/admin/groups">
             <UsersRound /> Users &amp; groups
           </NavLink>
@@ -306,6 +310,7 @@ export default function App() {
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="/admin/jobs/:jobId" element={<JobDetail />} />
             <Route path="/admin/metrics" element={<Metrics />} />
+            <Route path="/admin/usage" element={<Usage />} />
             <Route path="/admin/groups" element={<Groups me={me ?? anonymousMe} />} />
             <Route path="/account" element={<Account me={me ?? anonymousMe} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />

@@ -14,6 +14,11 @@ import { api, type Me, type Team, type User } from "../api";
  * layer only — renaming the tables would be a migration through the grant
  * model to change a word nobody outside this screen reads.
  */
+// Mirrors catalog.Tiers. The server rejects anything it does not recognize
+// rather than coercing it, so a list that drifts shows up as a refused change
+// rather than as a tier that silently means "standard".
+const TIERS = ["standard", "elevated", "unlimited"];
+
 export default function Groups({ me }: { me: Me }) {
   const [users, setUsers] = useState<User[]>([]);
   const [teams, setTeams] = useState<Team[]>([]);
@@ -73,6 +78,7 @@ export default function Groups({ me }: { me: Me }) {
           <span>Email</span>
           <span>Name</span>
           <span>Role</span>
+          <span>Tier</span>
           <span>Status</span>
           <span />
         </div>
@@ -89,6 +95,23 @@ export default function Groups({ me }: { me: Me }) {
               >
                 <option value="member">member</option>
                 <option value="admin">admin</option>
+              </select>
+            </span>
+            {/* Capacity, not permission: what this account may ask of the
+                service, as opposed to what it may administer. Raising someone's
+                limits should not mean making them an administrator. */}
+            <span>
+              <select
+                className="select"
+                style={{ fontSize: 12.5, padding: "4px 8px" }}
+                value={u.tier || "standard"}
+                onChange={(e) => act(() => api.updateUser(u.id, { tier: e.target.value }))}
+              >
+                {TIERS.map((t) => (
+                  <option key={t} value={t}>
+                    {t}
+                  </option>
+                ))}
               </select>
             </span>
             <span style={{ fontSize: 12.5, color: u.disabled ? "var(--path-fg)" : "var(--benign-fg)" }}>
