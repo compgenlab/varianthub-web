@@ -4,10 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"strings"
 
+	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // handleSiteSettings returns the deployment's settings three ways: as
@@ -78,39 +77,16 @@ func (s *Server) handleClearCache(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"cleared": true})
 }
 
-// clearAnnotationCache truncates the annotation cache.
+// clearAnnotationCache empties the annotation cache.
 //
-// The tables do not exist yet: the cache is moving into this service (see
-// internal/anncache) and until that lands there is nothing to clear, so this
-// no-ops rather than erroring. It is wired up now because the control belongs
-// with the rest of the deployment settings, not because it has work to do.
-//
-// Existence is checked first because TRUNCATE has no IF EXISTS, and "nothing to
-// clear" is success rather than an error about a missing relation.
-//
-// Only the parents are named: values and tool lines follow by CASCADE, the same
-// foreign key that makes eviction remove whole units rather than half of one.
+// Its own connection rather than the catalog's pool, because the cache is not
+// part of the catalog: it is a separate store that happens to share a database,
+// and a deployment could move it to another one without this handler changing.
 func clearAnnotationCache(ctx context.Context, dsn string) error {
-	pool, err := pgxpool.New(ctx, dsn)
+	store, err := anncache.Open(ctx, dsn)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-
-	var present []string
-	for _, t := range []string{"cache_variant_source", "cache_tool_header", "cache_data_source"} {
-		var reg *string
-		if err := pool.QueryRow(ctx, `SELECT to_regclass($1)::text`, t).Scan(&reg); err != nil {
-			return err
-		}
-		if reg != nil {
-			present = append(present, t)
-		}
-	}
-	if len(present) == 0 {
-		return nil
-	}
-	_, err = pool.Exec(ctx,
-		`TRUNCATE TABLE `+strings.Join(present, ", ")+` RESTART IDENTITY CASCADE`)
-	return err
+	defer store.Close()
+	return store.Clear(ctx)
 }
