@@ -2,6 +2,45 @@ import { useEffect, useState } from "react";
 import { AlertTriangle, RotateCcw, Trash2 } from "lucide-react";
 import { api, type SiteSettings as Settings } from "../api";
 
+// The tier limits, least-privileged first: that is the caller a public
+// deployment is protecting itself from, and the number most easily got wrong.
+//
+// Keys mirror catalog.SettingKeys. One that drifts is saved by the form and
+// never read by the server, so it appears to have no effect — which is why the
+// server asserts its own list against its parser.
+const TIER_LIMITS: { key: keyof Settings & string; label: string; hint: string }[] = [
+  {
+    key: "anon_concurrent",
+    label: "Anonymous — at once",
+    hint: "Jobs a signed-out visitor may have running at the same time.",
+  },
+  {
+    key: "anon_per_hour",
+    label: "Anonymous — per hour",
+    hint: "Submissions an hour. 12 is one every five minutes.",
+  },
+  {
+    key: "standard_concurrent",
+    label: "Standard — at once",
+    hint: "What every account gets unless an administrator moves it.",
+  },
+  {
+    key: "standard_per_hour",
+    label: "Standard — per hour",
+    hint: "Submissions an hour. 60 is one a minute.",
+  },
+  {
+    key: "elevated_concurrent",
+    label: "Elevated — at once",
+    hint: "For accounts doing bulk work, assigned deliberately.",
+  },
+  {
+    key: "elevated_per_hour",
+    label: "Elevated — per hour",
+    hint: "Submissions an hour.",
+  },
+];
+
 /**
  * The deployment's own settings.
  *
@@ -148,6 +187,27 @@ export default function SiteSettingsTab() {
           onRevert={() => revert("cache_max_age")}
           onChange={(v) => setForm({ ...form, cache_max_age: v })}
         />
+      </Section>
+
+      <Section title="Service limits">
+        <p className="lede" style={{ fontSize: 13, margin: "0 0 14px" }}>
+          What one caller may ask for. Concurrent jobs are enforced when work is
+          picked up, so an over-limit job waits rather than being refused;
+          submissions are enforced at the door and answer 429. Blank or 0 is
+          unlimited. A tier is assigned per account under Users &amp; groups.
+        </p>
+        {TIER_LIMITS.map(({ key, label, hint }) => (
+          <Field
+            key={key}
+            label={label}
+            hint={hint}
+            value={form[key] === "0" ? "" : (form[key] ?? "")}
+            placeholder={String(defaults[key] || "unlimited")}
+            overridden={overridden(key)}
+            onRevert={() => revert(key)}
+            onChange={(v) => setForm({ ...form, [key]: v })}
+          />
+        ))}
       </Section>
 
       <div className="row gap-8" style={{ marginTop: 22 }}>

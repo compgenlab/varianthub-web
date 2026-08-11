@@ -94,6 +94,17 @@ type fileConfig struct {
 		RatePerMin     *int   `toml:"rate_per_min"`
 		RateBurst      *int   `toml:"rate_burst"`
 		MaxJobsPerIP   *int   `toml:"max_jobs_per_ip"`
+
+		// Per-tier service limits. Concurrent running jobs, and submissions per
+		// hour; 0 is unbounded. An administrator can override each from the
+		// settings form, so these describe a fresh installation rather than
+		// being the last word.
+		AnonConcurrent     *int `toml:"anon_concurrent"`
+		AnonPerHour        *int `toml:"anon_per_hour"`
+		StandardConcurrent *int `toml:"standard_concurrent"`
+		StandardPerHour    *int `toml:"standard_per_hour"`
+		ElevatedConcurrent *int `toml:"elevated_concurrent"`
+		ElevatedPerHour    *int `toml:"elevated_per_hour"`
 		MaxUploadBytes *int64 `toml:"max_upload_bytes"`
 	} `toml:"limits"`
 }
@@ -198,6 +209,12 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setInt(&c.RatePerMin, f.Limits.RatePerMin)
 	setInt(&c.RateBurst, f.Limits.RateBurst)
 	setInt(&c.MaxJobsPerIP, f.Limits.MaxJobsPerIP)
+	setInt(&c.AnonConcurrent, f.Limits.AnonConcurrent)
+	setInt(&c.AnonPerHour, f.Limits.AnonPerHour)
+	setInt(&c.StandardConcurrent, f.Limits.StandardConcurrent)
+	setInt(&c.StandardPerHour, f.Limits.StandardPerHour)
+	setInt(&c.ElevatedConcurrent, f.Limits.ElevatedConcurrent)
+	setInt(&c.ElevatedPerHour, f.Limits.ElevatedPerHour)
 	if f.Limits.MaxUploadBytes != nil {
 		c.MaxUploadBytes = *f.Limits.MaxUploadBytes
 	}

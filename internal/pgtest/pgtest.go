@@ -36,6 +36,22 @@ const EnvDSN = "VHW_TEST_DATABASE_URL"
 // order they run in.
 func Pool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	pool, err := pgxpool.New(context.Background(), DSN(t))
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// DSN is Pool for a caller that needs the connection string rather than a pool
+// — anything that opens its own, as the queue does.
+//
+// The schema is created and migrated before this returns, because a store that
+// runs a statement on connect (the queue's crash recovery does) would otherwise
+// meet a schema that is not there yet.
+func DSN(t *testing.T) string {
+	t.Helper()
 	dsn := os.Getenv(EnvDSN)
 	if dsn == "" {
 		t.Skipf("%s not set; skipping tests that need Postgres", EnvDSN)
@@ -67,19 +83,14 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	}
 	setup.Close()
 
-	pool, err := pgxpool.New(ctx, dsn+"&search_path="+schema)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
 	t.Cleanup(func() {
 		drop, err := pgxpool.New(context.Background(), dsn)
 		if err == nil {
 			_, _ = drop.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
 			drop.Close()
 		}
-		pool.Close()
 	})
-	return pool
+	return dsn + "&search_path=" + schema
 }
 
 // migrations are every migration, discovered rather than listed.

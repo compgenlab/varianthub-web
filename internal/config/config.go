@@ -120,6 +120,21 @@ type Config struct {
 	// CacheMaxAge discards entries unused for longer, as a duration string.
 	CacheMaxAge string
 
+	// Service limits per tier: concurrent running jobs, and submissions per
+	// hour. 0 is unbounded. Defaults here, overridable per installation from the
+	// settings form — so a deployment is described by its file and tuned without
+	// one.
+	//
+	// Per hour rather than per minute, which is the unit the per-IP submit rate
+	// uses: "one job every five minutes" is what an anonymous visitor should
+	// get, and per-minute integers cannot express it.
+	AnonConcurrent     int
+	AnonPerHour        int
+	StandardConcurrent int
+	StandardPerHour    int
+	ElevatedConcurrent int
+	ElevatedPerHour    int
+
 	JobTimeout time.Duration // per-job wall clock
 	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
 	// default: a tool's one-time install fetches tens of gigabytes, and being
@@ -168,7 +183,19 @@ func Defaults() *Config {
 		RatePerMin:     30,
 		RateBurst:      10,
 		MaxJobsPerIP:   2,
-		References:     map[string]string{},
+
+		// An anonymous visitor gets one job at a time and one every five
+		// minutes: enough to try the service, not enough to occupy it. An
+		// account gets one at a time and one a minute, which is what a public
+		// deployment can promise everybody at once.
+		AnonConcurrent:     1,
+		AnonPerHour:        12,
+		StandardConcurrent: 1,
+		StandardPerHour:    60,
+		ElevatedConcurrent: 5,
+		ElevatedPerHour:    600,
+
+		References: map[string]string{},
 		TrustedProxy: []string{
 			"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		},
@@ -294,6 +321,12 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_RATE_PER_MIN", &c.RatePerMin)
 	envIntInto("VHW_RATE_BURST", &c.RateBurst)
 	envIntInto("VHW_MAX_JOBS_PER_IP", &c.MaxJobsPerIP)
+	envIntInto("VHW_ANON_CONCURRENT", &c.AnonConcurrent)
+	envIntInto("VHW_ANON_PER_HOUR", &c.AnonPerHour)
+	envIntInto("VHW_STANDARD_CONCURRENT", &c.StandardConcurrent)
+	envIntInto("VHW_STANDARD_PER_HOUR", &c.StandardPerHour)
+	envIntInto("VHW_ELEVATED_CONCURRENT", &c.ElevatedConcurrent)
+	envIntInto("VHW_ELEVATED_PER_HOUR", &c.ElevatedPerHour)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n

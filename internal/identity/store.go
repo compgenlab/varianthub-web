@@ -36,13 +36,29 @@ func (s *Store) SetNow(fn func() int64) { s.nowFn = fn }
 // The projection carries whether a password exists, never the hash itself: no
 // caller of scanUser needs it, and a hash that is never selected cannot be
 // logged, serialized or compared by accident.
-const userCols = `id, email, name, role, disabled, password_hash = '', created_at, updated_at`
+const userCols = `id, email, name, role, tier, disabled, password_hash = '', created_at, updated_at`
 
 func scanUser(row interface{ Scan(...any) error }) (User, error) {
 	var u User
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.SSO,
+	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Tier, &u.Disabled, &u.SSO,
 		&u.CreatedAt, &u.UpdatedAt)
 	return u, err
+}
+
+// SetTier moves an account between service tiers.
+//
+// Validated by the caller against catalog.Tiers rather than here: which tiers
+// exist is a question about the deployment's settings, and this package has no
+// business knowing the answer. What it does enforce is that the column is never
+// empty, since an empty tier reads as "unknown" and resolves to the standard
+// limits — correct, but by accident rather than by decision.
+func (s *Store) SetTier(ctx context.Context, userID, tier string) error {
+	if strings.TrimSpace(tier) == "" {
+		return fmt.Errorf("a tier is required")
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE app_user SET tier=$2, updated_at=$3 WHERE id=$1`, userID, tier, s.nowFn())
+	return err
 }
 
 // CreateUser adds an account. An empty password means the account cannot log in
@@ -141,18 +157,30 @@ func (s *Store) CountUsers(ctx context.Context) (int, error) {
 // unknown address from a wrong password: saying which would let anyone probe
 // for registered addresses.
 func (s *Store) Authenticate(ctx context.Context, email, password string) (User, error) {
-	var u User
 	var hash string
 	row := s.pool.QueryRow(ctx,
 		`SELECT `+userCols+`, password_hash FROM app_user WHERE lower(email)=lower($1)`,
 		NormalizeEmail(email))
-	err := row.Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.Disabled, &u.SSO,
-		&u.CreatedAt, &u.UpdatedAt, &hash)
+	// Through scanUser with the hash appended, rather than a second scan written
+	// out in the same column order. The two drifted the moment a column was
+	// added to userCols: this one still matched positionally, so it read the new
+	// column into the old field and then failed every password in the
+	// installation. One scan, one order.
+	u, err := scanUser(withExtra{row, []any{&hash}})
 	if err != nil || u.Disabled || !CheckPassword(hash, password) {
 		return User{}, errors.New("invalid email or password")
 	}
 	return u, nil
 }
+
+// withExtra adapts a row so scanUser can read the columns it knows about and
+// the caller can read whatever was selected after them.
+type withExtra struct {
+	row   interface{ Scan(...any) error }
+	extra []any
+}
+
+func (w withExtra) Scan(dest ...any) error { return w.row.Scan(append(dest, w.extra...)...) }
 
 // ErrNoLocalPassword is returned when an account has no password here to change.
 var ErrNoLocalPassword = errors.New("this account signs in through an identity provider, so it has no password here")

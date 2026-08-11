@@ -9,6 +9,7 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -31,8 +32,12 @@ type Server struct {
 	spa      *SPA            // nil serves no web UI (API-only)
 	trusted  []*net.IPNet
 	limiter  *limit.Limiter
-	remote   *remoteSizer
-	oidc     *oidcProvider // nil when no external sign-in is configured
+	// tierLimiter holds the per-caller buckets. Separate from limiter because
+	// its rate is not fixed at construction: it comes from the caller's tier,
+	// which an administrator can change while the process runs.
+	tierLimiter *limit.Limiter
+	remote      *remoteSizer
+	oidc        *oidcProvider // nil when no external sign-in is configured
 }
 
 // New builds the server. cat may be nil, in which case the catalog endpoints
@@ -47,8 +52,10 @@ func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, ids *identity.S
 		spa:      spa,
 		trusted:  limit.ParseCIDRs(cfg.TrustedProxy),
 		limiter:  limit.New(cfg.RatePerMin, cfg.RateBurst),
-		remote:   newRemoteSizer(),
-		oidc:     newCILogon(cfg),
+		// Rate and burst come per call, so the constructor's are unused.
+		tierLimiter: limit.New(1, 1),
+		remote:      newRemoteSizer(),
+		oidc:        newCILogon(cfg),
 	}
 }
 
@@ -169,6 +176,7 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("PUT /api/v1/admin/settings", s.handleSetSiteSettings)
 	m.HandleFunc("POST /api/v1/admin/cache/clear", s.handleClearCache)
 	m.HandleFunc("GET /api/v1/admin/metrics", s.handleMetrics)
+	m.HandleFunc("GET /api/v1/admin/usage", s.handleUsage)
 	m.HandleFunc("GET /api/v1/admin/storage", s.handleListStorage)
 	m.HandleFunc("GET /api/v1/admin/storage/check", s.handleCheckStorage)
 	m.HandleFunc("POST /api/v1/admin/storage", s.handleCreateStorage)
@@ -256,25 +264,76 @@ func (s *Server) limiterGC(ctx context.Context) {
 			return
 		case <-t.C:
 			s.limiter.GC(30 * time.Minute)
+			// Longer, because these buckets refill far more slowly: evicting one
+			// at 30 minutes would hand back a full hour's allowance to anyone who
+			// paused for half an hour.
+			s.tierLimiter.GC(6 * time.Hour)
 		}
 	}
 }
 
-// throttle rate-limits by resolved client IP. Wraps submit routes only.
+// throttle applies the caller's submission rate. Wraps submit routes only.
 //
-// See throttled: identified callers are exempt, anonymous ones are not.
+// Keyed by account where there is one and by session or client IP otherwise, so
+// a rate is something a person carries rather than something an address does:
+// two colleagues behind one NAT are not each other's problem, and one person on
+// four machines does not get four times the service.
+//
+// Every caller is subject to one now. Identified callers used to be exempt, on
+// the grounds that an account is accountable — true, but it leaves the limit
+// unenforceable on a deployment where an account is one sign-in away. The tier
+// replaces the exemption: an account that needs to submit in bulk is moved to
+// one that can, deliberately, by an administrator.
+//
+// The per-IP limiter stays underneath as a second line, because an account is
+// only accountable after the fact and a flood is a problem during it.
 func (s *Server) throttle(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !s.throttled(r) {
-			h.ServeHTTP(w, r)
+		ip := limit.ClientIP(r, s.trusted)
+		if s.throttled(r) && !s.limiter.Allow(ip) {
+			writeError(w, http.StatusTooManyRequests, "rate limit exceeded — slow down")
 			return
 		}
-		if !s.limiter.Allow(limit.ClientIP(r, s.trusted)) {
-			writeError(w, http.StatusTooManyRequests, "rate limit exceeded — slow down")
+		key, lim := s.callerLimits(r, ip)
+		if !s.tierLimiter.AllowAt(key, lim.PerHour, 1) {
+			writeError(w, http.StatusTooManyRequests, rateMessage(lim.PerHour))
 			return
 		}
 		h.ServeHTTP(w, r)
 	})
+}
+
+// callerLimits resolves who is being limited, and by how much.
+//
+// A burst of one, deliberately: these rates are low enough that any burst would
+// be most of the budget. "One an hour" with a burst of two means two at once and
+// then nothing, which is not what the number says.
+func (s *Server) callerLimits(r *http.Request, ip string) (string, catalog.Limits) {
+	site := s.site(r.Context())
+	c := callerOf(r)
+	if c.User == nil {
+		// By session where there is one, so a visitor is limited as a visitor
+		// rather than as an address shared with everyone behind the same router.
+		key := c.AnonSession
+		if key == "" {
+			key = ip
+		}
+		return "anon:" + key, site.AnonLimits()
+	}
+	return "user:" + c.User.ID, site.LimitsFor(c.User.Tier)
+}
+
+// rateMessage says which limit was hit and what it is. "Slow down" is not
+// actionable when the answer is "ask for a higher tier", and somebody who has
+// just been refused should not have to guess which limit they met.
+func rateMessage(perHour int) string {
+	switch {
+	case perHour >= 60 && perHour%60 == 0:
+		return fmt.Sprintf("rate limit exceeded — you may submit %d job(s) a minute", perHour/60)
+	case perHour > 0:
+		return fmt.Sprintf("rate limit exceeded — you may submit %d job(s) an hour", perHour)
+	}
+	return "rate limit exceeded — slow down"
 }
 
 // withCORS allows the SPA's origin when one is configured. With no configured

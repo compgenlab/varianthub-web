@@ -4,14 +4,12 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/compgenlab/varianthub-web/internal/pgtest"
 )
 
 // These tests need a real Postgres — the whole point of the port is behavior the
@@ -35,67 +33,42 @@ import (
 //
 // Sorted, because migrations are ordered by their numeric prefix and a later one
 // alters what an earlier one created.
-func jobMigrations(t *testing.T) []string {
-	t.Helper()
-	files, err := filepath.Glob("../../migrations/*_job*.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) == 0 {
-		t.Fatal("no job migrations found; the glob or the layout has moved")
-	}
-	sort.Strings(files)
-	return files
-}
-
+// These need a real Postgres; see internal/pgtest for the container invocation.
+//
+// Every migration, through the shared harness, rather than the ones whose
+// filename happened to contain "job". That glob decided whether a migration
+// reached these tests by what it was called, so one that altered the job table
+// under another name was silently absent — which showed up as a missing column
+// in whichever test touched it, saying nothing about the glob.
 func testQueue(t *testing.T) *Queue {
 	t.Helper()
-	dsn := os.Getenv("VHW_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("VHW_TEST_DATABASE_URL not set; skipping Postgres queue tests")
-	}
-	ctx := context.Background()
-
-	var ddl strings.Builder
-	for _, f := range jobMigrations(t) {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		ddl.Write(b)
-		ddl.WriteString("\n")
-	}
-
-	// Isolate this test in its own schema, and get the schema in place *before*
-	// Open — Open runs a crash-recovery UPDATE against job on connect.
-	schema := fmt.Sprintf("t_%d", time.Now().UnixNano())
-	setup, err := pgxpool.New(ctx, dsn)
+	q, err := New(pgtest.Pool(t))
 	if err != nil {
-		t.Fatalf("connect: %v", err)
+		t.Fatalf("New: %v", err)
 	}
-	if _, err := setup.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
-		setup.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-	if _, err := setup.Exec(ctx, `SET search_path TO `+schema+`; `+ddl.String()); err != nil {
-		setup.Close()
-		t.Fatalf("apply migration: %v", err)
-	}
-	setup.Close()
+	t.Cleanup(q.Close)
+	return q
+}
 
-	q, err := Open(ctx, dsn+"&search_path="+schema)
+// testQueuePair is two queues over one database, for the cases that are about
+// two processes rather than one — a peer worker booting, or the API starting up
+// while a worker is busy. Each opens its own pool, because that is what a
+// separate process has.
+func testQueuePair(t *testing.T) (*Queue, *Queue) {
+	t.Helper()
+	dsn := pgtest.DSN(t)
+	ctx := context.Background()
+	a, err := Open(ctx, dsn)
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	t.Cleanup(func() {
-		drop, err := pgxpool.New(context.Background(), dsn)
-		if err == nil {
-			_, _ = drop.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
-			drop.Close()
-		}
-		q.Close()
-	})
-	return q
+	t.Cleanup(a.Close)
+	b, err := Open(ctx, dsn)
+	if err != nil {
+		t.Fatalf("Open peer: %v", err)
+	}
+	t.Cleanup(b.Close)
+	return a, b
 }
 
 // waitFor polls until cond() or the deadline, failing the test on timeout.
@@ -445,7 +418,7 @@ func TestOpeningTheQueueLeavesRunningJobsAlone(t *testing.T) {
 	if dsn == "" {
 		t.Skip("VHW_TEST_DATABASE_URL not set")
 	}
-	q := testQueue(t)
+	q, other := testQueuePair(t)
 	ctx := context.Background()
 
 	id, err := q.Enqueue(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
@@ -456,13 +429,8 @@ func TestOpeningTheQueueLeavesRunningJobsAlone(t *testing.T) {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
 
-	// A second process opens the same database and runs recovery — this is the
-	// API starting up, or a peer worker booting, while this worker is busy.
-	other, err := Open(ctx, q.dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer other.Close()
+	// The second process runs recovery — the API starting up, or a peer worker
+	// booting, while this worker is busy.
 	if n, err := other.ReclaimExpired(ctx); err != nil {
 		t.Fatal(err)
 	} else if n != 0 {
@@ -486,7 +454,7 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 	if os.Getenv("VHW_TEST_DATABASE_URL") == "" {
 		t.Skip("VHW_TEST_DATABASE_URL not set")
 	}
-	q := testQueue(t)
+	q, peer := testQueuePair(t)
 	ctx := context.Background()
 	// Short enough to watch expire, with renew well inside the TTL.
 	q.SetLease(2*time.Second, 200*time.Millisecond)
@@ -524,12 +492,6 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 	q.mu.Lock()
 	q.running[id] = &runningJob{cancel: func() {}}
 	q.mu.Unlock()
-
-	peer, err := Open(ctx, q.dsn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer peer.Close()
 
 	deadline := time.Now().Add(3 * time.Second) // past the 2s TTL
 	for time.Now().Before(deadline) {

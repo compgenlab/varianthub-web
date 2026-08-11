@@ -3,8 +3,11 @@ package api
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 
+	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/identity"
 )
 
@@ -60,6 +63,7 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Role     *string `json:"role"`
+		Tier     *string `json:"tier"`
 		Disabled *bool   `json:"disabled"`
 		Password *string `json:"password"`
 	}
@@ -70,6 +74,23 @@ func (s *Server) handleUpdateUser(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if req.Role != nil {
 		if err := s.identity.SetRole(r.Context(), id, *req.Role); err != nil {
+			writeError(w, statusForIdentity(err), err.Error())
+			return
+		}
+	}
+	if req.Tier != nil {
+		// Checked here rather than in the identity store: which tiers exist is a
+		// question about this deployment's settings, and that package has no
+		// business knowing the answer. Rejected rather than coerced, because a
+		// tier the server does not recognize resolves to the standard limits —
+		// so silently accepting a typo would look like a promotion that worked.
+		if !catalog.ValidTier(*req.Tier) {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("unknown tier %q (want one of %s)",
+					*req.Tier, strings.Join(catalog.Tiers, ", ")))
+			return
+		}
+		if err := s.identity.SetTier(r.Context(), id, *req.Tier); err != nil {
 			writeError(w, statusForIdentity(err), err.Error())
 			return
 		}
