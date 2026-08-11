@@ -218,7 +218,14 @@ export default function App() {
   // Set when an anonymous visitor asks to sign in, so the wall can be reached
   // deliberately — from the landing page, or on an open instance where nothing
   // would otherwise turn them away.
-  const [signIn, setSignIn] = useState(false);
+  // Open on the sign-in screen when a sign-in has just failed. The CILogon
+  // callback reports itself by redirecting to /?error=..., and the message it
+  // wants shown lives on that screen — without this the visitor is returned to
+  // the marketing page with no sign that anything went wrong, which reads as
+  // the button having done nothing.
+  const [signIn, setSignIn] = useState(() =>
+    new URLSearchParams(location.search).has("error"),
+  );
 
   useEffect(() => {
     api
@@ -248,7 +255,21 @@ export default function App() {
     if (!signIn && !me?.needs_bootstrap) {
       return <Landing me={me ?? fallbackMe} onSignIn={() => setSignIn(true)} />;
     }
-    return <SignIn me={me ?? fallbackMe} onDone={() => location.reload()} />;
+    return (
+      <SignIn
+        me={me ?? fallbackMe}
+        onDone={() => location.reload()}
+        onCancel={() => {
+          // Drop the ?error= as well as closing the screen. Left in place it
+          // reopens sign-in on the next reload, so the way out would not stay
+          // out.
+          if (location.search) {
+            history.replaceState(null, "", location.pathname);
+          }
+          setSignIn(false);
+        }}
+      />
+    );
   }
 
   return (
