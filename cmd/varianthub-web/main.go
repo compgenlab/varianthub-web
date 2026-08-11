@@ -95,9 +95,6 @@ func serve(ctx context.Context, cfg *config.Config) error {
 	}
 	defer q.Close()
 
-	// The API listens so ?wait= can be woken by a worker in another replica.
-	q.StartListener(ctx)
-
 	// The catalog backs the snapshot/source endpoints. It shares the database, so
 	// a failure here is not survivable in practice -- but the server is still
 	// useful for submitting and polling, so report it rather than refusing to

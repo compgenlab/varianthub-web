@@ -70,7 +70,6 @@ const (
 	// may be in another process, which is the whole reason this goes through
 	// the database rather than a method call.
 	chanCancel = "job_cancel"
-	chanDone   = "job_done"
 )
 
 // Job is one row of the job table (its metadata, without the input/result blobs).
@@ -156,8 +155,6 @@ func (q *Queue) Cancel(ctx context.Context, id string) (Job, error) {
 		RETURNING `+jobCols, id, StatusCancelled, q.nowFn(), StatusQueued)
 	job, err := scanJob(row)
 	if err == nil {
-		// Wake anyone in WaitFor: the job is terminal now.
-		_, _ = q.pool.Exec(ctx, `SELECT pg_notify($1,$2)`, chanDone, id)
 		return job, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -242,9 +239,8 @@ type Queue struct {
 
 	wg sync.WaitGroup
 
-	mu      sync.Mutex
-	waiters map[string][]chan struct{} // job id -> waiters blocked in WaitFor
-	queued  chan struct{}              // wakes one worker (cap 1, non-blocking send)
+	mu     sync.Mutex
+	queued chan struct{} // wakes one worker (cap 1, non-blocking send)
 	// running tracks jobs this process is executing, so a cancel arriving over
 	// NOTIFY can reach the right subprocess. Only ever holds jobs claimed here;
 	// a cancel for another replica's job finds nothing and is ignored, which is
@@ -317,7 +313,6 @@ func Open(ctx context.Context, dsn string) (*Queue, error) {
 		pool:       pool,
 		dsn:        dsn,
 		nowFn:      func() int64 { return time.Now().Unix() },
-		waiters:    map[string][]chan struct{}{},
 		queued:     make(chan struct{}, 1),
 		running:    map[string]*runningJob{},
 		workerID:   id,
@@ -949,15 +944,10 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		log.Printf("queue: finish job %s: %v", id, err)
 		return
 	}
-	if _, err := tx.Exec(wctx, `SELECT pg_notify($1,$2)`, chanDone, id); err != nil {
-		log.Printf("queue: notify job %s: %v", id, err)
-		return
-	}
 	if err := tx.Commit(wctx); err != nil {
 		log.Printf("queue: commit job %s: %v", id, err)
 		return
 	}
-	q.wake(id)
 }
 
 // WorkerID identifies this process in the claims it holds, for logs that need

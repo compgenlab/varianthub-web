@@ -1,8 +1,6 @@
 package api
 
 import (
-	"encoding/json"
-
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
@@ -75,25 +73,52 @@ type JobsResponse struct {
 	Scoped bool        `json:"scoped" doc:"The list was narrowed to the caller's own jobs, as opposed to an administrator seeing everything."`
 }
 
-// AcceptedResponse is a submission that has not finished.
+// AcceptedResponse is a queued submission.
+//
+// Every submission answers this way, whatever happens next. Annotation is
+// asynchronous, so a submission's whole result is the identifier to follow it
+// by — and three calls then each do one thing: GET /jobs/{id} for status,
+// /jobs/{id}/export for results, /jobs/{id}/cancel to stop it. The alternative
+// is one response shape that means different things depending on how quickly
+// the work happened to finish, which every client has to handle both ways.
 type AcceptedResponse struct {
-	JobID  string `json:"job_id" doc:"Poll GET /jobs/{id} for progress, and GET /jobs/{id}/export for results."`
-	Status string `json:"status,omitempty" doc:"Present only when the caller waited and the job was still running when the wait elapsed."`
+	JobID string `json:"job_id" doc:"Poll GET /jobs/{id} for progress, and GET /jobs/{id}/export for results."`
 }
 
-// JobResultResponse is a finished submission, and GET /jobs/{id}.
-type JobResultResponse struct {
-	JobID      string          `json:"job_id" doc:"Stable identifier for this run."`
-	Kind       string          `json:"kind" doc:"\"locus\" for a variant list, \"vcf\" for a submitted file."`
-	Snapshot   string          `json:"snapshot" doc:"The snapshot annotated against. An individual-source selection becomes a generated snapshot, which is what makes the run reproducible."`
-	Status     string          `json:"status" doc:"queued | running | done | error | cancelled."`
-	NVariants  int64           `json:"n_variants" doc:"How many variants were annotated."`
-	CreatedAt  int64           `json:"created_at" doc:"Unix seconds."`
-	StartedAt  int64           `json:"started_at" doc:"Unix seconds. Zero until a worker claims it."`
-	FinishedAt int64           `json:"finished_at" doc:"Unix seconds. Zero until it finishes."`
-	Label      string          `json:"label" doc:"A human-readable summary of what was submitted."`
-	Error      string          `json:"error,omitempty" doc:"Set only for a failed job."`
-	Results    json.RawMessage `json:"results,omitempty" doc:"The annotated variants, present once there are any. For large result sets prefer GET /jobs/{id}/export, which streams."`
+// JobStatusResponse is GET /jobs/{id}: what a job is and how far it has got.
+//
+// Its own type rather than queue.Job, which is the database row. The row also
+// carries client_ip, session and user_id, and this route is deliberately public
+// — an anonymous result's link is its credential, so it is meant to be passed
+// to someone else. Returning the row would hand whoever holds a shared link the
+// submitter's address and session identifier, which is not what sharing a result
+// is understood to share.
+//
+// Results are not here and never were. They are GET /jobs/{id}/export, which
+// streams and takes a format; embedding them would make a status poll download
+// the whole result set every few seconds.
+type JobStatusResponse struct {
+	JobID      string `json:"job_id" doc:"Stable identifier for this run."`
+	Kind       string `json:"kind" doc:"\"locus\" for a variant list, \"vcf\" for a submitted file."`
+	Snapshot   string `json:"snapshot" doc:"The snapshot annotated against. An individual-source selection becomes a generated snapshot, which is what makes the run reproducible."`
+	Selection  string `json:"selection" doc:"The annotation fields asked for, or empty for the snapshot's defaults."`
+	Status     string `json:"status" doc:"queued | running | done | error | cancelled. Fetch results once this is \"done\"."`
+	NVariants  int64  `json:"n_variants" doc:"How many variants were annotated."`
+	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
+	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
+	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
+	Label      string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
+	Error      string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+}
+
+// jobStatus projects a queue row onto the published shape.
+func jobStatus(j queue.Job) JobStatusResponse {
+	return JobStatusResponse{
+		JobID: j.ID, Kind: j.Kind, Snapshot: j.Snapshot, Selection: j.Selection,
+		Status: j.Status, NVariants: j.NVariants, CreatedAt: j.CreatedAt,
+		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Label: j.Label,
+		Error: j.Error,
+	}
 }
 
 // CancelResponse is POST /jobs/{id}/cancel.

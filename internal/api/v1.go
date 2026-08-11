@@ -22,7 +22,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/limit"
@@ -539,8 +538,14 @@ func anyOf(s string) any {
 	return s
 }
 
-// submit enqueues a job and, when ?wait= is given, blocks briefly so a fast job
-// can return its result inline instead of forcing the caller to poll.
+// submit enqueues a job and answers with its identifier.
+//
+// Always 202, never a result. Submission used to take ?wait= and block briefly
+// so a fast job could come back inline, which made one call return two
+// different shapes depending on how quickly the work happened to finish. Every
+// client had to handle both regardless, because the window was never a
+// guarantee — so the shape that was always required is now the only one, and
+// each of status, results and cancellation is its own call.
 func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
 	id, err := s.queue.Enqueue(r.Context(), nj)
@@ -548,47 +553,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-
-	wait := s.waitFor(r)
-	if wait <= 0 {
-		writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id})
-		return
-	}
-	job, ok, err := s.queue.WaitFor(r.Context(), id, wait)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if !ok || !job.Terminal() {
-		// Still running when the window closed: 202 and the caller polls. This is
-		// not an error -- ?wait= is an optimization, not a guarantee.
-		writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id, Status: job.Status})
-		return
-	}
-	s.writeJobWithResult(w, r, job)
-}
-
-// waitFor parses ?wait= (seconds or a Go duration), clamped to the server cap.
-func (s *Server) waitFor(r *http.Request) time.Duration {
-	raw := strings.TrimSpace(r.URL.Query().Get("wait"))
-	if raw == "" {
-		return 0
-	}
-	var d time.Duration
-	if n, err := strconv.Atoi(raw); err == nil {
-		d = time.Duration(n) * time.Second
-	} else if parsed, err := time.ParseDuration(raw); err == nil {
-		d = parsed
-	} else {
-		return 0
-	}
-	if d < 0 {
-		return 0
-	}
-	if cap := s.cfg.SubmitWaitCap; cap > 0 && d > cap {
-		d = cap
-	}
-	return d
+	writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id})
 }
 
 // --- jobs ---
@@ -732,7 +697,7 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, job)
+	writeJSON(w, http.StatusOK, jobStatus(job))
 }
 
 // handleCancelJob stops a job.
@@ -809,33 +774,6 @@ func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
 		// is a job from before logs were kept, the second is a quiet run.
 		"recorded": found,
 	})
-}
-
-// handleExport streams a finished job's entire result set.
-//
-// This is the bulk path: no pagination, no sorting, no filtering. A consumer
-// annotating a whole site catalog wants every row exactly as the engine emitted
-// it, and the stored blob is already that -- so it is copied through verbatim
-// rather than decoded and re-encoded.
-// writeJobWithResult returns the job object with its results embedded, which is
-// what ?wait= promises on completion within the window.
-func (s *Server) writeJobWithResult(w http.ResponseWriter, r *http.Request, job queue.Job) {
-	out := JobResultResponse{
-		JobID: job.ID, Kind: job.Kind, Snapshot: job.Snapshot,
-		Status: job.Status, NVariants: job.NVariants,
-		CreatedAt: job.CreatedAt, StartedAt: job.StartedAt,
-		FinishedAt: job.FinishedAt, Label: job.Label,
-	}
-	if job.Status == queue.StatusError {
-		out.Error = job.Error
-		writeJSON(w, http.StatusOK, out)
-		return
-	}
-	body, ok, err := s.queue.Result(r.Context(), job.ID)
-	if err == nil && ok && len(body) > 0 {
-		out.Results = json.RawMessage(body)
-	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 func clampInt(raw string, def, lo, hi int) int {

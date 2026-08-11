@@ -1,6 +1,8 @@
 package api
 
-import "net/http"
+import (
+	"net/http"
+)
 
 // The published REST API, as data.
 //
@@ -104,12 +106,6 @@ func (s *Server) publishedRoutes() []publishedRoute {
 			RequestSchema: annotateRequestSchema(),
 			Response:      AcceptedResponse{},
 			Status:        http.StatusAccepted,
-			Params: []param{{
-				Name: "wait", In: "query", Type: "string",
-				Doc: "Block for up to this long for the job to finish, e.g. \"30s\". " +
-					"Capped by the server. Without it the call returns as soon as the " +
-					"job is queued.",
-			}},
 		},
 		{
 			Method: "POST", Path: "/api/v1/annotate/vcf", OpID: "annotateVCF",
@@ -117,10 +113,6 @@ func (s *Server) publishedRoutes() []publishedRoute {
 			Handler: s.handleAnnotateVCF, Throttled: true,
 			Response: AcceptedResponse{},
 			Status:   http.StatusAccepted,
-			Params: []param{{
-				Name: "wait", In: "query", Type: "string",
-				Doc: "Block for up to this long for the job to finish.",
-			}},
 		},
 		{
 			Method: "GET", Path: "/api/v1/jobs", OpID: "listJobs",
@@ -134,10 +126,11 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		},
 		{
 			Method: "GET", Path: "/api/v1/jobs/{id}", OpID: "getJob",
-			Public:   true,
-			Summary:  "Fetch a job's status, and its results once it has finished.",
+			Public: true,
+			Summary: "Fetch a job's status. Results are a separate call, " +
+				"GET /jobs/{id}/export.",
 			Handler:  s.handleGetJob,
-			Response: JobResultResponse{},
+			Response: JobStatusResponse{},
 			Params: []param{{
 				Name: "id", In: "path", Required: true, Type: "string",
 				Doc: "The job identifier returned by a submission.",

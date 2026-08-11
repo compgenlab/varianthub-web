@@ -387,16 +387,12 @@ export const api = {
     build?: string;
     variants: string[];
     annotations?: string | string[];
-    wait?: number;
-  }) => {
-    const { wait, ...rest } = body;
-    const qs = wait ? `?wait=${wait}` : "";
-    return req<{ job_id: string } & Partial<Job>>(`/annotate${qs}`, {
+  }) =>
+    req<{ job_id: string }>("/annotate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(rest),
-    });
-  },
+      body: JSON.stringify(body),
+    }),
 
   annotateVCF: (
     file: File,
@@ -408,7 +404,7 @@ export const api = {
     if (opts.sources?.length) fd.append("sources", opts.sources.join(","));
     if (opts.build) fd.append("build", opts.build);
     if (opts.annotations) fd.append("annotations", opts.annotations);
-    return req<{ job_id: string } & Partial<Job>>("/annotate/vcf", {
+    return req<{ job_id: string }>("/annotate/vcf", {
       method: "POST",
       body: fd,
     });

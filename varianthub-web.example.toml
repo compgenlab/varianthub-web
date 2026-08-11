@@ -133,4 +133,3 @@ max_age     = "2160h"
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
   max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
-  submit_wait_cap = "10s"                           # VHW_SUBMIT_WAIT_CAP

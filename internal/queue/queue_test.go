@@ -229,62 +229,6 @@ func TestCrashRecoveryRequeuesRunning(t *testing.T) {
 	}
 }
 
-func TestWaitForReturnsOnDone(t *testing.T) {
-	q := testQueue(t)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	q.StartListener(ctx)
-
-	q.StartWorkers(ctx, 1, func(_ context.Context, _ Job, _ []byte) (Outcome, error) {
-		time.Sleep(50 * time.Millisecond)
-		return Outcome{Result: []byte(`[]`)}, nil
-	})
-	id, _ := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("x")})
-
-	start := time.Now()
-	job, ok, err := q.WaitFor(ctx, id, 5*time.Second)
-	if err != nil || !ok {
-		t.Fatalf("WaitFor: ok=%v err=%v", ok, err)
-	}
-	if job.Status != StatusDone {
-		t.Errorf("status = %q, want done", job.Status)
-	}
-	// The NOTIFY should wake it well before the 2s safety poll.
-	if elapsed := time.Since(start); elapsed > waitPoll {
-		t.Errorf("WaitFor took %s — NOTIFY path likely not working", elapsed)
-	}
-}
-
-func TestWaitForTimeoutReturnsCurrent(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	// No workers: the job stays queued.
-	id, _ := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("x")})
-
-	start := time.Now()
-	job, ok, err := q.WaitFor(ctx, id, 200*time.Millisecond)
-	if err != nil || !ok {
-		t.Fatalf("WaitFor: ok=%v err=%v", ok, err)
-	}
-	if job.Status != StatusQueued {
-		t.Errorf("status = %q, want queued", job.Status)
-	}
-	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
-		t.Errorf("WaitFor returned after %s, expected to wait ~200ms", elapsed)
-	}
-}
-
-func TestWaitForUnknownID(t *testing.T) {
-	q := testQueue(t)
-	_, ok, err := q.WaitFor(context.Background(), "nope", time.Second)
-	if err != nil {
-		t.Fatalf("WaitFor: %v", err)
-	}
-	if ok {
-		t.Errorf("ok = true for an unknown job id")
-	}
-}
-
 func TestQueueListAndGC(t *testing.T) {
 	q := testQueue(t)
 	q.nowFn = monotonicNow()

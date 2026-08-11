@@ -179,14 +179,25 @@ func TestGeneratedSchemasMatchTheWireShape(t *testing.T) {
 		t.Errorf("omitempty fields are marked required: %v", items.Required)
 	}
 
-	// json.RawMessage is a JSON document, not a base64 string.
-	job := schemaOf(JobResultResponse{})
-	results := job.Properties["results"]
-	if results == nil {
-		t.Fatal("results is missing from the job schema")
+}
+
+// json.RawMessage is a JSON document, not the base64 string its underlying
+// []byte would otherwise produce.
+//
+// Against a fixture rather than a published type: none carries a RawMessage
+// today, and the special case in schemaOf is exactly the kind of thing that
+// stops being true the moment nothing checks it. The next published field to
+// carry arbitrary JSON should describe itself correctly on arrival.
+func TestRawMessageIsDescribedAsADocument(t *testing.T) {
+	type withRaw struct {
+		Payload json.RawMessage `json:"payload" doc:"Arbitrary JSON."`
 	}
-	if results.Type == "string" || results.Type == "array" {
-		t.Errorf("results is described as %q; it carries arbitrary JSON", results.Type)
+	payload := schemaOf(withRaw{}).Properties["payload"]
+	if payload == nil {
+		t.Fatal("payload is missing from the schema")
+	}
+	if payload.Type == "string" || payload.Type == "array" {
+		t.Errorf("payload is described as %q; it carries arbitrary JSON", payload.Type)
 	}
 }
 

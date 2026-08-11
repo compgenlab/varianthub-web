@@ -127,7 +127,6 @@ type Config struct {
 	// attempt has to redo from the start.
 	DownloadTimeout time.Duration
 	JobTTL          time.Duration // terminal jobs GC'd after this
-	SubmitWaitCap   time.Duration // ceiling on ?wait=
 	MaxUploadBytes  int64         // cap on a POST /annotate/vcf body
 
 	RatePerMin   int      // per-IP submit rate
@@ -165,7 +164,6 @@ func Defaults() *Config {
 		// the JSON blob that backs export and once as rows that back paging and
 		// sorting, so this multiplies the larger of those by seven.
 		JobTTL:         7 * 24 * time.Hour,
-		SubmitWaitCap:  10 * time.Second,
 		MaxUploadBytes: 64 << 20,
 		RatePerMin:     30,
 		RateBurst:      10,
@@ -296,7 +294,6 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_RATE_PER_MIN", &c.RatePerMin)
 	envIntInto("VHW_RATE_BURST", &c.RateBurst)
 	envIntInto("VHW_MAX_JOBS_PER_IP", &c.MaxJobsPerIP)
-	envDurInto("VHW_SUBMIT_WAIT_CAP", &c.SubmitWaitCap)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n

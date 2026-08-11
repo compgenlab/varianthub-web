@@ -95,7 +95,6 @@ type fileConfig struct {
 		RateBurst      *int   `toml:"rate_burst"`
 		MaxJobsPerIP   *int   `toml:"max_jobs_per_ip"`
 		MaxUploadBytes *int64 `toml:"max_upload_bytes"`
-		SubmitWaitCap  string `toml:"submit_wait_cap"`
 	} `toml:"limits"`
 }
 
@@ -201,9 +200,6 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setInt(&c.MaxJobsPerIP, f.Limits.MaxJobsPerIP)
 	if f.Limits.MaxUploadBytes != nil {
 		c.MaxUploadBytes = *f.Limits.MaxUploadBytes
-	}
-	if err := setDur(&c.SubmitWaitCap, f.Limits.SubmitWaitCap, path, "limits.submit_wait_cap"); err != nil {
-		return hasSecret, err
 	}
 	return hasSecret, nil
 }
