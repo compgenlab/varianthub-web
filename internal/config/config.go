@@ -106,6 +106,20 @@ type Config struct {
 	// installed. Off by default; the cache is what makes a repeated query cheap.
 	NoCache bool
 
+	// The shared annotation cache, as this deployment is configured. These are
+	// defaults: an administrator can override each from the settings form, and
+	// the stored value wins (see catalog.Site). The file remains the description
+	// of a fresh deployment.
+	//
+	// Distinct from NoCache, which is a diagnostic that computes fresh values
+	// while leaving the cache configured. CacheEnabled false means jobs are given
+	// no cache at all.
+	CacheEnabled bool
+	// CacheMaxEntries caps cached (variant, source) units; 0 is unbounded.
+	CacheMaxEntries int64
+	// CacheMaxAge discards entries unused for longer, as a duration string.
+	CacheMaxAge string
+
 	JobTimeout time.Duration // per-job wall clock
 	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
 	// default: a tool's one-time install fetches tens of gigabytes, and being
@@ -113,7 +127,6 @@ type Config struct {
 	// attempt has to redo from the start.
 	DownloadTimeout time.Duration
 	JobTTL          time.Duration // terminal jobs GC'd after this
-	SubmitWaitCap   time.Duration // ceiling on ?wait=
 	MaxUploadBytes  int64         // cap on a POST /annotate/vcf body
 
 	RatePerMin   int      // per-IP submit rate
@@ -150,13 +163,12 @@ func Defaults() *Config {
 		// The cost is real and worth knowing: a result is stored twice, once as
 		// the JSON blob that backs export and once as rows that back paging and
 		// sorting, so this multiplies the larger of those by seven.
-		JobTTL:          7 * 24 * time.Hour,
-		SubmitWaitCap:   10 * time.Second,
-		MaxUploadBytes:  64 << 20,
-		RatePerMin:      30,
-		RateBurst:       10,
-		MaxJobsPerIP:    2,
-		References:      map[string]string{},
+		JobTTL:         7 * 24 * time.Hour,
+		MaxUploadBytes: 64 << 20,
+		RatePerMin:     30,
+		RateBurst:      10,
+		MaxJobsPerIP:   2,
+		References:     map[string]string{},
 		TrustedProxy: []string{
 			"127.0.0.0/8", "::1/128", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
 		},
@@ -243,6 +255,7 @@ func applyEnv(c *Config) {
 	envStr("VHW_DATABASE_URL", &c.DatabaseURL)
 	envBoolInto("VHW_ALLOW_ANONYMOUS", &c.AllowAnonymous)
 	envBoolInto("VHW_NO_CACHE", &c.NoCache)
+	envBoolInto("VHW_CACHE_ENABLED", &c.CacheEnabled)
 
 	envStr("VHW_CILOGON_CLIENT_ID", &c.CILogonClientID)
 	envStr("VHW_CILOGON_CLIENT_SECRET", &c.CILogonClientSecret)
@@ -281,7 +294,6 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_RATE_PER_MIN", &c.RatePerMin)
 	envIntInto("VHW_RATE_BURST", &c.RateBurst)
 	envIntInto("VHW_MAX_JOBS_PER_IP", &c.MaxJobsPerIP)
-	envDurInto("VHW_SUBMIT_WAIT_CAP", &c.SubmitWaitCap)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n

@@ -53,7 +53,7 @@ func TestPublishedTypesTagEveryExportedField(t *testing.T) {
 	for _, v := range []any{
 		PingResponse{}, BuildsResponse{}, SourcesResponse{}, SnapshotsResponse{},
 		SnapshotResponse{}, JobsResponse{}, AcceptedResponse{},
-		JobResultResponse{}, CancelResponse{}, ErrorResponse{},
+		JobStatusResponse{}, CancelResponse{}, ErrorResponse{},
 	} {
 		rt := reflect.TypeOf(v)
 		walk(rt, rt.Name())
@@ -122,7 +122,7 @@ func TestPublishedFieldsAreDocumented(t *testing.T) {
 	for _, v := range []any{
 		PingResponse{}, BuildsResponse{}, SourcesResponse{}, SnapshotsResponse{},
 		SnapshotResponse{}, JobsResponse{}, AcceptedResponse{},
-		JobResultResponse{}, CancelResponse{}, ErrorResponse{},
+		JobStatusResponse{}, CancelResponse{}, ErrorResponse{},
 	} {
 		rt := reflect.TypeOf(v)
 		walk(rt, rt.Name())

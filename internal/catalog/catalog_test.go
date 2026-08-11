@@ -3,88 +3,19 @@ package catalog
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/compgenlab/varianthub-web/internal/pgtest"
 )
 
-// Like the queue tests, these need a real Postgres; see internal/queue for the
-// container invocation. Each test gets its own schema.
-// allMigrations are every migration, discovered rather than listed.
-//
-// The list used to be written by hand, so adding a table meant remembering to
-// add it here too — and forgetting showed up as `relation "reference" does not
-// exist` in whichever test happened to touch it, rather than as anything about
-// the list. Globbing means a new migration is exercised by the existing tests
-// the moment it lands.
-//
-// Sorted, because migrations are ordered by their numeric prefix and a later one
-// alters what an earlier one created.
-func allMigrations(t *testing.T) []string {
-	t.Helper()
-	files, err := filepath.Glob("../../migrations/*.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) == 0 {
-		t.Fatal("no migrations found; the glob or the layout has moved")
-	}
-	sort.Strings(files)
-	return files
-}
-
+// These need a real Postgres; see internal/pgtest for the container invocation.
+// Each test gets its own migrated schema.
 func testStore(t *testing.T) *Store {
 	t.Helper()
-	dsn := os.Getenv("VHW_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("VHW_TEST_DATABASE_URL not set; skipping catalog tests")
-	}
-	ctx := context.Background()
-
-	var ddl strings.Builder
-	for _, f := range allMigrations(t) {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		ddl.Write(b)
-		ddl.WriteString("\n")
-	}
-
-	schema := fmt.Sprintf("c_%d", time.Now().UnixNano())
-	setup, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	if _, err := setup.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
-		setup.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-	if _, err := setup.Exec(ctx, `SET search_path TO `+schema+`; `+ddl.String()); err != nil {
-		setup.Close()
-		t.Fatalf("apply migrations: %v", err)
-	}
-	setup.Close()
-
-	pool, err := pgxpool.New(ctx, dsn+"&search_path="+schema)
-	if err != nil {
-		t.Fatalf("open: %v", err)
-	}
-	t.Cleanup(func() {
-		drop, err := pgxpool.New(context.Background(), dsn)
-		if err == nil {
-			_, _ = drop.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
-			drop.Close()
-		}
-		pool.Close()
-	})
-	return New(pool)
+	return New(pgtest.Pool(t))
 }
 
 func seeded(t *testing.T) *Store {

@@ -109,6 +109,22 @@
   # GRCh38 = "/mnt/ref/GRCh38.fa"
   # GRCh37 = "/mnt/ref/hs37d5.fa"
 
+# The shared annotation cache.
+#
+# Variant annotations do not change, so a value computed once can be reused by
+# every later job asking about the same variant and source. It lives in the
+# database configured above, shared by every worker.
+#
+# Defaults only: Administration -> Settings overrides each of these without a
+# redeploy, and the stored value wins. This file describes a fresh installation.
+[cache]
+enabled     = true
+# Cached (variant, source) entries to keep; trimmed oldest-first at the end of
+# each run. Omit for unlimited.
+max_entries = 50000000
+# Entries unused for longer than this are discarded. "2160h" is 90 days.
+max_age     = "2160h"
+
 [limits]
   # The submit rate applies to anonymous callers only; an account is
   # accountable, and throttling a signed-in bulk load would make it throttle
@@ -117,4 +133,3 @@
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
   max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
-  submit_wait_cap = "10s"                           # VHW_SUBMIT_WAIT_CAP

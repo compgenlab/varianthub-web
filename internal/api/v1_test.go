@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -51,29 +50,6 @@ func TestSelectionNormalization(t *testing.T) {
 	}
 }
 
-func TestWaitForClamping(t *testing.T) {
-	s := New(&config.Config{SubmitWaitCap: 10 * time.Second}, nil, nil, nil, nil)
-	cases := []struct {
-		raw  string
-		want time.Duration
-	}{
-		{"", 0},
-		{"3", 3 * time.Second},
-		{"2s", 2 * time.Second},
-		{"500ms", 500 * time.Millisecond},
-		{"99", 10 * time.Second}, // clamped to the cap
-		{"5m", 10 * time.Second}, // clamped to the cap
-		{"-1", 0},                // negative is no wait, not an error
-		{"nonsense", 0},          // unparseable is no wait, not a 400
-	}
-	for _, tc := range cases {
-		r := httptest.NewRequest("POST", "/api/v1/annotate?wait="+tc.raw, nil)
-		if got := s.waitFor(r); got != tc.want {
-			t.Fatalf("wait=%q -> %v, want %v", tc.raw, got, tc.want)
-		}
-	}
-}
-
 // History scoping reads the resolved caller, not the request.
 //
 // It used to read an X-Varhub-Session header the browser wrote for itself. That
@@ -108,7 +84,7 @@ func openServer(t *testing.T) http.Handler {
 	t.Helper()
 	return New(&config.Config{
 		AllowAnonymous: true, Version: "test",
-		RatePerMin: 1000, RateBurst: 1000, SubmitWaitCap: time.Second,
+		RatePerMin: 1000, RateBurst: 1000,
 	}, nil, nil, nil, nil).Routes()
 }
 

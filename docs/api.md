@@ -216,9 +216,10 @@ snapshot, so the selection is persisted as one — a real snapshot in state
 resubmitting the same selection reuses one row instead of accumulating a snapshot
 per job.
 
-`?wait=<seconds|duration>` blocks up to a server-capped interval
-(`VHW_SUBMIT_WAIT_CAP`, default 10s) so fast jobs return inline. On completion
-within the window the response is a `200` job object with `results` embedded.
+Submission is always `202` with a `job_id`, whatever happens next: annotation is
+asynchronous, so a submission's whole result is the identifier to follow it by.
+Poll `GET /jobs/{id}` for status and fetch `GET /jobs/{id}/export` when it is
+`done`.
 
 ### `POST /api/v1/annotate/vcf`
 

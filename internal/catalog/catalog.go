@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/compgenlab/varianthub-web/internal/anncache"
 )
 
 // ErrNotFound is returned when a snapshot or source id does not exist.
@@ -139,11 +141,19 @@ type Store struct {
 	// Where asset content lives when it is not inline. Nil keeps it in the
 	// database, which is what an installation with no storage configured does.
 	blobs AssetBlobs
+	// Deployment settings, cached briefly: see site.go. A pointer so a derived
+	// store (WithAssetBlobs) shares one cache rather than copying a mutex — and
+	// so both see a change the moment either writes one.
+	site *siteCache
 }
 
 // New wraps a pool.
 func New(pool *pgxpool.Pool) *Store {
-	return &Store{pool: pool, nowFn: func() int64 { return time.Now().Unix() }}
+	return &Store{
+		pool:  pool,
+		nowFn: func() int64 { return time.Now().Unix() },
+		site:  &siteCache{},
+	}
 }
 
 // Open connects to Postgres and returns a Store. The caller must Close it.
@@ -277,8 +287,18 @@ func (s *Store) GetSnapshot(ctx context.Context, id string) (Snapshot, error) {
 	return snap, nil
 }
 
+// execer is the part of pgx these writes need, so one can be run either on the
+// pool or inside a caller's transaction.
+type execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // PutSource inserts or updates a source by id.
 func (s *Store) PutSource(ctx context.Context, src Source) error {
+	return s.putSource(ctx, s.pool, src)
+}
+
+func (s *Store) putSource(ctx context.Context, db execer, src Source) error {
 	if src.ID == "" || src.Name == "" || src.Version == "" {
 		return errors.New("source needs id, name and version")
 	}
@@ -295,7 +315,7 @@ func (s *Store) PutSource(ctx context.Context, src Source) error {
 		src.IndexStatus = "indexed"
 	}
 	now := s.nowFn()
-	_, err := s.pool.Exec(ctx, `
+	_, err := db.Exec(ctx, `
 		INSERT INTO source (id,name,version,title,detail,kind,build,visibility,
 		                    index_status,origin,toml_text,created_at,updated_at)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$12)
@@ -859,15 +879,39 @@ func (s *Store) UpdateSourceTOML(ctx context.Context, id string, next Source) (S
 	// know and must not overwrite.
 	next.IndexStatus = existing.IndexStatus
 
+	// One transaction, because the three writes are one fact: this source now
+	// emits something different. Applied piecemeal, a failure between them leaves
+	// a manifest live beside cached values computed from the manifest it
+	// replaced — which is not a stale cache but a wrong one, and it looks exactly
+	// like a correct one.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return Source{}, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+
 	// Regenerable, and now describing a manifest that no longer exists.
-	if _, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		DELETE FROM snapshot
 		 WHERE state = $1
 		   AND id IN (SELECT snapshot_id FROM snapshot_source WHERE source_id = $2)`,
 		StateAdhoc, id); err != nil {
 		return Source{}, err
 	}
-	if err := s.PutSource(ctx, next); err != nil {
+	if err := s.putSource(ctx, tx, next); err != nil {
+		return Source{}, err
+	}
+	// The annotation cache keys a source by "name:version", and neither has
+	// changed — this edit is refused outright if they had. So nothing about the
+	// key says the stored values are now answers to a different question: which
+	// fields the source emits, and where each reads from, are exactly what a
+	// manifest edit changes. A revision counter in the key would express that,
+	// at the cost of a column every writer has to keep true; discarding what
+	// cannot be trusted is the same outcome for the price of recomputing it.
+	if err := anncache.PurgeSource(ctx, tx, existing.Ref()); err != nil {
+		return Source{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return Source{}, err
 	}
 	return next, nil

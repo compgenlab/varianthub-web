@@ -215,6 +215,15 @@ export interface Annotation {
   default?: boolean;
 }
 
+/** The deployment's own settings, from /admin/settings. */
+export type SiteSettings = {
+  allow_anonymous: boolean;
+  cache_enabled: boolean;
+  cache_max_entries: number;
+  /** A Go duration string ("2160h"); empty means unbounded. */
+  cache_max_age: string;
+};
+
 /** One storage location's reachability, from /admin/storage/check. */
 export interface StorageHealth {
   id: string;
@@ -378,16 +387,12 @@ export const api = {
     build?: string;
     variants: string[];
     annotations?: string | string[];
-    wait?: number;
-  }) => {
-    const { wait, ...rest } = body;
-    const qs = wait ? `?wait=${wait}` : "";
-    return req<{ job_id: string } & Partial<Job>>(`/annotate${qs}`, {
+  }) =>
+    req<{ job_id: string }>("/annotate", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(rest),
-    });
-  },
+      body: JSON.stringify(body),
+    }),
 
   annotateVCF: (
     file: File,
@@ -399,7 +404,7 @@ export const api = {
     if (opts.sources?.length) fd.append("sources", opts.sources.join(","));
     if (opts.build) fd.append("build", opts.build);
     if (opts.annotations) fd.append("annotations", opts.annotations);
-    return req<{ job_id: string } & Partial<Job>>("/annotate/vcf", {
+    return req<{ job_id: string }>("/annotate/vcf", {
       method: "POST",
       body: fd,
     });
@@ -640,6 +645,29 @@ export const api = {
 
   revokeToken: (id: string) =>
     req<void>(`/auth/tokens/${encodeURIComponent(id)}`, { method: "DELETE" }),
+
+  // --- deployment settings ---
+  //
+  // Three views of each setting: what the file says, what an administrator has
+  // overridden, and what actually applies. The form needs all three to show a
+  // value as inherited or overridden, and "revert" is sending an empty string.
+  settings: () =>
+    req<{
+      defaults: SiteSettings;
+      overrides: Record<string, string>;
+      effective: SiteSettings;
+      keys: string[];
+      cache_available: boolean;
+    }>("/admin/settings"),
+
+  saveSettings: (values: Record<string, string>) =>
+    req<{ effective: SiteSettings }>("/admin/settings", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(values),
+    }),
+
+  clearCache: () => req<{ cleared: boolean }>("/admin/cache/clear", { method: "POST" }),
 
   users: () => req<{ users: User[] }>("/admin/users"),
 

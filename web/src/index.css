@@ -328,7 +328,12 @@ table.rt thead th button {
   letter-spacing: inherit; text-transform: inherit;
   display: inline-flex; align-items: center; gap: 5px;
 }
-table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline); }
+/* Top, not middle. One source with a lot to say — a transcript consequence
+   list, say — makes its row tall, and centred cells push every short value in
+   that row to the vertical middle, away from the header it belongs under.
+   Reading across a row then means hunting. Top-aligned, every value starts on
+   the same line whatever the tallest cell does. */
+table.rt tbody td { padding: 10px 16px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
 .src-tag { color: var(--accent); text-transform: none; letter-spacing: 0; font-size: 10px; }
 .num { text-align: right; font-family: var(--mono); font-size: 12.5px; }
 

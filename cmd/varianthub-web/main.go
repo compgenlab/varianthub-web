@@ -16,8 +16,10 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/api"
 	"github.com/compgenlab/varianthub-web/internal/blob"
+	"github.com/compgenlab/varianthub-web/internal/cacherunner"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -92,9 +94,6 @@ func serve(ctx context.Context, cfg *config.Config) error {
 		return err
 	}
 	defer q.Close()
-
-	// The API listens so ?wait= can be woken by a worker in another replica.
-	q.StartListener(ctx)
 
 	// The catalog backs the snapshot/source endpoints. It shares the database, so
 	// a failure here is not survivable in practice -- but the server is still
@@ -243,20 +242,89 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer cat.Close()
 
-	if cfg.NoCache {
-		// Loud, because it is a diagnostic mode with a real cost: every value is
-		// recomputed and nothing is kept, so a repeated query pays full price.
-		log.Printf("worker: annotation cache DISABLED (VHW_NO_CACHE) — every value " +
-			"recomputed, nothing persisted")
+	annotator, closeCache, err := withCache(ctx, cfg, cat, exec)
+	if err != nil {
+		return err
 	}
+	defer closeCache()
+
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, exec, cat, cfg.DataDir, cfg.VarhubBin))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
 	q.Wait()
 	return nil
+}
+
+// withCache puts the shared annotation cache in front of the engine, where the
+// deployment wants one.
+//
+// The cache is here rather than inside varhub because varhub runs a source's
+// tool steps as bash: a DSN in the job's home would be readable by any code a
+// registered manifest chooses to run. Here it also gets to skip the process
+// entirely, which is most of the saving.
+//
+// Returns the runner to use and a function to release the cache. Both are always
+// usable — a deployment with no cache gets the engine unchanged.
+func withCache(ctx context.Context, cfg *config.Config, cat *catalog.Store,
+	exec *runner.ExecRunner) (runner.Runner, func(), error) {
+
+	noop := func() {}
+	if cfg.NoCache {
+		// Loud, because it is a diagnostic mode with a real cost: every value is
+		// recomputed and nothing is kept, so a repeated query pays full price. It
+		// is also the only way to tell "asked and got nothing" from "replaying an
+		// older, emptier answer", so it has to bypass this cache as well as
+		// varhub's own.
+		log.Printf("worker: annotation cache DISABLED (VHW_NO_CACHE) — every value " +
+			"recomputed, nothing persisted")
+		return exec, noop, nil
+	}
+	if cfg.DatabaseURL == "" {
+		return exec, noop, nil
+	}
+
+	site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read site settings: %w", err)
+	}
+	if !site.CacheEnabled {
+		log.Printf("worker: annotation cache off by setting; jobs will compute every value")
+		// Still wrapped: the setting is read per job, so turning it back on takes
+		// effect on the next job rather than on the next restart.
+	}
+
+	store, err := anncache.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	log.Printf("worker: shared annotation cache on %s (max %d unit(s), max age %s)",
+		"postgres", site.CacheMaxEntries, orNever(site.CacheMaxAgeText))
+	return &cacherunner.Runner{
+			Inner:   exec,
+			Cache:   store,
+			Catalog: cat,
+			// Read per job rather than captured, so an administrator's change
+			// reaches a running worker.
+			Site: func(ctx context.Context) catalog.Site {
+				s, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+				if err != nil {
+					// The configured default rather than a guess: a database blip
+					// should not silently change the cache policy.
+					return catalog.SiteFromConfig(cfg)
+				}
+				return s
+			},
+		}, func() { store.Close() }, nil
+}
+
+func orNever(s string) string {
+	if s == "" {
+		return "unbounded"
+	}
+	return s
 }
 
 // homeProvider chooses where a job's annotation config comes from.

@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/compgenlab/varianthub-web/internal/anncache"
 )
 
 func seedSource(t *testing.T, s *Store, ctx context.Context) Source {
@@ -117,5 +119,74 @@ func TestAManifestCannotRenameTheSource(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "vep:114") {
 		t.Errorf("err = %q, want it to name what the manifest describes", err)
+	}
+}
+
+// A manifest edit changes which fields a source emits and where each reads from,
+// while its name and version — the only things the annotation cache keys on —
+// stay exactly as they were. Nothing about the key says the stored values are
+// now answers to a different question, so the edit has to say it.
+func TestUpdatingAManifestDiscardsThatSourcesCachedValues(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	src := seedSource(t, s, ctx)
+
+	cache := anncache.New(s.pool)
+	locus := anncache.Locus{Chrom: "chr1", Pos: 100, Ref: "A", Alt: "T"}
+	if err := cache.Put(ctx, "GRCh38", []anncache.Unit{
+		{Locus: locus, Source: src.Ref(), Entries: anncache.Hit{"consequence": {Str: "missense"}}},
+		{Locus: locus, Source: "gnomad:4.1", Entries: anncache.Hit{"af": {Num: 0.25, IsNum: true}}},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	next := src
+	next.TOML = src.TOML + "  requires_reference = true\n"
+	if _, err := s.UpdateSourceTOML(ctx, src.ID, next); err != nil {
+		t.Fatal(err)
+	}
+
+	hits, err := cache.Lookup(ctx, "GRCh38", []anncache.Locus{locus},
+		[]string{src.Ref(), "gnomad:4.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := hits.Get(locus.Key(), src.Ref()); ok {
+		t.Error("values computed from the replaced manifest survived the edit")
+	}
+	// Only that source. Everything else was computed from a manifest nobody
+	// touched and is still correct.
+	if _, ok := hits.Get(locus.Key(), "gnomad:4.1"); !ok {
+		t.Error("the edit discarded another source's values")
+	}
+}
+
+// A rejected edit must not have cost anything: the manifest is unchanged, so
+// what was computed from it is still the right answer.
+func TestARefusedManifestEditKeepsTheCache(t *testing.T) {
+	s := testStore(t)
+	ctx := context.Background()
+	src := seedSource(t, s, ctx)
+
+	cache := anncache.New(s.pool)
+	locus := anncache.Locus{Chrom: "chr1", Pos: 100, Ref: "A", Alt: "T"}
+	if err := cache.Put(ctx, "GRCh38", []anncache.Unit{
+		{Locus: locus, Source: src.Ref(), Entries: anncache.Hit{"consequence": {Str: "missense"}}},
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	renamed := src
+	renamed.ID, renamed.Name, renamed.Version = "vep:114", "vep", "114"
+	if _, err := s.UpdateSourceTOML(ctx, src.ID, renamed); err == nil {
+		t.Fatal("a manifest renamed the source in place")
+	}
+
+	hits, err := cache.Lookup(ctx, "GRCh38", []anncache.Locus{locus}, []string{src.Ref()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := hits.Get(locus.Key(), src.Ref()); !ok {
+		t.Error("a refused edit discarded the cache anyway")
 	}
 }

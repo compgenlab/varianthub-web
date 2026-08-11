@@ -5,6 +5,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // The published responses' JSON keys, pinned.
@@ -33,9 +35,9 @@ func TestPublishedResponseKeys(t *testing.T) {
 		{"accepted", AcceptedResponse{}, []string{"job_id"}},
 		{"cancel", CancelResponse{}, []string{"cancelled", "job"}},
 		{"error", ErrorResponse{}, []string{"error"}},
-		{"job result", JobResultResponse{}, []string{
-			"created_at", "finished_at", "job_id", "kind", "label",
-			"n_variants", "snapshot", "started_at", "status"}},
+		{"job status", JobStatusResponse{}, []string{
+			"created_at", "job_id", "kind", "n_variants", "selection",
+			"snapshot", "status"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -88,5 +90,41 @@ func TestListingItemsCarryTheirAdditions(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// GET /jobs/{id} is deliberately public — an anonymous result's link is its
+// credential, so it is meant to be handed to someone else. The queue row it is
+// built from carries the submitter's address, session and account, and sharing a
+// result is not understood to share any of those.
+//
+// Asserted on the projection rather than on a live response so it fails at the
+// moment someone widens the type, which is when it is cheap to notice.
+func TestJobStatusDoesNotCarryTheSubmittersIdentity(t *testing.T) {
+	full := queue.Job{
+		ID: "j1", Kind: "locus", Snapshot: "snap", Selection: "af",
+		Status: "done", NVariants: 3, Label: "chr1:100:A:T",
+		ClientIP: "203.0.113.7", Session: "sess-secret", UserID: "user-42",
+		CreatedAt: 1, StartedAt: 2, FinishedAt: 3,
+	}
+	b, err := json.Marshal(jobStatus(full))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := string(b)
+	for _, leaked := range []string{"203.0.113.7", "sess-secret", "user-42"} {
+		if strings.Contains(body, leaked) {
+			t.Errorf("a shared job link discloses %q:\n%s", leaked, body)
+		}
+	}
+	// And it still says the things a caller polls it for.
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"job_id", "status", "n_variants", "finished_at"} {
+		if _, ok := got[want]; !ok {
+			t.Errorf("%q is missing from a job status", want)
+		}
 	}
 }

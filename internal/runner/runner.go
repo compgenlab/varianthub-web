@@ -356,6 +356,33 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	return Result{Variants: out, N: len(probe), Columns: cols, Log: tail}, nil
 }
 
+// ColumnLister describes a result set's columns without annotating anything.
+//
+// For a caller that produced results some other way and still owes them a
+// header — the annotation cache, which can answer a whole job from stored values
+// and never run the engine at all. Without this it would have to rebuild the
+// column model from the catalog, which is the second implementation of that
+// model this package exists to avoid.
+type ColumnLister interface {
+	Columns(ctx context.Context, snapshot string, present map[string]bool) ([]Column, error)
+}
+
+// Columns describes the given keys for a snapshot, materializing a home to ask
+// the CLI. Cheaper than annotating — it reads manifests and opens no source —
+// but not free, so it is for the path that skipped the run entirely.
+func (r *ExecRunner) Columns(ctx context.Context, snapshot string, present map[string]bool) ([]Column, error) {
+	bin := r.Bin
+	if bin == "" {
+		bin = "varhub"
+	}
+	home, cleanup, err := r.Home.Home(ctx, snapshot)
+	if err != nil {
+		return nil, fmt.Errorf("prepare annotation home: %w", err)
+	}
+	defer cleanup()
+	return r.columns(ctx, bin, home, snapshot, present)
+}
+
 // columns asks the CLI for the snapshot's annotation catalog and keeps the
 // entries the engine actually emitted, in snapshot order.
 //
