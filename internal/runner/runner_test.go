@@ -100,7 +100,9 @@ func TestExecRunnerLocus(t *testing.T) {
 	if len(got) != 1 || got[0].Chrom != "chr1" || got[0].Pos != 115256529 {
 		t.Fatalf("unexpected variant: %+v", got)
 	}
-	if got[0].Annotations["auto_id"] != "chr1_115256529_T_C" {
+	// The portable form: chromosome without its "chr", hyphen-joined, as gnomAD
+	// and the variant portals write it. See cghts VariantID.
+	if got[0].Annotations["auto_id"] != "1-115256529-T-C" {
 		t.Errorf("auto_id = %v", got[0].Annotations["auto_id"])
 	}
 	if got[0].Annotations["tstv"] != "TS" {

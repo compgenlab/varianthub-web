@@ -68,7 +68,8 @@ func TestCatalogDrivenAnnotation(t *testing.T) {
 			t.Errorf("missing default annotation %q; got %v", key, got[0].Annotations)
 		}
 	}
-	if got[0].Annotations["auto_id"] != "chr1_115256529_T_C" {
+	// The portable form; see cghts VariantID.
+	if got[0].Annotations["auto_id"] != "1-115256529-T-C" {
 		t.Errorf("auto_id = %v", got[0].Annotations["auto_id"])
 	}
 	if got[0].Annotations["tstv"] != "TS" {
