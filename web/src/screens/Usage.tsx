@@ -6,9 +6,10 @@ import { api, type Split, type Usage as UsageData, type UserUsage } from "../api
 /**
  * Who has been using this installation, and how much.
  *
- * Separate from Metrics, which is about the machine — queue depth, bytes on
- * disk. This is about people, read at a different time and for a different
- * reason, and it scans the job table to answer.
+ * The people half of Usage & Metrics; the machine half — queue depth, bytes on
+ * disk — lives in Metrics.tsx, which is the page that renders both. Its own
+ * component with its own fetch, so a failure on either side shows where it
+ * happened instead of blanking the page, and neither waits on the other.
  */
 export default function Usage() {
   const [u, setU] = useState<UsageData | null>(null);
@@ -28,36 +29,29 @@ export default function Usage() {
 
   if (err) {
     return (
-      <div className="page page-wide" style={{ paddingTop: 30 }}>
-        <h1 className="title">Usage</h1>
-        <p className="err" style={{ marginTop: 16, fontSize: 13 }}>
-          {err}
-        </p>
-      </div>
+      <p className="err" style={{ marginTop: 16, fontSize: 13 }}>
+        {err}
+      </p>
     );
   }
   if (!u) {
     return (
-      <div className="page page-wide" style={{ paddingTop: 30 }}>
-        <h1 className="title">Usage</h1>
-        <p className="lede" style={{ marginTop: 16 }}>
-          Loading…
-        </p>
-      </div>
+      <p className="lede" style={{ marginTop: 16 }}>
+        Loading usage…
+      </p>
     );
   }
 
   const active = u.users.filter((r) => r.jobs.total > 0);
 
   return (
-    <div className="page page-wide" style={{ paddingTop: 30 }}>
-      <h1 className="title">Usage</h1>
-      <p className="lede" style={{ marginTop: 6 }}>
+    <>
+      <p className="lede" style={{ fontSize: 13.5, margin: "6px 0 0" }}>
         Annotation work only — provisioning downloads are the deployment's own
         doing, not somebody's usage.
       </p>
 
-      <div className="row gap-10" style={{ marginTop: 22, flexWrap: "wrap" }}>
+      <div className="row gap-10" style={{ marginTop: 18, flexWrap: "wrap" }}>
         <Stat icon={<UsersRound size={15} />} label="Accounts" value={u.accounts} />
         <Stat
           icon={<UserRound size={15} />}
@@ -128,7 +122,7 @@ export default function Usage() {
           </div>
         )}
       </div>
-    </div>
+    </>
   );
 }
 

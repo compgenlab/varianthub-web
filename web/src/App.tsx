@@ -9,7 +9,7 @@ import {
   Routes,
   useLocation,
 } from "react-router-dom";
-import { Activity, ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
+import { ChartColumn, ChevronDown, FilePlus2, HardDrive, LogIn, LogOut, ServerCog, Settings, ShieldCheck, Table2, Terminal, UserRound, UsersRound } from "lucide-react";
 
 import { api, setToken, type Me } from "./api";
 import { AnnotateProvider } from "./flow";
@@ -25,7 +25,6 @@ import Account from "./screens/Account";
 import Groups from "./screens/Groups";
 import Admin from "./screens/Admin";
 import Metrics from "./screens/Metrics";
-import Usage from "./screens/Usage";
 import SourceDetail from "./screens/SourceDetail";
 import SnapshotDetail from "./screens/SnapshotDetail";
 import JobDetail from "./screens/JobDetail";
@@ -176,10 +175,7 @@ function Shell({
             <ServerCog /> System jobs
           </NavLink>
           <NavLink to="/admin/metrics">
-            <ChartColumn /> Metrics
-          </NavLink>
-          <NavLink to="/admin/usage">
-            <Activity /> Usage
+            <ChartColumn /> Usage &amp; Metrics
           </NavLink>
           <NavLink to="/admin/groups">
             <UsersRound /> Users &amp; groups
@@ -310,7 +306,9 @@ export default function App() {
             <Route path="/admin/jobs" element={<SystemJobs />} />
             <Route path="/admin/jobs/:jobId" element={<JobDetail />} />
             <Route path="/admin/metrics" element={<Metrics />} />
-            <Route path="/admin/usage" element={<Usage />} />
+            {/* The two were separate pages. Anyone who bookmarked the old URL
+                should land on the page that absorbed it, not on a 404. */}
+            <Route path="/admin/usage" element={<Navigate to="/admin/metrics" replace />} />
             <Route path="/admin/groups" element={<Groups me={me ?? anonymousMe} />} />
             <Route path="/account" element={<Account me={me ?? anonymousMe} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
