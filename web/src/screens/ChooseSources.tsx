@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { ArrowRight, Check, Lock, TriangleAlert, Globe } from "lucide-react";
+import { ArrowRight, Check, Globe, Lock, Minus, TriangleAlert } from "lucide-react";
 
 import { api, type Annotation, type Build, type Snapshot, type Source } from "../api";
 import { useFlow } from "../flow";
@@ -167,6 +167,19 @@ export default function ChooseSources() {
         ? flow.annotations.filter((n) => n !== name)
         : [...flow.annotations, name],
     );
+  }
+
+  // Counted against the fields on offer rather than against flow.annotations
+  // itself, which can still name a field from a source since deselected —
+  // otherwise the header reads "13 of 12" and its checkbox never fills.
+  const chosen = fields.filter((f) => flow.annotations.includes(f.name)).length;
+  const allChosen = fields.length > 0 && chosen === fields.length;
+  const someChosen = chosen > 0 && !allChosen;
+
+  // Clearing sets the empty list rather than subtracting the visible fields, so
+  // "select none" also drops any such leftover.
+  function toggleAllFields() {
+    flow.setAnnotations(allChosen ? [] : fields.map((f) => f.name));
   }
 
   function next() {
@@ -455,22 +468,6 @@ export default function ChooseSources() {
             <span className="label" style={{ margin: 0 }}>
               Fields to apply
             </span>
-            <span className="row gap-10">
-              <button
-                className="btn link"
-                style={{ fontSize: 12.5 }}
-                onClick={() => flow.setAnnotations(fields.map((f) => f.name))}
-              >
-                Select all
-              </button>
-              <button
-                className="btn link"
-                style={{ fontSize: 12.5 }}
-                onClick={() => flow.setAnnotations([])}
-              >
-                Select none
-              </button>
-            </span>
           </div>
 
           {fields.length === 0 ? (
@@ -479,6 +476,40 @@ export default function ChooseSources() {
             </div>
           ) : (
             <div className="card" style={{ padding: "6px 0" }}>
+              {/* Select-all as the first row of the list rather than as a pair of
+                  links above it, so its box sits in the same column as the boxes
+                  it controls — which is what makes it read as "all of these"
+                  rather than as an unrelated control that happens to be nearby. */}
+              <button
+                className="trow row gap-10"
+                // "mixed" is the state a partial selection is actually in.
+                // Reporting it as unchecked would tell a screen reader that
+                // nothing is selected while the page plainly shows otherwise.
+                aria-pressed={allChosen ? "true" : someChosen ? "mixed" : "false"}
+                style={{
+                  cursor: "pointer",
+                  padding: "8px 18px",
+                  borderBottom: "1px solid var(--hairline)",
+                  // Never the selected-row tint, whatever its state. It is a
+                  // control over the list rather than a member of it, and taking
+                  // the tint made it blend into the rows when everything was
+                  // checked and stand apart from them when only some was — the
+                  // header changing character as the selection changed.
+                  background: "var(--surface)",
+                }}
+                onClick={toggleAllFields}
+              >
+                <span
+                  className={`check sm ${allChosen ? "on" : someChosen ? "some" : ""}`}
+                >
+                  {allChosen && <Check size={12} strokeWidth={3} />}
+                  {someChosen && <Minus size={12} strokeWidth={3} />}
+                </span>
+                <span style={{ flex: 1, fontWeight: 500 }}>Select all</span>
+                <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>
+                  {chosen} of {fields.length}
+                </span>
+              </button>
               {fields.map((f) => {
                 const on = flow.annotations.includes(f.name);
                 return (

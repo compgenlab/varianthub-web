@@ -288,6 +288,10 @@ p.lede { font-size: 14px; color: var(--text-2); max-width: 64ch; line-height: 1.
   flex: none; display: grid; place-items: center; background: var(--surface);
 }
 .check.on { background: var(--accent); border-color: var(--accent); color: #fff; }
+/* A partial selection. Filled like a checked box rather than outlined like an
+   empty one: it means "some of these", which is nearer to on than to off, and
+   the dash is what separates the two at a glance. */
+.check.some { background: var(--accent); border-color: var(--accent); color: #fff; }
 .check.sm { width: 18px; height: 18px; border-radius: 5px; }
 
 .rowgrid { display: grid; gap: 12px; align-items: center; }
