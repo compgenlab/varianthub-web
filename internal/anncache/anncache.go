@@ -29,6 +29,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -297,6 +298,16 @@ func (s *Store) Put(ctx context.Context, assembly string, units []Unit) error {
 	return tx.Commit(ctx)
 }
 
+// Execer is the part of pgx a purge needs.
+//
+// Taken as an interface so a purge can join a transaction that belongs to
+// somebody else. Invalidating a source's values is not an independent event: it
+// is one half of "this source now emits something different", and the two have
+// to land together or not at all.
+type Execer interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+}
+
 // PurgeSource removes everything cached for one source.
 //
 // For the case a version cannot express: editing a source's manifest changes
@@ -304,8 +315,13 @@ func (s *Store) Put(ctx context.Context, assembly string, units []Unit) error {
 // "name:version" the cache keys on — stays exactly as it was. Every entry under
 // that key is now an answer to a question that is no longer being asked.
 func (s *Store) PurgeSource(ctx context.Context, source string) error {
-	_, err := s.pool.Exec(ctx, `DELETE FROM cache_variant_source WHERE source=$1`, source)
-	if err != nil {
+	return PurgeSource(ctx, s.pool, source)
+}
+
+// PurgeSource removes one source's values through the given connection or
+// transaction. See Store.PurgeSource.
+func PurgeSource(ctx context.Context, db Execer, source string) error {
+	if _, err := db.Exec(ctx, `DELETE FROM cache_variant_source WHERE source=$1`, source); err != nil {
 		return fmt.Errorf("anncache: purge %s: %w", source, err)
 	}
 	return nil
