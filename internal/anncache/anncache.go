@@ -43,7 +43,16 @@ type Locus struct {
 
 // Key is the locus's identity as a map key, matching varhub's own locus key so
 // the two can be compared without a conversion.
+//
+// It is also the form varhub takes on the command line, which is not a
+// coincidence worth relying on: Arg says so explicitly, so a change to either
+// does not silently become a change to the other.
 func (l Locus) Key() string {
+	return l.Chrom + ":" + strconv.FormatInt(l.Pos, 10) + ":" + l.Ref + ":" + l.Alt
+}
+
+// Arg renders the locus as varhub expects it on the command line.
+func (l Locus) Arg() string {
 	return l.Chrom + ":" + strconv.FormatInt(l.Pos, 10) + ":" + l.Ref + ":" + l.Alt
 }
 
