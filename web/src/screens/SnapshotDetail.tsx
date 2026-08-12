@@ -113,7 +113,7 @@ export default function SnapshotDetail() {
       <div className="row gap-14" style={{ marginBottom: 20, fontSize: 12 }}>
         {snapshot.contains_private && (
           <span className="row gap-8" style={{ color: "var(--text-2)" }}>
-            <Lock size={11} /> contains private sources
+            <Lock size={11} /> not offered to everyone
           </span>
         )}
         {snapshot.contains_remote && (

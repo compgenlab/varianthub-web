@@ -27,12 +27,14 @@ func TestSourceRequestDerive(t *testing.T) {
 	if src.Title != "Lab panel" {
 		t.Errorf("title = %q", src.Title)
 	}
-	// Private unless asked otherwise. The two mistakes are not symmetric: a
-	// source that should have been public is one request away from being fixed,
-	// while one that should have been private has already been readable by
-	// everyone who could reach the server.
-	if src.Visibility != catalog.VisibilityPrivate {
-		t.Errorf("visibility = %q, want private", src.Visibility)
+	// Left empty when the request says nothing, so "not mentioned" stays distinct
+	// from "make it closed" — the two callers want different things from silence.
+	// Registration falls through to the store's closed default (asserted against a
+	// real row by TestRegisteringWithoutSayingIsStillClosed); an update carries the
+	// stored value forward, which is what stopped a manifest edit from silently
+	// closing a public source.
+	if src.Visibility != "" {
+		t.Errorf("visibility = %q, want it left for the caller to default", src.Visibility)
 	}
 	// The manifest is stored byte-for-byte; varhub reads it, not our projection.
 	if src.TOML != fragment {
@@ -49,7 +51,7 @@ func TestSourceRequestOverrides(t *testing.T) {
 		t.Fatal(err)
 	}
 	if src.ID != "custom" || src.Title != "T" || src.Detail != "D" ||
-		src.Origin != "uploaded" || src.Visibility != catalog.VisibilityPrivate {
+		src.Origin != "uploaded" || src.Visibility != catalog.VisibilityRestricted {
 		t.Errorf("overrides not applied: %+v", src)
 	}
 }

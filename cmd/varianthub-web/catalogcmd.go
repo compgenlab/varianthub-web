@@ -86,7 +86,11 @@ func cmdSource(ctx context.Context, cfg *config.Config, args []string) error {
 		id := fs.String("id", "", "catalog id (default: <name>-<version> from the TOML)")
 		title := fs.String("title", "", "display title (default: the TOML's title)")
 		detail := fs.String("detail", "", "one-line description for the picker")
-		private := fs.Bool("private", false, "mark the source private (needs a team grant)")
+		private := fs.Bool("private", false,
+			"shorthand for -visibility restricted (kept for existing scripts)")
+		vis := fs.String("visibility", "",
+			"who may use it: public (anyone, incl. anonymous) | signed_in (any account) | "+
+				"restricted (needs a team grant). Default: restricted")
 		origin := fs.String("origin", "", "provenance note, e.g. \"registry: ncbi-clinvar\"")
 		building := fs.Bool("building", false, "mark the index as still being built")
 		if err := fs.Parse(args[1:]); err != nil {
@@ -119,7 +123,14 @@ func cmdSource(ctx context.Context, cfg *config.Config, args []string) error {
 			src.Detail = *detail
 		}
 		if *private {
-			src.Visibility = catalog.VisibilityPrivate
+			src.Visibility = catalog.VisibilityRestricted
+		}
+		// After -private, so the explicit flag wins when both are given.
+		if *vis != "" {
+			if !catalog.ValidVisibility(*vis) {
+				return fmt.Errorf("visibility %q: want public, signed_in or restricted", *vis)
+			}
+			src.Visibility = *vis
 		}
 		if *origin != "" {
 			src.Origin = *origin

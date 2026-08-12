@@ -1,12 +1,30 @@
 // Typed client for /api/v1. Shapes mirror docs/api.md — treat a change here as a
 // change to a shared contract.
 
+/**
+ * Who may use a source, gene list or snapshot, from least to most restrictive.
+ *
+ * - `public` — anyone who can reach the server, anonymous visitors included
+ * - `signed_in` — any account, with no group membership needed
+ * - `restricted` — members of a group it has been granted to
+ */
+export type Visibility = "public" | "signed_in" | "restricted";
+
 export interface Snapshot {
   id: string;
   title?: string;
   description?: string;
   build: string;
   state: string;
+  /** The snapshot's own level. What it is actually offered at is the most
+   *  restrictive of this and every source it pins — it cannot promise access to
+   *  a source the caller may not use. */
+  visibility: Visibility;
+  /** What the snapshot is actually offered at — more restrictive than
+   *  `visibility` when a pinned source says so. Shown alongside rather than
+   *  instead of it, or a snapshot set to public that a source holds at signed_in
+   *  reads as a broken setting. */
+  effective_visibility?: Visibility;
   source_count?: number;
   contains_private?: boolean;
   /** True when a pinned source is read from its origin rather than our storage. */
@@ -27,7 +45,7 @@ export interface Source {
   detail?: string;
   kind: string;
   build?: string;
-  visibility: string;
+  visibility: Visibility;
   index_status: string;
   /** Set on the reference genome ad-hoc snapshots pin for this assembly. */
   is_default_reference?: boolean;
@@ -624,7 +642,7 @@ export const api = {
     id?: string;
     title?: string;
     detail?: string;
-    visibility?: "public" | "private";
+    visibility?: Visibility;
     origin?: string;
     assets?: SourceAsset[];
     settings?: SourceSettings;
@@ -641,6 +659,35 @@ export const api = {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+    }),
+
+  /** Changes who may use a source. Gene lists are sources, so this is their
+   *  toggle too. */
+  setSourceVisibility: (id: string, visibility: Visibility) =>
+    req<{ id: string; ref: string; visibility: Visibility }>(
+      `/admin/sources/${encodeURIComponent(id)}/visibility`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ visibility }),
+      },
+    ),
+
+  /** Changes a snapshot's own level. The response reports what actually takes
+   *  effect, which is more restrictive when a pinned source says so. */
+  setSnapshotVisibility: (id: string, visibility: Visibility) =>
+    req<{
+      id: string;
+      visibility: Visibility;
+      effective_visibility: Visibility;
+      /** Sources more restrictive than the snapshot's own level, if any. */
+      constrained_by?: string[];
+      /** Set when the stored level is not the effective one. */
+      note?: string;
+    }>(`/admin/snapshots/${encodeURIComponent(id)}/visibility`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ visibility }),
     }),
 
   /** The GTF sources a gene list can be built on, with how many genes each has
@@ -671,7 +718,7 @@ export const api = {
     title?: string;
     description?: string;
     annotation_name?: string;
-    visibility?: "public" | "private";
+    visibility?: Visibility;
   }) =>
     req<{
       id: string;

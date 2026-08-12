@@ -7,7 +7,7 @@ import { api, type AccessRequest, type Me, type Team, type User } from "../api";
  * Users and groups.
  *
  * Groups exist because grants attach to them rather than to individuals: a
- * private source is shared with a group, and someone joining or leaving it
+ * restricted source is shared with a group, and someone joining or leaving it
  * should not mean revisiting every source.
  *
  * The API and the schema still say "team". The rename is deliberate at this
@@ -59,7 +59,7 @@ export default function Groups({ me }: { me: Me }) {
       <h1 className="title">Users &amp; groups</h1>
       <p className="lede" style={{ fontSize: 13.5, margin: "6px 0 18px" }}>
         Users sign in with a password and carry their own API tokens. Groups are
-        what private sources are granted to.
+        what restricted sources are granted to.
       </p>
 
       {err && (
@@ -150,7 +150,7 @@ export default function Groups({ me }: { me: Me }) {
       <div className="card">
         {teams.length === 0 && (
           <div style={{ padding: "16px 18px", fontSize: 13, color: "var(--text-3)" }}>
-            No groups yet. Create one to grant access to private sources.
+            No groups yet. Create one to grant access to restricted sources.
           </div>
         )}
         {teams.map((t) => (

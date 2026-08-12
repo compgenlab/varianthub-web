@@ -29,11 +29,53 @@ import (
 // ErrNotFound is returned when a snapshot or source id does not exist.
 var ErrNotFound = errors.New("not found")
 
-// Visibility values.
+// Visibility levels, from least to most restrictive.
+//
+// Ordered, not just distinct: a snapshot's effective level is the most
+// restrictive of its own and every source it pins, which only means anything if
+// they compare. VisibilityRank is that order; nothing should compare the strings.
 const (
-	VisibilityPublic  = "public"
-	VisibilityPrivate = "private"
+	// VisibilityPublic is anyone who can reach the server, anonymous included.
+	VisibilityPublic = "public"
+	// VisibilitySignedIn is any account, with no grant needed.
+	//
+	// The level that was missing. "Not for anonymous visitors" is a property of
+	// the deployment rather than of each dataset, and expressing it through team
+	// grants meant administration that grew with the catalog to say one thing.
+	VisibilitySignedIn = "signed_in"
+	// VisibilityRestricted is membership of a team the source is granted to.
+	// What used to be called "private"; the meaning is unchanged.
+	VisibilityRestricted = "restricted"
 )
+
+// VisibilityRank orders the levels so they can be compared. Higher is more
+// restrictive. An unrecognized value ranks as the most restrictive there is:
+// a level this code does not understand is not one it should hand data out on.
+func VisibilityRank(v string) int {
+	switch v {
+	case VisibilityPublic:
+		return 0
+	case VisibilitySignedIn:
+		return 1
+	case VisibilityRestricted:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// ValidVisibility reports whether v is a level this service knows.
+func ValidVisibility(v string) bool {
+	return v == VisibilityPublic || v == VisibilitySignedIn || v == VisibilityRestricted
+}
+
+// MostRestrictive returns whichever of two levels gives away less.
+func MostRestrictive(a, b string) string {
+	if VisibilityRank(b) > VisibilityRank(a) {
+		return b
+	}
+	return a
+}
 
 // Snapshot states.
 const (
@@ -98,6 +140,7 @@ type Snapshot struct {
 	Description string   `json:"description,omitempty" doc:"What this bundle is for."`
 	Build       string   `json:"build" doc:"The genome assembly. Every pinned source either declares this exact string or declares none."`
 	State       string   `json:"state" doc:"draft | published | adhoc. Drafts are not offered for annotation."`
+	Visibility  string   `json:"visibility" doc:"public | signed_in | restricted. The snapshot's own level; what it is actually offered at is the most restrictive of this and every source it pins, since it cannot promise access to a source the caller may not use."`
 	Defaults    []string `json:"defaults,omitempty" doc:"Annotation fields selected when the caller asks for none."`
 	Tags        []string `json:"tags,omitempty" doc:"Free-form labels for grouping snapshots."`
 	PublishedAt int64    `json:"published_at,omitempty" doc:"Unix seconds."`
@@ -123,15 +166,40 @@ func (s Snapshot) ContainsRemote() bool {
 	return false
 }
 
-// ContainsPrivate reports whether any pinned source is private. Drives the lock
-// notice on the snapshot cards.
+// ContainsPrivate reports whether any pinned source is above public. Drives the
+// lock notice on the snapshot cards.
+//
+// Any restriction counts, not only the strongest: the notice answers "is this
+// bundle offered to everyone", and signed_in is as much a no as restricted.
 func (s Snapshot) ContainsPrivate() bool {
 	for _, src := range s.Sources {
-		if src.Visibility == VisibilityPrivate {
+		if src.Visibility != VisibilityPublic {
 			return true
 		}
 	}
 	return false
+}
+
+// EffectiveVisibility is the level a snapshot is actually offered at: the most
+// restrictive of its own and every source it pins.
+//
+// A snapshot can be narrowed beyond its sources — a bundle assembled for one
+// group out of individually public sources — but never widened past them.
+// Widening would be a promise the catalog cannot keep: the caller would be handed
+// a snapshot whose annotations they are not allowed to compute.
+//
+// Only meaningful with Sources populated, which is why it is a method on the
+// snapshot rather than a stored column. Listings that carry no sources fall back
+// to the stored level, which is the floor.
+func (s Snapshot) EffectiveVisibility() string {
+	out := s.Visibility
+	if out == "" {
+		out = VisibilityPublic
+	}
+	for _, src := range s.Sources {
+		out = MostRestrictive(out, src.Visibility)
+	}
+	return out
 }
 
 // Store reads and writes the catalog.
@@ -198,12 +266,12 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	return s, err
 }
 
-const snapshotCols = `id, title, description, build, state, defaults, tags,
+const snapshotCols = `id, title, description, build, state, visibility, defaults, tags,
 	COALESCE(published_at,0), created_at, updated_at`
 
 func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 	var s Snapshot
-	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.Build, &s.State,
+	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.Build, &s.State, &s.Visibility,
 		&s.Defaults, &s.Tags, &s.PublishedAt, &s.CreatedAt, &s.UpdatedAt)
 	return s, err
 }
@@ -306,10 +374,10 @@ func (s *Store) putSource(ctx context.Context, db execer, src Source) error {
 		return fmt.Errorf("source %q has no TOML manifest", src.ID)
 	}
 	if src.Visibility == "" {
-		// Default closed. Publishing something private is a disclosure that
-		// cannot be undone; a private source nobody can see is a support
+		// Default closed. Publishing something restricted is a disclosure that
+		// cannot be undone; a restricted source nobody can see is a support
 		// request. The costs are not symmetric.
-		src.Visibility = VisibilityPrivate
+		src.Visibility = VisibilityRestricted
 	}
 	if src.IndexStatus == "" {
 		src.IndexStatus = "indexed"
@@ -616,6 +684,45 @@ func (s *Store) SourceSnapshots(ctx context.Context, sourceID string) ([]string,
 	return out, rows.Err()
 }
 
+// SetSourceVisibility changes who may use a source.
+//
+// Its own write rather than part of the manifest update, because it is an access
+// decision rather than a statement about the data — and because the manifest
+// update refuses a source that a snapshot pins, which must not stand between an
+// administrator and closing something off.
+func (s *Store) SetSourceVisibility(ctx context.Context, id, level string) (Source, error) {
+	if !ValidVisibility(level) {
+		return Source{}, fmt.Errorf("unknown visibility %q", level)
+	}
+	row := s.pool.QueryRow(ctx,
+		`UPDATE source SET visibility=$2, updated_at=$3 WHERE id=$1 RETURNING `+sourceCols,
+		id, level, s.nowFn())
+	src, err := scanSource(row)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Source{}, fmt.Errorf("source %q: %w", id, ErrNotFound)
+	}
+	return src, err
+}
+
+// SetSnapshotVisibility changes a snapshot's own level.
+//
+// Only ever a floor: what a snapshot is actually offered at is the most
+// restrictive of this and every source it pins. See Snapshot.EffectiveVisibility.
+func (s *Store) SetSnapshotVisibility(ctx context.Context, id, level string) error {
+	if !ValidVisibility(level) {
+		return fmt.Errorf("unknown visibility %q", level)
+	}
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE snapshot SET visibility=$2, updated_at=$3 WHERE id=$1`, id, level, s.nowFn())
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("snapshot %q: %w", id, ErrNotFound)
+	}
+	return nil
+}
+
 // ErrSourcePinned is returned when deleting a source a snapshot still pins.
 var ErrSourcePinned = errors.New("source is pinned by a snapshot")
 
@@ -899,6 +1006,18 @@ func (s *Store) UpdateSourceTOML(ctx context.Context, id string, next Source) (S
 	// What the deployment learned by provisioning, which the manifest does not
 	// know and must not overwrite.
 	next.IndexStatus = existing.IndexStatus
+
+	// Likewise who may see it: an access decision somebody made deliberately, and
+	// nothing a manifest says about the data should undo it. An edit that means to
+	// change it says so; silence means keep.
+	//
+	// This is what made editing a manifest silently close a public source. The
+	// editor posts only the TOML, the request carried no visibility, and the
+	// default landed on the row — so an unrelated one-line change took a source
+	// away from every anonymous caller using it, with nothing in the UI to say so.
+	if next.Visibility == "" {
+		next.Visibility = existing.Visibility
+	}
 
 	// One transaction, because the three writes are one fact: this source now
 	// emits something different. Applied piecemeal, a failure between them leaves

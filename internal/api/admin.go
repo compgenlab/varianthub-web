@@ -83,15 +83,29 @@ func (req sourceRequest) derive() (catalog.Source, error) {
 	if req.Origin != "" {
 		src.Origin = req.Origin
 	}
+	// Left empty when the request says nothing, so "not mentioned" stays distinct
+	// from "make it closed".
+	//
+	// It used to default to restricted right here, which is correct for
+	// registration and wrong for an edit: the manifest editor posts only the TOML,
+	// so saving an unrelated one-line change to a public source silently made it
+	// invisible to everyone who was using it. The two callers want different
+	// things from silence, so neither is decided here — registration falls through
+	// to the store's closed default, and an update carries the stored value
+	// forward.
 	switch req.Visibility {
 	case "":
-		src.Visibility = catalog.VisibilityPrivate // default closed
-	case catalog.VisibilityPublic:
-		src.Visibility = catalog.VisibilityPublic
-	case catalog.VisibilityPrivate:
-		src.Visibility = catalog.VisibilityPrivate
+		src.Visibility = ""
+	case "private":
+		// What restricted used to be called. Accepted so a script written against
+		// the old name keeps working, and meaning exactly what it did before.
+		src.Visibility = catalog.VisibilityRestricted
 	default:
-		return catalog.Source{}, errors.New(`visibility must be "public" or "private"`)
+		if !catalog.ValidVisibility(req.Visibility) {
+			return catalog.Source{}, errors.New(
+				`visibility must be "public", "signed_in" or "restricted"`)
+		}
+		src.Visibility = req.Visibility
 	}
 	return src, nil
 }

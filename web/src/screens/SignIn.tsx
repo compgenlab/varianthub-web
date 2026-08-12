@@ -368,7 +368,7 @@ function CILogonInfo({ onClose }: { onClose: () => void }) {
           </p>
           <p style={{ margin: 0 }}>
             It also confirms the address you sign in with is really yours, which
-            is what lets an administrator grant you access to a private source
+            is what lets an administrator grant you access to a restricted source
             knowing it reached the right person.
           </p>
           <p style={{ margin: 0 }}>

@@ -131,7 +131,10 @@ export default function SourceDetail() {
       </div>
 
       <SourceSettingsPanel source={source} />
-      {source.visibility === "private" && <SourceGrants id={source.id} />}
+      {/* Grants are what restricted is made of, and they still work as a
+          per-source exception on signed_in — so the panel is offered for
+          anything not open to everyone. */}
+      {source.visibility !== "public" && <SourceGrants id={source.id} />}
       <SourceConfig id={source.id} />
     </div>
   );
@@ -383,7 +386,7 @@ function SourceSettingsPanel({ source }: { source: Source }) {
 }
 
 /**
- * Which groups may see a private source.
+ * Which groups may see a restricted source.
  *
  * Grants attach to groups rather than to individuals so that access survives
  * membership changes: adding someone to the group is one action, not one per

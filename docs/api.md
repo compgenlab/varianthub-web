@@ -806,9 +806,35 @@ nobody can sign in to.
 
 ### Visibility
 
-A source is **private by default** and visible to administrators plus any team it
-has been granted to. Grants attach to teams rather than to people so access
-survives membership changes.
+Every source, gene list and snapshot carries one of three levels:
+
+| Level | Who |
+|---|---|
+| `public` | Anyone who can reach the server, anonymous visitors included |
+| `signed_in` | Any account — no group membership needed |
+| `restricted` | Members of a team it has been granted to |
+
+A source is **`restricted` by default**. Grants attach to teams rather than to
+people so access survives membership changes.
+
+`signed_in` exists because the other two could not express the most common case.
+"Not for anonymous visitors" is a property of the deployment rather than of each
+dataset, and saying it through grants meant per-source administration that grew
+with the catalog. A grant still works as a per-source exception at any level.
+
+A snapshot's stored level is only ever a **floor**. What it is actually offered at
+— reported as `effective_visibility` — is the most restrictive of its own level
+and every source it pins, so a snapshot can be narrowed beyond its sources but
+never opened past them. Setting one to `public` while it pins something
+`restricted` succeeds and returns a `note` plus `constrained_by` naming the
+sources holding it down, rather than appearing to do nothing.
+
+Changing a level is its own endpoint (`PUT .../visibility`) rather than a field on
+the manifest editor. Editing a manifest is a statement about what a source *is*;
+this is a statement about who it is for, and folding the second into the first
+meant an unrelated one-line edit could close a source to everyone using it.
+
+The name `private` is accepted on input and means `restricted`.
 
 A snapshot pinning a source the caller cannot see is **hidden entirely** — absent
 from the listing, `404` (not `403`) when fetched by name, and refused by
@@ -859,6 +885,8 @@ startup if still set.
 | `DELETE` | `/api/v1/admin/teams/{id}` | delete; its grants go with it |
 | `POST` | `/api/v1/admin/teams/{id}/members` | add a member |
 | `DELETE` | `/api/v1/admin/teams/{id}/members/{user}` | remove one |
-| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a private source |
+| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a restricted source |
 | `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
 | `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |
+| `PUT` | `/api/v1/admin/sources/{id}/visibility` | set `public` \| `signed_in` \| `restricted` |
+| `PUT` | `/api/v1/admin/snapshots/{id}/visibility` | same, and reports the effective level |

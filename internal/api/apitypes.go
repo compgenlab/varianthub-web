@@ -48,9 +48,18 @@ type SourcesResponse struct {
 // SnapshotSummary is one entry of GET /snapshots.
 type SnapshotSummary struct {
 	catalog.Snapshot
-	SourceCount     int  `json:"source_count" doc:"How many sources the snapshot pins."`
-	ContainsPrivate bool `json:"contains_private" doc:"The snapshot pins something not every caller can see."`
-	ContainsRemote  bool `json:"contains_remote" doc:"The snapshot pins a source read over the network at query time, so a run depends on somebody else's server being up."`
+	SourceCount int `json:"source_count" doc:"How many sources the snapshot pins."`
+	// EffectiveVisibility is what the snapshot is actually offered at, as
+	// opposed to the level stored on it: the most restrictive of its own and
+	// every source it pins.
+	//
+	// Reported alongside rather than instead of `visibility`, because an
+	// administrator needs to see both to understand the difference — a snapshot
+	// set to public that a pinned source holds at signed_in reads as a broken
+	// setting unless the two are shown together.
+	EffectiveVisibility string `json:"effective_visibility" doc:"public | signed_in | restricted. What the snapshot is actually offered at — more restrictive than its own visibility when a pinned source says so."`
+	ContainsPrivate     bool   `json:"contains_private" doc:"The snapshot pins something not every caller can see."`
+	ContainsRemote      bool   `json:"contains_remote" doc:"The snapshot pins a source read over the network at query time, so a run depends on somebody else's server being up."`
 }
 
 // SnapshotsResponse is GET /snapshots.

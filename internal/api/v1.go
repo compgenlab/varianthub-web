@@ -150,10 +150,11 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, SnapshotSummary{
-			Snapshot:        sn,
-			SourceCount:     len(full.Sources),
-			ContainsPrivate: full.ContainsPrivate(),
-			ContainsRemote:  full.ContainsRemote(),
+			Snapshot:            sn,
+			SourceCount:         len(full.Sources),
+			EffectiveVisibility: full.EffectiveVisibility(),
+			ContainsPrivate:     full.ContainsPrivate(),
+			ContainsRemote:      full.ContainsRemote(),
 		})
 	}
 	writeJSON(w, http.StatusOK, SnapshotsResponse{Snapshots: out})

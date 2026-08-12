@@ -177,7 +177,7 @@ func TestCreateGeneListRegistersAnOrdinarySource(t *testing.T) {
 		t.Errorf("build = %q, want the GTF's assembly", src.Build)
 	}
 	// Private unless asked otherwise, matching source registration.
-	if src.Visibility != catalog.VisibilityPrivate {
+	if src.Visibility != catalog.VisibilityRestricted {
 		t.Errorf("visibility = %q, want private by default", src.Visibility)
 	}
 	for _, want := range []string{`gene_field = "gene_name"`, `"TP53"`, `name        = "cancer_gene"`} {
