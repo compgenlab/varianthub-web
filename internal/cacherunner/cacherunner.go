@@ -15,6 +15,7 @@ package cacherunner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -49,7 +50,38 @@ type Runner struct {
 	MaxRuns int
 }
 
-var _ runner.Runner = (*Runner)(nil)
+var (
+	_ runner.Runner     = (*Runner)(nil)
+	_ runner.Downloader = (*Runner)(nil)
+)
+
+// Download provisions sources, unchanged, by handing the request to the engine.
+//
+// Here because this type stands in front of the runner the worker holds, and a
+// decorator that alters one thing must not remove the others. Without it the
+// worker asked its runner to download, the wrapper did not offer that, and every
+// provisioning job on every installation with a cache was refused — the failure
+// that comes of narrowing an object to the one interface you were thinking about.
+//
+// Nothing is cached: a download is a side effect on disk, not a value about a
+// variant.
+func (r *Runner) Download(ctx context.Context, req runner.DownloadRequest) (runner.DownloadResult, error) {
+	d, ok := r.Inner.(runner.Downloader)
+	if !ok {
+		return runner.DownloadResult{}, errors.New("the wrapped runner cannot download sources")
+	}
+	return d.Download(ctx, req)
+}
+
+// Columns describes a result set, passed through for the same reason as
+// Download: the caller asks the runner it was given, and this is that runner.
+func (r *Runner) Columns(ctx context.Context, snapshot string, present map[string]bool) ([]runner.Column, error) {
+	l, ok := r.Inner.(runner.ColumnLister)
+	if !ok {
+		return nil, errors.New("the wrapped runner cannot describe columns")
+	}
+	return l.Columns(ctx, snapshot, present)
+}
 
 // Annotate answers from the cache what it can and passes the rest to the engine.
 func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Result, error) {

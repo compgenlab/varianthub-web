@@ -504,9 +504,12 @@ func storeLog(ctx context.Context, q *queue.Queue, id, output string) {
 func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *catalog.Store,
 	job queue.Job, input []byte) (queue.Outcome, error) {
 
-	exec, ok := r.(*runner.ExecRunner)
+	// By capability, not by concrete type. The worker's runner is wrapped in the
+	// annotation cache, and asking for *ExecRunner refused every download on any
+	// installation that had one.
+	exec, ok := r.(runner.Downloader)
 	if !ok {
-		return queue.Outcome{}, errors.New("download requires the exec runner")
+		return queue.Outcome{}, errors.New("this runner cannot download sources")
 	}
 	var req struct {
 		StorageID string   `json:"storage_id"`

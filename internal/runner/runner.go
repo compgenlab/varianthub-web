@@ -108,6 +108,18 @@ type Runner interface {
 	Annotate(ctx context.Context, req Request) (Result, error)
 }
 
+// Downloader provisions a snapshot's sources.
+//
+// Named as its own capability rather than left as a method only ExecRunner has,
+// because the worker holds one Runner and asks it for both. A decorator that
+// changes how annotation happens has no opinion about downloading, and asserting
+// on the concrete type made every such decorator silently remove the ability —
+// which is exactly how wrapping the runner in the annotation cache broke
+// provisioning without failing a single test.
+type Downloader interface {
+	Download(ctx context.Context, req DownloadRequest) (DownloadResult, error)
+}
+
 // HomeProvider supplies a VARHUB_HOME for a job: a directory holding config.toml
 // and an annotations/ tree.
 //
