@@ -727,7 +727,7 @@ func TestSourceDefaultsToPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Visibility != VisibilityPrivate {
+	if got.Visibility != VisibilityRestricted {
 		t.Errorf("visibility = %q, want private", got.Visibility)
 	}
 	// A stated visibility is honoured.

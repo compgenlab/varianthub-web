@@ -1,8 +1,15 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { Check, Globe, Lock } from "lucide-react";
+import { Check, Globe } from "lucide-react";
 
-import { api, type Annotation, type Snapshot, type Source } from "../api";
+import {
+  api,
+  type Annotation,
+  type Snapshot,
+  type Source,
+  type Visibility,
+} from "../api";
+import { LEVEL_HELP, LEVEL_LABEL, LevelIcon } from "./Visibility";
 
 /**
  * One snapshot: what it pins, what it publishes, and what it is called.
@@ -17,6 +24,10 @@ export default function SnapshotDetail() {
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
+  // Derived server-side from the pinned sources, so it arrives beside the
+  // snapshot rather than on it.
+  const [visibility, setVisibility] = useState<Visibility>("public");
+  const [limitedBy, setLimitedBy] = useState<string[]>([]);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
 
@@ -26,6 +37,8 @@ export default function SnapshotDetail() {
       setSnapshot(d.snapshot);
       setAnnotations(d.annotations ?? []);
       setSources(s.sources ?? []);
+      setVisibility(d.visibility);
+      setLimitedBy(d.constrained_by ?? []);
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -111,11 +124,20 @@ export default function SnapshotDetail() {
         {snapshot.id} · {snapshot.build} · {snapshot.state}
       </p>
       <div className="row gap-14" style={{ marginBottom: 20, fontSize: 12 }}>
-        {snapshot.contains_private && (
-          <span className="row gap-8" style={{ color: "var(--text-2)" }}>
-            <Lock size={11} /> contains private sources
-          </span>
-        )}
+        {/* Shown, not set — a snapshot's level follows from what it pins, so
+            the sources named here are the only thing that can change it. */}
+        <span
+          className="row gap-8"
+          style={{ color: "var(--text-2)" }}
+          title={
+            limitedBy.length
+              ? `Limited by ${limitedBy.join(", ")}`
+              : LEVEL_HELP[visibility]
+          }
+        >
+          <LevelIcon level={visibility} /> {LEVEL_LABEL[visibility]}
+          {limitedBy.length ? ` — limited by ${limitedBy.join(", ")}` : ""}
+        </span>
         {snapshot.contains_remote && (
           <span className="row gap-8" style={{ color: "var(--text-2)" }}>
             <Globe size={11} /> reads some sources over the network

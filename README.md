@@ -145,7 +145,9 @@ writes under `annotations/sources/`:
 
 ```sh
 varianthub-web source add clinvar.toml          # derives name/version/kind
-varianthub-web source add --private cosmic.toml
+varianthub-web source add --visibility public clinvar.toml     # anyone, incl. anonymous
+varianthub-web source add --visibility signed_in gnomad.toml   # any account
+varianthub-web source add --visibility restricted cosmic.toml  # needs a team grant
 varianthub-web source list
 
 varianthub-web snapshot add clinical-v4 \

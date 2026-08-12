@@ -355,10 +355,10 @@ func TestTeamsAndGrants(t *testing.T) {
 		t.Fatalf("Members = %+v, %v", members, err)
 	}
 
-	// Grants attach to teams, so a private source needs a team in common.
+	// Grants attach to teams, so a restricted source needs a team in common.
 	if _, err := s.pool.Exec(ctx,
 		`INSERT INTO source (id,name,version,kind,build,visibility,toml_text,created_at,updated_at)
-		 VALUES ('priv','priv','1','vcf','GRCh38','private','',1,1)`); err != nil {
+		 VALUES ('priv','priv','1','vcf','GRCh38','restricted','',1,1)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.Grant(ctx, "priv", lab.ID, alice.ID); err != nil {

@@ -1,6 +1,18 @@
 import { useEffect, useMemo, useState } from "react";
 import { Check, Plus, TriangleAlert } from "lucide-react";
-import { api, type GeneListCheck, type GeneModel, type Source } from "../api";
+import {
+  api,
+  type GeneListCheck,
+  type GeneModel,
+  type Source,
+  type Visibility,
+} from "../api";
+import {
+  LEVEL_HELP,
+  LEVEL_LABEL,
+  LEVELS,
+  VisibilityPicker,
+} from "./Visibility";
 
 // The gene-list builder.
 //
@@ -83,9 +95,17 @@ export default function GeneLists({
                     without it, and a snapshot that pins one without the other
                     fails at annotate time rather than at save. */}
                 {s.genelist_gtf ? ` · via ${s.genelist_gtf}` : ""}
-                {s.visibility === "private" ? " · private" : ""}
               </span>
             </span>
+            {/* A gene list is a source, so this is the same toggle the sources
+                table uses and the same endpoint behind it. */}
+            <VisibilityPicker
+              level={s.visibility}
+              onChange={async (next) => {
+                await api.setSourceVisibility(s.id, next);
+                onChange();
+              }}
+            />
           </div>
         ))}
       </div>
@@ -110,7 +130,11 @@ function BuildGeneList({
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const [annName, setAnnName] = useState("");
-  const [priv, setPriv] = useState(true);
+  // Closed by default: the two mistakes are not symmetric. A list that should
+  // have been public is one change away from being fixed; one that should have
+  // been restricted has already been readable by everyone who could reach the
+  // server.
+  const [visibility, setVisibility] = useState<Visibility>("restricted");
 
   const [check, setCheck] = useState<GeneListCheck | null>(null);
   const [checkErr, setCheckErr] = useState("");
@@ -185,7 +209,7 @@ function BuildGeneList({
         title: title.trim() || undefined,
         description: description.trim() || undefined,
         annotation_name: annName.trim() || undefined,
-        visibility: priv ? "private" : "public",
+        visibility,
       });
       onDone();
     } catch (e) {
@@ -360,13 +384,24 @@ function BuildGeneList({
           />
 
           <label className="label" style={{ marginTop: 14 }}>
-            <input
-              type="checkbox"
-              checked={priv}
-              onChange={(e) => setPriv(e.target.checked)}
-            />{" "}
-            Private
+            Who can use it
           </label>
+          <select
+            className="select"
+            value={visibility}
+            onChange={(e) => setVisibility(e.target.value as Visibility)}
+          >
+            {LEVELS.map((l) => (
+              <option key={l} value={l}>
+                {LEVEL_LABEL[l]}
+              </option>
+            ))}
+          </select>
+          <p
+            style={{ fontSize: 12, color: "var(--text-3)", margin: "4px 0 0" }}
+          >
+            {LEVEL_HELP[visibility]}
+          </p>
 
           <button
             className="btn"

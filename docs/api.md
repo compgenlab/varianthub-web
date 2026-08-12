@@ -113,7 +113,9 @@ Curated, versioned bundles. Feeds Step 1's snapshot cards.
       "source_count": 6,
       "description": "Curated for germline variant review …",
       "tags": ["VEP·110", "ClinVar", "gnomAD·4.1", "SpliceAI"],
-      "contains_private": false,
+      "visibility": "signed_in",
+      "constrained_by": ["gnomad:4.1 (signed_in)"],
+      "contains_private": true,
       "state": "published",
       "pinned_at": 1780000000
     }
@@ -121,9 +123,12 @@ Curated, versioned bundles. Feeds Step 1's snapshot cards.
 }
 ```
 
-`contains_private` drives the card's lock notice. The list is already filtered to
-what the caller may see — a snapshot whose private sources they lack grants for
-must not appear.
+`visibility` is derived from the pinned sources rather than stored (see
+[Visibility](#visibility)), and `constrained_by` names the ones holding it above
+`public`. `contains_private` drives the card's lock notice.
+
+The list is already filtered to what the caller may see — a snapshot pinning
+sources they cannot use must not appear.
 
 ### `GET /api/v1/snapshots/{id}`
 
@@ -806,9 +811,39 @@ nobody can sign in to.
 
 ### Visibility
 
-A source is **private by default** and visible to administrators plus any team it
-has been granted to. Grants attach to teams rather than to people so access
-survives membership changes.
+Every source, gene list and snapshot carries one of three levels:
+
+| Level | Who |
+|---|---|
+| `public` | Anyone who can reach the server, anonymous visitors included |
+| `signed_in` | Any account — no group membership needed |
+| `restricted` | Members of a team it has been granted to |
+
+A source is **`restricted` by default**. Grants attach to teams rather than to
+people so access survives membership changes.
+
+`signed_in` exists because the other two could not express the most common case.
+"Not for anonymous visitors" is a property of the deployment rather than of each
+dataset, and saying it through grants meant per-source administration that grew
+with the catalog. A grant still works as a per-source exception at any level.
+
+**Only sources carry a level.** A snapshot's is derived — the most restrictive of
+everything it pins — and reported rather than set. A snapshot is a claim about
+which annotations a result carries, so it can never be offered more widely than
+the sources behind it; and a stored level could only agree with them or
+contradict them, which is a way for an access decision to be quietly wrong with
+two places to look for why.
+
+The listing reports it as `visibility`, alongside `constrained_by` naming the
+pinned sources that are not public. To change a snapshot's level, change a
+source's, or pin different sources.
+
+Changing a level is its own endpoint (`PUT .../visibility`) rather than a field on
+the manifest editor. Editing a manifest is a statement about what a source *is*;
+this is a statement about who it is for, and folding the second into the first
+meant an unrelated one-line edit could close a source to everyone using it.
+
+The name `private` is accepted on input and means `restricted`.
 
 A snapshot pinning a source the caller cannot see is **hidden entirely** — absent
 from the listing, `404` (not `403`) when fetched by name, and refused by
@@ -859,6 +894,7 @@ startup if still set.
 | `DELETE` | `/api/v1/admin/teams/{id}` | delete; its grants go with it |
 | `POST` | `/api/v1/admin/teams/{id}/members` | add a member |
 | `DELETE` | `/api/v1/admin/teams/{id}/members/{user}` | remove one |
-| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a private source |
+| `GET` | `/api/v1/admin/sources/{id}/grants` | teams that may see a restricted source |
 | `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
 | `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |
+| `PUT` | `/api/v1/admin/sources/{id}/visibility` | set `public` \| `signed_in` \| `restricted` |

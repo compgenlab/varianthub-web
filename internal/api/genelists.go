@@ -223,15 +223,15 @@ func (s *Server) handleCreateGeneList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "generated an invalid manifest: "+err.Error())
 		return
 	}
-	// Private unless asked otherwise, the same default source registration uses,
+	// Closed unless asked otherwise, the same default source registration uses,
 	// and for the same reason: the two mistakes are not symmetric. A list that
 	// should have been public is one request away from being fixed; one that
-	// should have been private has already been readable by everyone who could
+	// should have been restricted has already been readable by everyone who could
 	// reach the server. A panel can say as much about what a lab is working on as
 	// the data behind it.
-	src.Visibility = catalog.VisibilityPrivate
-	if strings.EqualFold(req.Visibility, catalog.VisibilityPublic) {
-		src.Visibility = catalog.VisibilityPublic
+	src.Visibility = catalog.VisibilityRestricted
+	if v := strings.ToLower(strings.TrimSpace(req.Visibility)); catalog.ValidVisibility(v) {
+		src.Visibility = v
 	}
 	// A gene list has no files of its own — it is a set of names plus a reference
 	// to a GTF that does — so it is usable the moment it is registered.

@@ -4,6 +4,7 @@ import { ArrowRight, Check, Globe, Lock, Minus, TriangleAlert } from "lucide-rea
 
 import { api, type Annotation, type Build, type Snapshot, type Source } from "../api";
 import { useFlow } from "../flow";
+import { LEVEL_LABEL } from "./Visibility";
 
 type Mode = "snapshot" | "sources";
 
@@ -265,7 +266,7 @@ export default function ChooseSources() {
                       className="row gap-8"
                       style={{ marginTop: 8, fontSize: 11.5, color: "var(--text-2)" }}
                     >
-                      <Lock size={11} /> Contains private sources
+                      <Lock size={11} /> Not offered to everyone
                     </div>
                   )}
                   {/* Says what it costs, not that something is wrong: a remote
@@ -427,10 +428,11 @@ export default function ChooseSources() {
                     className="mono"
                     style={{
                       fontSize: 11,
-                      color: s.visibility === "private" ? "var(--private)" : "var(--text-3)",
+                      color:
+                        s.visibility === "public" ? "var(--text-3)" : "var(--private)",
                     }}
                   >
-                    {s.visibility}
+                    {LEVEL_LABEL[s.visibility] ?? s.visibility}
                   </span>
                 </button>
               );

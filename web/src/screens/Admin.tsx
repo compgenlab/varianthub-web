@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 import SiteSettingsTab from "./SiteSettings";
 import GeneListsTab from "./GeneLists";
+import {
+  LEVEL_HELP,
+  LEVEL_LABEL,
+  LEVELS,
+  VisibilityBadge,
+  VisibilityPicker,
+} from "./Visibility";
 import { Link } from "react-router-dom";
 import {
   Check,
@@ -23,6 +30,7 @@ import {
   type SourceFile,
   type SourceAsset,
   type StorageLocation,
+  type Visibility,
 } from "../api";
 import { humanSize } from "./Files";
 
@@ -181,7 +189,12 @@ export default function Admin() {
               <Plus size={15} /> Add source
             </button>
           </div>
-          <SourceTable sources={sources} files={files} storage={storage} />
+          <SourceTable
+            sources={sources}
+            files={files}
+            storage={storage}
+            onChange={load}
+          />
         </>
       ) : (
         <>
@@ -205,15 +218,18 @@ export default function Admin() {
   );
 }
 
-// The list reports; it no longer acts, so it needs no way to refresh itself.
+// The list reports, and changes who may use a source — an access decision, which
+// is why it needs onChange: the row has to show what was actually stored.
 function SourceTable({
   sources,
   files,
   storage,
+  onChange,
 }: {
   sources: Source[];
   files: SourceFile[];
   storage: StorageLocation[];
+  onChange: () => void;
 }) {
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
@@ -298,15 +314,13 @@ function SourceTable({
               </span>
             )}
           </span>
-          <span
-            style={{
-              fontSize: 12.5,
-              color:
-                s.visibility === "private" ? "var(--private)" : "var(--text-2)",
+          <VisibilityPicker
+            level={s.visibility}
+            onChange={async (next) => {
+              await api.setSourceVisibility(s.id, next);
+              onChange();
             }}
-          >
-            {s.visibility === "private" ? "Private" : "Public"}
-          </span>
+          />
           <ProvisionCell
             source={s}
             have={provisioned.get(s.id)}
@@ -554,8 +568,27 @@ function SnapshotList({
                   ? ` · defaults: ${s.defaults.join(", ")}`
                   : " · no defaults"}
               </div>
+              {/* Why, not just what. A snapshot's level is derived, so the only
+                  way to change it is to change one of these — naming them is the
+                  difference between a fact and an instruction. */}
+              {s.constrained_by?.length ? (
+                <div
+                  style={{
+                    fontSize: 11.5,
+                    color: "var(--text-3)",
+                    marginTop: 3,
+                  }}
+                >
+                  Limited by {s.constrained_by.join(", ")}
+                </div>
+              ) : null}
             </div>
             <div className="row gap-8">
+              {/* Shown, not set. A snapshot's level follows from what it pins,
+                  so a control here would be a second place to make an access
+                  decision — one that could only agree with the sources or be
+                  quietly wrong. Change it by changing a source. */}
+              <VisibilityBadge level={s.visibility} />
               <Link
                 className="btn secondary sm"
                 style={{ textDecoration: "none" }}
@@ -609,7 +642,7 @@ function AddSource({
   const [check, setCheck] = useState<Awaited<
     ReturnType<typeof api.validateSource>
   > | null>(null);
-  const [priv, setPriv] = useState(false);
+  const [visibility, setVisibility] = useState<Visibility>("public");
   const [origin, setOrigin] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
@@ -721,7 +754,7 @@ function AddSource({
       setMissing([]);
       const created = await api.createSource({
         toml,
-        visibility: priv ? "private" : "public",
+        visibility,
         origin: origin || undefined,
         assets: assets.length > 0 ? assets : undefined,
         settings: prefix.trim()
@@ -934,14 +967,28 @@ function AddSource({
             }}
           />
 
-          <label className="row gap-8" style={{ marginTop: 14, fontSize: 13 }}>
-            <input
-              type="checkbox"
-              checked={priv}
-              onChange={(e) => setPriv(e.target.checked)}
-            />
-            Private (licensed data — access grants are not implemented yet)
+          <label className="label" style={{ marginTop: 14, marginBottom: 4 }}>
+            Who can use it
           </label>
+          <select
+            className="select"
+            value={visibility}
+            onChange={(e) => setVisibility(e.target.value as Visibility)}
+          >
+            {LEVELS.map((l) => (
+              <option key={l} value={l}>
+                {LEVEL_LABEL[l]}
+              </option>
+            ))}
+          </select>
+          <p
+            style={{ fontSize: 12, color: "var(--text-3)", margin: "4px 0 0" }}
+          >
+            {LEVEL_HELP[visibility]}
+            {visibility === "restricted"
+              ? ". Grant it to a group from the source's page once it is registered."
+              : ""}
+          </p>
 
           <label className="label" style={{ marginTop: 14, marginBottom: 4 }}>
             Annotation prefix{" "}

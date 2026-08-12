@@ -413,7 +413,7 @@ func TestPrivateSourcesNeedAGrant(t *testing.T) {
 		}
 	}
 	put("open", catalog.VisibilityPublic)
-	put("secret", catalog.VisibilityPrivate)
+	put("secret", catalog.VisibilityRestricted)
 
 	names := func(tok string) map[string]bool {
 		t.Helper()
@@ -481,7 +481,7 @@ func TestSnapshotsWithPrivateSourcesAreHidden(t *testing.T) {
 	_, memberTok := h.member(t, "member@example.com")
 
 	for id, vis := range map[string]string{
-		"pub": catalog.VisibilityPublic, "priv": catalog.VisibilityPrivate,
+		"pub": catalog.VisibilityPublic, "priv": catalog.VisibilityRestricted,
 	} {
 		if err := h.cat.PutSource(ctx, catalog.Source{
 			ID: id, Name: id, Version: "1", Kind: "vcf", Build: "GRCh38", Visibility: vis,
@@ -561,7 +561,7 @@ func TestAdhocSelectionRefusesHiddenSources(t *testing.T) {
 
 	if err := h.cat.PutSource(ctx, catalog.Source{
 		ID: "priv", Name: "priv", Version: "1", Kind: "vcf", Build: "GRCh38",
-		Visibility: catalog.VisibilityPrivate,
+		Visibility: catalog.VisibilityRestricted,
 		TOML:       "[[sources]]\nname = \"priv\"\nversion = \"1\"\n",
 	}); err != nil {
 		t.Fatal(err)
@@ -717,7 +717,7 @@ func TestAllowAnonymous(t *testing.T) {
 	// granted nothing.
 	if err := h.cat.PutSource(context.Background(), catalog.Source{
 		ID: "secret", Name: "secret", Version: "1", Kind: "vcf", Build: "GRCh38",
-		Visibility: catalog.VisibilityPrivate,
+		Visibility: catalog.VisibilityRestricted,
 		TOML:       "[[sources]]\nname = \"secret\"\nversion = \"1\"\n",
 	}); err != nil {
 		t.Fatal(err)
