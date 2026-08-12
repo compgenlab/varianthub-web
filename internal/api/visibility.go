@@ -90,24 +90,20 @@ func (v visibility) filterSources(in []catalog.Source) []catalog.Source {
 	return out
 }
 
-// canSeeSnapshot reports whether the caller clears the snapshot's own level and
-// every source it pins.
+// canSeeSnapshot reports whether the caller can see every source a snapshot pins.
 //
 // All or nothing, deliberately. A snapshot is a claim about which annotations a
 // result carries; handing back a version of it with a source quietly removed
 // would answer a different question than the one asked, and the caller would have
 // no way to tell.
 //
-// The snapshot's own level can only narrow this further — it is checked in
-// addition to the sources, never instead of them. A public snapshot pinning a
-// restricted source stays hidden, because the alternative is offering a bundle
-// whose annotations the caller is not allowed to compute.
+// A snapshot has no level of its own to check. It cannot be offered more widely
+// than its sources without promising annotations the caller may not compute, and
+// it cannot be narrowed further without a second place for an access decision to
+// live — one that could only agree with the sources or contradict them.
 func (v visibility) canSeeSnapshot(snap catalog.Snapshot) bool {
 	if v.admin {
 		return true
-	}
-	if snap.Visibility != "" && !v.allows(snap.Visibility) {
-		return false
 	}
 	for _, src := range snap.Sources {
 		if !v.canSee(src) {

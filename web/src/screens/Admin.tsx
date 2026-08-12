@@ -5,6 +5,7 @@ import {
   LEVEL_HELP,
   LEVEL_LABEL,
   LEVELS,
+  VisibilityBadge,
   VisibilityPicker,
 } from "./Visibility";
 import { Link } from "react-router-dom";
@@ -567,40 +568,27 @@ function SnapshotList({
                   ? ` · defaults: ${s.defaults.join(", ")}`
                   : " · no defaults"}
               </div>
-              {/* Shown on every load, not only just after a change: a snapshot
-                  whose sources hold it below its own setting looks like a
-                  mis-set control until the two are stated together. */}
-              {s.effective_visibility &&
-                s.effective_visibility !== s.visibility && (
-                  <div
-                    style={{
-                      fontSize: 11.5,
-                      color: "var(--text-3)",
-                      marginTop: 3,
-                    }}
-                  >
-                    Set to {LEVEL_LABEL[s.visibility].toLowerCase()}, but
-                    offered at{" "}
-                    <strong>
-                      {LEVEL_LABEL[s.effective_visibility].toLowerCase()}
-                    </strong>{" "}
-                    — a source it pins is more restrictive.
-                  </div>
-                )}
+              {/* Why, not just what. A snapshot's level is derived, so the only
+                  way to change it is to change one of these — naming them is the
+                  difference between a fact and an instruction. */}
+              {s.constrained_by?.length ? (
+                <div
+                  style={{
+                    fontSize: 11.5,
+                    color: "var(--text-3)",
+                    marginTop: 3,
+                  }}
+                >
+                  Limited by {s.constrained_by.join(", ")}
+                </div>
+              ) : null}
             </div>
             <div className="row gap-8">
-              {/* A snapshot's own level only ever narrows what its sources
-                  already decide, so the picker surfaces the server's note when
-                  the two disagree — otherwise setting one to public and seeing
-                  nothing change reads as a broken control. */}
-              <VisibilityPicker
-                level={s.visibility}
-                onChange={async (next) => {
-                  const res = await api.setSnapshotVisibility(s.id, next);
-                  onChange();
-                  return res;
-                }}
-              />
+              {/* Shown, not set. A snapshot's level follows from what it pins,
+                  so a control here would be a second place to make an access
+                  decision — one that could only agree with the sources or be
+                  quietly wrong. Change it by changing a source. */}
+              <VisibilityBadge level={s.visibility} />
               <Link
                 className="btn secondary sm"
                 style={{ textDecoration: "none" }}

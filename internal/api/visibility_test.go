@@ -73,28 +73,29 @@ func TestAnUnknownLevelIsRefused(t *testing.T) {
 	}
 }
 
-// A snapshot cannot promise access to a source the caller may not use, so its own
-// level narrows and never widens.
-func TestSnapshotVisibilityIsTheMostRestrictiveOfItsParts(t *testing.T) {
+// A snapshot has no level of its own: it is exactly as open as the least open
+// thing it pins. Anything else would either promise annotations the caller may
+// not compute, or put an access decision in a second place.
+func TestSnapshotVisibilityIsDerivedFromItsSources(t *testing.T) {
 	anon := visibility{}
 	user := visibility{signedIn: true}
 
-	// Public snapshot, public sources: everybody.
-	open := catalog.Snapshot{Visibility: catalog.VisibilityPublic,
-		Sources: []catalog.Source{src("a", catalog.VisibilityPublic)}}
+	// All public: everybody, including a visitor with no account.
+	open := catalog.Snapshot{Sources: []catalog.Source{src("a", catalog.VisibilityPublic)}}
 	if !anon.canSeeSnapshot(open) {
 		t.Error("an anonymous caller was refused a fully public snapshot")
 	}
+	if got := open.EffectiveVisibility(); got != catalog.VisibilityPublic {
+		t.Errorf("EffectiveVisibility = %q, want public", got)
+	}
 
-	// Public snapshot pinning a signed_in source: the source wins. This is the
-	// case that would leak if the stored level were read on its own.
-	mixed := catalog.Snapshot{Visibility: catalog.VisibilityPublic,
-		Sources: []catalog.Source{
-			src("a", catalog.VisibilityPublic),
-			src("b", catalog.VisibilitySignedIn),
-		}}
+	// One signed_in source drags the whole snapshot up with it.
+	mixed := catalog.Snapshot{Sources: []catalog.Source{
+		src("a", catalog.VisibilityPublic),
+		src("b", catalog.VisibilitySignedIn),
+	}}
 	if anon.canSeeSnapshot(mixed) {
-		t.Error("a public snapshot exposed a signed_in source to an anonymous caller")
+		t.Error("a snapshot exposed a signed_in source to an anonymous caller")
 	}
 	if !user.canSeeSnapshot(mixed) {
 		t.Error("an account was refused a snapshot whose sources it can all see")
@@ -103,32 +104,30 @@ func TestSnapshotVisibilityIsTheMostRestrictiveOfItsParts(t *testing.T) {
 		t.Errorf("EffectiveVisibility = %q, want signed_in", got)
 	}
 
-	// The other direction: a snapshot restricted beyond its sources. This is what
-	// the stored column adds — a bundle for one group, out of public parts.
-	narrowed := catalog.Snapshot{Visibility: catalog.VisibilitySignedIn,
-		Sources: []catalog.Source{src("a", catalog.VisibilityPublic)}}
-	if anon.canSeeSnapshot(narrowed) {
-		t.Error("a snapshot restricted to accounts was shown to an anonymous caller")
+	// The most restrictive wins, not the most recent or the first.
+	strict := catalog.Snapshot{Sources: []catalog.Source{
+		src("a", catalog.VisibilityRestricted),
+		src("b", catalog.VisibilitySignedIn),
+		src("c", catalog.VisibilityPublic),
+	}}
+	if got := strict.EffectiveVisibility(); got != catalog.VisibilityRestricted {
+		t.Errorf("EffectiveVisibility = %q, want restricted", got)
 	}
-	if !user.canSeeSnapshot(narrowed) {
-		t.Error("an account was refused a signed_in snapshot")
-	}
-	if got := narrowed.EffectiveVisibility(); got != catalog.VisibilitySignedIn {
-		t.Errorf("EffectiveVisibility = %q, want signed_in", got)
+	if user.canSeeSnapshot(strict) {
+		t.Error("an ungranted account saw a snapshot pinning a restricted source")
 	}
 }
 
-// A snapshot from before the column existed has no stored level. It has to keep
-// behaving as it did — decided entirely by its sources — rather than falling into
-// the unknown-level refusal.
-func TestASnapshotWithNoStoredLevelIsDecidedByItsSources(t *testing.T) {
-	anon := visibility{}
-	old := catalog.Snapshot{Sources: []catalog.Source{src("a", catalog.VisibilityPublic)}}
-	if !anon.canSeeSnapshot(old) {
-		t.Error("a snapshot predating the visibility column became invisible")
-	}
-	if got := old.EffectiveVisibility(); got != catalog.VisibilityPublic {
+// A snapshot pinning nothing withholds nothing, so it is public. Worth pinning
+// because the fold starts at public and an empty range must not fall through to
+// something stricter by accident.
+func TestASnapshotPinningNothingIsPublic(t *testing.T) {
+	empty := catalog.Snapshot{}
+	if got := empty.EffectiveVisibility(); got != catalog.VisibilityPublic {
 		t.Errorf("EffectiveVisibility = %q, want public", got)
+	}
+	if !(visibility{}).canSeeSnapshot(empty) {
+		t.Error("an empty snapshot was hidden from an anonymous caller")
 	}
 }
 

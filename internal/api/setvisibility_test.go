@@ -145,88 +145,85 @@ func TestRegisteringWithoutSayingIsStillClosed(t *testing.T) {
 	}
 }
 
-func TestSetSnapshotVisibility(t *testing.T) {
+// A snapshot's level is reported, not set — so the listing has to carry it, and
+// has to name what is holding it there. A snapshot that only says "restricted"
+// leaves an administrator with nowhere to go: the fact is only useful with the
+// instruction attached.
+func TestSnapshotListingReportsItsDerivedLevelAndWhy(t *testing.T) {
 	h, sess := visHarness(t)
 	ctx := context.Background()
 	if err := h.cat.PutSnapshot(ctx,
-		catalog.Snapshot{ID: "snap", Build: "GRCh38"}, []string{"clinvar-2026"}); err != nil {
+		catalog.Snapshot{ID: "snap", Build: "GRCh38", State: catalog.StatePublished},
+		[]string{"clinvar-2026"}); err != nil {
 		t.Fatal(err)
 	}
 
-	got := h.doSession("PUT", "/api/v1/admin/snapshots/snap/visibility", sess,
-		visibilityRequest{Visibility: catalog.VisibilitySignedIn})
-	if got.Code != http.StatusOK {
-		t.Fatalf("set = %d: %s", got.Code, got.Body)
+	read := func() (string, []string) {
+		t.Helper()
+		got := h.doSession("GET", "/api/v1/snapshots?state=all", sess, nil)
+		if got.Code != http.StatusOK {
+			t.Fatalf("list = %d: %s", got.Code, got.Body)
+		}
+		var body struct {
+			Snapshots []struct {
+				ID            string   `json:"id"`
+				Visibility    string   `json:"visibility"`
+				ConstrainedBy []string `json:"constrained_by"`
+			} `json:"snapshots"`
+		}
+		if err := json.Unmarshal(got.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range body.Snapshots {
+			if s.ID == "snap" {
+				return s.Visibility, s.ConstrainedBy
+			}
+		}
+		t.Fatal("the snapshot is missing from the listing")
+		return "", nil
 	}
-	var body struct {
-		Visibility    string   `json:"visibility"`
-		Effective     string   `json:"effective_visibility"`
-		ConstrainedBy []string `json:"constrained_by"`
-	}
-	if err := json.Unmarshal(got.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	// Its sources are public, so its own level is the binding one.
-	if body.Visibility != catalog.VisibilitySignedIn || body.Effective != catalog.VisibilitySignedIn {
-		t.Errorf("stored %q effective %q", body.Visibility, body.Effective)
-	}
-	if len(body.ConstrainedBy) != 0 {
-		t.Errorf("nothing constrains this snapshot, but it reported %v", body.ConstrainedBy)
-	}
-}
 
-// Setting a snapshot to public when it pins something that is not has to say so.
-// Otherwise it looks like the setting was ignored.
-func TestASnapshotCannotBeOpenedPastItsSources(t *testing.T) {
-	h, sess := visHarness(t)
-	ctx := context.Background()
+	// Its one source is public, so it is.
+	if level, by := read(); level != catalog.VisibilityPublic || len(by) != 0 {
+		t.Errorf("level %q constrained_by %v, want public and nothing", level, by)
+	}
+
+	// Closing the source closes the snapshot, with no separate action.
 	if _, err := h.cat.SetSourceVisibility(ctx, "clinvar-2026", catalog.VisibilityRestricted); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.cat.PutSnapshot(ctx,
-		catalog.Snapshot{ID: "snap", Build: "GRCh38"}, []string{"clinvar-2026"}); err != nil {
-		t.Fatal(err)
+	level, by := read()
+	if level != catalog.VisibilityRestricted {
+		t.Errorf("level = %q, want restricted — the pinned source decides", level)
 	}
-
-	got := h.doSession("PUT", "/api/v1/admin/snapshots/snap/visibility", sess,
-		visibilityRequest{Visibility: catalog.VisibilityPublic})
-	if got.Code != http.StatusOK {
-		t.Fatalf("set = %d: %s", got.Code, got.Body)
-	}
-	var body struct {
-		Visibility    string   `json:"visibility"`
-		Effective     string   `json:"effective_visibility"`
-		ConstrainedBy []string `json:"constrained_by"`
-		Note          string   `json:"note"`
-	}
-	if err := json.Unmarshal(got.Body.Bytes(), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body.Effective != catalog.VisibilityRestricted {
-		t.Errorf("effective = %q, want restricted — the pinned source decides", body.Effective)
-	}
-	if len(body.ConstrainedBy) != 1 || !strings.Contains(body.ConstrainedBy[0], "clinvar:2026") {
-		t.Errorf("constrained_by = %v, want the source that is doing it", body.ConstrainedBy)
-	}
-	if body.Note == "" {
-		t.Error("no note explaining why the stored level is not the effective one")
+	if len(by) != 1 || !strings.Contains(by[0], "clinvar:2026") {
+		t.Errorf("constrained_by = %v, want the source doing it", by)
 	}
 }
 
-// The toggles are the web app's surface, not the published API's — the same split
+// There is no snapshot toggle to reach, by design. A route that quietly 404s is
+// indistinguishable from one that was never wired up, so this pins the absence
+// rather than leaving it to be rediscovered.
+func TestThereIsNoSnapshotVisibilityEndpoint(t *testing.T) {
+	h, sess := visHarness(t)
+	got := h.doSession("PUT", "/api/v1/admin/snapshots/snap/visibility", sess,
+		visibilityRequest{Visibility: catalog.VisibilityPublic})
+	if got.Code != http.StatusNotFound {
+		t.Errorf("PUT snapshot visibility = %d, want 404 — a snapshot's level is derived",
+			got.Code)
+	}
+}
+
+// The toggle is the web app's surface, not the published API's — the same split
 // every other admin route follows.
 func TestVisibilityTogglesAreNotOnTheTokenSurface(t *testing.T) {
 	h, _ := visHarness(t)
 	_, tok := h.admin(t)
 
-	for _, path := range []string{
-		"/api/v1/admin/sources/clinvar-2026/visibility",
-		"/api/v1/admin/snapshots/snap/visibility",
-	} {
-		got := h.do("PUT", path, tok, visibilityRequest{Visibility: catalog.VisibilityPublic})
-		if got.Code != http.StatusNotFound {
-			t.Errorf("PUT %s with a token = %d, want 404", path, got.Code)
-		}
+	got := h.do("PUT", "/api/v1/admin/sources/clinvar-2026/visibility", tok,
+		visibilityRequest{Visibility: catalog.VisibilityPublic})
+	if got.Code != http.StatusNotFound {
+		t.Errorf("PUT with a token = %d, want 404", got.Code)
 	}
 }
 

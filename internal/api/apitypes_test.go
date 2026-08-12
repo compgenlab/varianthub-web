@@ -29,8 +29,11 @@ func TestPublishedResponseKeys(t *testing.T) {
 		{"builds", BuildsResponse{}, []string{"builds"}},
 		{"sources", SourcesResponse{}, []string{"sources"}},
 		{"snapshots", SnapshotsResponse{}, []string{"snapshots"}},
+		// `visibility` is the level the snapshot is offered at, derived from the
+		// sources it pins. `constrained_by` is omitempty — absent on a public
+		// snapshot, which is why it is not listed here.
 		{"snapshot", SnapshotResponse{}, []string{
-			"annotations", "contains_private", "contains_remote", "snapshot"}},
+			"annotations", "contains_private", "contains_remote", "snapshot", "visibility"}},
 		{"jobs", JobsResponse{}, []string{"jobs", "limit", "offset", "scoped"}},
 		{"accepted", AcceptedResponse{}, []string{"job_id"}},
 		{"cancel", CancelResponse{}, []string{"cancelled", "job"}},

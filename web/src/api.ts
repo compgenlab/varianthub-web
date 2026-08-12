@@ -16,15 +16,14 @@ export interface Snapshot {
   description?: string;
   build: string;
   state: string;
-  /** The snapshot's own level. What it is actually offered at is the most
-   *  restrictive of this and every source it pins — it cannot promise access to
-   *  a source the caller may not use. */
+  /** Derived from the sources it pins — the most restrictive of them — and not
+   *  settable. A snapshot cannot be offered more widely than the sources behind
+   *  it, and a stored level could only agree with them or be quietly wrong. */
   visibility: Visibility;
-  /** What the snapshot is actually offered at — more restrictive than
-   *  `visibility` when a pinned source says so. Shown alongside rather than
-   *  instead of it, or a snapshot set to public that a source holds at signed_in
-   *  reads as a broken setting. */
-  effective_visibility?: Visibility;
+  /** The pinned sources holding it above public, each with its level. Empty when
+   *  the snapshot is public. Names *why*, so the fact is also an instruction:
+   *  changing one of these is the only way to change the snapshot's level. */
+  constrained_by?: string[];
   source_count?: number;
   contains_private?: boolean;
   /** True when a pinned source is read from its origin rather than our storage. */
@@ -483,6 +482,10 @@ export const api = {
   snapshot: (id: string) =>
     req<{
       snapshot: Snapshot;
+      /** Derived from the pinned sources; not settable. */
+      visibility: Visibility;
+      /** The pinned sources holding it above public, each with its level. */
+      constrained_by?: string[];
       contains_private: boolean;
       contains_remote: boolean;
       annotations: Annotation[];
@@ -672,23 +675,6 @@ export const api = {
         body: JSON.stringify({ visibility }),
       },
     ),
-
-  /** Changes a snapshot's own level. The response reports what actually takes
-   *  effect, which is more restrictive when a pinned source says so. */
-  setSnapshotVisibility: (id: string, visibility: Visibility) =>
-    req<{
-      id: string;
-      visibility: Visibility;
-      effective_visibility: Visibility;
-      /** Sources more restrictive than the snapshot's own level, if any. */
-      constrained_by?: string[];
-      /** Set when the stored level is not the effective one. */
-      note?: string;
-    }>(`/admin/snapshots/${encodeURIComponent(id)}/visibility`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ visibility }),
-    }),
 
   /** The GTF sources a gene list can be built on, with how many genes each has
    *  available. Zero means it has not been provisioned yet, and the form cannot

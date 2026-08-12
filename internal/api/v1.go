@@ -150,11 +150,12 @@ func (s *Server) handleSnapshots(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		out = append(out, SnapshotSummary{
-			Snapshot:            sn,
-			SourceCount:         len(full.Sources),
-			EffectiveVisibility: full.EffectiveVisibility(),
-			ContainsPrivate:     full.ContainsPrivate(),
-			ContainsRemote:      full.ContainsRemote(),
+			Snapshot:        sn,
+			SourceCount:     len(full.Sources),
+			Visibility:      full.EffectiveVisibility(),
+			ConstrainedBy:   snapshotConstraints(full),
+			ContainsPrivate: full.ContainsPrivate(),
+			ContainsRemote:  full.ContainsRemote(),
 		})
 	}
 	writeJSON(w, http.StatusOK, SnapshotsResponse{Snapshots: out})
@@ -189,6 +190,8 @@ func (s *Server) handleSnapshot(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, SnapshotResponse{
 		Snapshot:        snap,
+		Visibility:      snap.EffectiveVisibility(),
+		ConstrainedBy:   snapshotConstraints(snap),
 		ContainsPrivate: snap.ContainsPrivate(),
 		ContainsRemote:  snap.ContainsRemote(),
 		Annotations:     snapshotAnnotations(snap),

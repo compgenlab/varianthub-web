@@ -140,7 +140,6 @@ type Snapshot struct {
 	Description string   `json:"description,omitempty" doc:"What this bundle is for."`
 	Build       string   `json:"build" doc:"The genome assembly. Every pinned source either declares this exact string or declares none."`
 	State       string   `json:"state" doc:"draft | published | adhoc. Drafts are not offered for annotation."`
-	Visibility  string   `json:"visibility" doc:"public | signed_in | restricted. The snapshot's own level; what it is actually offered at is the most restrictive of this and every source it pins, since it cannot promise access to a source the caller may not use."`
 	Defaults    []string `json:"defaults,omitempty" doc:"Annotation fields selected when the caller asks for none."`
 	Tags        []string `json:"tags,omitempty" doc:"Free-form labels for grouping snapshots."`
 	PublishedAt int64    `json:"published_at,omitempty" doc:"Unix seconds."`
@@ -180,22 +179,23 @@ func (s Snapshot) ContainsPrivate() bool {
 	return false
 }
 
-// EffectiveVisibility is the level a snapshot is actually offered at: the most
-// restrictive of its own and every source it pins.
+// EffectiveVisibility is the level a snapshot is offered at: the most restrictive
+// of everything it pins.
 //
-// A snapshot can be narrowed beyond its sources — a bundle assembled for one
-// group out of individually public sources — but never widened past them.
-// Widening would be a promise the catalog cannot keep: the caller would be handed
-// a snapshot whose annotations they are not allowed to compute.
+// Derived rather than stored, deliberately. A snapshot is a claim about which
+// annotations a result carries, so it can never be offered more widely than the
+// sources behind it — handing somebody a snapshot whose annotations they are not
+// allowed to compute is not a degraded answer, it is a wrong one. A stored level
+// could only agree with this or contradict it, and the second is a way for an
+// access decision to be quietly wrong with two places to look for why.
 //
-// Only meaningful with Sources populated, which is why it is a method on the
-// snapshot rather than a stored column. Listings that carry no sources fall back
-// to the stored level, which is the floor.
+// So a source's level is the only thing anybody sets, and a snapshot reports what
+// follows from it.
+//
+// Only meaningful with Sources populated. A snapshot pinning nothing comes out
+// public, which is right: it offers no annotations to withhold.
 func (s Snapshot) EffectiveVisibility() string {
-	out := s.Visibility
-	if out == "" {
-		out = VisibilityPublic
-	}
+	out := VisibilityPublic
 	for _, src := range s.Sources {
 		out = MostRestrictive(out, src.Visibility)
 	}
@@ -266,12 +266,12 @@ func scanSource(row interface{ Scan(...any) error }) (Source, error) {
 	return s, err
 }
 
-const snapshotCols = `id, title, description, build, state, visibility, defaults, tags,
+const snapshotCols = `id, title, description, build, state, defaults, tags,
 	COALESCE(published_at,0), created_at, updated_at`
 
 func scanSnapshot(row interface{ Scan(...any) error }) (Snapshot, error) {
 	var s Snapshot
-	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.Build, &s.State, &s.Visibility,
+	err := row.Scan(&s.ID, &s.Title, &s.Description, &s.Build, &s.State,
 		&s.Defaults, &s.Tags, &s.PublishedAt, &s.CreatedAt, &s.UpdatedAt)
 	return s, err
 }
@@ -704,24 +704,9 @@ func (s *Store) SetSourceVisibility(ctx context.Context, id, level string) (Sour
 	return src, err
 }
 
-// SetSnapshotVisibility changes a snapshot's own level.
-//
-// Only ever a floor: what a snapshot is actually offered at is the most
-// restrictive of this and every source it pins. See Snapshot.EffectiveVisibility.
-func (s *Store) SetSnapshotVisibility(ctx context.Context, id, level string) error {
-	if !ValidVisibility(level) {
-		return fmt.Errorf("unknown visibility %q", level)
-	}
-	tag, err := s.pool.Exec(ctx,
-		`UPDATE snapshot SET visibility=$2, updated_at=$3 WHERE id=$1`, id, level, s.nowFn())
-	if err != nil {
-		return err
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("snapshot %q: %w", id, ErrNotFound)
-	}
-	return nil
-}
+// There is deliberately no SetSnapshotVisibility. A snapshot's level follows from
+// the sources it pins (Snapshot.EffectiveVisibility); to change it, change a
+// source's, or pin different ones.
 
 // ErrSourcePinned is returned when deleting a source a snapshot still pins.
 var ErrSourcePinned = errors.New("source is pinned by a snapshot")

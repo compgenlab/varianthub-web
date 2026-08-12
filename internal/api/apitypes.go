@@ -49,17 +49,14 @@ type SourcesResponse struct {
 type SnapshotSummary struct {
 	catalog.Snapshot
 	SourceCount int `json:"source_count" doc:"How many sources the snapshot pins."`
-	// EffectiveVisibility is what the snapshot is actually offered at, as
-	// opposed to the level stored on it: the most restrictive of its own and
-	// every source it pins.
-	//
-	// Reported alongside rather than instead of `visibility`, because an
-	// administrator needs to see both to understand the difference — a snapshot
-	// set to public that a pinned source holds at signed_in reads as a broken
-	// setting unless the two are shown together.
-	EffectiveVisibility string `json:"effective_visibility" doc:"public | signed_in | restricted. What the snapshot is actually offered at — more restrictive than its own visibility when a pinned source says so."`
-	ContainsPrivate     bool   `json:"contains_private" doc:"The snapshot pins something not every caller can see."`
-	ContainsRemote      bool   `json:"contains_remote" doc:"The snapshot pins a source read over the network at query time, so a run depends on somebody else's server being up."`
+	// Visibility is the level the snapshot is offered at, derived from what it
+	// pins. Reported rather than settable: a snapshot has no level of its own.
+	Visibility string `json:"visibility" doc:"public | signed_in | restricted. Derived — the most restrictive of every source the snapshot pins — and not settable, since a snapshot cannot be offered more widely than the sources behind it."`
+	// ConstrainedBy names the sources holding it above public, so a listing can
+	// say why rather than only that.
+	ConstrainedBy   []string `json:"constrained_by,omitempty" doc:"The pinned sources that are not public, each with its level. Empty when the snapshot is public."`
+	ContainsPrivate bool     `json:"contains_private" doc:"The snapshot pins something not every caller can see."`
+	ContainsRemote  bool     `json:"contains_remote" doc:"The snapshot pins a source read over the network at query time, so a run depends on somebody else's server being up."`
 }
 
 // SnapshotsResponse is GET /snapshots.
@@ -69,7 +66,12 @@ type SnapshotsResponse struct {
 
 // SnapshotResponse is GET /snapshots/{id}.
 type SnapshotResponse struct {
-	Snapshot        catalog.Snapshot   `json:"snapshot" doc:"The snapshot and the exact source versions it pins."`
+	Snapshot   catalog.Snapshot `json:"snapshot" doc:"The snapshot and the exact source versions it pins."`
+	Visibility string           `json:"visibility" doc:"public | signed_in | restricted. Derived from the pinned sources and not settable."`
+	// ConstrainedBy names the sources holding it above public — the fact and the
+	// instruction together, since changing one of them is the only way to change
+	// the snapshot's level.
+	ConstrainedBy   []string           `json:"constrained_by,omitempty" doc:"The pinned sources that are not public, each with its level."`
 	ContainsPrivate bool               `json:"contains_private" doc:"The snapshot pins something not every caller can see."`
 	ContainsRemote  bool               `json:"contains_remote" doc:"The snapshot pins a source read over the network at query time."`
 	Annotations     []annotationOption `json:"annotations" doc:"The fields this snapshot offers, each flagged with whether it is on by default — which is a property of the snapshot's selection, not of the annotation."`

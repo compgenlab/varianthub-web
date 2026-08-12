@@ -71,62 +71,20 @@ func (s *Server) handleSetSourceVisibility(w http.ResponseWriter, r *http.Reques
 	})
 }
 
-// handleSetSnapshotVisibility changes who may use one snapshot.
+// There is deliberately no snapshot equivalent. A snapshot's level follows from
+// what it pins, so the way to change it is to change a source's level or to pin
+// different sources. Offering a setting here would put an access decision in two
+// places, where the second can only agree with the first or be quietly wrong.
 //
-// A snapshot's own level can only narrow what its sources already decide, so this
-// reports the effective level alongside the stored one. Otherwise setting a
-// snapshot to public and seeing nothing change would look like the setting was
-// ignored, when what happened is that a pinned source is the binding constraint.
-func (s *Server) handleSetSnapshotVisibility(w http.ResponseWriter, r *http.Request) {
-	if s.catalog == nil {
-		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
-		return
-	}
-	var req visibilityRequest
-	if err := decodeJSON(r, &req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-		return
-	}
-	level, err := req.parse()
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-
-	id := r.PathValue("id")
-	if err := s.catalog.SetSnapshotVisibility(r.Context(), id, level); err != nil {
-		if errors.Is(err, catalog.ErrNotFound) {
-			writeError(w, http.StatusNotFound, err.Error())
-			return
+// snapshotConstraints names the pinned sources holding a snapshot above public,
+// so a listing can say *why* it is not offered to everyone rather than only that
+// it is not.
+func snapshotConstraints(snap catalog.Snapshot) []string {
+	var by []string
+	for _, src := range snap.Sources {
+		if src.Visibility != catalog.VisibilityPublic {
+			by = append(by, src.Ref()+" ("+src.Visibility+")")
 		}
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
 	}
-	// Re-read with sources so the effective level is the real one.
-	snap, err := s.catalog.GetSnapshot(r.Context(), id)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-
-	out := map[string]any{
-		"id":                   snap.ID,
-		"visibility":           snap.Visibility,
-		"effective_visibility": snap.EffectiveVisibility(),
-	}
-	// Name the sources doing the constraining, so "why is my public snapshot
-	// still hidden" is answerable from the response rather than by checking each
-	// pinned source by hand.
-	if eff := snap.EffectiveVisibility(); eff != snap.Visibility {
-		var by []string
-		for _, src := range snap.Sources {
-			if catalog.VisibilityRank(src.Visibility) > catalog.VisibilityRank(snap.Visibility) {
-				by = append(by, src.Ref()+" ("+src.Visibility+")")
-			}
-		}
-		out["constrained_by"] = by
-		out["note"] = fmt.Sprintf(
-			"stored as %s, but offered at %s because of the sources it pins", snap.Visibility, eff)
-	}
-	writeJSON(w, http.StatusOK, out)
+	return by
 }

@@ -113,7 +113,9 @@ Curated, versioned bundles. Feeds Step 1's snapshot cards.
       "source_count": 6,
       "description": "Curated for germline variant review …",
       "tags": ["VEP·110", "ClinVar", "gnomAD·4.1", "SpliceAI"],
-      "contains_private": false,
+      "visibility": "signed_in",
+      "constrained_by": ["gnomad:4.1 (signed_in)"],
+      "contains_private": true,
       "state": "published",
       "pinned_at": 1780000000
     }
@@ -121,9 +123,12 @@ Curated, versioned bundles. Feeds Step 1's snapshot cards.
 }
 ```
 
-`contains_private` drives the card's lock notice. The list is already filtered to
-what the caller may see — a snapshot whose private sources they lack grants for
-must not appear.
+`visibility` is derived from the pinned sources rather than stored (see
+[Visibility](#visibility)), and `constrained_by` names the ones holding it above
+`public`. `contains_private` drives the card's lock notice.
+
+The list is already filtered to what the caller may see — a snapshot pinning
+sources they cannot use must not appear.
 
 ### `GET /api/v1/snapshots/{id}`
 
@@ -822,12 +827,16 @@ people so access survives membership changes.
 dataset, and saying it through grants meant per-source administration that grew
 with the catalog. A grant still works as a per-source exception at any level.
 
-A snapshot's stored level is only ever a **floor**. What it is actually offered at
-— reported as `effective_visibility` — is the most restrictive of its own level
-and every source it pins, so a snapshot can be narrowed beyond its sources but
-never opened past them. Setting one to `public` while it pins something
-`restricted` succeeds and returns a `note` plus `constrained_by` naming the
-sources holding it down, rather than appearing to do nothing.
+**Only sources carry a level.** A snapshot's is derived — the most restrictive of
+everything it pins — and reported rather than set. A snapshot is a claim about
+which annotations a result carries, so it can never be offered more widely than
+the sources behind it; and a stored level could only agree with them or
+contradict them, which is a way for an access decision to be quietly wrong with
+two places to look for why.
+
+The listing reports it as `visibility`, alongside `constrained_by` naming the
+pinned sources that are not public. To change a snapshot's level, change a
+source's, or pin different sources.
 
 Changing a level is its own endpoint (`PUT .../visibility`) rather than a field on
 the manifest editor. Editing a manifest is a statement about what a source *is*;
@@ -889,4 +898,3 @@ startup if still set.
 | `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
 | `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |
 | `PUT` | `/api/v1/admin/sources/{id}/visibility` | set `public` \| `signed_in` \| `restricted` |
-| `PUT` | `/api/v1/admin/snapshots/{id}/visibility` | same, and reports the effective level |
