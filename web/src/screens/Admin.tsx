@@ -1,7 +1,17 @@
 import { useEffect, useState } from "react";
 import SiteSettingsTab from "./SiteSettings";
+import GeneListsTab from "./GeneLists";
 import { Link } from "react-router-dom";
-import { Check, Cloud, Globe, HardDrive, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import {
+  Check,
+  Cloud,
+  Globe,
+  HardDrive,
+  Plus,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 
 import {
   api,
@@ -44,7 +54,12 @@ const CODE_STYLE: React.CSSProperties = {
   tabSize: 2,
 };
 
-type Tab = "sources" | "snapshots" | "builds" | "settings";
+// Gene lists sit beside sources rather than inside them. One *is* a source, and
+// registering it by hand on the Sources tab still works — but it is made a
+// completely different way, by pasting genes rather than by writing a manifest,
+// and folding that into the source form would mean one screen with two unrelated
+// halves.
+type Tab = "sources" | "genelists" | "snapshots" | "builds" | "settings";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -116,7 +131,9 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(["sources", "snapshots", "builds", "settings"] as Tab[]).map((t) => (
+        {(
+          ["sources", "genelists", "snapshots", "builds", "settings"] as Tab[]
+        ).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -133,11 +150,13 @@ export default function Admin() {
           >
             {t === "sources"
               ? "Sources"
-              : t === "snapshots"
-                ? "Snapshots"
-                : t === "builds"
-                  ? "Genome builds"
-                  : "Settings"}
+              : t === "genelists"
+                ? "Gene lists"
+                : t === "snapshots"
+                  ? "Snapshots"
+                  : t === "builds"
+                    ? "Genome builds"
+                    : "Settings"}
           </button>
         ))}
       </div>
@@ -148,22 +167,21 @@ export default function Admin() {
         <SiteSettingsTab />
       ) : tab === "builds" ? (
         <BuildList />
+      ) : tab === "genelists" ? (
+        <GeneListsTab sources={sources} onChange={load} />
       ) : tab === "sources" ? (
         <>
           <div className="between" style={{ marginBottom: 14 }}>
             <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
-              Any tabix-indexed file — BED, GTF, VCF or tab-delimited — plus gene
-              lists and tool sources. Registered from a varhub source manifest.
+              Any tabix-indexed file — BED, GTF, VCF or tab-delimited — plus
+              gene lists and tool sources. Registered from a varhub source
+              manifest.
             </p>
             <button className="btn sm" onClick={() => setAdding(true)}>
               <Plus size={15} /> Add source
             </button>
           </div>
-          <SourceTable
-            sources={sources}
-            files={files}
-            storage={storage}
-          />
+          <SourceTable sources={sources} files={files} storage={storage} />
         </>
       ) : (
         <>
@@ -200,11 +218,13 @@ function SourceTable({
   const cols = "1.4fr .6fr .6fr .6fr 1.5fr 34px";
   // Which source's manifest is expanded, if any.
 
-
   // A source is "provisioned" when files are recorded for it. Summarized per
   // source *and* per location: a source can be in two places at once, and
   // "1.2 GB somewhere" does not answer the question the row is being read for.
-  const provisioned = new Map<string, Map<string, { bytes: number; count: number }>>();
+  const provisioned = new Map<
+    string,
+    Map<string, { bytes: number; count: number }>
+  >();
   for (const f of files) {
     const byLoc = provisioned.get(f.source_id) ?? new Map();
     const cur = byLoc.get(f.storage_id) ?? { bytes: 0, count: 0 };
@@ -225,7 +245,9 @@ function SourceTable({
         <span>Data</span>
         <span />
       </div>
-      {sources.length === 0 && <div className="empty">No sources registered yet.</div>}
+      {sources.length === 0 && (
+        <div className="empty">No sources registered yet.</div>
+      )}
       {sources.map((s) => (
         <div
           key={s.id}
@@ -240,16 +262,26 @@ function SourceTable({
             <Link
               to={`/admin/sources/${encodeURIComponent(s.id)}`}
               title="Open this source"
-              style={{ fontSize: 14, fontWeight: 500, color: "var(--accent-text)" }}
+              style={{
+                fontSize: 14,
+                fontWeight: 500,
+                color: "var(--accent-text)",
+              }}
             >
               {s.title || s.name}
             </Link>
             <br />
-            <span className="mono" style={{ fontSize: 11, color: "var(--text-3)" }}>
+            <span
+              className="mono"
+              style={{ fontSize: 11, color: "var(--text-3)" }}
+            >
               {s.origin || s.id}
             </span>
           </span>
-          <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
+          <span
+            className="mono"
+            style={{ fontSize: 12, color: "var(--accent-text)" }}
+          >
             {s.version}
           </span>
           <span className="row gap-8" style={{ flexWrap: "wrap" }}>
@@ -258,7 +290,10 @@ function SourceTable({
                 needs no download, so without this it reads as one that has
                 simply not been fetched yet. */}
             {s.stream && (
-              <span className="tag tag-remote" title="Read from its origin over the network">
+              <span
+                className="tag tag-remote"
+                title="Read from its origin over the network"
+              >
                 <Globe size={10} /> remote
               </span>
             )}
@@ -266,7 +301,8 @@ function SourceTable({
           <span
             style={{
               fontSize: 12.5,
-              color: s.visibility === "private" ? "var(--private)" : "var(--text-2)",
+              color:
+                s.visibility === "private" ? "var(--private)" : "var(--text-2)",
             }}
           >
             {s.visibility === "private" ? "Private" : "Public"}
@@ -292,8 +328,6 @@ function SourceTable({
   );
 }
 
-
-
 /**
  * One place a source's data is stored.
  *
@@ -313,7 +347,9 @@ function StoredAt({
   const s3 = location?.kind === "s3";
   // The bucket, for an s3 location: the URI is the operational identifier, and
   // the friendly name may be anything someone typed.
-  const where = s3 ? (location?.uri ?? "").replace(/^s3:\/\//, "") : location?.name;
+  const where = s3
+    ? (location?.uri ?? "").replace(/^s3:\/\//, "")
+    : location?.name;
   return (
     <span className="row gap-8" style={{ fontSize: 12.5 }}>
       <i className="status-dot" style={{ background: "var(--benign-dot)" }} />
@@ -351,7 +387,10 @@ function ProvisionCell({
 
   if (source.state?.state === "installing") {
     return (
-      <span className="row gap-8" style={{ fontSize: 12.5, color: "var(--vus-fg)" }}>
+      <span
+        className="row gap-8"
+        style={{ fontSize: 12.5, color: "var(--vus-fg)" }}
+      >
         <i className="status-dot" style={{ background: "var(--vus-dot)" }} />
         Downloading…
         {source.state.job ? (
@@ -364,7 +403,11 @@ function ProvisionCell({
   }
 
   if (source.needs_data === false && !source.stream) {
-    return <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>no data required</span>;
+    return (
+      <span style={{ fontSize: 12.5, color: "var(--text-3)" }}>
+        no data required
+      </span>
+    );
   }
 
   if (source.state?.state === "failed") {
@@ -387,12 +430,23 @@ function ProvisionCell({
     return (
       <span style={{ display: "block" }}>
         {[...have].map(([id, v]) => (
-          <StoredAt key={id} location={storage.find((l) => l.id === id)} {...v} />
+          <StoredAt
+            key={id}
+            location={storage.find((l) => l.id === id)}
+            {...v}
+          />
         ))}
         {/* A streamed source that also has a copy: say so, or the copy looks
             like the only way it is read. */}
         {streamed && (
-          <span style={{ fontSize: 11, color: "var(--text-3)", display: "block", marginTop: 2 }}>
+          <span
+            style={{
+              fontSize: 11,
+              color: "var(--text-3)",
+              display: "block",
+              marginTop: 2,
+            }}
+          >
             also readable from its origin
           </span>
         )}
@@ -402,7 +456,9 @@ function ProvisionCell({
 
   if (targets.length === 0) {
     return (
-      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>no usable storage configured</span>
+      <span style={{ fontSize: 12, color: "var(--vus-fg)" }}>
+        no usable storage configured
+      </span>
     );
   }
 
@@ -452,7 +508,9 @@ function SnapshotList({
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       {err && <p className="err">{err}</p>}
-      {snapshots.length === 0 && <div className="card empty">No snapshots yet.</div>}
+      {snapshots.length === 0 && (
+        <div className="card empty">No snapshots yet.</div>
+      )}
       {snapshots.map((s) => (
         <div key={s.id} className="card" style={{ padding: "15px 18px" }}>
           <div className="between" style={{ gap: 14 }}>
@@ -460,7 +518,11 @@ function SnapshotList({
               <div className="row gap-10">
                 <Link
                   to={`/admin/snapshots/${encodeURIComponent(s.id)}`}
-                  style={{ fontSize: 15, fontWeight: 600, color: "var(--accent-text)" }}
+                  style={{
+                    fontSize: 15,
+                    fontWeight: 600,
+                    color: "var(--accent-text)",
+                  }}
                 >
                   {s.title || s.id}
                 </Link>
@@ -470,16 +532,27 @@ function SnapshotList({
                     fontSize: 9.5,
                     padding: "2px 7px",
                     borderRadius: 5,
-                    background: s.state === "published" ? "var(--benign-bg)" : "var(--vus-bg)",
-                    color: s.state === "published" ? "var(--benign-fg)" : "var(--vus-fg)",
+                    background:
+                      s.state === "published"
+                        ? "var(--benign-bg)"
+                        : "var(--vus-bg)",
+                    color:
+                      s.state === "published"
+                        ? "var(--benign-fg)"
+                        : "var(--vus-fg)",
                   }}
                 >
                   {s.state}
                 </span>
               </div>
-              <div className="mono" style={{ fontSize: 11.5, color: "var(--text-3)" }}>
+              <div
+                className="mono"
+                style={{ fontSize: 11.5, color: "var(--text-3)" }}
+              >
                 {s.id} · {s.build} · {s.source_count ?? 0} sources
-                {s.defaults?.length ? ` · defaults: ${s.defaults.join(", ")}` : " · no defaults"}
+                {s.defaults?.length
+                  ? ` · defaults: ${s.defaults.join(", ")}`
+                  : " · no defaults"}
               </div>
             </div>
             <div className="row gap-8">
@@ -517,19 +590,25 @@ function SnapshotList({
               </button>
             </div>
           </div>
-
         </div>
       ))}
     </div>
   );
 }
 
-
-function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => void }) {
+function AddSource({
+  onCancel,
+  onDone,
+}: {
+  onCancel: () => void;
+  onDone: () => void;
+}) {
   const [toml, setToml] = useState(DEFAULT_TOML);
   // Derived from the client rather than restated: this had drifted from what
   // the endpoint actually returns, so fields the server sent were invisible here.
-  const [check, setCheck] = useState<Awaited<ReturnType<typeof api.validateSource>> | null>(null);
+  const [check, setCheck] = useState<Awaited<
+    ReturnType<typeof api.validateSource>
+  > | null>(null);
   const [priv, setPriv] = useState(false);
   const [origin, setOrigin] = useState("");
   const [busy, setBusy] = useState(false);
@@ -645,7 +724,9 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         visibility: priv ? "private" : "public",
         origin: origin || undefined,
         assets: assets.length > 0 ? assets : undefined,
-        settings: prefix.trim() ? { annotation_prefix: prefix.trim() } : undefined,
+        settings: prefix.trim()
+          ? { annotation_prefix: prefix.trim() }
+          : undefined,
       });
       // Declared by the manifest and supplied by nobody. Not fatal — a source
       // can be registered and its files added later — but it will fail at
@@ -694,9 +775,10 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
         Register a source
       </h1>
       <p className="lede" style={{ fontSize: 13.5 }}>
-        Pull a dataset from a registry, or write the manifest directly. Everything
-        resolves to a TOML manifest that pins where the file comes from and how it
-        is indexed — stored verbatim and handed to the engine unchanged.
+        Pull a dataset from a registry, or write the manifest directly.
+        Everything resolves to a TOML manifest that pins where the file comes
+        from and how it is indexed — stored verbatim and handed to the engine
+        unchanged.
       </p>
 
       <div
@@ -737,7 +819,9 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
               value={regID}
               onChange={(e) => setRegID(e.target.value)}
             >
-              {registries.length === 0 && <option value="">(no registries)</option>}
+              {registries.length === 0 && (
+                <option value="">(no registries)</option>
+              )}
               {registries.map((r) => (
                 <option key={r.id} value={r.id}>
                   {r.name}
@@ -757,15 +841,21 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
                 onClick={() => setReload((n) => n + 1)}
                 title="Re-read this registry's manifest"
               >
-                <RefreshCw size={12} /> {entries === null ? "Refreshing…" : "Refresh"}
+                <RefreshCw size={12} />{" "}
+                {entries === null ? "Refreshing…" : "Refresh"}
               </button>
             </div>
             {regErr && (
-              <div className="empty err" style={{ padding: "16px 13px", fontSize: 12.5 }}>
+              <div
+                className="empty err"
+                style={{ padding: "16px 13px", fontSize: 12.5 }}
+              >
                 {regErr}
               </div>
             )}
-            {!regErr && entries === null && <div className="empty">Loading…</div>}
+            {!regErr && entries === null && (
+              <div className="empty">Loading…</div>
+            )}
             {!regErr && entries?.length === 0 && (
               <div className="empty">This registry lists no sources.</div>
             )}
@@ -784,13 +874,22 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
                       {e.title || e.name}
                     </span>
                     <br />
-                    <span className="mono" style={{ fontSize: 10.5, color: "var(--text-3)" }}>
+                    <span
+                      className="mono"
+                      style={{ fontSize: 10.5, color: "var(--text-3)" }}
+                    >
                       {ref}
                       {e.assembly ? ` · ${e.assembly}` : ""}
                       {e.non_commercial ? " · non-commercial" : ""}
                     </span>
                   </span>
-                  <span style={{ fontSize: 12, fontWeight: 500, color: "var(--accent-text)" }}>
+                  <span
+                    style={{
+                      fontSize: 12,
+                      fontWeight: 500,
+                      color: "var(--accent-text)",
+                    }}
+                  >
                     {loadingRef === ref ? "…" : "Use →"}
                   </span>
                 </button>
@@ -807,7 +906,10 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             {check && (
               <span
                 className="mono row gap-8"
-                style={{ fontSize: 11, color: check.valid ? "var(--benign-fg)" : "var(--path-fg)" }}
+                style={{
+                  fontSize: 11,
+                  color: check.valid ? "var(--benign-fg)" : "var(--path-fg)",
+                }}
               >
                 {check.valid ? (
                   <>
@@ -833,13 +935,19 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
           />
 
           <label className="row gap-8" style={{ marginTop: 14, fontSize: 13 }}>
-            <input type="checkbox" checked={priv} onChange={(e) => setPriv(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={priv}
+              onChange={(e) => setPriv(e.target.checked)}
+            />
             Private (licensed data — access grants are not implemented yet)
           </label>
 
           <label className="label" style={{ marginTop: 14, marginBottom: 4 }}>
             Annotation prefix{" "}
-            <span style={{ textTransform: "none", letterSpacing: 0 }}>(optional)</span>
+            <span style={{ textTransform: "none", letterSpacing: 0 }}>
+              (optional)
+            </span>
           </label>
           <input
             className="input mono"
@@ -848,14 +956,24 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             placeholder={check?.valid ? "(manifest default)" : ""}
             onChange={(e) => setPrefix(e.target.value)}
           />
-          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "6px 0 0", lineHeight: 1.5 }}>
-            Renames this source&apos;s output fields. Worth setting when a second
-            version of something already registered goes in — two sources whose
-            fields share a name collide silently, and the prefix is what keeps
-            them apart. Blank uses whatever the manifest declares.
+          <p
+            style={{
+              fontSize: 11.5,
+              color: "var(--text-3)",
+              margin: "6px 0 0",
+              lineHeight: 1.5,
+            }}
+          >
+            Renames this source&apos;s output fields. Worth setting when a
+            second version of something already registered goes in — two sources
+            whose fields share a name collide silently, and the prefix is what
+            keeps them apart. Blank uses whatever the manifest declares.
           </p>
           {origin && (
-            <p className="mono" style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}>
+            <p
+              className="mono"
+              style={{ fontSize: 11, color: "var(--text-3)", marginTop: 6 }}
+            >
               origin: {origin}
             </p>
           )}
@@ -879,11 +997,22 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
           {missing.length > 0 && (
             <div
               className="card"
-              style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+              style={{
+                padding: 12,
+                marginTop: 14,
+                borderColor: "var(--vus-fg)",
+              }}
             >
-              <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0, lineHeight: 1.55 }}>
-                <strong>Registered, but incomplete.</strong> This source declares
-                helper files that nobody supplied:{" "}
+              <p
+                style={{
+                  fontSize: 12.5,
+                  color: "var(--vus-fg)",
+                  margin: 0,
+                  lineHeight: 1.55,
+                }}
+              >
+                <strong>Registered, but incomplete.</strong> This source
+                declares helper files that nobody supplied:{" "}
                 <span className="mono">{missing.join(", ")}</span>. Its build or
                 tool steps will fail without them. A registry copy should ship
                 them beside the manifest — if it does not, the registry entry is
@@ -892,15 +1021,29 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
             </div>
           )}
 
-          {err && <p className="err" style={{ fontSize: 13, marginTop: 12 }}>{err}</p>}
+          {err && (
+            <p className="err" style={{ fontSize: 13, marginTop: 12 }}>
+              {err}
+            </p>
+          )}
 
-          <div className="row gap-10" style={{ marginTop: 14, justifyContent: "flex-end" }}>
-            <button className="btn secondary" onClick={missing.length ? onDone : onCancel}>
+          <div
+            className="row gap-10"
+            style={{ marginTop: 14, justifyContent: "flex-end" }}
+          >
+            <button
+              className="btn secondary"
+              onClick={missing.length ? onDone : onCancel}
+            >
               {missing.length ? "Done" : "Cancel"}
             </button>
             <button
               className="btn"
-              disabled={busy || !check?.valid || (needsData && targets.length > 0 && !target)}
+              disabled={
+                busy ||
+                !check?.valid ||
+                (needsData && targets.length > 0 && !target)
+              }
               onClick={register}
             >
               {busy
@@ -926,14 +1069,23 @@ function AddSource({ onCancel, onDone }: { onCancel: () => void; onDone: () => v
  * being one-click imported applies more strongly to a script than to the TOML
  * that names it.
  */
-function AssetList({ assets, error }: { assets: SourceAsset[]; error?: string }) {
+function AssetList({
+  assets,
+  error,
+}: {
+  assets: SourceAsset[];
+  error?: string;
+}) {
   const [open, setOpen] = useState("");
   if (error) {
     return (
-      <div className="card" style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}>
+      <div
+        className="card"
+        style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
+      >
         <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
-          This source names helper files that could not be fetched: {error}. It can
-          still be registered, but a build recipe will fail without them.
+          This source names helper files that could not be fetched: {error}. It
+          can still be registered, but a build recipe will fail without them.
         </p>
       </div>
     );
@@ -1015,10 +1167,10 @@ function DownloadTarget({
         style={{ padding: 12, marginTop: 14, borderColor: "var(--vus-fg)" }}
       >
         <p style={{ fontSize: 12.5, color: "var(--vus-fg)", margin: 0 }}>
-          This source has data to download, but no storage location is configured.
-          It can still be registered — add a location under{" "}
-          <strong>Storage &amp; files</strong>, then download it from the sources
-          list.
+          This source has data to download, but no storage location is
+          configured. It can still be registered — add a location under{" "}
+          <strong>Storage &amp; files</strong>, then download it from the
+          sources list.
         </p>
       </div>
     );
@@ -1031,7 +1183,10 @@ function DownloadTarget({
       </div>
 
       {streamed && (
-        <label className="row gap-8" style={{ fontSize: 13, marginBottom: alsoCopy ? 10 : 0 }}>
+        <label
+          className="row gap-8"
+          style={{ fontSize: 13, marginBottom: alsoCopy ? 10 : 0 }}
+        >
           <input
             type="checkbox"
             checked={alsoCopy}
@@ -1058,7 +1213,13 @@ function DownloadTarget({
               </option>
             ))}
           </select>
-          <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0" }}>
+          <p
+            style={{
+              fontSize: 11.5,
+              color: "var(--text-3)",
+              margin: "8px 0 0",
+            }}
+          >
             The download is queued as soon as the source is registered. Watch it
             under <strong>System jobs</strong>.
           </p>
@@ -1120,15 +1281,28 @@ function AddRegistry({
         onChange={(e) => setUrl(e.target.value)}
         placeholder="https://example.org/registry.toml"
       />
-      {err && <p className="err" style={{ fontSize: 12, marginTop: 8 }}>{err}</p>}
-      {warn && (
-        <p style={{ fontSize: 12, marginTop: 8, color: "var(--vus-fg)" }}>{warn}</p>
+      {err && (
+        <p className="err" style={{ fontSize: 12, marginTop: 8 }}>
+          {err}
+        </p>
       )}
-      <div className="row gap-8" style={{ marginTop: 12, justifyContent: "flex-end" }}>
+      {warn && (
+        <p style={{ fontSize: 12, marginTop: 8, color: "var(--vus-fg)" }}>
+          {warn}
+        </p>
+      )}
+      <div
+        className="row gap-8"
+        style={{ marginTop: 12, justifyContent: "flex-end" }}
+      >
         <button className="btn secondary sm" onClick={onCancel}>
           Cancel
         </button>
-        <button className="btn sm" disabled={busy || !name.trim() || !url.trim()} onClick={save}>
+        <button
+          className="btn sm"
+          disabled={busy || !name.trim() || !url.trim()}
+          onClick={save}
+        >
           {busy ? "Checking…" : "Add"}
         </button>
       </div>
@@ -1176,7 +1350,9 @@ function BuildSnapshot({
   // same genome in real life but a false match here annotates against the wrong
   // coordinates and says nothing about it.
   const pinnable = sources.filter((s) => !s.build || s.build === build);
-  const chosen = sources.filter((s) => picked[s.id] && (!s.build || s.build === build)).map((s) => s.id);
+  const chosen = sources
+    .filter((s) => picked[s.id] && (!s.build || s.build === build))
+    .map((s) => s.id);
 
   async function save(publish: boolean) {
     setBusy(true);
@@ -1210,7 +1386,10 @@ function BuildSnapshot({
         Build a snapshot
       </h1>
 
-      <div className="row gap-14" style={{ flexWrap: "wrap", marginBottom: 20 }}>
+      <div
+        className="row gap-14"
+        style={{ flexWrap: "wrap", marginBottom: 20 }}
+      >
         <div style={{ flex: 1, minWidth: 220 }}>
           <label className="label">Snapshot id</label>
           <input
@@ -1231,11 +1410,17 @@ function BuildSnapshot({
         </div>
         <div style={{ minWidth: 190 }}>
           <label className="label">Build</label>
-          <select className="select mono" value={build} onChange={(e) => setBuild(e.target.value)}>
+          <select
+            className="select mono"
+            value={build}
+            onChange={(e) => setBuild(e.target.value)}
+          >
             {/* Whatever is selected stays listed even with no matching record,
                 so the control never silently shows a different build than the
                 one the snapshot would be saved with. */}
-            {!builds.some((b) => b.name === build) && <option key={build}>{build}</option>}
+            {!builds.some((b) => b.name === build) && (
+              <option key={build}>{build}</option>
+            )}
             {builds.map((b) => (
               <option key={b.name} value={b.name}>
                 {b.name}
@@ -1268,12 +1453,18 @@ function BuildSnapshot({
                   else's server staying up, which is worth knowing before it is
                   published rather than after a run fails. */}
               {s.stream && (
-                <span className="tag tag-remote" title="Read from its origin over the network">
+                <span
+                  className="tag tag-remote"
+                  title="Read from its origin over the network"
+                >
                   <Globe size={10} /> remote
                 </span>
               )}
             </span>
-            <span className="mono" style={{ fontSize: 12, color: "var(--accent-text)" }}>
+            <span
+              className="mono"
+              style={{ fontSize: 12, color: "var(--accent-text)" }}
+            >
               {s.version}
             </span>
           </button>
@@ -1290,11 +1481,17 @@ function BuildSnapshot({
         />
       </div>
 
-      {err && <p className="err" style={{ fontSize: 13, marginTop: 14 }}>{err}</p>}
+      {err && (
+        <p className="err" style={{ fontSize: 13, marginTop: 14 }}>
+          {err}
+        </p>
+      )}
 
       <div className="between" style={{ marginTop: 18 }}>
         <span style={{ fontSize: 13, color: "var(--text-2)" }}>
-          <strong style={{ fontSize: 15, color: "var(--text)" }}>{chosen.length}</strong>{" "}
+          <strong style={{ fontSize: 15, color: "var(--text)" }}>
+            {chosen.length}
+          </strong>{" "}
           sources pinned
         </span>
         <div className="row gap-10">
@@ -1379,7 +1576,11 @@ function BuildList() {
   };
 
   const remove = async (b: Build) => {
-    if (!confirm(`Remove ${b.name}? Sources already registered against it are left alone.`)) {
+    if (
+      !confirm(
+        `Remove ${b.name}? Sources already registered against it are left alone.`,
+      )
+    ) {
       return;
     }
     setErr("");
@@ -1395,10 +1596,10 @@ function BuildList() {
     <>
       <div className="between" style={{ marginBottom: 14 }}>
         <p className="lede" style={{ fontSize: 13.5, margin: 0 }}>
-          The assemblies offered when starting an annotation. A build&apos;s name must
-          match the <code>build</code> a source manifest declares, exactly — <code>GRCh38</code>{" "}
-          and <code>hg38</code> are the same genome in real life but are not
-          interchangeable here.
+          The assemblies offered when starting an annotation. A build&apos;s
+          name must match the <code>build</code> a source manifest declares,
+          exactly — <code>GRCh38</code> and <code>hg38</code> are the same
+          genome in real life but are not interchangeable here.
         </p>
         <button className="btn sm" onClick={() => setAdding((v) => !v)}>
           <Plus size={15} /> Add build
@@ -1424,7 +1625,11 @@ function BuildList() {
               onChange={(e) => setLabel(e.target.value)}
               style={{ flex: 1, minWidth: 220 }}
             />
-            <button className="btn sm" disabled={!name.trim() || busy} onClick={add}>
+            <button
+              className="btn sm"
+              disabled={!name.trim() || busy}
+              onClick={add}
+            >
               {busy ? "Saving…" : "Save"}
             </button>
           </div>
@@ -1432,16 +1637,25 @@ function BuildList() {
       )}
 
       <div className="card">
-        <div className="rowgrid thead" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
+        <div
+          className="rowgrid thead"
+          style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}
+        >
           <span>Build</span>
           <span>Label</span>
           <span>Default reference</span>
           <span>Sources</span>
           <span />
         </div>
-        {builds?.length === 0 && <div className="empty">No builds defined yet.</div>}
+        {builds?.length === 0 && (
+          <div className="empty">No builds defined yet.</div>
+        )}
         {builds?.map((b) => (
-          <div key={b.name} className="trow rowgrid" style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}>
+          <div
+            key={b.name}
+            className="trow rowgrid"
+            style={{ gridTemplateColumns: "1fr 1.1fr 1.5fr .5fr 90px" }}
+          >
             <span className="mono" style={{ fontWeight: 500 }}>
               {b.name}
             </span>
@@ -1458,7 +1672,10 @@ function BuildList() {
                 <select
                   className="select sm mono"
                   style={{ maxWidth: 240 }}
-                  value={refsFor(b.name).find((r) => r.is_default_reference)?.id ?? ""}
+                  value={
+                    refsFor(b.name).find((r) => r.is_default_reference)?.id ??
+                    ""
+                  }
                   onChange={(e) => e.target.value && setDefault(e.target.value)}
                 >
                   {/* Present until one is chosen, and never selectable

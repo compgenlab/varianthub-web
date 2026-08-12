@@ -29,6 +29,7 @@ func TestTheWrapperKeepsEveryCapabilityTheEngineHas(t *testing.T) {
 		{"Runner (annotate)", func(v any) bool { _, ok := v.(runner.Runner); return ok }},
 		{"Downloader (provision sources)", func(v any) bool { _, ok := v.(runner.Downloader); return ok }},
 		{"ColumnLister (describe results)", func(v any) bool { _, ok := v.(runner.ColumnLister); return ok }},
+		{"GeneLister (validate gene lists)", func(v any) bool { _, ok := v.(runner.GeneLister); return ok }},
 	} {
 		if !c.has(wrapped) {
 			t.Errorf("the cache wrapper does not satisfy %s — enabling the cache "+

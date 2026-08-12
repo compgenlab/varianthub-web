@@ -608,6 +608,8 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 			return queue.Outcome{}, fmt.Errorf("record files for %s: %w", src.Ref(), err)
 		}
 		log.Printf("worker: download job %s: %s → %d file(s)", job.ID, src.Ref(), len(mine))
+
+		cacheGTFGenes(ctx, r, cat, job.ID, src, lw.Note)
 	}
 
 	// The job's "result" is the manifest of what landed, so the UI can show it
@@ -617,6 +619,56 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		return queue.Outcome{}, err
 	}
 	return queue.Outcome{Result: body, N: len(res.Files)}, nil
+}
+
+// cacheGTFGenes records which genes a freshly provisioned GTF source knows, so a
+// gene list can be validated against it without reading the file.
+//
+// Here, in the worker, because only the worker has the data volume: the API
+// server mounts the config alone, so a form handler cannot read a GTF even in
+// principle. This is the moment the file is known to be present and correct, and
+// it is the moment it can have changed — a re-provisioned source is a different
+// GTF, and a stale gene set would validate a list against genes that are no
+// longer there.
+//
+// Never fails the job. The download succeeded, the files are on disk, and the
+// source is usable for annotation; a gene cache that could not be built is a
+// missing convenience, not a broken provision. It is reported to the job log
+// rather than swallowed, because the gene-list form will otherwise refuse every
+// gene with no explanation, and this is the only place that says why.
+func cacheGTFGenes(ctx context.Context, r runner.Runner, cat *catalog.Store,
+	jobID string, src catalog.Source, note func(string)) {
+
+	if cat == nil || !src.IsGTF() {
+		return
+	}
+	lister, ok := r.(runner.GeneLister)
+	if !ok {
+		return
+	}
+	// WithoutCancel for the same reason the state updates use it: a job that was
+	// cancelled after the files landed still provisioned them, and the gene cache
+	// belongs with the files.
+	ctx = context.WithoutCancel(ctx)
+
+	genes, err := lister.Genes(ctx, src.ID, src.Ref())
+	if err != nil {
+		log.Printf("worker: download job %s: read genes for %s: %v", jobID, src.Ref(), err)
+		note(fmt.Sprintf("could not read %s's genes, so gene lists cannot be validated "+
+			"against it yet: %v", src.Ref(), err))
+		return
+	}
+	out := make([]catalog.Gene, 0, len(genes))
+	for _, g := range genes {
+		out = append(out, catalog.Gene{GeneID: g.GeneID, GeneName: g.GeneName})
+	}
+	if err := cat.ReplaceGTFGenes(ctx, src.ID, out); err != nil {
+		log.Printf("worker: download job %s: store genes for %s: %v", jobID, src.Ref(), err)
+		note(fmt.Sprintf("could not store %s's genes: %v", src.Ref(), err))
+		return
+	}
+	log.Printf("worker: download job %s: %s → %d gene(s)", jobID, src.Ref(), len(out))
+	note(fmt.Sprintf("%s: %d gene(s) available for gene lists", src.Ref(), len(out)))
 }
 
 // runCleanup reclaims a removed source's files.
