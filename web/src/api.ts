@@ -35,6 +35,10 @@ export interface Source {
   is_reference?: boolean;
   /** The source cannot run without a reference genome for its build (VEP does). */
   requires_reference?: boolean;
+  /** For a gene list, the gene model it resolves variants through, as "name" or
+   *  "name:version". Selecting the list pins this too — it cannot answer without
+   *  one. */
+  genelist_gtf?: string;
   origin?: string;
   stream?: boolean;
   /** Whether the source can be annotated with yet, and what is happening to it. */
@@ -234,6 +238,34 @@ export type SiteSettings = {
   elevated_per_hour: number;
 };
 
+/** A GTF source a gene list can resolve variants through. */
+export type GeneModel = {
+  id: string;
+  ref: string;
+  title?: string;
+  build?: string;
+  /** Genes available for validation. Zero means the source has not been
+   *  provisioned yet, so nothing can be checked against it. */
+  genes: number;
+};
+
+/** What a validation says about a pasted gene list. */
+export type GeneListCheck = {
+  gtf: string;
+  gene_field: "gene_name" | "gene_id";
+  /** Distinct genes found in the pasted text. */
+  total: number;
+  known: number;
+  /** The ones the gene model does not have, spelled as they were typed. A list
+   *  cannot be saved while this is non-empty. */
+  unknown?: string[];
+  /** The parsed list, so the user can see what was actually read out of their
+   *  paste. */
+  genes?: string[];
+  /** How many genes the model has in total. */
+  available: number;
+};
+
 /** Somebody who authenticated through a provider and has no account here yet. */
 export interface AccessRequest {
   id: string;
@@ -427,17 +459,18 @@ export const api = {
   // includeDrafts is for the admin view only: the annotation flow must not offer
   // a snapshot that can still be re-pinned.
   snapshots: (includeDrafts = false) =>
-    req<{ snapshots: Snapshot[] }>(`/snapshots${includeDrafts ? "?state=all" : ""}`),
+    req<{ snapshots: Snapshot[] }>(
+      `/snapshots${includeDrafts ? "?state=all" : ""}`,
+    ),
   snapshot: (id: string) =>
     req<{
       snapshot: Snapshot;
       contains_private: boolean;
       contains_remote: boolean;
       annotations: Annotation[];
-    }>(
-      `/snapshots/${encodeURIComponent(id)}`,
-    ),
-  sources: () => req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
+    }>(`/snapshots/${encodeURIComponent(id)}`),
+  sources: () =>
+    req<{ sources: (Source & { annotations: Annotation[] })[] }>("/sources"),
   builds: () => req<{ builds: Build[] }>("/builds"),
 
   annotate: (body: {
@@ -455,7 +488,12 @@ export const api = {
 
   annotateVCF: (
     file: File,
-    opts: { snapshot?: string; sources?: string[]; build?: string; annotations?: string },
+    opts: {
+      snapshot?: string;
+      sources?: string[];
+      build?: string;
+      annotations?: string;
+    },
   ) => {
     const fd = new FormData();
     fd.append("vcf", file);
@@ -493,7 +531,13 @@ export const api = {
 
   results: (
     id: string,
-    p: { page?: number; per_page?: number; sort?: string; order?: string; q?: string } = {},
+    p: {
+      page?: number;
+      per_page?: number;
+      sort?: string;
+      order?: string;
+      q?: string;
+    } = {},
   ) => {
     const q = new URLSearchParams();
     if (p.page) q.set("page", String(p.page));
@@ -502,7 +546,9 @@ export const api = {
     if (p.order) q.set("order", p.order);
     if (p.q) q.set("q", p.q);
     const qs = q.toString();
-    return req<ResultPage>(`/jobs/${encodeURIComponent(id)}/results${qs ? `?${qs}` : ""}`);
+    return req<ResultPage>(
+      `/jobs/${encodeURIComponent(id)}/results${qs ? `?${qs}` : ""}`,
+    );
   },
 
   /**
@@ -567,14 +613,11 @@ export const api = {
       needs_data?: boolean;
       /** True when it is read from its origin instead. */
       stream?: boolean;
-    }>(
-      "/admin/sources/validate",
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ toml }),
-      },
-    ),
+    }>("/admin/sources/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ toml }),
+    }),
 
   createSource: (body: {
     toml: string;
@@ -600,6 +643,49 @@ export const api = {
       body: JSON.stringify(body),
     }),
 
+  /** The GTF sources a gene list can be built on, with how many genes each has
+   *  available. Zero means it has not been provisioned yet, and the form cannot
+   *  validate against it. */
+  geneModels: () => req<GeneModel[]>("/admin/genelists/models"),
+
+  /** Checks a pasted list against a gene model without saving anything. */
+  validateGeneList: (body: {
+    gtf_source_id: string;
+    genes: string;
+    gene_field?: "gene_name" | "gene_id";
+  }) =>
+    req<GeneListCheck>("/admin/genelists/validate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
+  /** Registers a validated list as an ordinary source. Refuses on any unknown
+   *  gene — there is deliberately no way to save one anyway. */
+  createGeneList: (body: {
+    gtf_source_id: string;
+    genes: string;
+    gene_field?: "gene_name" | "gene_id";
+    name: string;
+    version: string;
+    title?: string;
+    description?: string;
+    annotation_name?: string;
+    visibility?: "public" | "private";
+  }) =>
+    req<{
+      id: string;
+      ref: string;
+      kind: string;
+      visibility: string;
+      gtf: string;
+      genes: number;
+    }>("/admin/genelists", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+
   createSnapshot: (body: {
     id: string;
     title?: string;
@@ -618,7 +704,12 @@ export const api = {
 
   updateSnapshotMeta: (
     id: string,
-    body: { title?: string; description?: string; defaults?: string[]; tags?: string[] },
+    body: {
+      title?: string;
+      description?: string;
+      defaults?: string[];
+      tags?: string[];
+    },
   ) =>
     req<Snapshot>(`/admin/snapshots/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -644,10 +735,13 @@ export const api = {
     ),
 
   setSnapshotSources: (id: string, sources: string[]) =>
-    req<{ snapshot: Snapshot }>(`/admin/snapshots/${encodeURIComponent(id)}/sources`, {
-      method: "PUT",
-      body: JSON.stringify({ sources }),
-    }),
+    req<{ snapshot: Snapshot }>(
+      `/admin/snapshots/${encodeURIComponent(id)}/sources`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ sources }),
+      },
+    ),
 
   deleteSource: (id: string) =>
     req<{ id: string; ref: string; cleanup_jobs: string[] }>(
@@ -656,12 +750,17 @@ export const api = {
     ),
 
   deleteSnapshot: (id: string) =>
-    req<void>(`/admin/snapshots/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    req<void>(`/admin/snapshots/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
 
   publishSnapshot: (id: string) =>
-    req<{ id: string; state: string }>(`/admin/snapshots/${encodeURIComponent(id)}/publish`, {
-      method: "POST",
-    }),
+    req<{ id: string; state: string }>(
+      `/admin/snapshots/${encodeURIComponent(id)}/publish`,
+      {
+        method: "POST",
+      },
+    ),
 
   me: () => req<Me>("/auth/me"),
 
@@ -686,10 +785,11 @@ export const api = {
   tokens: () => req<{ tokens: ApiToken[] }>("/auth/tokens"),
 
   /** The OpenAPI document describing the published REST API. */
-  openapi: () => req<{
-    info: { title: string; version: string; description?: string };
-    paths: Record<string, Record<string, never>>;
-  }>("/openapi.json"),
+  openapi: () =>
+    req<{
+      info: { title: string; version: string; description?: string };
+      paths: Record<string, Record<string, never>>;
+    }>("/openapi.json"),
 
   /** Lifetimes the server accepts. Mirrored from identity.TokenLifetimes; the
    *  server rejects anything else, so this list only decides what is offered. */
@@ -721,11 +821,15 @@ export const api = {
 
   usage: () => req<Usage>("/admin/usage"),
 
-  accessRequests: () => req<{ requests: AccessRequest[] }>("/admin/access-requests"),
+  accessRequests: () =>
+    req<{ requests: AccessRequest[] }>("/admin/access-requests"),
   approveAccess: (id: string) =>
-    req<{ user: User }>(`/admin/access-requests/${encodeURIComponent(id)}/approve`, {
-      method: "POST",
-    }),
+    req<{ user: User }>(
+      `/admin/access-requests/${encodeURIComponent(id)}/approve`,
+      {
+        method: "POST",
+      },
+    ),
   declineAccess: (id: string) =>
     req<void>(`/admin/access-requests/${encodeURIComponent(id)}/decline`, {
       method: "POST",
@@ -738,11 +842,17 @@ export const api = {
       body: JSON.stringify(values),
     }),
 
-  clearCache: () => req<{ cleared: boolean }>("/admin/cache/clear", { method: "POST" }),
+  clearCache: () =>
+    req<{ cleared: boolean }>("/admin/cache/clear", { method: "POST" }),
 
   users: () => req<{ users: User[] }>("/admin/users"),
 
-  createUser: (body: { email: string; name?: string; role: string; password: string }) =>
+  createUser: (body: {
+    email: string;
+    name?: string;
+    role: string;
+    password: string;
+  }) =>
     req<{ user: User }>("/admin/users", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -751,7 +861,12 @@ export const api = {
 
   updateUser: (
     id: string,
-    body: { role?: string; tier?: string; disabled?: boolean; password?: string },
+    body: {
+      role?: string;
+      tier?: string;
+      disabled?: boolean;
+      password?: string;
+    },
   ) =>
     req<{ user: User }>(`/admin/users/${encodeURIComponent(id)}`, {
       method: "PATCH",
@@ -785,7 +900,9 @@ export const api = {
     ),
 
   grants: (sourceId: string) =>
-    req<{ teams: Team[] }>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`),
+    req<{ teams: Team[] }>(
+      `/admin/sources/${encodeURIComponent(sourceId)}/grants`,
+    ),
 
   grant: (sourceId: string, teamId: string) =>
     req<void>(`/admin/sources/${encodeURIComponent(sourceId)}/grants`, {
@@ -812,16 +929,21 @@ export const api = {
     ),
 
   sourceSettings: (id: string) =>
-    req<{ settings: SourceSettings; manifest_prefix: string; is_tool: boolean }>(
-      `/admin/sources/${encodeURIComponent(id)}/settings`,
-    ),
+    req<{
+      settings: SourceSettings;
+      manifest_prefix: string;
+      is_tool: boolean;
+    }>(`/admin/sources/${encodeURIComponent(id)}/settings`),
 
   setSourceSettings: (id: string, body: SourceSettings) =>
-    req<{ settings: SourceSettings }>(`/admin/sources/${encodeURIComponent(id)}/settings`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+    req<{ settings: SourceSettings }>(
+      `/admin/sources/${encodeURIComponent(id)}/settings`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
 
   metrics: () => req<Metrics>("/admin/metrics"),
 
@@ -833,7 +955,8 @@ export const api = {
    * timeout, and the moment someone asks is the moment the answer has to be
    * current rather than cached.
    */
-  storageCheck: () => req<{ locations: StorageHealth[] }>("/admin/storage/check"),
+  storageCheck: () =>
+    req<{ locations: StorageHealth[] }>("/admin/storage/check"),
 
   moveSource: (id: string, storageID: string) =>
     req<{ job_id: string; from: string; to: string }>(
@@ -846,7 +969,6 @@ export const api = {
       method: "POST",
     }),
 
-
   addStorage: (body: { name: string; kind: "s3"; uri: string }) =>
     req<{ id: string }>("/admin/storage", {
       method: "POST",
@@ -857,7 +979,12 @@ export const api = {
   deleteStorage: (id: string) =>
     req<void>(`/admin/storage/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
-  putBuild: (b: { name: string; label?: string; description?: string; sort_order?: number }) =>
+  putBuild: (b: {
+    name: string;
+    label?: string;
+    description?: string;
+    sort_order?: number;
+  }) =>
     req<{ name: string }>("/admin/builds", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
@@ -868,7 +995,9 @@ export const api = {
   // cascading: those keep their assembly strings and keep working, so removing
   // the build would only stop it being offered.
   deleteBuild: (name: string) =>
-    req<void>(`/admin/builds/${encodeURIComponent(name)}`, { method: "DELETE" }),
+    req<void>(`/admin/builds/${encodeURIComponent(name)}`, {
+      method: "DELETE",
+    }),
 
   files: (p: { source?: string; storage?: string } = {}) => {
     const q = new URLSearchParams();
@@ -888,28 +1017,38 @@ export const api = {
     force?: boolean;
     include_streamed?: boolean;
   }) =>
-    req<{ job_id: string; sources: string[]; storage: StorageLocation }>("/admin/downloads", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+    req<{ job_id: string; sources: string[]; storage: StorageLocation }>(
+      "/admin/downloads",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
 
   registries: () => req<{ registries: Registry[] }>("/admin/registries"),
 
   addRegistry: (body: { name: string; url: string; id?: string }) =>
-    req<{ id: string; name: string; url: string; warning?: string }>("/admin/registries", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    }),
+    req<{ id: string; name: string; url: string; warning?: string }>(
+      "/admin/registries",
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
 
   deleteRegistry: (id: string) =>
-    req<void>(`/admin/registries/${encodeURIComponent(id)}`, { method: "DELETE" }),
+    req<void>(`/admin/registries/${encodeURIComponent(id)}`, {
+      method: "DELETE",
+    }),
 
   registryDatasets: (id: string) =>
-    req<{ registry: Registry; sources: RegistryEntry[]; snapshots: RegistryEntry[] }>(
-      `/admin/registries/${encodeURIComponent(id)}/datasets`,
-    ),
+    req<{
+      registry: Registry;
+      sources: RegistryEntry[];
+      snapshots: RegistryEntry[];
+    }>(`/admin/registries/${encodeURIComponent(id)}/datasets`),
 
   // Returns the entry's manifest for review. Not a one-click import: the
   // fragment is executed by varhub, so it goes into the editor to be read first.

@@ -53,6 +53,7 @@ type Runner struct {
 var (
 	_ runner.Runner     = (*Runner)(nil)
 	_ runner.Downloader = (*Runner)(nil)
+	_ runner.GeneLister = (*Runner)(nil)
 )
 
 // Download provisions sources, unchanged, by handing the request to the engine.
@@ -71,6 +72,20 @@ func (r *Runner) Download(ctx context.Context, req runner.DownloadRequest) (runn
 		return runner.DownloadResult{}, errors.New("the wrapped runner cannot download sources")
 	}
 	return d.Download(ctx, req)
+}
+
+// Genes lists a GTF source's genes, passed through for the same reason as
+// Download.
+//
+// Nothing is cached here either: this reads a file to answer which genes exist,
+// which is not a statement about a variant and has its own store — the gtf_gene
+// table the worker fills from this.
+func (r *Runner) Genes(ctx context.Context, sourceID, ref string) ([]runner.Gene, error) {
+	l, ok := r.Inner.(runner.GeneLister)
+	if !ok {
+		return nil, errors.New("the wrapped runner cannot list a source's genes")
+	}
+	return l.Genes(ctx, sourceID, ref)
 }
 
 // Columns describes a result set, passed through for the same reason as
