@@ -36,6 +36,7 @@ type SourceItem struct {
 	NeedsData         bool                 `json:"needs_data" doc:"False for builtins, which compute from the variant itself and have nothing to download."`
 	RequiresReference bool                 `json:"requires_reference" doc:"The source cannot run without a reference genome for its build. VEP declares this."`
 	IsReference       bool                 `json:"is_reference" doc:"A reference genome. Contributes no annotations and is chosen separately."`
+	GeneListGTF       string               `json:"genelist_gtf,omitempty" doc:"For a gene-list source, the gene model it resolves variants through, as \"name\" or \"name:version\". Selecting the list pins this too — it cannot answer without one."`
 	State             catalog.SourceState  `json:"state" doc:"Whether the source can be annotated with yet. Registering one and being able to use it are different things: a tool needs its image and setup, and until then every annotation using it fails."`
 }
 

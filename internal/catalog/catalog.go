@@ -441,6 +441,20 @@ func (s *Store) PutSnapshot(ctx context.Context, snap Snapshot, sourceIDs []stri
 	if err := checkReferences(pinned); err != nil {
 		return fmt.Errorf("snapshot %q: %w", snap.ID, err)
 	}
+	// A gene list resolves variants to genes through a GTF it names, and varhub
+	// looks that up *within the snapshot*. Pinning one without its gene model
+	// produces a snapshot that loads and then fails every job with "gtf X is not
+	// a GTF source in this snapshot" — caught here instead, where whoever is
+	// assembling it can add the missing source.
+	if missing := missingGeneListGTF(pinned); len(missing) > 0 {
+		var parts []string
+		for list, want := range missing {
+			parts = append(parts, fmt.Sprintf("%s needs %q", list, want))
+		}
+		sort.Strings(parts)
+		return fmt.Errorf("snapshot %q: %s; pin the gene model alongside the gene list",
+			snap.ID, strings.Join(parts, "; "))
+	}
 	// A nil Go slice binds as SQL NULL, and a column DEFAULT does not apply when
 	// NULL is passed explicitly — so nil would violate the NOT NULL constraint
 	// rather than fall back to '{}'.
@@ -540,6 +554,13 @@ func (s *Store) EnsureAdhocSnapshot(ctx context.Context, build string, sourceIDs
 	// this later cannot drift onto a newer genome — the default is a choice made
 	// once, not an indirection resolved every time.
 	sourceIDs, err := s.withDefaultReference(ctx, build, sourceIDs)
+	if err != nil {
+		return "", err
+	}
+	// And the gene model a chosen gene list resolves through, for the same
+	// reason: somebody picking "cancer genes" is asking for the answer, not for
+	// a lesson in how it is computed.
+	sourceIDs, err = s.withGeneListGTF(ctx, sourceIDs)
 	if err != nil {
 		return "", err
 	}
