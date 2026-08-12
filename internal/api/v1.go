@@ -278,6 +278,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			Source: src, Ref: src.Ref(), Annotations: anns,
 			NeedsData: src.NeedsData(), State: st,
 			RequiresReference: src.RequiresReference(), IsReference: src.IsReference(),
+			GeneListGTF:       src.GeneListGTF(),
 		})
 	}
 	writeJSON(w, http.StatusOK, SourcesResponse{Sources: out})
