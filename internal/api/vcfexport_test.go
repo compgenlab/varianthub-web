@@ -84,21 +84,31 @@ func TestExportVCFEndToEnd(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	out := w.Body.String()
+	out := vcfBody(t, w)
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 
 	if lines[0] != "##fileformat=VCFv4.2" {
 		t.Errorf("first line = %q", lines[0])
 	}
 	// Every column is declared, with its key sanitised into a legal ID.
+	//
+	// Number=A, not 1: a multi-allelic record carries one comma-separated value
+	// per ALT, so that is what the header has to say. Declaring 1 and writing
+	// two values is a file a strict parser may reject and a lenient one reads as
+	// a single string. A Flag is per record and stays Number=0.
 	for _, want := range []string{
-		`##INFO=<ID=GENE,Number=1,Type=String,`,
-		`##INFO=<ID=gnomAD_AF,Number=1,Type=Float,`,
+		`##INFO=<ID=GENE,Number=A,Type=String,`,
+		`##INFO=<ID=gnomAD_AF,Number=A,Type=Float,`,
 		`##INFO=<ID=is_coding,Number=0,Type=Flag,`,
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing header %s\n%s", want, out)
 		}
+	}
+	// And the id is mapped back to the key it stands for, so the file can be
+	// turned into rows without this server's column model.
+	if !strings.Contains(out, `##varianthub_column=<ID=gnomAD_AF,Key=gnomAD-AF>`) {
+		t.Errorf("no column mapping for a key whose id had to be sanitised\n%s", out)
 	}
 	if !strings.Contains(out, "gencode:48") {
 		t.Error("a column lost its source attribution in the header")
@@ -176,9 +186,9 @@ func TestVCFJobDefaultsToVCFOutput(t *testing.T) {
 		[][4]any{{"chr1", int64(100), "A", "G"}},
 		[]string{`{"GENE":"TP53"}`})
 
-	if w := h.do("GET", "/api/v1/jobs/vcfjob/export", tok, nil); !strings.HasPrefix(
-		w.Body.String(), "##fileformat=VCFv4.2") {
-		t.Errorf("a VCF job did not default to VCF: %.60s", w.Body.String())
+	if out := vcfBody(t, h.do("GET", "/api/v1/jobs/vcfjob/export", tok, nil)); !strings.HasPrefix(
+		out, "##fileformat=VCFv4.2") {
+		t.Errorf("a VCF job did not default to VCF: %.60s", out)
 	}
 	// And a locus job still defaults to JSON, which is what a script expects.
 	if w := h.do("GET", "/api/v1/jobs/locusjob/export", tok, nil); !strings.HasPrefix(

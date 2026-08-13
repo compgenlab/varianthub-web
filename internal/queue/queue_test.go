@@ -138,22 +138,20 @@ func TestEnqueueProcessDone(t *testing.T) {
 	if in := <-gotInput; in != "chr1:100:A:G" {
 		t.Errorf("runner saw input %q", in)
 	}
-	result, ok, err := q.Result(ctx, id)
-	if err != nil || !ok {
-		t.Fatalf("Result: ok=%v err=%v", ok, err)
-	}
-	if !strings.Contains(string(result), `"echo":"chr1:100:A:G"`) {
-		t.Errorf("result = %s", result)
-	}
-
-	// The blob is projected into queryable rows in the same transaction, so a
-	// chunk observed as done always has results that can be paged.
+	// The runner's output is projected into queryable rows in the same
+	// transaction as the status change, so a chunk observed as done always has
+	// results that can be paged. These rows are the only copy Postgres keeps:
+	// the blob the engine emitted is written out as the stored VCF, not stored.
 	page, err := q.Results(ctx, id, ResultQuery{})
 	if err != nil {
 		t.Fatalf("Results: %v", err)
 	}
 	if page.Total != 1 || len(page.Rows) != 1 {
 		t.Fatalf("Results total=%d rows=%d, want 1 and 1", page.Total, len(page.Rows))
+	}
+	if got := page.Rows[0].Annotations["echo"]; got != "chr1:100:A:G" {
+		t.Errorf("annotations = %v, want the runner's echo of its input",
+			page.Rows[0].Annotations)
 	}
 	if page.Rows[0].Chrom != "chr1" || page.Rows[0].Pos != 100 {
 		t.Errorf("row = %+v", page.Rows[0])
@@ -212,10 +210,11 @@ func TestQueueListAndGC(t *testing.T) {
 	newID, _ := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "2.2.2.2", Body: []byte("b")})
 	queuedID, _ := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "3.3.3.3", Body: []byte("c")})
 
-	// Give the old job a result blob so the cascade delete is exercised. It
+	// Give the old job a result row so the cascade delete is exercised. It
 	// hangs off the chunk that produced it, which is what the job points at.
 	if _, err := q.pool.Exec(ctx,
-		`INSERT INTO chunk_result (chunk_id,json) VALUES ($1,'[]')`, oldChunk); err != nil {
+		`INSERT INTO chunk_result (chunk_id,vcf_uri) VALUES ($1,'file:///gone.vcf.gz')`,
+		oldChunk); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -256,8 +255,9 @@ func TestQueueListAndGC(t *testing.T) {
 	if _, ok, _ := q.GetJob(ctx, queuedID); !ok {
 		t.Errorf("queued chunk must never be GC'd")
 	}
-	if _, ok, _ := q.Result(ctx, oldID); ok {
-		t.Errorf("GC'd chunk result blob should be gone (ON DELETE CASCADE)")
+	if page, err := q.Results(ctx, oldID, ResultQuery{}); err != nil || page.Total != 0 {
+		t.Errorf("GC'd chunk's variant rows should be gone (ON DELETE CASCADE): "+
+			"total=%d err=%v", page.Total, err)
 	}
 }
 

@@ -367,9 +367,10 @@ func (q *Queue) Log(ctx context.Context, jobID string) (string, bool, error) {
 
 // Outcome is what a Runner produces for a completed chunk.
 type Outcome struct {
-	// Result is the annotation JSON, stored verbatim. It is what the CLI
-	// emitted, and what the inline ?wait= path returns without touching
-	// chunk_variant.
+	// Result is the annotation JSON the CLI emitted. It is projected into
+	// chunk_variant and written out as the stored VCF, and is not itself
+	// stored: for 2.6M variants it is gigabytes of JSON in one column, and
+	// nothing has read it since chunk_variant existed to be paged instead.
 	Result []byte
 	// N is the number of variants.
 	N int
@@ -380,9 +381,10 @@ type Outcome struct {
 	// Variants says whether Result is an annotated-variant array that should
 	// be projected into chunk_variant. A download's result is a file manifest.
 	Variants bool
-	// VCFURI is the chunk's answer already assembled as a VCF, when the worker
-	// was able to build one. Empty for a locus chunk, which has no submitted
-	// file to merge onto, and for a merge that did not succeed — in both cases
+	// VCFURI is where the chunk's answer was stored as a VCF. Every annotation
+	// chunk produces one — a submitted file with the annotations set on its
+	// records, or a sites-only render for a locus list — and it is what every
+	// export is a conversion of. Empty when the build did not succeed, and then
 	// the export renders from rows instead.
 	VCFURI string
 }
@@ -1031,21 +1033,6 @@ func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 	return *uri, nil
 }
 
-// Result returns a done job's result JSON.
-func (q *Queue) Result(ctx context.Context, jobID string) ([]byte, bool, error) {
-	var js string
-	err := q.pool.QueryRow(ctx, `
-		SELECT json FROM chunk_result
-		 WHERE chunk_id = (SELECT result_chunk_id FROM job_state WHERE id=$1)`, jobID).Scan(&js)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	return []byte(js), true, nil
-}
-
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanChunk(row rowScanner) (Chunk, error) {
@@ -1523,27 +1510,28 @@ func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, 
 	}
 	defer tx.Rollback(wctx) //nolint:errcheck // no-op after Commit
 
-	if out.Result != nil {
+	// Where the answer is, not the answer. The variants themselves went into
+	// storage as a VCF and into chunk_variant as rows; this row holds the
+	// pointer to the file.
+	if out.VCFURI != "" {
 		if _, err := tx.Exec(wctx,
-			`INSERT INTO chunk_result (chunk_id,json,vcf_uri) VALUES ($1,$2,$3)
-			 ON CONFLICT (chunk_id) DO UPDATE
-			    SET json = excluded.json, vcf_uri = excluded.vcf_uri`,
-			id, string(out.Result), nullable(out.VCFURI)); err != nil {
+			`INSERT INTO chunk_result (chunk_id,vcf_uri) VALUES ($1,$2)
+			 ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`,
+			id, out.VCFURI); err != nil {
 			log.Printf("queue: store chunk %s result: %v", id, err)
 			return
 		}
-		// Rows for querying. Same transaction as the blob and the status
-		// change, so a chunk is never observably "done" with results that are
-		// not yet queryable.
-		//
-		// Skipped for a download: its result is a file manifest, not variants, and
-		// forcing it through the variant projection would fail on a shape that was
-		// never meant to fit.
-		if out.Variants {
-			if err := insertVariants(wctx, tx, id, out.Result); err != nil {
-				log.Printf("queue: store chunk %s variants: %v", id, err)
-				return
-			}
+	}
+	// Rows for querying. Same transaction as the status change, so a chunk is
+	// never observably "done" with results that are not yet queryable.
+	//
+	// Skipped for a download: its result is a file manifest, not variants, and
+	// forcing it through the variant projection would fail on a shape that was
+	// never meant to fit.
+	if out.Variants && out.Result != nil {
+		if err := insertVariants(wctx, tx, id, out.Result); err != nil {
+			log.Printf("queue: store chunk %s variants: %v", id, err)
+			return
 		}
 	}
 	var errArg any

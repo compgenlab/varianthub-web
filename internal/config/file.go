@@ -344,7 +344,28 @@ type S3Site struct {
 	URI string `toml:"uri"`
 	// Endpoint is an S3-compatible gateway. Empty means AWS itself.
 	Endpoint string `toml:"endpoint"`
-	Region   string `toml:"region"`
+	// PublicEndpoint says Endpoint is reachable from outside the deployment,
+	// and so may be signed into a download link.
+	//
+	// With it, GET /jobs/{id}/export?format=vcf answers 302 and the caller
+	// fetches the annotated VCF straight from storage. Without it — the default
+	// — the same request returns the file, funnelled through the API server.
+	// Both deliver identical bytes; the flag decides who carries them.
+	//
+	// Off by default because the failure is asymmetric. A deployment that
+	// relays when it could have redirected spends bandwidth. One that signs
+	// links against an address only reachable inside the cluster hands out URLs
+	// that are correctly signed and useless, and they fail at the client as a
+	// DNS error that says nothing about why.
+	//
+	// Setting this also needs CORS on the bucket, allowing GET from the web
+	// origin. A command-line caller following the redirect does not care, but
+	// the browser fetches the download with a header on it and will not read a
+	// cross-origin response without it — so without CORS the API works and the
+	// web UI's download button stops, which is a confusing pair of symptoms to
+	// be handed at once.
+	PublicEndpoint bool   `toml:"public_endpoint"`
+	Region         string `toml:"region"`
 	// AccessKey and SecretKey are presented when both are set.
 	AccessKey string `toml:"access_key"`
 	SecretKey string `toml:"secret_key"`

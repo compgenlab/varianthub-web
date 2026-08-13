@@ -653,6 +653,14 @@ export const api = {
    * force the token into the query string — where it lands in browser history and
    * every intermediary's access log. Buffering the body in the tab is the cost;
    * at the scale the design targets (thousands of rows) that is a few MB.
+   *
+   * vcf arrives gzipped, because it is the stored object served as it is — so
+   * the saved name ends .vcf.gz. Where the deployment has declared a publicly
+   * reachable object store, the server answers 302 and these bytes come from
+   * there rather than through the API. fetch follows that on its own, but the
+   * bucket must allow this origin or the browser will not read the response —
+   * a command-line caller has no such requirement, so a missing CORS rule shows
+   * up here and nowhere else.
    */
   downloadExport: async (
     id: string,
@@ -682,7 +690,7 @@ export const api = {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `variants-${id.slice(0, 8)}.${format}`;
+    a.download = `variants-${id.slice(0, 8)}.${format}${format === "vcf" ? ".gz" : ""}`;
     document.body.appendChild(a);
     a.click();
     a.remove();

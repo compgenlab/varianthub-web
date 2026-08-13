@@ -146,6 +146,90 @@ func InfoValue(v any) (string, bool) {
 	}
 }
 
+// assignInfoIDs gives every column the INFO id it is written under, and says
+// which of them are flags.
+//
+// taken is the set of ids already spoken for — a submitted file's own, so ours
+// land beside them instead of overwriting them. Rendering a file that had no
+// submitter passes an empty set, and that is the only difference between the
+// two paths: one function decides this, so the id a column is written under
+// cannot depend on which path wrote it.
+func assignInfoIDs(cols []queue.Column, taken map[string]bool) (ids map[string]string, flag map[string]bool) {
+	ids = make(map[string]string, len(cols))
+	flag = make(map[string]bool, len(cols))
+	for _, c := range cols {
+		ids[c.Key] = uniqueInfoID(c.Key, taken)
+		flag[c.Key] = InfoType(c.Type) == "Flag"
+	}
+	return ids, flag
+}
+
+// InfoNumber is the Number a column's INFO definition declares.
+//
+// "A" — one value per ALT — for everything that carries a value, because that
+// is what is written: a multi-allelic record gets one comma-separated value per
+// allele, with "." for the alleles that had none. It used to declare Number=1
+// and write two values for a two-allele record, which is a file a strict parser
+// is entitled to reject and a lenient one reads as a single string.
+//
+// A Flag is Number=0 and is per record, not per allele. There is no way to say
+// "this flag applies to the second ALT only" in VCF, so a flag set for any
+// allele is set for the record.
+func InfoNumber(t string) string {
+	if InfoType(t) == "Flag" {
+		return "0"
+	}
+	return "A"
+}
+
+// columnLinePrefix introduces the header line that maps an INFO id back to the
+// annotation key it carries.
+const columnLinePrefix = "##varianthub_column=<"
+
+// ColumnLine records which INFO id an annotation was written under.
+//
+// The id is sanitised from the key and may be suffixed to avoid a collision, so
+// it is not always the key and cannot always be turned back into one. Reading
+// the file's own annotations back — which is what every tab, csv and json export
+// now does — needs the mapping exactly, not approximately, and re-deriving it
+// would mean a reader reproducing the writer's collision handling against a
+// submitter's header it no longer has.
+//
+// So the writer says. A file carrying these lines can be turned back into rows
+// by anything that reads VCF, without this server's database or its column
+// model — which is the point of making the file the primary result.
+func ColumnLine(id, key string) string {
+	return columnLinePrefix + "ID=" + id + ",Key=" + Escape(key) + ">"
+}
+
+// ParseColumnLine reads one back. ok is false for any other header line.
+func ParseColumnLine(line string) (id, key string, ok bool) {
+	rest, found := strings.CutPrefix(strings.TrimSpace(line), columnLinePrefix)
+	if !found {
+		return "", "", false
+	}
+	rest, found = strings.CutSuffix(rest, ">")
+	if !found {
+		return "", "", false
+	}
+	for _, part := range strings.Split(rest, ",") {
+		k, v, hasEq := strings.Cut(part, "=")
+		if !hasEq {
+			continue
+		}
+		switch k {
+		case "ID":
+			id = v
+		case "Key":
+			key = Unescape(v)
+		}
+	}
+	if id == "" || key == "" {
+		return "", "", false
+	}
+	return id, key, true
+}
+
 // uniqueInfoID is the INFO id an annotation is written under, avoiding a
 // collision with one the submitter already uses.
 //
@@ -273,4 +357,49 @@ func Escape(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// Unescape reverses Escape.
+//
+// Every two-digit hex escape is decoded, not only the six Escape writes. A file
+// this reads back may have been written by something else — the point of making
+// the VCF primary is that it is a file, not a private format — and VCF's
+// percent-encoding is one scheme whichever tool applied it.
+//
+// A stray "%" that does not introduce a valid escape is left alone rather than
+// treated as an error. It is a value in somebody's data, not a protocol
+// violation worth failing a whole export over.
+func Unescape(s string) string {
+	if !strings.Contains(s, "%") {
+		return s // the overwhelmingly common case, with no allocation
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] != '%' || i+2 >= len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		hi, hiOK := hexNibble(s[i+1])
+		lo, loOK := hexNibble(s[i+2])
+		if !hiOK || !loOK {
+			b.WriteByte(s[i])
+			continue
+		}
+		b.WriteByte(hi<<4 | lo)
+		i += 2
+	}
+	return b.String()
+}
+
+func hexNibble(c byte) (byte, bool) {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0', true
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10, true
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10, true
+	}
+	return 0, false
 }

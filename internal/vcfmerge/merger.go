@@ -46,26 +46,18 @@ func New(hdr *vcf.VcfHeader, cols []queue.Column) *Merger {
 	for _, id := range hdr.InfoIDs() {
 		taken[id] = true
 	}
-	m := &Merger{
-		hdr:  hdr,
-		cols: cols,
-		ids:  make(map[string]string, len(cols)),
-		flag: make(map[string]bool, len(cols)),
-	}
+	ids, flag := assignInfoIDs(cols, taken)
+	m := &Merger{hdr: hdr, cols: cols, ids: ids, flag: flag}
 	for _, c := range cols {
-		id := uniqueInfoID(c.Key, taken)
-		m.ids[c.Key] = id
-		typ := InfoType(c.Type)
-		m.flag[c.Key] = typ == "Flag"
-		number := "1"
-		if typ == "Flag" {
-			number = "0"
-		}
 		hdr.AddInfo(&vcf.AnnotationDef{
-			IsInfo: true, ID: id, Number: number, Type: typ,
+			IsInfo: true, ID: ids[c.Key], Number: InfoNumber(c.Type), Type: InfoType(c.Type),
 			Description: HeaderDescription(c),
 			Source:      "VariantHub",
 		})
+		// Beside the definition, the key the id stands for. The definition says
+		// what the values are; this says which annotation they belong to, which
+		// is what the tab/csv/json exports read the file back with.
+		hdr.AddLine(ColumnLine(ids[c.Key], c.Key))
 	}
 	return m
 }
@@ -120,6 +112,32 @@ func Merge(rd *vcf.VcfReader, w io.Writer, hdr *vcf.VcfHeader, cols []queue.Colu
 		return 0, err
 	}
 	return m.WriteRecords(rd, w, ann)
+}
+
+// Variants reads the engine's JSON output as rows, in the order it reported
+// them.
+//
+// What Render needs, where DecodeAnnotations is what Merge needs: a merge looks
+// each record's annotations up by locus, while a render has no file to follow
+// and the engine's order is the only order there is.
+func Variants(b []byte) ([]queue.Variant, error) {
+	var rows []queue.Variant
+	if err := json.Unmarshal(b, &rows); err != nil {
+		return nil, fmt.Errorf("parse engine output: %w", err)
+	}
+	return rows, nil
+}
+
+// SliceStream serves an already-materialized set of variants as a Stream.
+func SliceStream(vs []queue.Variant) Stream {
+	return func(fn func(queue.Variant) error) error {
+		for _, v := range vs {
+			if err := fn(v); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // DecodeAnnotations reads the engine's JSON output into the form Merge wants.

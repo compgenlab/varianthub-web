@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/queue"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 )
 
 // resultsReady checks a job is finished and returns the right status otherwise.
@@ -116,40 +117,45 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	qy.Limit, qy.Offset = 0, 0 // export is the whole matching set
 
 	filename := "variants-" + job.ID[:min(8, len(job.ID))] + "." + format
+	if format == "vcf" {
+		// The stored object is gzipped and that is what every path serves, so
+		// the name says so. A file called .vcf that is gzip is the bug this
+		// replaces — a split job's download was exactly that.
+		filename += ".gz"
+	}
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
+
+	// The VCF is the stored answer, so it is handed over rather than built:
+	// a signed link to the object when the store is reachable from outside,
+	// the object relayed when it is not, and only failing both is it rebuilt.
+	if format == "vcf" {
+		s.exportVCFResult(w, r, job, cols, qy, filename)
+		return
+	}
+
+	rows, release := s.rowSource(r, job, qy)
+	defer release()
 
 	// Headers go out before the first row, so a mid-stream database error cannot
 	// be turned into a clean error response. Nothing is buffered — a large export
 	// must not be held in memory to preserve that option.
 	switch format {
 	case "json":
-		s.exportJSON(w, r, job, cols, qy)
+		s.exportJSON(w, job, rows)
 	case "tsv":
-		s.exportDelimited(w, r, job, cols, qy, '\t')
+		s.exportDelimited(w, job, cols, rows, '\t')
 	case "csv":
-		s.exportDelimited(w, r, job, cols, qy, ',')
-	case "vcf":
-		// A submitted VCF is answered with its own file annotated, which keeps
-		// the ID, QUAL, FILTER, existing INFO, FORMAT and sample columns the
-		// caller sent. Falls back to rendering from rows when there is no
-		// stored input to merge onto — a job old enough to have been swept —
-		// so a download degrades rather than fails.
-		if job.Kind == queue.KindVCF && s.exportMergedVCF(w, r, job, cols, qy) {
-			return
-		}
-		s.exportVCF(w, r, job, cols, qy)
+		s.exportDelimited(w, job, cols, rows, ',')
 	}
 }
 
-func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Job,
-	cols []queue.Column, qy queue.ResultQuery) {
-
+func (s *Server) exportJSON(w http.ResponseWriter, job queue.Job, rows vcfmerge.Stream) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	first := true
 	fmt.Fprint(w, "[")
-	err := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
+	err := rows(func(v queue.Variant) error {
 		if !first {
 			fmt.Fprint(w, ",")
 		}
@@ -169,8 +175,8 @@ func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Jo
 	}
 }
 
-func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job queue.Job,
-	cols []queue.Column, qy queue.ResultQuery, sep rune) {
+func (s *Server) exportDelimited(w http.ResponseWriter, job queue.Job,
+	cols []queue.Column, rows vcfmerge.Stream, sep rune) {
 
 	if sep == '\t' {
 		w.Header().Set("Content-Type", "text/tab-separated-values; charset=utf-8")
@@ -192,7 +198,7 @@ func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job que
 		return
 	}
 
-	err := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
+	err := rows(func(v queue.Variant) error {
 		row := []string{v.Chrom, fmt.Sprint(v.Pos), v.Ref, v.Alt}
 		// Iterate the column model, not the map: column order must match the
 		// header, and map iteration order does not.

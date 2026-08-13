@@ -35,6 +35,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
 
+	"github.com/compgenlab/cghts/htsio/bgzf"
 	"github.com/compgenlab/cghts/vcf"
 )
 
@@ -271,7 +272,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin, cfg.JobStorage, chunkSizeFor(ctx, cfg, cat)))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, chunkSizeFor(ctx, cfg, cat)))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -395,12 +396,16 @@ func registerS3Sites(cfg *config.Config) {
 	if len(cfg.S3Sites) == 0 {
 		return
 	}
+	// A conversion, not a field-by-field copy. The two structs are the same
+	// declaration twice — one with toml tags, one without, because config owns
+	// reading files and blob owns talking to the store — so this compiles only
+	// while they still match. Listing the fields by hand meant a field added to
+	// one and forgotten here was silently zero, which for a credential reads as
+	// a permission problem and for public_endpoint reads as presigning being
+	// unsupported.
 	sites := make([]blob.Site, 0, len(cfg.S3Sites))
 	for _, s := range cfg.S3Sites {
-		sites = append(sites, blob.Site{
-			Name: s.Name, URI: s.URI, Endpoint: s.Endpoint, Region: s.Region,
-			AccessKey: s.AccessKey, SecretKey: s.SecretKey, Default: s.Default,
-		})
+		sites = append(sites, blob.Site(s))
 	}
 	blob.RegisterSites(sites)
 	log.Printf("config: %d S3 site(s) declared with their own credentials", len(sites))
@@ -450,7 +455,7 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // bridges — and it is written outside the Outcome because an Outcome is the
 // chunk's result, while a log exists for the runs that produced no result at
 // all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin, cfgJobStorage string, chunkSize func() int) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, cfgVersion string, chunkSize func() int) queue.Runner {
 	return func(ctx context.Context, chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 		switch chunk.Kind {
 		case queue.KindSplit:
@@ -539,7 +544,7 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 		// and rewritten per request — and that is why the input had to be kept
 		// for as long as the results were downloadable.
 		//
-		// Best effort: a merge that fails must not fail a chunk whose
+		// Best effort: a build that fails must not fail a chunk whose
 		// annotation succeeded. Without a stored VCF the export falls back to
 		// rendering from rows, which is the same answer more slowly and with
 		// less of the submitter's file in it.
@@ -557,24 +562,30 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 			}
 			return out, nil
 		}
-		if chunk.Kind == queue.KindVCF && inputPath != "" {
-			uri, mErr := buildResultVCF(ctx, cfgJobStorage, chunk, inputPath, res, alw)
-			if mErr != nil {
-				log.Printf("worker: chunk %s: build result VCF: %v", chunk.ID, mErr)
-				alw.Note("··· could not pre-build the annotated VCF; downloads will " +
-					"render from the result rows instead")
-			} else {
-				out.VCFURI = uri
-				// The input existed to be annotated and to be merged onto. Both
-				// are done and the merged file is stored, so it is scrap —
-				// keeping it until expiry meant holding two copies of every
-				// submission for a week.
-				//
-				// After the result is stored, never before. Reversed, a
-				// failure in between would leave a chunk with neither the file
-				// it was sent nor the answer built from it.
-				dropInput(ctx, q, chunk.ID, alw)
-			}
+		// Every job, not only one submitted as a file. A locus list has no
+		// submitted VCF to merge onto, so its answer is rendered sites-only —
+		// but it is the same object, under the same name, built by the same
+		// step. That is what lets every export be a conversion of one stored
+		// file rather than a second rendering from a copy of the same data in
+		// Postgres.
+		uri, mErr := buildResultVCF(ctx, cfgJobStorage, cfgVersion, chunk, inputPath, res, alw)
+		if mErr != nil {
+			log.Printf("worker: chunk %s: build result VCF: %v", chunk.ID, mErr)
+			alw.Note("··· could not pre-build the annotated VCF; downloads will " +
+				"render from the result rows instead")
+			return out, nil
+		}
+		out.VCFURI = uri
+		if inputPath != "" {
+			// The input existed to be annotated and to be merged onto. Both are
+			// done and the merged file is stored, so it is scrap — keeping it
+			// until expiry meant holding two copies of every submission for a
+			// week.
+			//
+			// After the result is stored, never before. Reversed, a failure in
+			// between would leave a chunk with neither the file it was sent nor
+			// the answer built from it.
+			dropInput(ctx, q, chunk.ID, alw)
 		}
 		return out, nil
 	}
@@ -606,19 +617,20 @@ func dropInput(ctx context.Context, q *queue.Queue, id string, alw *queue.LogWri
 	alw.Note("··· submitted file removed; the annotated VCF stands in for it")
 }
 
-// buildResultVCF merges a chunk's annotations onto the file it was submitted
-// with and stores the result, returning where it went.
+// buildResultVCF stores a chunk's answer as a VCF, and reports where it went.
 //
-// Streamed from the staged input straight into the upload, so the merged file
-// is never held in memory or written to disk a second time — a chromosome's
-// worth of VCF would be hundreds of megabytes of both.
-func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
+// Two sources, one object. A submitted file is read back and the annotations set
+// on its records, which is what keeps the submitter's ID, QUAL, FILTER, INFO,
+// FORMAT and sample columns; a locus list, which never had a file, is rendered
+// sites-only. Either way the job ends up with one object under one name, so
+// nothing downstream has to ask which kind of job produced it.
+//
+// Streamed from the staged input straight into the upload, so the file is never
+// held in memory or written to disk a second time — a chromosome's worth of VCF
+// would be hundreds of megabytes of both.
+func buildResultVCF(ctx context.Context, jobStorage, version string, chunk queue.Chunk,
 	inputPath string, res runner.Result, alw *queue.LogWriter) (string, error) {
 
-	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
-	if err != nil {
-		return "", err
-	}
 	// runner.Column and queue.Column are the same struct declared twice — the
 	// runner describes what the engine reported, the queue describes what was
 	// stored — so this converts rather than translates. If they ever stop
@@ -627,39 +639,13 @@ func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
 	for i, c := range res.Columns {
 		cols[i] = queue.Column(c)
 	}
+	meta := vcfmerge.Meta{Version: version, JobID: chunk.JobID, Snapshot: chunk.Snapshot}
 
-	in, err := os.Open(inputPath)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
-
-	// The staged file keeps the name it was stored under, so whether it is
-	// compressed is something this is told rather than something it works out.
-	var src io.Reader = in
-	if strings.HasSuffix(inputPath, ".gz") {
-		gz, gzErr := gzip.NewReader(in)
-		if gzErr != nil {
-			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
-		}
-		defer gz.Close()
-		src = gz
-	}
-	rd, err := vcf.NewVcfReader(src)
-	if err != nil {
-		return "", err
-	}
-	hdr, err := rd.Header()
-	if err != nil {
-		return "", err
-	}
-
-	// A pipe rather than a buffer: the merge writes as the upload reads, so
+	// A pipe rather than a buffer: the write happens as the upload reads, so
 	// neither side has to hold the file.
 	pr, pw := io.Pipe()
 	go func() {
-		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
-		pw.CloseWithError(mErr)
+		pw.CloseWithError(writeResultVCF(pw, meta, cols, inputPath, res))
 	}()
 
 	// Under the job's prefix, not the chunk's. Storage is laid out by job and
@@ -674,6 +660,70 @@ func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
 	}
 	alw.Note("··· annotated VCF stored at " + uri)
 	return uri, nil
+}
+
+// writeResultVCF gzips the job's answer into w.
+//
+// Compressed because this object is kept for the job's whole life and an
+// annotated chromosome is hundreds of megabytes. The name says so — see
+// queue.ResultName — so every reader is told rather than sniffing.
+func writeResultVCF(w io.Writer, meta vcfmerge.Meta, cols []queue.Column,
+	inputPath string, res runner.Result) error {
+
+	zw := bgzf.NewWriter(w)
+	if err := writeAnnotated(zw, meta, cols, inputPath, res); err != nil {
+		return err
+	}
+	// Closing is what flushes the final block and writes the BGZF EOF marker.
+	// Skipped, the object uploads cleanly and is truncated garbage on the way
+	// back — and without the marker htslib reports the file as unterminated.
+	return zw.Close()
+}
+
+func writeAnnotated(w io.Writer, meta vcfmerge.Meta, cols []queue.Column,
+	inputPath string, res runner.Result) error {
+
+	if inputPath == "" {
+		// No submitted file: the answer is the engine's rows, written out as a
+		// sites-only VCF.
+		variants, err := vcfmerge.Variants(res.Variants)
+		if err != nil {
+			return err
+		}
+		return vcfmerge.Render(w, meta, cols, vcfmerge.SliceStream(variants))
+	}
+
+	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
+	if err != nil {
+		return err
+	}
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+
+	// The staged file keeps the name it was stored under, so whether it is
+	// compressed is something this is told rather than something it works out.
+	var src io.Reader = in
+	if strings.HasSuffix(inputPath, ".gz") {
+		gz, gzErr := gzip.NewReader(in)
+		if gzErr != nil {
+			return fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		return err
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		return err
+	}
+	_, err = vcfmerge.Merge(rd, w, hdr, cols, ann)
+	return err
 }
 
 // sweepStorage removes job-storage files that no job owns, on demand.

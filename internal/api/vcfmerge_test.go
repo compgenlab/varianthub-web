@@ -52,7 +52,7 @@ func TestMergedVCFPreservesTheSubmittedFile(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	out := w.Body.String()
+	out := vcfBody(t, w)
 
 	// Everything the submitter sent survives. Each of these was dropped by the
 	// rendered-from-rows path, which is why this exists.
@@ -105,7 +105,7 @@ func TestMergedVCFDoesNotClobberTheSubmittersFields(t *testing.T) {
 	_, tok := h.admin(t)
 	seedVCFJob(t, h, "clash")
 
-	out := h.do("GET", "/api/v1/jobs/clash/export?format=vcf", tok, nil).Body.String()
+	out := vcfBody(t, h.do("GET", "/api/v1/jobs/clash/export?format=vcf", tok, nil))
 
 	if !strings.Contains(out, "GENE=theirs") {
 		t.Errorf("the submitter's own GENE value was replaced:\n%s", out)
@@ -131,7 +131,7 @@ func TestMergedVCFHandlesMultipleAlternates(t *testing.T) {
 	_, tok := h.admin(t)
 	seedVCFJob(t, h, "multi")
 
-	out := h.do("GET", "/api/v1/jobs/multi/export?format=vcf", tok, nil).Body.String()
+	out := vcfBody(t, h.do("GET", "/api/v1/jobs/multi/export?format=vcf", tok, nil))
 	var multi string
 	for _, l := range strings.Split(out, "\n") {
 		if strings.HasPrefix(l, "chr12\t25245351\t") {
@@ -158,9 +158,9 @@ func TestMergedVCFIsDeterministic(t *testing.T) {
 	_, tok := h.admin(t)
 	seedVCFJob(t, h, "stable")
 
-	first := h.do("GET", "/api/v1/jobs/stable/export?format=vcf", tok, nil).Body.String()
+	first := vcfBody(t, h.do("GET", "/api/v1/jobs/stable/export?format=vcf", tok, nil))
 	for i := 0; i < 4; i++ {
-		again := h.do("GET", "/api/v1/jobs/stable/export?format=vcf", tok, nil).Body.String()
+		again := vcfBody(t, h.do("GET", "/api/v1/jobs/stable/export?format=vcf", tok, nil))
 		if again != first {
 			t.Fatalf("export %d differs from the first:\n%s\n---\n%s", i+1, first, again)
 		}
@@ -181,7 +181,7 @@ func TestMergedVCFFallsBackWithoutTheInput(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.HasPrefix(w.Body.String(), "##fileformat=VCFv4.2") {
-		t.Errorf("no VCF was produced:\n%.200s", w.Body.String())
+	if out := vcfBody(t, w); !strings.HasPrefix(out, "##fileformat=VCFv4.2") {
+		t.Errorf("no VCF was produced:\n%.200s", out)
 	}
 }
