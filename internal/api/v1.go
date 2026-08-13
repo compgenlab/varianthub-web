@@ -31,19 +31,6 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
-// maxVariantsPerRequest caps a JSON locus submission.
-//
-// This is a policy, not a workaround. It used to be one: loci reached the engine
-// as argv, so a large batch tripped the kernel's ARG_MAX and failed with
-// "argument list too long" — and the cap existed to keep submissions well below
-// a ceiling nobody chose. Loci now travel in a file (runner.ExecRunner writes
-// loci.txt and passes --loci-file), which removed that ceiling entirely.
-//
-// The number stays because the real limit is what a shared annotation service
-// will do for one caller in one request, which is a decision about capacity
-// rather than about exec. It is the default; a tier can raise it or lift it.
-const maxVariantsPerRequest = 10000
-
 // normalizeLocus accepts the dash-delimited variant form docs/api.md uses in its
 // examples and rewrites it to the colon-delimited form the engine parses.
 //
@@ -435,10 +422,14 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "`variants` is required and must be non-empty")
 		return
 	}
-	if len(loci) > maxVariantsPerRequest {
+	// The caller's own cap, not a fixed number. Checked here because a locus
+	// list's variant count is the length of a slice — the VCF path cannot do
+	// this at the door, since counting a compressed file means decompressing it.
+	_, lim := s.callerLimits(r, limit.ClientIP(r, s.trusted))
+	if !lim.AllowsVariants(len(loci)) {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"%d variants exceeds the %d-variant limit for this endpoint; use POST /api/v1/annotate/vcf for bulk submissions",
-			len(loci), maxVariantsPerRequest))
+			"%d variants exceeds the %d-variant limit for this account; use POST /api/v1/annotate/vcf for bulk submissions",
+			len(loci), lim.MaxVariants))
 		return
 	}
 	sel, err := selection(in.Annotations)
@@ -684,6 +675,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 	c := callerOf(r)
 	_, lim := s.callerLimits(r, nj.ClientIP)
 	nj.MaxConcurrent = lim.Concurrent
+	nj.MaxVariants = lim.MaxVariants
 	nj.Origin = queue.OriginWeb
 	if c.ViaToken {
 		nj.Origin = queue.OriginAPI

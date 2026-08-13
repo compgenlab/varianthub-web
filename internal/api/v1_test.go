@@ -82,10 +82,19 @@ func TestSessionOf(t *testing.T) {
 // handler would touch it.
 func openServer(t *testing.T) http.Handler {
 	t.Helper()
-	return New(&config.Config{
-		AllowAnonymous: true, Version: "test",
-		RatePerMin: 1000, RateBurst: 1000,
-	}, nil, nil, nil, nil).Routes()
+	// Built from the shipped defaults, not from a literal. The per-tier limits
+	// are zero in a bare Config and zero means *unlimited*, so a literal would
+	// quietly test a server with no caps at all — including the cap the test
+	// below is about.
+	cfg := config.Defaults()
+	cfg.AllowAnonymous = true
+	cfg.Version = "test"
+	cfg.RatePerMin, cfg.RateBurst = 1000, 1000
+	// Rates off, caps kept. A handful of requests from one test is not what the
+	// per-hour limit exists to stop, and leaving it on makes every case after
+	// the twelfth fail with a 429 that says nothing about what it was checking.
+	cfg.AnonPerHour, cfg.AnonConcurrent = 0, 0
+	return New(cfg, nil, nil, nil, nil).Routes()
 }
 
 func postJSON(t *testing.T, h http.Handler, path string, body any) *httptest.ResponseRecorder {
@@ -144,10 +153,11 @@ func TestAnnotateValidation(t *testing.T) {
 		}
 	})
 
-	// Loci reach the engine as argv, so an oversized batch must be rejected with
-	// a clear limit rather than failing later on ARG_MAX.
+	// Past the caller's variant cap the submission is refused at the door, where
+	// the count is just the length of a slice. The number comes from the tier
+	// rather than from a constant, so an account can be given more.
 	t.Run("over the variant cap", func(t *testing.T) {
-		many := make([]string, maxVariantsPerRequest+1)
+		many := make([]string, config.Defaults().AnonMaxVariants+1)
 		for i := range many {
 			many[i] = fmt.Sprintf("chr1-%d-A-T", i+1)
 		}

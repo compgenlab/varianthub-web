@@ -197,17 +197,18 @@ type Config struct {
 	JobTTL          time.Duration // terminal jobs GC'd after this
 	// MaxUploadBytes caps a POST /annotate/vcf body.
 	//
-	// Held at 64 MB deliberately, below the size the limits will eventually
-	// allow. The upload is currently read into memory in one piece and stored
-	// as a Postgres BYTEA, so this figure is bounded by what the API process
-	// can hold rather than by what a caller should be able to send — and a
-	// whole chromosome of a WGS cohort is around 150 MB compressed. Raising it
-	// before the upload streams to object storage would turn a rejected request
-	// into an OOM.
+	// A backstop against someone streaming us a terabyte, not the limit that
+	// decides how much work a job is. That is the variant count, checked
+	// separately: a byte cap cannot tell a large file of few richly-annotated
+	// variants from a small one holding millions, and it is the millions that
+	// cost something.
 	//
-	// It is a backstop in any case, not the limit that matters: the variant
-	// count is. A byte cap alone cannot tell a large file of few richly-
-	// annotated variants from a small one holding millions.
+	// 512 MB clears a whole chromosome of a WGS cohort — around 26 MB
+	// compressed for chr22, and well under this uncompressed. It only became
+	// safe once nothing held the upload whole: the API streams it to storage,
+	// the worker stages it to a file, the cache reads that file, and the export
+	// streams it back. While any of those buffered it, this number was bounded
+	// by what a process could hold rather than by what a caller should send.
 	MaxUploadBytes int64
 
 	RatePerMin   int      // per-IP submit rate
@@ -251,7 +252,7 @@ func Defaults() *Config {
 		// the JSON blob that backs export and once as rows that back paging and
 		// sorting, so this multiplies the larger of those by seven.
 		JobTTL:         7 * 24 * time.Hour,
-		MaxUploadBytes: 64 << 20,
+		MaxUploadBytes: 512 << 20,
 		RatePerMin:     30,
 		RateBurst:      10,
 		MaxJobsPerIP:   2,

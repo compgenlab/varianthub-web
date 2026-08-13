@@ -111,6 +111,15 @@ type Job struct {
 	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 
+	// MaxVariants is the variant cap this job was admitted under; 0 is
+	// unlimited. Stamped at submit, so the terms a job runs under are the ones
+	// that applied when it was accepted.
+	//
+	// Not serialized: it is an internal admission decision, and a caller who
+	// wants to know their limit asks about their account rather than reading it
+	// off somebody's job.
+	MaxVariants int `json:"-"`
+
 	// InputURI is where this job's input is stored, set only on the Job a claim
 	// returns — Get and List do not fill it, because nothing reading a job's
 	// status needs it.
@@ -156,6 +165,10 @@ type NewJob struct {
 	// Origin is how the job arrived: OriginWeb, OriginAPI, or empty when
 	// unrecorded. Reporting only — it decides nothing.
 	Origin string
+	// MaxVariants caps how many variants this job may carry; 0 is unlimited.
+	// Recorded on the row so the worker enforcing it does not have to resolve
+	// an account that may not exist.
+	MaxVariants int
 
 	// Body is the input itself, for submissions small enough to be worth
 	// carrying: a locus list is a few hundred bytes and a round trip through
@@ -194,13 +207,13 @@ func weightOf(w int) int {
 // more ceremony.
 const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
-	`COALESCE(origin,''), created_at, ` +
+	`COALESCE(origin,''), COALESCE(max_variants,0), created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
-	`COALESCE(j.origin,''), j.created_at, ` +
+	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a job has already finished.
@@ -673,11 +686,11 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
-		                  weight,max_concurrent,origin,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+		                  weight,max_concurrent,origin,max_variants,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
 		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
-		j.MaxConcurrent, j.Origin, q.nowFn()); err != nil {
+		j.MaxConcurrent, j.Origin, j.MaxVariants, q.nowFn()); err != nil {
 		return "", err
 	}
 	// One of the two, never both — matching the CHECK rather than trusting it.
@@ -820,7 +833,7 @@ func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.Origin, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
+		&j.Origin, &j.MaxVariants, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Job{}, err
 	}
 	return j, nil

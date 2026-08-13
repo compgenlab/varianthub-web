@@ -1,0 +1,14 @@
+-- The variant cap a job was admitted under.
+--
+-- Stamped at submit rather than read at dispatch, for the same reason
+-- max_concurrent is: the limit a job runs under should be the one that applied
+-- when it was accepted. Raising somebody's tier must not retroactively change
+-- what is already queued, and lowering it must not fail work already taken on.
+--
+-- It is on the row and not looked up because the worker enforcing it has no
+-- account to read from — an anonymous submission has none at all — and because
+-- a job that has been sitting in the queue for an hour should not be judged
+-- against a setting an administrator changed in the meantime.
+--
+-- 0 is unlimited, matching every other limit here.
+ALTER TABLE job ADD COLUMN IF NOT EXISTS max_variants INTEGER NOT NULL DEFAULT 0;

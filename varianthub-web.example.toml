@@ -155,7 +155,13 @@ max_age     = "2160h"
   rate_per_min = 30                                 # VHW_RATE_PER_MIN
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
-  max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+  # A backstop against someone streaming us a terabyte, not the limit that says
+  # how much work a job is — that is the variant count below. A byte cap cannot
+  # tell a large file of few richly-annotated variants from a small one holding
+  # millions, and it is the millions that cost something.
+  #
+  # 512 MB clears a whole chromosome of a WGS cohort with room to spare.
+  max_upload_bytes = 536870912                      # VHW_MAX_UPLOAD_BYTES
 
   # What one caller may ask of the service, by tier.
   #
