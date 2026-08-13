@@ -34,6 +34,18 @@ type Stats struct {
 	// Recent activity, by completion time.
 	Last24h int64 `json:"last_24h"`
 	Last7d  int64 `json:"last_7d"`
+
+	// Abandoned counts jobs whose worker was killed rather than reporting —
+	// currently retrying, plus those that gave up. Counted apart from Failed
+	// because it is a different kind of trouble: a failure is the job going
+	// wrong, an abandonment is the process running it disappearing, and the
+	// usual cause is the container's memory limit.
+	//
+	// Retrying and exhausted are separate because they answer different
+	// questions. A steady trickle of retries that eventually succeed is a
+	// deployment losing capacity; exhausted jobs are work that was thrown away.
+	AbandonedRetrying  int64 `json:"abandoned_retrying"`
+	AbandonedExhausted int64 `json:"abandoned_exhausted"`
 }
 
 // ActiveDownloads maps a source id to the download job currently working on it.
@@ -84,11 +96,14 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		       coalesce(min(created_at) FILTER (WHERE status = $3), 0),
 		       coalesce(sum(n_variants) FILTER (WHERE status = $1), 0),
 		       count(*) FILTER (WHERE finished_at >= $5),
-		       count(*) FILTER (WHERE finished_at >= $6)
+		       count(*) FILTER (WHERE finished_at >= $6),
+		       count(*) FILTER (WHERE status = $3 AND attempts > 0),
+		       count(*) FILTER (WHERE status = $2 AND attempts >= $8)
 		  FROM job`,
 		StatusDone, StatusError, StatusQueued, StatusRunning,
-		now-24*3600, now-7*24*3600, StatusCancelled).
+		now-24*3600, now-7*24*3600, StatusCancelled, MaxAttempts).
 		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Cancelled, &s.Queued, &s.Running,
-			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d)
+			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d,
+			&s.AbandonedRetrying, &s.AbandonedExhausted)
 	return s, err
 }

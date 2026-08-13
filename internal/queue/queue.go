@@ -416,15 +416,22 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 	// that this happened. Without it an abandoned job carries no record of the
 	// abandonment: the worker died without writing anything, and "abandoned 3
 	// times" arrives with no times, no workers, and no output.
-	var reclaiming []string
+	// The worker is read here and not after: the reclaim clears claimed_by, so
+	// once it has run the identity of the process that died is gone. Without it,
+	// "abandoned 3 times" cannot be turned into "worker-7 lost twelve jobs in an
+	// hour", which is the question asked when a pod is being OOM-killed — and
+	// answering it meant grepping individual job logs for the "starting on
+	// worker" line.
+	type lost struct{ id, worker string }
+	var reclaiming []lost
 	if rows, qErr := q.pool.Query(ctx, `
-		SELECT id FROM job
+		SELECT id, COALESCE(claimed_by,'') FROM job
 		 WHERE status=$1 AND COALESCE(lease_until, 0) < $2 AND attempts < $3`,
 		StatusRunning, q.nowFn(), MaxAttempts); qErr == nil {
 		for rows.Next() {
-			var id string
-			if rows.Scan(&id) == nil {
-				reclaiming = append(reclaiming, id)
+			var l lost
+			if rows.Scan(&l.id, &l.worker) == nil {
+				reclaiming = append(reclaiming, l)
 			}
 		}
 		rows.Close()
@@ -439,10 +446,19 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("reclaim expired jobs: %w", err)
 	}
-	for _, id := range reclaiming {
-		_ = q.AppendLog(ctx, id, "··· its worker stopped renewing the lease; "+
+	for _, l := range reclaiming {
+		who := l.worker
+		if who == "" {
+			who = "its worker"
+		}
+		_ = q.AppendLog(ctx, l.id, "··· "+who+" stopped renewing the lease; "+
 			"requeued for another attempt. The process was killed rather than "+
 			"failing, so nothing above this line is its explanation.\n")
+		// Also to the process log, where it can be correlated with pod restarts.
+		// A job's own log answers "what happened to this job"; this answers "is
+		// one worker losing all of them", which is the question when a container
+		// is being OOM-killed and the kill itself is invisible from in here.
+		log.Printf("queue: job %s abandoned by %s; requeued", l.id, who)
 	}
 	n := int(tag.RowsAffected())
 	if n > 0 {
@@ -844,6 +860,12 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 //
 // Skip any caller at the per-caller cap, and break ties by oldest created_at then
 // id.
+//
+// The timestamps are Unix seconds, so callers finishing inside the same second
+// tie and that burst drains FIFO. Deliberate: jobs completing that fast mean the
+// queue is not contended, so there is nothing for fairness to protect, and the
+// next tick resolves it. Finer resolution would buy ordering nobody is waiting
+// on, at the cost of widening three columns and everything that reads them.
 //
 // FOR UPDATE OF j is required rather than a bare FOR UPDATE: Postgres refuses to
 // lock the nullable side of an outer join, and r is a LEFT JOIN subquery. Locking
