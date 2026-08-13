@@ -300,6 +300,10 @@ type Queue struct {
 	pool  *pgxpool.Pool
 	nowFn func() int64
 
+	// disposeObjects removes a collected job's stored files. Nil in a process
+	// that has no storage configured; see SetObjectDisposer.
+	disposeObjects func(ctx context.Context, uris []string)
+
 	maxJobsPerIP int // per-IP concurrent running-job cap (<=0 = unlimited)
 	// slots is the pool's total capacity in job weight, not job count. A job
 	// runs only when the running set's weight plus its own fits. <=0 disables
@@ -602,6 +606,17 @@ func (q *Queue) Ping(ctx context.Context) error { return q.pool.Ping(ctx) }
 // scheduler (<=0 = unlimited). Call before starting workers.
 func (q *Queue) SetMaxJobsPerIP(n int) { q.maxJobsPerIP = n }
 
+// SetObjectDisposer supplies what removes a job's stored files when the job
+// itself is collected.
+//
+// A hook rather than a storage client held here, because this package is about
+// job persistence and knows nothing about buckets — the same separation that
+// keeps the runner from having one. Unset, expiring jobs still have their rows
+// removed and their objects are left for a listing sweep to find.
+func (q *Queue) SetObjectDisposer(f func(ctx context.Context, uris []string)) {
+	q.disposeObjects = f
+}
+
 // SetSlots sets the pool's capacity in job weight.
 //
 // Separate from the worker count on purpose: the goroutines decide how many
@@ -881,10 +896,42 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 // The blobs go with the job via ON DELETE CASCADE, so unlike the SQLite version
 // this is one statement rather than three inside a transaction.
 func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error) {
+	// The objects these jobs own, read before their rows go.
+	//
+	// job_input cascades from job, so deleting the row destroys the only record
+	// of where the object was — and an object nothing points at is invisible to
+	// everything short of listing the whole bucket. Without this, every VCF job
+	// that ages out leaves its input behind for good, and storage grows without
+	// limit while the table it was tracked in shrinks on schedule.
+	var owned []string
+	if rows, err := q.pool.Query(ctx, `
+		SELECT i.uri FROM job_input i JOIN job j ON j.id = i.job_id
+		 WHERE i.uri IS NOT NULL
+		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
+		for rows.Next() {
+			var uri string
+			if rows.Scan(&uri) == nil && uri != "" {
+				owned = append(owned, uri)
+			}
+		}
+		rows.Close()
+	} else {
+		// Not fatal: collecting the jobs matters more than collecting their
+		// objects, and a leaked object is recoverable by a listing while a table
+		// that never shrinks is not.
+		log.Printf("queue: could not list the objects of expiring jobs: %v", err)
+	}
+
 	tag, err := q.pool.Exec(ctx,
 		`DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
 	if err != nil {
 		return 0, err
+	}
+	// After the rows, deliberately. This order can leak an object when the
+	// disposal fails; the other order can leave a job that still looks complete
+	// with its input already gone, which is a wrong answer rather than waste.
+	if len(owned) > 0 && q.disposeObjects != nil {
+		q.disposeObjects(ctx, owned)
 	}
 
 	// The fair-share timestamps age out with the jobs. Safe because the ordering

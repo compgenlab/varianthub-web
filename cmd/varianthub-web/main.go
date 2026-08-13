@@ -219,6 +219,10 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	q.StartLeaseKeeper(ctx)
 
 	q.SetMaxJobsPerIP(cfg.MaxJobsPerIP)
+	// What removes an expiring job's stored input. In the worker and not the
+	// API because only one process should be doing the collecting, and this is
+	// the one already running the sweep.
+	q.SetObjectDisposer(disposeJobObjects)
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))
 
@@ -507,6 +511,30 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 			}
 		}
 		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}, nil
+	}
+}
+
+// disposeJobObjects removes the stored files of jobs the sweep has collected.
+//
+// Best effort, one at a time, and a failure on one does not stop the rest: the
+// rows are already gone by the time this runs, so the only thing left to do is
+// remove as much as possible and say what could not be. What survives is
+// recoverable — the layout is jobs/<job-id>/, so a listing can find prefixes
+// with no job — but it will not be found by anything keyed on the database.
+//
+// A background context because this runs during shutdown as often as not, and
+// an object left behind because the process was stopping is exactly the kind
+// that nothing later goes looking for.
+func disposeJobObjects(ctx context.Context, uris []string) {
+	var failed int
+	for _, uri := range uris {
+		if err := blob.Remove(context.WithoutCancel(ctx), uri); err != nil {
+			failed++
+			log.Printf("worker: could not remove %s from job storage: %v", uri, err)
+		}
+	}
+	if n := len(uris) - failed; n > 0 {
+		log.Printf("worker: removed %d expired job input(s) from job storage", n)
 	}
 }
 
