@@ -132,7 +132,7 @@ func TestSplitAndCollectAgreeOnWhereChunksLive(t *testing.T) {
 	// Each chunk annotated and stored, as the chunk jobs would do.
 	for i := range q.enqueued {
 		body := chunk(100+i*3, 3)
-		if _, err := StoreChunkResult(ctx, q.prefix, i, []byte(body), nil); err != nil {
+		if _, err := StoreChunkResult(ctx, q.prefix, i, strings.NewReader(body), nil); err != nil {
 			t.Fatalf("store chunk %d: %v", i, err)
 		}
 		idx := i
@@ -197,11 +197,11 @@ func TestOnlyTheFirstChunkResultKeepsItsHeader(t *testing.T) {
 	ctx := context.Background()
 	prefix := t.TempDir()
 
-	firstURI, err := StoreChunkResult(ctx, prefix, 0, []byte(chunk(100, 2)), nil)
+	firstURI, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(chunk(100, 2)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	restURI, err := StoreChunkResult(ctx, prefix, 1, []byte(chunk(200, 2)), nil)
+	restURI, err := StoreChunkResult(ctx, prefix, 1, strings.NewReader(chunk(200, 2)), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,4 +236,81 @@ func readGz(t *testing.T, path string) string {
 		}
 	}
 	return b.String()
+}
+
+// What a chunk stores has to be a VCF.
+//
+// The seam this covers is the one that had the bug: the caller had the engine's
+// JSON to hand and passed that. Each piece was individually well-formed, so the
+// join concatenated them without complaint into a file no VCF reader accepts —
+// and every unit test still passed, because they all fed this a real VCF.
+//
+// Reading the stored chunk back through a parser is what makes the difference
+// visible: gzipped JSON is a perfectly good gzip stream, and only a parser
+// objects to it.
+func TestAStoredChunkIsAVCFAndNotWhateverItWasGiven(t *testing.T) {
+	ctx := context.Background()
+	prefix := t.TempDir()
+
+	uri, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(chunk(100, 3)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+
+	rd, err := vcf.NewVcfReader(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.Header(); err != nil {
+		t.Fatalf("the stored chunk has no VCF header — it is not a VCF: %v", err)
+	}
+	var n int
+	for {
+		if _, err := rd.NextRecord(); err != nil {
+			break
+		}
+		n++
+	}
+	if n != 3 {
+		t.Errorf("the stored chunk holds %d records, want 3", n)
+	}
+}
+
+// The engine's JSON is not a VCF, and storing it must not quietly succeed.
+//
+// Pinning the shape of the mistake rather than trusting it not to recur: a JSON
+// array has no header lines, so it survives stripping intact and gzips into
+// something a reader only rejects at parse time.
+func TestJSONStoredAsAChunkDoesNotParseAsAVCF(t *testing.T) {
+	ctx := context.Background()
+	prefix := t.TempDir()
+
+	engineJSON := `[{"chrom":"chr1","pos":100,"ref":"A","alt":"T","annotations":{"GENE":"KRAS"}}]`
+	uri, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(engineJSON), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, _ := gzip.NewReader(f)
+	defer gz.Close()
+	rd, _ := vcf.NewVcfReader(gz)
+	if _, err := rd.Header(); err == nil {
+		t.Error("JSON stored as a chunk parsed as a VCF; the join would produce garbage silently")
+	}
 }

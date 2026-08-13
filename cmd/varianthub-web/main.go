@@ -544,7 +544,7 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 			// headerless unless it is the first. Stored under the batch's
 			// prefix, which is the split job's, so collect knows where to look
 			// without asking about each chunk job.
-			finishChunk(ctx, q, job, cfgJobStorage, res, alw)
+			finishChunk(ctx, q, job, cfgJobStorage, inputPath, res, alw)
 			return out, nil
 		}
 		if job.Kind == queue.KindVCF && inputPath != "" {
@@ -1081,6 +1081,64 @@ func joinLoc(root, rel string) string {
 	return filepath.Join(root, rel)
 }
 
+// storeChunkVCF merges a chunk's annotations onto the chunk itself and stores
+// the result.
+//
+// The same merge an unsplit job does, written to the batch's prefix instead of
+// the job's, and headerless unless this is the first chunk. What must not be
+// stored here is the engine's JSON: it is individually well-formed, so a join
+// concatenates it without complaint into a file no VCF reader accepts.
+func storeChunkVCF(ctx context.Context, prefix string, job queue.Job, inputPath string,
+	res runner.Result, alw *queue.LogWriter) (string, error) {
+
+	if inputPath == "" {
+		return "", errors.New("a chunk needs its staged input to merge onto")
+	}
+	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
+	if err != nil {
+		return "", err
+	}
+	cols := make([]queue.Column, len(res.Columns))
+	for i, c := range res.Columns {
+		cols[i] = queue.Column(c)
+	}
+
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	var src io.Reader = in
+	if strings.HasSuffix(inputPath, ".gz") {
+		gz, gzErr := gzip.NewReader(in)
+		if gzErr != nil {
+			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		return "", err
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		return "", err
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
+		pw.CloseWithError(mErr)
+	}()
+	uri, err := fanout.StoreChunkResult(ctx, prefix, *job.ChunkIndex, pr, alw.Note)
+	if err != nil {
+		pr.CloseWithError(err)
+		return "", err
+	}
+	return uri, nil
+}
+
 // runSplitJob cuts a submitted VCF into chunks and queues a job for each.
 //
 // The job the submitter was given and polls. It produces no variants of its
@@ -1157,7 +1215,7 @@ func runCollectJob(ctx context.Context, q *queue.Queue, job queue.Job,
 // Whoever finishes last queues the collect job, and exactly one caller is told
 // it was last — the count is bumped and read in one statement precisely so two
 // chunks finishing together cannot both start a collect.
-func finishChunk(ctx context.Context, q *queue.Queue, job queue.Job, jobStorage string,
+func finishChunk(ctx context.Context, q *queue.Queue, job queue.Job, jobStorage, inputPath string,
 	res runner.Result, alw *queue.LogWriter) {
 
 	bg := context.WithoutCancel(ctx)
@@ -1167,8 +1225,7 @@ func finishChunk(ctx context.Context, q *queue.Queue, job queue.Job, jobStorage 
 	}
 
 	ok := true
-	if _, err := fanout.StoreChunkResult(bg, prefix, *job.ChunkIndex,
-		res.Variants, alw.Note); err != nil {
+	if _, err := storeChunkVCF(bg, prefix, job, inputPath, res, alw); err != nil {
 		// The chunk annotated but its output could not be stored, so the joined
 		// file would have a hole. Reported as a failed chunk, which is what
 		// makes collect refuse rather than produce a file missing a range.

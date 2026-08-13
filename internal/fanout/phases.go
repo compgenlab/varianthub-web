@@ -1,9 +1,11 @@
 package fanout
 
 import (
-	"bytes"
+	"bufio"
+	"compress/gzip"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -155,39 +157,71 @@ func ChunkResultName(index int) string {
 // StoreChunkResult writes one chunk's annotated VCF, stripping the header from
 // every chunk but the first.
 //
-// The stripping happens here, on the way to storage, rather than at the join.
-// Doing it at the join would mean the join reading and rewriting every record —
-// which is the disk and time cost the byte concatenation exists to avoid.
-func StoreChunkResult(ctx context.Context, prefix string, index int, vcfBody []byte,
+// Takes the VCF itself — the submitted chunk with annotations merged onto it —
+// not the engine's JSON. Passing the JSON here produced gzipped JSON that the
+// join happily concatenated into something no reader would accept, and nothing
+// noticed because each piece was individually well-formed.
+//
+// The stripping happens on the way to storage rather than at the join. Doing it
+// at the join would mean reading and rewriting every record, which is the cost
+// the byte concatenation exists to avoid.
+func StoreChunkResult(ctx context.Context, prefix string, index int, vcfIn io.Reader,
 	note Note) (string, error) {
 
 	uri := prefix + "/" + ChunkResultName(index)
-	if index == 0 {
-		// The header of the whole joined file comes from here.
-		var gzBuf bytes.Buffer
-		if err := gzipInto(&gzBuf, vcfBody); err != nil {
-			return "", err
-		}
-		if err := blob.PutReader(ctx, uri, &gzBuf); err != nil {
-			return "", err
-		}
-		note.say("··· chunk 1 stored with the header the joined file will use")
-		return uri, nil
-	}
 
-	var stripped bytes.Buffer
-	var gzIn bytes.Buffer
-	if err := gzipInto(&gzIn, vcfBody); err != nil {
+	pr, pw := io.Pipe()
+	go func() {
+		zw := gzip.NewWriter(pw)
+		out := bufio.NewWriterSize(zw, 1<<20)
+		sc := bufio.NewScanner(vcfIn)
+		// A cohort record grows with its sample count; the 64 KB default would
+		// report a long one as end of input and truncate the chunk silently.
+		sc.Buffer(make([]byte, 0, 256*1024), maxLine)
+		n := 0
+		for sc.Scan() {
+			line := sc.Bytes()
+			if len(line) == 0 {
+				continue
+			}
+			if line[0] == '#' {
+				// Only the first chunk's header survives; the rest would land
+				// in the middle of the joined file, where no reader expects one.
+				if index != 0 {
+					continue
+				}
+			} else {
+				n++
+			}
+			if _, err := out.Write(line); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+			if err := out.WriteByte('\n'); err != nil {
+				pw.CloseWithError(err)
+				return
+			}
+		}
+		if err := sc.Err(); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if err := out.Flush(); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		if err := zw.Close(); err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		note.say("··· chunk %d stored (%d record(s))", index+1, n)
+		pw.Close()
+	}()
+
+	if err := blob.PutReader(ctx, uri, pr); err != nil {
+		pr.CloseWithError(err)
 		return "", err
 	}
-	n, err := StripHeader(&gzIn, &stripped)
-	if err != nil {
-		return "", err
-	}
-	if err := blob.PutReader(ctx, uri, &stripped); err != nil {
-		return "", err
-	}
-	note.say("··· chunk %d stored headerless (%d record(s))", index+1, n)
 	return uri, nil
 }
 
