@@ -6,11 +6,11 @@ import (
 	"testing"
 )
 
-func newBatch(t *testing.T, q *Queue, chunks int) (batchID string) {
+func newJob(t *testing.T, q *Queue, chunks int) (jobID string) {
 	t.Helper()
 	ctx := context.Background()
-	jobID := enqueueOne(t, q, "u")
-	id, err := q.CreateBatch(ctx, jobID, "/tmp/jobs/"+jobID)
+	chunkID := enqueueOne(t, q, "u")
+	id, err := q.CreateJob(ctx, chunkID, "/tmp/jobs/"+chunkID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -22,22 +22,22 @@ func newBatch(t *testing.T, q *Queue, chunks int) (batchID string) {
 	return id
 }
 
-// A batch whose split has not finished is pending, not complete.
+// A job whose split has not finished is pending, not complete.
 //
 // Zero of zero chunks reads as "all done" to any comparison that does not know
 // better, and a caller shown that would reasonably think their submission had
 // finished with no results.
-func TestABatchWithNoChunkCountYetIsPending(t *testing.T) {
+func TestAJobWithNoChunkCountYetIsPending(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newBatch(t, q, 0)
+	id := newJob(t, q, 0)
 
-	b, ok, err := q.GetBatch(ctx, id)
+	b, ok, err := q.GetJob(ctx, id)
 	if err != nil || !ok {
-		t.Fatalf("GetBatch: %v ok=%v", err, ok)
+		t.Fatalf("GetJob: %v ok=%v", err, ok)
 	}
 	if !b.Pending() {
-		t.Error("a batch that has not been counted should be pending")
+		t.Error("a job that has not been counted should be pending")
 	}
 	if b.Complete() {
 		t.Error("0 of 0 chunks reported as complete")
@@ -47,15 +47,15 @@ func TestABatchWithNoChunkCountYetIsPending(t *testing.T) {
 // Exactly one caller is told it was the last, however many finish at once.
 //
 // This is the whole reason the count is a counter. Asked as a query over
-// sibling jobs — "is every chunk terminal yet" — two finishing at the same
-// instant each see the other's row already updated and both answer yes, and the
-// collect step runs twice: two readers of the same chunks, two uploads to the
-// same key, and whichever lands second wins.
+// sibling chunks — "is every chunk terminal yet" — two finishing at the same
+// instant each see the other's row already updated and both answer yes, and
+// the collect step runs twice: two readers of the same chunks, two uploads to
+// the same key, and whichever lands second wins.
 func TestExactlyOneChunkIsToldItWasTheLast(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 	const chunks = 16
-	id := newBatch(t, q, chunks)
+	id := newJob(t, q, chunks)
 
 	var (
 		mu    sync.Mutex
@@ -83,7 +83,7 @@ func TestExactlyOneChunkIsToldItWasTheLast(t *testing.T) {
 	if lasts != 1 {
 		t.Errorf("%d chunks were told they were the last; collect would run that many times", lasts)
 	}
-	b, _, err := q.GetBatch(ctx, id)
+	b, _, err := q.GetJob(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,12 +92,12 @@ func TestExactlyOneChunkIsToldItWasTheLast(t *testing.T) {
 	}
 }
 
-// A failed chunk still counts toward completion, or a batch with one bad chunk
+// A failed chunk still counts toward completion, or a job with one bad chunk
 // waits for a collect step that can never start.
-func TestAFailedChunkStillCompletesTheBatch(t *testing.T) {
+func TestAFailedChunkStillCompletesTheJob(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newBatch(t, q, 2)
+	id := newJob(t, q, 2)
 
 	if last, err := q.ChunkFinished(ctx, id, false); err != nil || last {
 		t.Fatalf("first of two: last=%v err=%v", last, err)
@@ -107,10 +107,10 @@ func TestAFailedChunkStillCompletesTheBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !last {
-		t.Fatal("the batch never completed; collect would never run")
+		t.Fatal("the job never completed; collect would never run")
 	}
 
-	b, _, err := q.GetBatch(ctx, id)
+	b, _, err := q.GetJob(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -124,19 +124,20 @@ func TestAFailedChunkStillCompletesTheBatch(t *testing.T) {
 	}
 }
 
-// A chunk that finishes before the split has counted them does not complete the
-// batch. The split cannot have produced the last chunk if it has not finished.
+// A chunk that finishes before the split has counted them does not complete
+// the job. The split cannot have produced the last chunk if it has not
+// finished.
 func TestAChunkFinishingBeforeTheCountDoesNotComplete(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newBatch(t, q, 0)
+	id := newJob(t, q, 0)
 
 	last, err := q.ChunkFinished(ctx, id, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if last {
-		t.Error("a batch with no chunk count reported completion")
+		t.Error("a job with no chunk count reported completion")
 	}
 }
 
@@ -145,21 +146,21 @@ func TestAChunkFinishingBeforeTheCountDoesNotComplete(t *testing.T) {
 func TestChunksAreListedInSplitOrder(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newBatch(t, q, 3)
+	id := newJob(t, q, 3)
 
 	// Enqueued out of order on purpose.
 	for _, i := range []int{2, 0, 1} {
 		idx := i
-		if _, err := q.Enqueue(ctx, NewJob{
+		if _, err := q.Enqueue(ctx, NewChunk{
 			Kind: KindVCF, Snapshot: "s", UserID: "u",
 			InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-			BatchID:  id, ChunkIndex: &idx,
+			JobID:    id, ChunkIndex: &idx,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	chunks, err := q.BatchChunks(ctx, id)
+	chunks, err := q.JobChunks(ctx, id)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,13 +179,13 @@ func TestChunksAreListedInSplitOrder(t *testing.T) {
 func TestChunkZeroIsDistinctFromNotAChunk(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newBatch(t, q, 1)
+	id := newJob(t, q, 1)
 
 	zero := 0
-	chunkID, err := q.Enqueue(ctx, NewJob{
+	chunkID, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindVCF, Snapshot: "s", UserID: "u",
 		InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-		BatchID:  id, ChunkIndex: &zero,
+		JobID:    id, ChunkIndex: &zero,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,31 +207,32 @@ func TestChunkZeroIsDistinctFromNotAChunk(t *testing.T) {
 		t.Fatal(err)
 	}
 	if plain.ChunkIndex != nil {
-		t.Errorf("an ordinary job has chunk index %d", *plain.ChunkIndex)
+		t.Errorf("an ordinary chunk has chunk index %d", *plain.ChunkIndex)
 	}
 }
 
-// The joined answer is filed against the job the submitter was given.
+// The joined answer is filed against the chunk the submitter was given.
 //
-// They polled the split job and have never heard of the collect job. Filing it
-// anywhere else means a batch that finishes with its file in storage and no id
-// that reaches it — a download that returns nothing for a job reporting done.
-func TestTheJoinedAnswerIsReachableFromTheSubmittedJob(t *testing.T) {
+// They polled the split chunk and have never heard of the collect chunk.
+// Filing it anywhere else means a job that finishes with its file in storage
+// and no id that reaches it — a download that returns nothing for a chunk
+// reporting done.
+func TestTheJoinedAnswerIsReachableFromTheSubmittedChunk(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
 	submitted := enqueueOne(t, q, "u")
-	batchID, err := q.CreateBatch(ctx, submitted, "/tmp/jobs/"+submitted)
+	jobID, err := q.CreateJob(ctx, submitted, "/tmp/jobs/"+submitted)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, ok, err := q.GetBatch(ctx, batchID)
+	b, ok, err := q.GetJob(ctx, jobID)
 	if err != nil || !ok {
-		t.Fatalf("GetBatch: %v ok=%v", err, ok)
+		t.Fatalf("GetJob: %v ok=%v", err, ok)
 	}
 
 	const joined = "s3://varhub-dev/jobs/x/result.vcf.gz"
-	if err := q.SetResultVCF(ctx, b.JobID, joined); err != nil {
+	if err := q.SetResultVCF(ctx, b.ChunkID, joined); err != nil {
 		t.Fatal(err)
 	}
 
@@ -239,7 +241,7 @@ func TestTheJoinedAnswerIsReachableFromTheSubmittedJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !found {
-		t.Fatal("the job the caller holds has no answer; the file is unreachable")
+		t.Fatal("the chunk the caller holds has no answer; the file is unreachable")
 	}
 	if got != joined {
 		t.Errorf("ResultVCF = %q, want %q", got, joined)

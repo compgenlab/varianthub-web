@@ -2,9 +2,9 @@ package queue
 
 import "context"
 
-// Attempt is one time a job was handed to a worker.
+// Attempt is one time a chunk was handed to a worker.
 type Attempt struct {
-	// N matches job.attempts as it stood when this attempt was claimed.
+	// N matches chunk.attempts as it stood when this attempt was claimed.
 	N int `json:"attempt"`
 	// Worker is the process that claimed it. Omitted for callers who should not
 	// see the deployment's internals; see api.attemptsFor.
@@ -26,8 +26,8 @@ func (a Attempt) Abandoned() bool { return a.Outcome == OutcomeAbandoned }
 //
 // For an abandoned attempt this is how long it survived before its worker went
 // away — which is the part that separates "killed under load partway through"
-// from "died on startup", two very different problems that job.attempts reports
-// with the same number.
+// from "died on startup", two very different problems that chunk.attempts
+// reports with the same number.
 func (a Attempt) Duration() int64 {
 	if a.EndedAt == 0 {
 		return 0
@@ -35,12 +35,12 @@ func (a Attempt) Duration() int64 {
 	return a.EndedAt - a.StartedAt
 }
 
-// JobAttempts returns a job's attempts, oldest first.
-func (q *Queue) JobAttempts(ctx context.Context, id string) ([]Attempt, error) {
+// ChunkAttempts returns a chunk's attempts, oldest first.
+func (q *Queue) ChunkAttempts(ctx context.Context, id string) ([]Attempt, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT attempt, worker, started_at, COALESCE(ended_at,0),
 		       COALESCE(outcome,''), COALESCE(error,'')
-		  FROM job_attempt WHERE job_id = $1 ORDER BY attempt`, id)
+		  FROM chunk_attempt WHERE chunk_id = $1 ORDER BY attempt`, id)
 	if err != nil {
 		return nil, err
 	}
@@ -64,22 +64,23 @@ type WorkerHealth struct {
 	// not come back from.
 	Attempts  int64 `json:"attempts"`
 	Abandoned int64 `json:"abandoned"`
-	// MedianAbandonedAfter is the typical seconds an abandoned attempt survived,
-	// 0 when none were. A worker killed partway through long jobs and one that
-	// dies immediately on startup both show an abandonment count; this is what
-	// tells them apart, and the memory limit is the usual reason for the first.
+	// MedianAbandonedAfter is the typical seconds an abandoned attempt
+	// survived, 0 when none were. A worker killed partway through long chunks
+	// and one that dies immediately on startup both show an abandonment count;
+	// this is what tells them apart, and the memory limit is the usual reason
+	// for the first.
 	MedianAbandonedAfter int64 `json:"median_abandoned_after,omitempty"`
 }
 
 // WorkerHealthSince summarises each worker's attempts since a Unix timestamp,
 // worst abandonment count first.
 //
-// This is the question job_attempt exists to answer. job.attempts is a counter
-// with no dimensions: three abandonments could be one pod losing all of them —
-// a bad node, a memory limit set too low for that pod — or three pods each
-// losing one, which points at the jobs instead. The counter shows 3 either way,
-// and before this the only way to tell was grepping individual job logs for the
-// line naming the worker.
+// This is the question chunk_attempt exists to answer. chunk.attempts is a
+// counter with no dimensions: three abandonments could be one pod losing all
+// of them — a bad node, a memory limit set too low for that pod — or three
+// pods each losing one, which points at the chunks instead. The counter shows
+// 3 either way, and before this the only way to tell was grepping individual
+// chunk logs for the line naming the worker.
 func (q *Queue) WorkerHealthSince(ctx context.Context, since int64) ([]WorkerHealth, error) {
 	rows, err := q.pool.Query(ctx, `
 		SELECT worker,
@@ -88,7 +89,7 @@ func (q *Queue) WorkerHealthSince(ctx context.Context, since int64) ([]WorkerHea
 		       COALESCE(percentile_cont(0.5) WITHIN GROUP (
 		           ORDER BY ended_at - started_at)
 		         FILTER (WHERE outcome = $1 AND ended_at IS NOT NULL), 0)
-		  FROM job_attempt
+		  FROM chunk_attempt
 		 WHERE started_at >= $2
 		 GROUP BY worker
 		 ORDER BY count(*) FILTER (WHERE outcome = $1) DESC, worker`,

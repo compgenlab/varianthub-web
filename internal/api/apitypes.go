@@ -79,10 +79,10 @@ type SnapshotResponse struct {
 
 // JobsResponse is GET /jobs.
 type JobsResponse struct {
-	Jobs   []queue.Job `json:"jobs" doc:"Jobs, newest first."`
-	Limit  int         `json:"limit" doc:"The page size that produced this list."`
-	Offset int         `json:"offset" doc:"The offset that produced this list."`
-	Scoped bool        `json:"scoped" doc:"The list was narrowed to the caller's own jobs, as opposed to an administrator seeing everything."`
+	Jobs   []queue.Chunk `json:"jobs" doc:"Jobs, newest first."`
+	Limit  int           `json:"limit" doc:"The page size that produced this list."`
+	Offset int           `json:"offset" doc:"The offset that produced this list."`
+	Scoped bool          `json:"scoped" doc:"The list was narrowed to the caller's own jobs, as opposed to an administrator seeing everything."`
 }
 
 // AcceptedResponse is a queued submission.
@@ -99,7 +99,7 @@ type AcceptedResponse struct {
 
 // JobStatusResponse is GET /jobs/{id}: what a job is and how far it has got.
 //
-// Its own type rather than queue.Job, which is the database row. The row also
+// Its own type rather than queue.Chunk, which is the database row. The row also
 // carries client_ip, session and user_id, and this route is deliberately public
 // — an anonymous result's link is its credential, so it is meant to be passed
 // to someone else. Returning the row would hand whoever holds a shared link the
@@ -124,7 +124,7 @@ type JobStatusResponse struct {
 }
 
 // jobStatus projects a queue row onto the published shape.
-func jobStatus(j queue.Job) JobStatusResponse {
+func jobStatus(j queue.Chunk) JobStatusResponse {
 	return JobStatusResponse{
 		JobID: j.ID, Kind: j.Kind, Snapshot: j.Snapshot, Selection: j.Selection,
 		Status: j.Status, NVariants: j.NVariants, CreatedAt: j.CreatedAt,
@@ -135,9 +135,9 @@ func jobStatus(j queue.Job) JobStatusResponse {
 
 // CancelResponse is POST /jobs/{id}/cancel.
 type CancelResponse struct {
-	Job       queue.Job `json:"job" doc:"The job as it stands after the request."`
-	Cancelled bool      `json:"cancelled" doc:"False when the job had already finished, which is not an error — the caller's intent is satisfied either way."`
-	Detail    string    `json:"detail,omitempty" doc:"Explains a false cancelled."`
+	Job       queue.Chunk `json:"job" doc:"The job as it stands after the request."`
+	Cancelled bool        `json:"cancelled" doc:"False when the job had already finished, which is not an error — the caller's intent is satisfied either way."`
+	Detail    string      `json:"detail,omitempty" doc:"Explains a false cancelled."`
 }
 
 // ErrorResponse is any 4xx or 5xx.

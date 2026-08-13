@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// Variant is one annotated row of a job's results.
+// Variant is one annotated row of a chunk's results.
 type Variant struct {
 	Chrom       string         `json:"chrom"`
 	Pos         int64          `json:"pos"`
@@ -20,11 +20,12 @@ type Variant struct {
 	Annotations map[string]any `json:"annotations"`
 }
 
-// insertVariants explodes the CLI's result JSON into job_variant rows.
+// insertVariants explodes the CLI's result JSON into chunk_variant rows.
 //
-// It runs inside the same transaction as the result blob and the status change,
-// so a job is never observably done with results that are not yet queryable.
-func insertVariants(ctx context.Context, tx pgx.Tx, jobID string, result []byte) error {
+// It runs inside the same transaction as the result blob and the status
+// change, so a chunk is never observably done with results that are not yet
+// queryable.
+func insertVariants(ctx context.Context, tx pgx.Tx, chunkID string, result []byte) error {
 	var variants []Variant
 	if err := json.Unmarshal(result, &variants); err != nil {
 		return fmt.Errorf("parse result for indexing: %w", err)
@@ -43,19 +44,20 @@ func insertVariants(ctx context.Context, tx pgx.Tx, jobID string, result []byte)
 		if err != nil {
 			return fmt.Errorf("encode annotations for row %d: %w", i, err)
 		}
-		rows = append(rows, []any{jobID, i, v.Chrom, v.Pos, v.Ref, v.Alt, string(blob)})
+		rows = append(rows, []any{chunkID, i, v.Chrom, v.Pos, v.Ref, v.Alt, string(blob)})
 	}
 
-	// CopyFrom rather than a row-per-INSERT: a 5,000-variant job is 5,000 network
-	// round trips otherwise, which dominates the job's runtime for a fast query.
+	// CopyFrom rather than a row-per-INSERT: a 5,000-variant chunk is 5,000
+	// network round trips otherwise, which dominates the chunk's runtime for a
+	// fast query.
 	_, err := tx.CopyFrom(ctx,
-		pgx.Identifier{"job_variant"},
-		[]string{"job_id", "idx", "chrom", "pos", "ref", "alt", "annotations"},
+		pgx.Identifier{"chunk_variant"},
+		[]string{"chunk_id", "idx", "chrom", "pos", "ref", "alt", "annotations"},
 		pgx.CopyFromRows(rows))
 	return err
 }
 
-// ResultQuery narrows and orders a job's variants.
+// ResultQuery narrows and orders a chunk's variants.
 type ResultQuery struct {
 	Search string   // case-insensitive substring across annotation values and the locus
 	Sort   string   // "idx" (default) | "locus" | an annotation key
@@ -65,7 +67,7 @@ type ResultQuery struct {
 	Keys   []string // annotation keys that exist (for validating Sort)
 }
 
-// ResultPage is one page of a job's results.
+// ResultPage is one page of a chunk's results.
 type ResultPage struct {
 	Columns []Column  `json:"columns"`
 	Rows    []Variant `json:"rows"`
@@ -92,11 +94,11 @@ type Column struct {
 	Default   bool   `json:"default"`
 }
 
-// Columns returns a job's stored column model. Nil when the job predates the
-// column model or produced no rows.
-func (q *Queue) Columns(ctx context.Context, jobID string) ([]Column, error) {
+// Columns returns a chunk's stored column model. Nil when the chunk predates
+// the column model or produced no rows.
+func (q *Queue) Columns(ctx context.Context, chunkID string) ([]Column, error) {
 	var raw []byte
-	err := q.pool.QueryRow(ctx, `SELECT columns FROM job WHERE id=$1`, jobID).Scan(&raw)
+	err := q.pool.QueryRow(ctx, `SELECT columns FROM chunk WHERE id=$1`, chunkID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) || len(raw) == 0 {
 		return nil, nil
 	}
@@ -112,10 +114,10 @@ func (q *Queue) Columns(ctx context.Context, jobID string) ([]Column, error) {
 
 // buildResultSQL assembles the WHERE/ORDER BY for a results query.
 //
-// whereArgs and orderArgs are returned separately because the count query has a
-// WHERE but no ORDER BY: handing it the sort argument too makes Postgres reject
-// the statement for an argument it was never given a placeholder for.
-// Placeholders are numbered assuming the job id is $1, then whereArgs, then
+// whereArgs and orderArgs are returned separately because the count query has
+// a WHERE but no ORDER BY: handing it the sort argument too makes Postgres
+// reject the statement for an argument it was never given a placeholder for.
+// Placeholders are numbered assuming the chunk id is $1, then whereArgs, then
 // orderArgs.
 //
 // Sort keys are never interpolated raw: an annotation key reaches SQL only as a
@@ -126,10 +128,10 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 	whereArgs, orderArgs = []any{}, []any{}
 
 	if s := strings.TrimSpace(qy.Search); s != "" {
-		// Match the locus text or any annotation value. jsonb_each_text over one
-		// job's rows is cheap at this scale and needs no per-key index.
+		// Match the locus text or any annotation value. jsonb_each_text over
+		// one chunk's rows is cheap at this scale and needs no per-key index.
 		whereArgs = append(whereArgs, "%"+strings.ToLower(s)+"%")
-		n := len(whereArgs) + 1 // +1 for the job id at $1
+		n := len(whereArgs) + 1 // +1 for the chunk id at $1
 		where = fmt.Sprintf(`AND (
 			lower(chrom || ':' || pos || ':' || ref || ':' || alt) LIKE $%d
 			OR EXISTS (
@@ -160,7 +162,7 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 			return "", "", nil, nil, fmt.Errorf("unknown sort key %q", qy.Sort)
 		}
 		orderArgs = append(orderArgs, qy.Sort)
-		n := 1 + len(whereArgs) + len(orderArgs) // job id, where args, then this
+		n := 1 + len(whereArgs) + len(orderArgs) // chunk id, where args, then this
 		// Sort numerically when the value parses as a number, else textually. A
 		// numeric annotation sorted as text puts 10 before 9, which is wrong in a
 		// way readers notice immediately. NULLS LAST keeps empty cells at the end
@@ -183,9 +185,9 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// Results returns one page of a job's annotated variants.
-func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (ResultPage, error) {
-	cols, err := q.Columns(ctx, jobID)
+// Results returns one page of a chunk's annotated variants.
+func (q *Queue) Results(ctx context.Context, chunkID string, qy ResultQuery) (ResultPage, error) {
+	cols, err := q.Columns(ctx, chunkID)
 	if err != nil {
 		return ResultPage{}, err
 	}
@@ -210,18 +212,18 @@ func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (Resu
 	}
 
 	// The count has a WHERE but no ORDER BY, so it takes only the where args.
-	countArgs := append([]any{jobID}, whereArgs...)
+	countArgs := append([]any{chunkID}, whereArgs...)
 	var total int
 	if err := q.pool.QueryRow(ctx,
-		`SELECT count(*) FROM job_variant WHERE job_id=$1 `+where, countArgs...).
+		`SELECT count(*) FROM chunk_variant WHERE chunk_id=$1 `+where, countArgs...).
 		Scan(&total); err != nil {
 		return ResultPage{}, err
 	}
 
-	pageArgs := append(append(append([]any{jobID}, whereArgs...), orderArgs...),
+	pageArgs := append(append(append([]any{chunkID}, whereArgs...), orderArgs...),
 		qy.Limit, qy.Offset)
 	sql := fmt.Sprintf(
-		`SELECT chrom,pos,ref,alt,annotations FROM job_variant WHERE job_id=$1 %s %s LIMIT $%d OFFSET $%d`,
+		`SELECT chrom,pos,ref,alt,annotations FROM chunk_variant WHERE chunk_id=$1 %s %s LIMIT $%d OFFSET $%d`,
 		where, order, len(pageArgs)-1, len(pageArgs))
 
 	rows, err := q.pool.Query(ctx, sql, pageArgs...)
@@ -246,12 +248,12 @@ func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (Resu
 	return page, rows.Err()
 }
 
-// StreamResults calls fn for every matching variant in order, in batches, so an
+// StreamResults calls fn for every matching variant in order, in jobs, so an
 // export never holds a whole result set in memory.
-func (q *Queue) StreamResults(ctx context.Context, jobID string, qy ResultQuery,
+func (q *Queue) StreamResults(ctx context.Context, chunkID string, qy ResultQuery,
 	fn func(Variant) error) error {
 
-	cols, err := q.Columns(ctx, jobID)
+	cols, err := q.Columns(ctx, chunkID)
 	if err != nil {
 		return err
 	}
@@ -264,10 +266,10 @@ func (q *Queue) StreamResults(ctx context.Context, jobID string, qy ResultQuery,
 	if err != nil {
 		return err
 	}
-	all := append(append([]any{jobID}, whereArgs...), orderArgs...)
+	all := append(append([]any{chunkID}, whereArgs...), orderArgs...)
 
 	rows, err := q.pool.Query(ctx, fmt.Sprintf(
-		`SELECT chrom,pos,ref,alt,annotations FROM job_variant WHERE job_id=$1 %s %s`,
+		`SELECT chrom,pos,ref,alt,annotations FROM chunk_variant WHERE chunk_id=$1 %s %s`,
 		where, order), all...)
 	if err != nil {
 		return err

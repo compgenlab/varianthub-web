@@ -104,7 +104,7 @@ func TestListingItemsCarryTheirAdditions(t *testing.T) {
 // Asserted on the projection rather than on a live response so it fails at the
 // moment someone widens the type, which is when it is cheap to notice.
 func TestJobStatusDoesNotCarryTheSubmittersIdentity(t *testing.T) {
-	full := queue.Job{
+	full := queue.Chunk{
 		ID: "j1", Kind: "locus", Snapshot: "snap", Selection: "af",
 		Status: "done", NVariants: 3, Label: "chr1:100:A:T",
 		ClientIP: "203.0.113.7", Session: "sess-secret", UserID: "user-42",

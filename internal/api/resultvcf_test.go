@@ -32,8 +32,8 @@ func storeResultVCF(t *testing.T, h *harness, root, id, body string) string {
 	// job_result row, and an UPDATE that matches nothing would leave vcf_uri
 	// unset while looking like it had worked.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO job_result (job_id, json, vcf_uri) VALUES ($1, NULL, $2)
-		ON CONFLICT (job_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, id, p); err != nil {
+		INSERT INTO chunk_result (chunk_id, json, vcf_uri) VALUES ($1, NULL, $2)
+		ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, id, p); err != nil {
 		t.Fatal(err)
 	}
 	return p

@@ -1,5 +1,6 @@
-// Package queue is the Postgres-backed async job queue: it persists jobs, their
-// inputs, and their results, and drives a worker pool that annotates queued jobs.
+// Package queue is the Postgres-backed async chunk queue: it persists chunks,
+// their inputs, and their results, and drives a worker pool that annotates
+// queued chunks.
 //
 // It is a port of the SQLite queue that lived in varianthub-cli's internal/server.
 // Three things changed materially, and each is load-bearing:
@@ -10,8 +11,8 @@
 //     and losing the compare-and-set made a worker drop out of its drain loop.
 //   - WaitFor blocks on a LISTEN/NOTIFY broadcast instead of polling every 150ms.
 //     Polling a local file is cheap; polling over a socket, once per waiting HTTP
-//     request, is not. NOTIFY also means a waiter in one replica learns about a job
-//     finished by a worker in another.
+//     request, is not. NOTIFY also means a waiter in one replica learns about
+//     a chunk finished by a worker in another.
 //   - Schema lives in migrations/, not in an ad-hoc CREATE-IF-NOT-EXISTS plus an
 //     ALTER TABLE loop that string-matched driver error text.
 package queue
@@ -32,13 +33,13 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Job statuses.
+// Chunk statuses.
 const (
 	StatusQueued  = "queued"
 	StatusRunning = "running"
 	StatusDone    = "done"
 	StatusError   = "error"
-	// StatusCancelled is a job someone stopped on purpose.
+	// StatusCancelled is a chunk someone stopped on purpose.
 	//
 	// Its own status rather than an error with a message: a cancel is a
 	// decision, not a fault, and counting one as a failure would make a
@@ -47,15 +48,16 @@ const (
 	StatusCancelled = "cancelled"
 )
 
-// How one attempt at a job ended, in job_attempt.outcome.
+// How one attempt at a chunk ended, in chunk_attempt.outcome.
 //
-// Three of the four are the job statuses, deliberately: an attempt that
-// finished is an attempt that put the job into that state, and giving them
+// Three of the four are the chunk statuses, deliberately: an attempt that
+// finished is an attempt that put the chunk into that state, and giving them
 // separate spellings would mean two vocabularies for one fact.
 //
-// The fourth has no status because it is not something a job can be. A job
-// abandoned twice and then completed is a done job; only the attempts remember
-// that anything went wrong, which is the whole reason they are recorded.
+// The fourth has no status because it is not something a chunk can be. A chunk
+// abandoned twice and then completed is a done chunk; only the attempts
+// remember that anything went wrong, which is the whole reason they are
+// recorded.
 const (
 	OutcomeDone      = StatusDone
 	OutcomeError     = StatusError
@@ -65,7 +67,7 @@ const (
 	OutcomeAbandoned = "abandoned"
 )
 
-// Job kinds.
+// Chunk kinds.
 const (
 	KindLocus = "locus"
 	KindVCF   = "vcf"
@@ -74,95 +76,105 @@ const (
 	// reporting; the worker dispatches on this.
 	KindDownload = "download"
 	// KindCleanup reclaims a removed source's files, for the same reason
-	// downloads are jobs: only the worker mounts the storage.
+	// downloads are chunks: only the worker mounts the storage.
 	KindCleanup = "cleanup"
-	// KindMove relocates a source's files between storage locations. A job
+	// KindMove relocates a source's files between storage locations. A chunk
 	// because it moves the same volume of data a download does, and because
 	// only the worker can reach both ends.
 	KindMove = "move"
-	// KindSplit cuts a submitted VCF into chunks and queues one job per chunk.
+	// KindSplit cuts a submitted VCF into chunks and queues one chunk for
+	// each.
 	//
-	// A job rather than work done in the request handler: cutting a chromosome
-	// means reading hundreds of megabytes and writing them back, which is a
-	// worker's business. It is also the job the submitter was given, so it is
-	// what they poll while the split is running.
+	// A chunk rather than work done in the request handler: cutting a
+	// chromosome means reading hundreds of megabytes and writing them back,
+	// which is a worker's business. It is also the chunk the submitter was
+	// given, so it is what they poll while the split is running.
 	KindSplit = "split"
-	// KindCollect joins a batch's annotated chunks into the final file. Queued
+	// KindCollect joins a job's annotated chunks into the final file. Queued
 	// by whichever chunk finishes last.
 	KindCollect = "collect"
 )
 
 // Postgres NOTIFY channels.
 const (
-	chanQueued = "job_queued"
-	// chanCancel carries a job id whose run should stop. The worker holding it
-	// may be in another process, which is the whole reason this goes through
-	// the database rather than a method call.
-	chanCancel = "job_cancel"
+	chanQueued = "chunk_queued"
+	// chanCancel carries a chunk id whose run should stop. The worker holding
+	// it may be in another process, which is the whole reason this goes
+	// through the database rather than a method call.
+	chanCancel = "chunk_cancel"
 )
 
-// Job is one row of the job table (its metadata, without the input/result blobs).
-type Job struct {
+// Chunk is one row of the chunk table (its metadata, without the input/result
+// blobs): the unit a worker claims, leases, retries and abandons.
+//
+// It is still what the published API calls a job, and its id is still
+// serialized as job_id. That is not an oversight and not a transitional state:
+// the id a submitter is given is a chunk id — the split chunk's, for a split
+// submission — and renaming the field would break every client for no gain. A
+// Job here is the submission those chunks belong to, which callers reach
+// through the same /jobs/{id} they always have.
+type Chunk struct {
 	ID        string `json:"job_id" doc:"Stable identifier. Poll and fetch results with it."`
 	Kind      string `json:"kind" doc:"locus | vcf for annotation; download | move for provisioning."`
 	Snapshot  string `json:"snapshot" doc:"The snapshot annotated against. An individual-source selection becomes a generated snapshot, which is what makes the run reproducible."`
 	Selection string `json:"selection" doc:"The annotation fields asked for, or empty for the snapshot's defaults."`
 	Status    string `json:"status" doc:"queued | running | done | error | cancelled."`
-	Error     string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+	Error     string `json:"error,omitempty" doc:"Why the chunk failed, when it did."`
 	NVariants int64  `json:"n_variants" doc:"How many variants were annotated."`
-	ClientIP  string `json:"client_ip,omitempty" doc:"The address the job was submitted from."`
+	ClientIP  string `json:"client_ip,omitempty" doc:"The address the chunk was submitted from."`
 	Session   string `json:"session,omitempty" doc:"The submitter's session, which scopes an anonymous caller's own history."`
 	UserID    string `json:"user_id,omitempty" doc:"The owning account, when the submitter had one. Authoritative where session is not, being written from the credential the server verified."`
 	Label     string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
 
-	Weight     int    `json:"weight,omitempty" doc:"How many worker slots this job occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
-	Origin     string `json:"origin,omitempty" doc:"How the job was submitted: \"web\" from a browser session, \"api\" from a personal access token. Absent for jobs recorded before this was tracked."`
+	Weight     int    `json:"weight,omitempty" doc:"How many worker slots this chunk occupies while it runs. An annotation is 1; provisioning is heavier, because it saturates disk and CPU for hours and two at once finish later than one after the other."`
+	Origin     string `json:"origin,omitempty" doc:"How the chunk was submitted: \"web\" from a browser session, \"api\" from a personal access token. Absent for chunks recorded before this was tracked."`
 	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
 	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 
-	// MaxVariants is the variant cap this job was admitted under; 0 is
-	// unlimited. Stamped at submit, so the terms a job runs under are the ones
-	// that applied when it was accepted.
+	// MaxVariants is the variant cap this chunk was admitted under; 0 is
+	// unlimited. Stamped at submit, so the terms a chunk runs under are the
+	// ones that applied when it was accepted.
 	//
 	// Not serialized: it is an internal admission decision, and a caller who
-	// wants to know their limit asks about their account rather than reading it
-	// off somebody's job.
+	// wants to know their limit asks about their account rather than reading
+	// it off somebody's chunk.
 	MaxVariants int `json:"-"`
 
-	// BatchID names the split submission this job belongs to, and ChunkIndex
-	// its place in it. Empty and nil for an ordinary job.
+	// JobID names the split submission this chunk belongs to, and ChunkIndex
+	// its place in it. Empty and nil for an ordinary chunk.
 	//
-	// Not serialized here: what a caller needs is the batch's progress, which
-	// GET /batches/{id} answers, rather than an internal id hanging off every
-	// job in a list.
-	BatchID    string `json:"-"`
+	// Not serialized here: what a caller needs is the job's progress, which
+	// GET /jobs/{id} answers, rather than an internal id hanging off every
+	// chunk in a list.
+	JobID      string `json:"-"`
 	ChunkIndex *int   `json:"-"`
 
-	// InputURI is where this job's input is stored, set only on the Job a claim
-	// returns — Get and List do not fill it, because nothing reading a job's
-	// status needs it.
+	// InputURI is where this chunk's input is stored, set only on the Chunk a
+	// claim returns — Get and List do not fill it, because nothing reading a
+	// chunk's status needs it.
 	//
 	// Never serialized. It names a bucket and key inside the deployment, which
-	// is an operator's business and not something a job status response should
-	// hand to whoever asks. The rest of this struct is the published API; this
-	// is not part of it.
+	// is an operator's business and not something a chunk status response
+	// should hand to whoever asks. The rest of this struct is the published
+	// API; this is not part of it.
 	InputURI string `json:"-"`
 }
 
-// Terminal reports whether the job has reached a final status.
-func (j Job) Terminal() bool {
+// Terminal reports whether the chunk has reached a final status.
+func (j Chunk) Terminal() bool {
 	return j.Status == StatusDone || j.Status == StatusError || j.Status == StatusCancelled
 }
 
-// NewJob is the metadata for enqueuing a job (plus its input).
-type NewJob struct {
-	// ID is the job's identifier, minted by NewID. Empty means Enqueue mints
+// NewChunk is the metadata for enqueuing a chunk (plus its input).
+type NewChunk struct {
+	// ID is the chunk's identifier, minted by NewID. Empty means Enqueue mints
 	// one, which is what every caller that has no reason to care does.
 	//
-	// Supplied only by a caller that had to name the job before creating it —
-	// an upload writes its object to jobs/<id>/ so a bucket listing says which
-	// job each object belongs to. Never taken from a request: see NewID.
+	// Supplied only by a caller that had to name the chunk before creating it
+	// — an upload writes its object to jobs/<id>/ so a bucket listing says
+	// which chunk each object belongs to. Never taken from a request: see
+	// NewID.
 	ID        string
 	Kind      string
 	Snapshot  string
@@ -171,36 +183,37 @@ type NewJob struct {
 	Session   string
 	UserID    string
 	Label     string
-	// Weight is how much of the pool this job occupies; 0 means 1.
+	// Weight is how much of the pool this chunk occupies; 0 means 1.
 	Weight int
-	// MaxConcurrent caps how many of this submitter's jobs may run at once. 0
-	// falls back to the deployment's per-IP cap, which is what anonymous work
-	// and anything submitted before tiers existed gets.
+	// MaxConcurrent caps how many of this submitter's chunks may run at once.
+	// 0 falls back to the deployment's per-IP cap, which is what anonymous
+	// work and anything submitted before tiers existed gets.
 	//
 	// Recorded on the row rather than read from the account at dispatch: the
-	// claim query stays one statement over one table, a job keeps the terms it
-	// was admitted under, and an anonymous job has no account to read from.
+	// claim query stays one statement over one table, a chunk keeps the terms
+	// it was admitted under, and an anonymous chunk has no account to read
+	// from.
 	MaxConcurrent int
-	// Origin is how the job arrived: OriginWeb, OriginAPI, or empty when
+	// Origin is how the chunk arrived: OriginWeb, OriginAPI, or empty when
 	// unrecorded. Reporting only — it decides nothing.
 	Origin string
-	// MaxVariants caps how many variants this job may carry; 0 is unlimited.
+	// MaxVariants caps how many variants this chunk may carry; 0 is unlimited.
 	// Recorded on the row so the worker enforcing it does not have to resolve
 	// an account that may not exist.
 	MaxVariants int
-	// BatchID and ChunkIndex place this job in a split submission. ChunkIndex
+	// JobID and ChunkIndex place this chunk in a split submission. ChunkIndex
 	// is a pointer because 0 is a real chunk — the one carrying the header —
 	// and "not a chunk" has to be distinguishable from "the first chunk".
-	BatchID    string
+	JobID      string
 	ChunkIndex *int
 
 	// Body is the input itself, for submissions small enough to be worth
 	// carrying: a locus list is a few hundred bytes and a round trip through
 	// storage would cost more than it saves.
 	//
-	// Exactly one of Body and InputURI is set. The database enforces it, because
-	// neither is a job that can be claimed and then cannot run, and both is two
-	// inputs with no rule about which wins.
+	// Exactly one of Body and InputURI is set. The database enforces it,
+	// because neither is a chunk that can be claimed and then cannot run, and
+	// both is two inputs with no rule about which wins.
 	Body []byte
 	// InputURI locates the input in job storage, for submissions that should not
 	// pass through this process whole — an uploaded VCF above all. See
@@ -208,16 +221,16 @@ type NewJob struct {
 	InputURI string
 }
 
-// How a job was submitted. Empty is a third state, not a default: rows written
-// before this was recorded genuinely do not say, and counting them as either
-// would put a number on a distinction nobody captured.
+// How a chunk was submitted. Empty is a third state, not a default: rows
+// written before this was recorded genuinely do not say, and counting them as
+// either would put a number on a distinction nobody captured.
 const (
 	OriginWeb = "web"
 	OriginAPI = "api"
 )
 
-// weightOf normalizes a job's weight. 0 means the caller did not care, which is
-// one slot — the same as an annotation.
+// weightOf normalizes a chunk's weight. 0 means the caller did not care, which
+// is one slot — the same as an annotation.
 func weightOf(w int) int {
 	if w < 1 {
 		return 1
@@ -225,85 +238,86 @@ func weightOf(w int) int {
 	return w
 }
 
-// jobCols is the SELECT list backing scanJob. NULLable columns are coalesced in
-// SQL so the scan targets are plain Go values — the SQLite port used sql.NullXxx
-// and then threw the validity flag away, which amounts to the same thing with
-// more ceremony.
-const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
+// chunkCols is the SELECT list backing scanChunk. NULLable columns are
+// coalesced in SQL so the scan targets are plain Go values — the SQLite port
+// used sql.NullXxx and then threw the validity flag away, which amounts to the
+// same thing with more ceremony.
+const chunkCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
-	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(batch_id,''), chunk_index, created_at, ` +
+	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(job_id,''), chunk_index, created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
-// jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
-const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
+// chunkColsJ is chunkCols qualified with the "j" alias, for the claim query's
+// join.
+const chunkColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
-	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.batch_id,''), j.chunk_index, j.created_at, ` +
+	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.job_id,''), j.chunk_index, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
-// ErrNotCancellable is returned when a job has already finished.
-var ErrNotCancellable = errors.New("job is not running")
+// ErrNotCancellable is returned when a chunk has already finished.
+var ErrNotCancellable = errors.New("chunk is not running")
 
-// ErrNoSuchJob is returned for an unknown id.
-var ErrNoSuchJob = errors.New("no such job")
+// ErrNoSuchChunk is returned for an unknown id.
+var ErrNoSuchChunk = errors.New("no such chunk")
 
-// Cancel stops a job.
+// Cancel stops a chunk.
 //
-// A queued job is settled here and never starts. A running one is signalled
+// A queued chunk is settled here and never starts. A running one is signalled
 // over NOTIFY, because the worker executing it is usually in another process —
 // that is the whole reason this goes through the database rather than a method
 // call. Its worker records the outcome, so a cancel does not race the run to
 // write the row.
-func (q *Queue) Cancel(ctx context.Context, id string) (Job, error) {
+func (q *Queue) Cancel(ctx context.Context, id string) (Chunk, error) {
 	// Settle it here if it has not started: no worker is involved, so there is
 	// nothing to signal and nothing to wait for.
 	row := q.pool.QueryRow(ctx, `
-		UPDATE job SET status=$2, error='cancelled', finished_at=$3
+		UPDATE chunk SET status=$2, error='cancelled', finished_at=$3
 		 WHERE id=$1 AND status=$4
-		RETURNING `+jobCols, id, StatusCancelled, q.nowFn(), StatusQueued)
-	job, err := scanJob(row)
+		RETURNING `+chunkCols, id, StatusCancelled, q.nowFn(), StatusQueued)
+	chunk, err := scanChunk(row)
 	if err == nil {
-		return job, nil
+		return chunk, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
-		return Job{}, err
+		return Chunk{}, err
 	}
 
-	job, ok, err := q.Get(ctx, id)
+	chunk, ok, err := q.Get(ctx, id)
 	if err != nil {
-		return Job{}, err
+		return Chunk{}, err
 	}
 	if !ok {
-		return Job{}, ErrNoSuchJob
+		return Chunk{}, ErrNoSuchChunk
 	}
-	if job.Status != StatusRunning {
-		return job, ErrNotCancellable
+	if chunk.Status != StatusRunning {
+		return chunk, ErrNotCancellable
 	}
 	if _, err := q.pool.Exec(ctx, `SELECT pg_notify($1,$2)`, chanCancel, id); err != nil {
-		return Job{}, err
+		return Chunk{}, err
 	}
-	return job, nil
+	return chunk, nil
 }
 
-// SetLog records what a job's run printed.
+// SetLog records what a chunk's run printed.
 //
 // Written separately from the outcome and best-effort at the call site: a log
-// that fails to store must not turn a successful job into a failed one, and a
-// failed job's log is worth keeping even when the failure itself is what is
-// being recorded.
+// that fails to store must not turn a successful chunk into a failed one, and
+// a failed chunk's log is worth keeping even when the failure itself is what
+// is being recorded.
 func (q *Queue) SetLog(ctx context.Context, id, output string) error {
 	if output == "" {
 		return nil
 	}
 	_, err := q.pool.Exec(ctx, `
-		INSERT INTO job_log (job_id, output) VALUES ($1,$2)
-		ON CONFLICT (job_id) DO UPDATE SET output = excluded.output`, id, output)
+		INSERT INTO chunk_log (chunk_id, output) VALUES ($1,$2)
+		ON CONFLICT (chunk_id) DO UPDATE SET output = excluded.output`, id, output)
 	return err
 }
 
-// Log returns what a job's run printed, and whether anything was recorded.
+// Log returns what a chunk's run printed, and whether anything was recorded.
 func (q *Queue) Log(ctx context.Context, id string) (string, bool, error) {
 	var out string
-	err := q.pool.QueryRow(ctx, `SELECT output FROM job_log WHERE job_id=$1`, id).Scan(&out)
+	err := q.pool.QueryRow(ctx, `SELECT output FROM chunk_log WHERE chunk_id=$1`, id).Scan(&out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
@@ -313,57 +327,59 @@ func (q *Queue) Log(ctx context.Context, id string) (string, bool, error) {
 	return out, true, nil
 }
 
-// Outcome is what a Runner produces for a completed job.
+// Outcome is what a Runner produces for a completed chunk.
 type Outcome struct {
-	// Result is the annotation JSON, stored verbatim. It is what the CLI emitted,
-	// and what the inline ?wait= path returns without touching job_variant.
+	// Result is the annotation JSON, stored verbatim. It is what the CLI
+	// emitted, and what the inline ?wait= path returns without touching
+	// chunk_variant.
 	Result []byte
 	// N is the number of variants.
 	N int
-	// Columns is the JSON column model for these results (may be nil). Stored on
-	// the job so its results stay renderable even if the snapshot is re-pinned.
+	// Columns is the JSON column model for these results (may be nil). Stored
+	// on the chunk so its results stay renderable even if the snapshot is
+	// re-pinned.
 	Columns []byte
-	// Variants says whether Result is an annotated-variant array that should be
-	// projected into job_variant. A download's result is a file manifest.
+	// Variants says whether Result is an annotated-variant array that should
+	// be projected into chunk_variant. A download's result is a file manifest.
 	Variants bool
-	// VCFURI is the job's answer already assembled as a VCF, when the worker
-	// was able to build one. Empty for a locus job, which has no submitted file
-	// to merge onto, and for a merge that did not succeed — in both cases the
-	// export renders from rows instead.
+	// VCFURI is the chunk's answer already assembled as a VCF, when the worker
+	// was able to build one. Empty for a locus chunk, which has no submitted
+	// file to merge onto, and for a merge that did not succeed — in both cases
+	// the export renders from rows instead.
 	VCFURI string
 }
 
-// Runner annotates one job's input. An error marks the job failed (its message
-// is stored on the job).
-type Runner func(ctx context.Context, job Job, input []byte) (Outcome, error)
+// Runner annotates one chunk's input. An error marks the chunk failed (its
+// message is stored on the chunk).
+type Runner func(ctx context.Context, chunk Chunk, input []byte) (Outcome, error)
 
-// Queue is the job queue and its worker pool.
+// Queue is the chunk queue and its worker pool.
 type Queue struct {
 	pool  *pgxpool.Pool
 	nowFn func() int64
 
-	// disposeObjects removes a collected job's stored files. Nil in a process
-	// that has no storage configured; see SetObjectDisposer.
+	// disposeObjects removes a collected chunk's stored files. Nil in a
+	// process that has no storage configured; see SetObjectDisposer.
 	disposeObjects func(ctx context.Context, uris []string)
 
-	maxJobsPerIP int // per-IP concurrent running-job cap (<=0 = unlimited)
-	// slots is the pool's total capacity in job weight, not job count. A job
-	// runs only when the running set's weight plus its own fits. <=0 disables
-	// the check, which is the pre-weight behaviour.
+	maxJobsPerIP int // per-IP concurrent running-chunk cap (<=0 = unlimited)
+	// slots is the pool's total capacity in chunk weight, not chunk count. A
+	// chunk runs only when the running set's weight plus its own fits. <=0
+	// disables the check, which is the pre-weight behaviour.
 	slots int
 
 	wg sync.WaitGroup
 
 	mu     sync.Mutex
 	queued chan struct{} // wakes one worker (cap 1, non-blocking send)
-	// running tracks jobs this process is executing, so a cancel arriving over
-	// NOTIFY can reach the right subprocess. Only ever holds jobs claimed here;
-	// a cancel for another replica's job finds nothing and is ignored, which is
-	// correct — that replica is listening too.
+	// running tracks chunks this process is executing, so a cancel arriving
+	// over NOTIFY can reach the right subprocess. Only ever holds chunks
+	// claimed here; a cancel for another replica's chunk finds nothing and is
+	// ignored, which is correct — that replica is listening too.
 	//
-	// It is also exactly the set whose leases this process must renew: a job is
-	// in here for as long as this process is really working on it.
-	running map[string]*runningJob
+	// It is also exactly the set whose leases this process must renew: a chunk
+	// is in here for as long as this process is really working on it.
+	running map[string]*runningChunk
 
 	// workerID identifies this process in the claims it holds. Random per
 	// process rather than derived from a hostname or pid, both of which a
@@ -373,35 +389,38 @@ type Queue struct {
 	workerID string
 	// leaseTTL is how long a claim stays valid without renewal, and leaseRenew
 	// how often the holder refreshes it. The gap between them is the margin: a
-	// worker has several chances to renew before anything reclaims its work, so
-	// a slow query or a pause does not cost it a job it is actively running.
+	// worker has several chances to renew before anything reclaims its work,
+	// so a slow query or a pause does not cost it a chunk it is actively
+	// running.
 	leaseTTL   time.Duration
 	leaseRenew time.Duration
 }
 
 // Default lease timings. The TTL is generous relative to the renew interval
-// because the cost of the two errors is not symmetric: renewing more often than
-// needed costs one tiny UPDATE, while expiring a lease a live worker still holds
-// takes a job away mid-run and lets a second worker start it again.
+// because the cost of the two errors is not symmetric: renewing more often
+// than needed costs one tiny UPDATE, while expiring a lease a live worker
+// still holds takes a chunk away mid-run and lets a second worker start it
+// again.
 const (
 	// Sized for the longest thing a worker actually does, not for the shortest.
 	//
-	// Two minutes was too tight. A provisioning job runs for hours doing heavy
-	// I/O, and a node under disk pressure can starve the process past that —
-	// after which the holder is still working while a peer reclaims the job and
-	// starts it again, both writing to one destination. Renewal is cheap and
-	// frequent, so the margin here is a dozen missed renewals rather than six.
+	// Two minutes was too tight. A provisioning chunk runs for hours doing
+	// heavy I/O, and a node under disk pressure can starve the process past
+	// that — after which the holder is still working while a peer reclaims the
+	// chunk and starts it again, both writing to one destination. Renewal is
+	// cheap and frequent, so the margin here is a dozen missed renewals rather
+	// than six.
 	defaultLeaseTTL   = 15 * time.Minute
 	defaultLeaseRenew = 30 * time.Second
 )
 
-// MaxAttempts is how many times a job may be handed to a worker before it is
+// MaxAttempts is how many times a chunk may be handed to a worker before it is
 // failed instead of requeued.
 //
-// Only reached by jobs whose worker died without reporting anything: a job that
-// fails cleanly is already terminal. Three is enough to ride out a rolling
-// restart or a one-off eviction, and few enough that a job which kills its
-// worker every time stops rather than doing so forever.
+// Only reached by chunks whose worker died without reporting anything: a chunk
+// that fails cleanly is already terminal. Three is enough to ride out a
+// rolling restart or a one-off eviction, and few enough that a chunk which
+// kills its worker every time stops rather than doing so forever.
 const MaxAttempts = 3
 
 // New wraps an existing pool, matching how the catalog and the annotation cache
@@ -409,7 +428,7 @@ const MaxAttempts = 3
 // could open a second connection to the same database; nothing has needed that
 // since the notification listener started borrowing from the pool instead.
 //
-// Jobs left running by a crashed worker are not touched here: see
+// Chunks left running by a crashed worker are not touched here: see
 // ReclaimExpired, and the comment on it for why recovering on open was wrong.
 //
 // The caller must have applied migrations/ first; nothing here creates schema.
@@ -422,7 +441,7 @@ func New(pool *pgxpool.Pool) (*Queue, error) {
 		pool:       pool,
 		nowFn:      func() int64 { return time.Now().Unix() },
 		queued:     make(chan struct{}, 1),
-		running:    map[string]*runningJob{},
+		running:    map[string]*runningChunk{},
 		workerID:   id,
 		leaseTTL:   defaultLeaseTTL,
 		leaseRenew: defaultLeaseRenew,
@@ -453,62 +472,63 @@ func (q *Queue) SetLease(ttl, renew time.Duration) {
 	q.leaseTTL, q.leaseRenew = ttl, renew
 }
 
-// ReclaimExpired returns abandoned jobs to the queue, reporting how many.
+// ReclaimExpired returns abandoned chunks to the queue, reporting how many.
 //
-// A job is abandoned when its lease has run out: the worker that claimed it
-// renews while it works, so nobody renewing means nobody is working on it. That
-// is a fact about the job rather than about the caller, which is what makes this
-// safe to run from any process at any time — including while other workers are
-// busy, and including several replicas running it at once.
+// A chunk is abandoned when its lease has run out: the worker that claimed it
+// renews while it works, so nobody renewing means nobody is working on it.
+// That is a fact about the chunk rather than about the caller, which is what
+// makes this safe to run from any process at any time — including while other
+// workers are busy, and including several replicas running it at once.
 //
 // The predecessor of this was a blanket "requeue everything running" in Open.
-// Both the API and the worker open the queue, so restarting the API reset jobs
-// underneath the worker still executing them, and a multi-hour download could
-// end up running twice against the same destination. The signal there was "a
-// process started", which says nothing about whether anyone else is working.
+// Both the API and the worker open the queue, so restarting the API reset
+// chunks underneath the worker still executing them, and a multi-hour download
+// could end up running twice against the same destination. The signal there
+// was "a process started", which says nothing about whether anyone else is
+// working.
 //
 // A NULL lease is expired: rows claimed before leases existed have nobody
 // renewing them either, so they are abandoned by the same definition.
 func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 	// Close the attempts of everything whose lease has lapsed, before either
-	// statement below changes the status they are selected by. One statement for
-	// both the retrying and the exhausted, because from the attempt's point of
-	// view they are the same event: a worker took this job and never came back.
-	// Whether the *job* gets another go is a separate decision, recorded on the
-	// job.
+	// statement below changes the status they are selected by. One statement
+	// for both the retrying and the exhausted, because from the attempt's
+	// point of view they are the same event: a worker took this chunk and
+	// never came back. Whether the *chunk* gets another go is a separate
+	// decision, recorded on the chunk.
 	//
 	// This is the row nothing else preserves. finish() never ran for these — the
 	// process that would have called it is gone — so without this write the
 	// attempt's worker, its start and how long it survived are lost at the moment
 	// the reclaim clears claimed_by.
 	if _, err := q.pool.Exec(ctx, `
-		UPDATE job_attempt a
+		UPDATE chunk_attempt a
 		   SET ended_at=$1, outcome=$2
-		  FROM job j
-		 WHERE a.job_id = j.id AND a.outcome IS NULL
+		  FROM chunk j
+		 WHERE a.chunk_id = j.id AND a.outcome IS NULL
 		   AND j.status = $3 AND COALESCE(j.lease_until, 0) < $4`,
 		q.nowFn(), OutcomeAbandoned, StatusRunning, q.nowFn()); err != nil {
 		return 0, fmt.Errorf("close abandoned attempts: %w", err)
 	}
-	// Past MaxAttempts the job is failed rather than requeued. Without this a
-	// job that kills its worker every run came back forever, and each attempt
-	// cost whatever the previous one had produced — the scratch of a killed
-	// build is only cleaned up by the process that made it.
+	// Past MaxAttempts the chunk is failed rather than requeued. Without this
+	// a chunk that kills its worker every run came back forever, and each
+	// attempt cost whatever the previous one had produced — the scratch of a
+	// killed build is only cleaned up by the process that made it.
 	//
 	// The error text says what happened, because "attempt 3 of 3" is the part
 	// an operator needs and the raw truth ("no worker ever reported on this")
-	// is not otherwise visible anywhere.
-	// Charged here and nowhere else. An abandoned job's worker died rather than
-	// reporting, so finish() never ran for it — but it held a slot for a lease's
-	// worth of time on every attempt, and a caller whose jobs keep dying would
-	// otherwise retry at everyone else's expense for free.
+	// is not otherwise visible anywhere. Charged here and nowhere else. An
+	// abandoned chunk's worker died rather than reporting, so finish() never
+	// ran for it — but it held a slot for a lease's worth of time on every
+	// attempt, and a caller whose chunks keep dying would otherwise retry at
+	// everyone else's expense for free.
 	//
 	// DISTINCT because ON CONFLICT cannot touch the same row twice in one
-	// statement, and a caller with several exhausted jobs would otherwise fail
-	// the whole sweep.
+	// statement, and a caller with several exhausted chunks would otherwise
+	// fail the whole sweep.
 	if _, err := q.pool.Exec(ctx, `
 		WITH failed AS (
-		UPDATE job
+		UPDATE chunk
 		   SET status=$1, claimed_by=NULL, lease_until=NULL, finished_at=$4,
 		       error=$5
 		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
@@ -521,25 +541,25 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		   SET last_finished_at = GREATEST(queue_caller.last_finished_at, excluded.last_finished_at)`,
 		StatusError, StatusRunning, q.nowFn(), q.nowFn(),
 		fmt.Sprintf("abandoned %d times without completing — its worker was killed "+
-			"each time rather than reporting a failure; see the job log for what it "+
+			"each time rather than reporting a failure; see the chunk log for what it "+
 			"was doing", MaxAttempts),
 		MaxAttempts); err != nil {
-		return 0, fmt.Errorf("fail exhausted jobs: %w", err)
+		return 0, fmt.Errorf("fail exhausted chunks: %w", err)
 	}
-	// Which jobs are about to be reclaimed, so each can be told in its own log
-	// that this happened. Without it an abandoned job carries no record of the
-	// abandonment: the worker died without writing anything, and "abandoned 3
-	// times" arrives with no times, no workers, and no output.
+	// Which chunks are about to be reclaimed, so each can be told in its own
+	// log that this happened. Without it an abandoned chunk carries no record
+	// of the abandonment: the worker died without writing anything, and
+	// "abandoned 3 times" arrives with no times, no workers, and no output.
 	// The worker is read here and not after: the reclaim clears claimed_by, so
-	// once it has run the identity of the process that died is gone. Without it,
-	// "abandoned 3 times" cannot be turned into "worker-7 lost twelve jobs in an
-	// hour", which is the question asked when a pod is being OOM-killed — and
-	// answering it meant grepping individual job logs for the "starting on
-	// worker" line.
+	// once it has run the identity of the process that died is gone. Without
+	// it, "abandoned 3 times" cannot be turned into "worker-7 lost twelve
+	// chunks in an hour", which is the question asked when a pod is being
+	// OOM-killed — and answering it meant grepping individual chunk logs for
+	// the "starting on worker" line.
 	type lost struct{ id, worker string }
 	var reclaiming []lost
 	if rows, qErr := q.pool.Query(ctx, `
-		SELECT id, COALESCE(claimed_by,'') FROM job
+		SELECT id, COALESCE(claimed_by,'') FROM chunk
 		 WHERE status=$1 AND COALESCE(lease_until, 0) < $2 AND attempts < $3`,
 		StatusRunning, q.nowFn(), MaxAttempts); qErr == nil {
 		for rows.Next() {
@@ -552,13 +572,13 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 	}
 
 	tag, err := q.pool.Exec(ctx, `
-		UPDATE job
+		UPDATE chunk
 		   SET status=$1, started_at=NULL, claimed_by=NULL, lease_until=NULL
 		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
 		   AND attempts < $4`,
 		StatusQueued, StatusRunning, q.nowFn(), MaxAttempts)
 	if err != nil {
-		return 0, fmt.Errorf("reclaim expired jobs: %w", err)
+		return 0, fmt.Errorf("reclaim expired chunks: %w", err)
 	}
 	for _, l := range reclaiming {
 		who := l.worker
@@ -568,11 +588,12 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		_ = q.AppendLog(ctx, l.id, "··· "+who+" stopped renewing the lease; "+
 			"requeued for another attempt. The process was killed rather than "+
 			"failing, so nothing above this line is its explanation.\n")
-		// Also to the process log, where it can be correlated with pod restarts.
-		// A job's own log answers "what happened to this job"; this answers "is
-		// one worker losing all of them", which is the question when a container
-		// is being OOM-killed and the kill itself is invisible from in here.
-		log.Printf("queue: job %s abandoned by %s; requeued", l.id, who)
+		// Also to the process log, where it can be correlated with pod
+		// restarts. A chunk's own log answers "what happened to this chunk";
+		// this answers "is one worker losing all of them", which is the
+		// question when a container is being OOM-killed and the kill itself is
+		// invisible from in here.
+		log.Printf("queue: chunk %s abandoned by %s; requeued", l.id, who)
 	}
 	n := int(tag.RowsAffected())
 	if n > 0 {
@@ -608,7 +629,7 @@ func (q *Queue) StartLeaseKeeper(ctx context.Context) {
 						log.Printf("queue: reclaim expired: %v", err)
 					}
 				} else if n > 0 {
-					log.Printf("queue: reclaimed %d abandoned job(s)", n)
+					log.Printf("queue: reclaimed %d abandoned chunk(s)", n)
 				}
 			}
 		}
@@ -632,7 +653,7 @@ func (q *Queue) renewLeases(ctx context.Context) error {
 		return nil
 	}
 	_, err := q.pool.Exec(ctx, `
-		UPDATE job SET lease_until=$1
+		UPDATE chunk SET lease_until=$1
 		 WHERE id = ANY($2) AND status=$3 AND claimed_by=$4`,
 		q.nowFn()+int64(q.leaseTTL.Seconds()), ids, StatusRunning, q.workerID)
 	return err
@@ -644,25 +665,25 @@ func (q *Queue) Close() { q.pool.Close() }
 // Ping checks the database is reachable. Used by the readiness probe.
 func (q *Queue) Ping(ctx context.Context) error { return q.pool.Ping(ctx) }
 
-// SetMaxJobsPerIP sets the per-IP concurrent running-job cap enforced by the fair
-// scheduler (<=0 = unlimited). Call before starting workers.
+// SetMaxJobsPerIP sets the per-IP concurrent running-chunk cap enforced by the
+// fair scheduler (<=0 = unlimited). Call before starting workers.
 func (q *Queue) SetMaxJobsPerIP(n int) { q.maxJobsPerIP = n }
 
-// SetObjectDisposer supplies what removes a job's stored files when the job
-// itself is collected.
+// SetObjectDisposer supplies what removes a chunk's stored files when the
+// chunk itself is collected.
 //
 // A hook rather than a storage client held here, because this package is about
-// job persistence and knows nothing about buckets — the same separation that
-// keeps the runner from having one. Unset, expiring jobs still have their rows
-// removed and their objects are left for a listing sweep to find.
+// chunk persistence and knows nothing about buckets — the same separation that
+// keeps the runner from having one. Unset, expiring chunks still have their
+// rows removed and their objects are left for a listing sweep to find.
 func (q *Queue) SetObjectDisposer(f func(ctx context.Context, uris []string)) {
 	q.disposeObjects = f
 }
 
-// SetSlots sets the pool's capacity in job weight.
+// SetSlots sets the pool's capacity in chunk weight.
 //
 // Separate from the worker count on purpose: the goroutines decide how many
-// jobs can be in flight at all, this decides how much work they may hold. A
+// chunks can be in flight at all, this decides how much work they may hold. A
 // deployment that wants annotations to keep flowing during a provisioning run
 // gives itself more slots than a download weighs.
 func (q *Queue) SetSlots(n int) { q.slots = n }
@@ -670,15 +691,15 @@ func (q *Queue) SetSlots(n int) { q.slots = n }
 // NewID returns a random 128-bit hex id.
 //
 // Exported so a caller can mint one *before* enqueuing, which is what lets an
-// uploaded input be stored under the id of the job that will read it. Without
-// that the object would have to be written under some other name and the two
-// reconciled afterwards, and "which objects belong to jobs that no longer
-// exist" would need a join instead of a listing.
+// uploaded input be stored under the id of the chunk that will read it.
+// Without that the object would have to be written under some other name and
+// the two reconciled afterwards, and "which objects belong to chunks that no
+// longer exist" would need a join instead of a listing.
 //
 // This is for internal callers — the API handler that accepts an upload. It is
-// not a hook for letting a client choose its own job id: that would hand out
-// collisions with other people's jobs, an enumerable id space, and the ability
-// to claim an id before its owner does.
+// not a hook for letting a client choose its own chunk id: that would hand out
+// collisions with other people's chunks, an enumerable id space, and the
+// ability to claim an id before its owner does.
 func NewID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
@@ -689,15 +710,16 @@ func NewID() (string, error) {
 
 // idPattern is what NewID produces, and the only shape Enqueue accepts.
 //
-// Checked rather than trusted because a job id becomes a path segment in job
-// storage. An id containing a slash or a "…/../…" would place the object
-// somewhere other than the prefix it was meant for — silently, since writing to
-// a valid-looking key succeeds. Every other reason to validate is secondary to
-// that one.
+// Checked rather than trusted because a chunk id becomes a path segment in
+// chunk storage. An id containing a slash or a "…/../…" would place the object
+// somewhere other than the prefix it was meant for — silently, since writing
+// to a valid-looking key succeeds. Every other reason to validate is secondary
+// to that one.
 var idPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
-// Enqueue records a new queued job (metadata + its input) and wakes a worker.
-func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
+// Enqueue records a new queued chunk (metadata + its input) and wakes a
+// worker.
+func (q *Queue) Enqueue(ctx context.Context, j NewChunk) (string, error) {
 	id := j.ID
 	if id == "" {
 		var err error
@@ -705,7 +727,7 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 			return "", err
 		}
 	} else if !idPattern.MatchString(id) {
-		return "", fmt.Errorf("job id %q is not one NewID produced", id)
+		return "", fmt.Errorf("chunk id %q is not one NewID produced", id)
 	}
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
@@ -714,13 +736,13 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
-		                  weight,max_concurrent,origin,max_variants,batch_id,chunk_index,created_at)
+		`INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
+		                  weight,max_concurrent,origin,max_variants,job_id,chunk_index,created_at)
 		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
 		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
 		j.MaxConcurrent, j.Origin, j.MaxVariants,
-		nullable(j.BatchID), j.ChunkIndex, q.nowFn()); err != nil {
+		nullable(j.JobID), j.ChunkIndex, q.nowFn()); err != nil {
 		return "", err
 	}
 	// One of the two, never both — matching the CHECK rather than trusting it.
@@ -739,10 +761,11 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 		}
 	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job_input (job_id,body,uri) VALUES ($1,$2,$3)`, id, body, uri); err != nil {
+		`INSERT INTO chunk_input (chunk_id,body,uri) VALUES ($1,$2,$3)`, id, body, uri); err != nil {
 		return "", err
 	}
-	// NOTIFY fires on commit, so a listener never sees a job it cannot yet claim.
+	// NOTIFY fires on commit, so a listener never sees a chunk it cannot yet
+	// claim.
 	if _, err := tx.Exec(ctx, `SELECT pg_notify($1,$2)`, chanQueued, id); err != nil {
 		return "", err
 	}
@@ -753,7 +776,7 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	if j.InputURI != "" {
 		where = "input at " + j.InputURI
 	}
-	log.Printf("queue: job %s queued (kind=%s, ip=%s, session=%s, selection=%q, %s)",
+	log.Printf("queue: chunk %s queued (kind=%s, ip=%s, session=%s, selection=%q, %s)",
 		id, j.Kind, j.ClientIP, j.Session, j.Selection, where)
 	q.poke()
 	return id, nil
@@ -767,35 +790,35 @@ func (q *Queue) poke() {
 	}
 }
 
-// Get returns a job's metadata (ok=false when the id is unknown).
-func (q *Queue) Get(ctx context.Context, id string) (Job, bool, error) {
-	row := q.pool.QueryRow(ctx, `SELECT `+jobCols+` FROM job WHERE id=$1`, id)
-	j, err := scanJob(row)
+// Get returns a chunk's metadata (ok=false when the id is unknown).
+func (q *Queue) Get(ctx context.Context, id string) (Chunk, bool, error) {
+	row := q.pool.QueryRow(ctx, `SELECT `+chunkCols+` FROM chunk WHERE id=$1`, id)
+	j, err := scanChunk(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Job{}, false, nil
+		return Chunk{}, false, nil
 	}
 	if err != nil {
-		return Job{}, false, err
+		return Chunk{}, false, err
 	}
 	return j, true, nil
 }
 
-// Result returns a done job's result JSON (ok=false when the id is unknown or the
-// job has no stored result yet).
-// Input returns the body a job was submitted with, for the jobs that carry one.
+// Result returns a done chunk's result JSON (ok=false when the id is unknown
+// or the chunk has no stored result yet). Input returns the body a chunk was
+// submitted with, for the chunks that carry one.
 //
-// Retained rather than discarded once the job runs, which is what lets a VCF
+// Retained rather than discarded once the chunk runs, which is what lets a VCF
 // submission be answered with its own file annotated instead of a synthesised
 // one carrying only the columns this server knows about.
 //
-// ok is false for a job whose input is in storage. That is not an error and
-// callers must not treat it as one: it is the ordinary case for anything large,
-// and the point of storing it there is that this process never holds it. Use
-// InputRef and stream it.
+// ok is false for a chunk whose input is in storage. That is not an error and
+// callers must not treat it as one: it is the ordinary case for anything
+// large, and the point of storing it there is that this process never holds
+// it. Use InputRef and stream it.
 func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	var body []byte
 	err := q.pool.QueryRow(ctx,
-		`SELECT body FROM job_input WHERE job_id=$1 AND body IS NOT NULL`, id).Scan(&body)
+		`SELECT body FROM chunk_input WHERE chunk_id=$1 AND body IS NOT NULL`, id).Scan(&body)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
@@ -805,17 +828,18 @@ func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	return body, true, nil
 }
 
-// KnownJobIDs returns every job id the database still has a row for.
+// KnownChunkIDs returns every chunk id the database still has a row for.
 //
 // For the storage sweep, which decides what to delete by what is *absent* — so
-// this has to be the whole set, not a page of it. A job whose id is missing from
-// a partial answer would have its files collected while it was still queued.
+// this has to be the whole set, not a page of it. A chunk whose id is missing
+// from a partial answer would have its files collected while it was still
+// queued.
 //
-// The whole table, because a job's files are owned for as long as its row
-// exists, whatever state it is in. Filtering to terminal jobs here would delete
-// the input of everything currently queued.
-func (q *Queue) KnownJobIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := q.pool.Query(ctx, `SELECT id FROM job`)
+// The whole table, because a chunk's files are owned for as long as its row
+// exists, whatever state it is in. Filtering to terminal chunks here would
+// delete the input of everything currently queued.
+func (q *Queue) KnownChunkIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := q.pool.Query(ctx, `SELECT id FROM chunk`)
 	if err != nil {
 		return nil, err
 	}
@@ -863,15 +887,15 @@ func (q *Queue) TryLock(ctx context.Context, name string) (ok bool, release func
 	}, nil
 }
 
-// ResultVCF returns where a job's answer-as-a-VCF is stored, and whether one
+// ResultVCF returns where a chunk's answer-as-a-VCF is stored, and whether one
 // was built at all.
 //
-// False is the ordinary case, not a failure: a locus job has no submitted file
-// to merge onto, and a job that finished before this existed has no object. The
-// caller renders from rows instead.
+// False is the ordinary case, not a failure: a locus chunk has no submitted
+// file to merge onto, and a chunk that finished before this existed has no
+// object. The caller renders from rows instead.
 func (q *Queue) ResultVCF(ctx context.Context, id string) (string, bool, error) {
 	var uri *string
-	err := q.pool.QueryRow(ctx, `SELECT vcf_uri FROM job_result WHERE job_id=$1`, id).Scan(&uri)
+	err := q.pool.QueryRow(ctx, `SELECT vcf_uri FROM chunk_result WHERE chunk_id=$1`, id).Scan(&uri)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
@@ -884,11 +908,11 @@ func (q *Queue) ResultVCF(ctx context.Context, id string) (string, bool, error) 
 	return *uri, true, nil
 }
 
-// InputRef returns where a job's input is stored, and whether it is stored at
-// all rather than carried inline.
+// InputRef returns where a chunk's input is stored, and whether it is stored
+// at all rather than carried inline.
 func (q *Queue) InputRef(ctx context.Context, id string) (string, bool, error) {
 	var uri *string
-	err := q.pool.QueryRow(ctx, `SELECT uri FROM job_input WHERE job_id=$1`, id).Scan(&uri)
+	err := q.pool.QueryRow(ctx, `SELECT uri FROM chunk_input WHERE chunk_id=$1`, id).Scan(&uri)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
@@ -901,17 +925,17 @@ func (q *Queue) InputRef(ctx context.Context, id string) (string, bool, error) {
 	return *uri, true, nil
 }
 
-// DropInput deletes a job's input row, and reports the storage URI it referred
-// to so the caller can delete the object too.
+// DropInput deletes a chunk's input row, and reports the storage URI it
+// referred to so the caller can delete the object too.
 //
-// Two steps rather than one, and deliberately not transactional: an object left
-// behind after the row is gone is scrap that the storage sweep collects, while a
-// row pointing at an object that has been deleted is a job that looks runnable
-// and is not. Losing the pointer last is the safe order.
+// Two steps rather than one, and deliberately not transactional: an object
+// left behind after the row is gone is scrap that the storage sweep collects,
+// while a row pointing at an object that has been deleted is a chunk that
+// looks runnable and is not. Losing the pointer last is the safe order.
 func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 	var uri *string
 	err := q.pool.QueryRow(ctx,
-		`DELETE FROM job_input WHERE job_id=$1 RETURNING uri`, id).Scan(&uri)
+		`DELETE FROM chunk_input WHERE chunk_id=$1 RETURNING uri`, id).Scan(&uri)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", nil
 	}
@@ -926,7 +950,7 @@ func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 
 func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
 	var js string
-	err := q.pool.QueryRow(ctx, `SELECT json FROM job_result WHERE job_id=$1`, id).Scan(&js)
+	err := q.pool.QueryRow(ctx, `SELECT json FROM chunk_result WHERE chunk_id=$1`, id).Scan(&js)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -938,28 +962,29 @@ func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
 
 type rowScanner interface{ Scan(dest ...any) error }
 
-func scanJob(row rowScanner) (Job, error) {
-	var j Job
+func scanChunk(row rowScanner) (Chunk, error) {
+	var j Chunk
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.Origin, &j.MaxVariants, &j.BatchID, &j.ChunkIndex,
+		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex,
 		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
-		return Job{}, err
+		return Chunk{}, err
 	}
 	return j, nil
 }
 
-// JobFilter narrows a List query. Empty fields are not constrained.
-type JobFilter struct {
+// ChunkFilter narrows a List query. Empty fields are not constrained.
+type ChunkFilter struct {
 	Status   string   // queued|running|done|error
 	Session  string   // scope to one submitter's session id
 	UserID   string   // scope to one account
 	ClientIP string   // scope to one client IP
-	Kinds    []string // restrict to these job kinds
+	Kinds    []string // restrict to these chunk kinds
 }
 
-// List returns jobs newest-first matching the filter, with limit/offset paging.
-func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job, error) {
+// List returns chunks newest-first matching the filter, with limit/offset
+// paging.
+func (q *Queue) List(ctx context.Context, f ChunkFilter, limit, offset int) ([]Chunk, error) {
 	if limit <= 0 {
 		limit = 50
 	}
@@ -988,7 +1013,7 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 		args = append(args, f.Kinds)
 		where = append(where, fmt.Sprintf("kind = ANY($%d)", len(args)))
 	}
-	query := `SELECT ` + jobCols + ` FROM job`
+	query := `SELECT ` + chunkCols + ` FROM chunk`
 	if len(where) > 0 {
 		query += ` WHERE ` + strings.Join(where, " AND ")
 	}
@@ -1001,9 +1026,9 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Job
+	var out []Chunk
 	for rows.Next() {
-		j, err := scanJob(rows)
+		j, err := scanChunk(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -1012,28 +1037,29 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 	return out, rows.Err()
 }
 
-// DeleteOlderThan removes terminal jobs (finished_at set) whose finished_at is
-// before cutoff, along with their input and result blobs. Queued and running jobs
-// are never touched. Returns the number of jobs deleted.
+// DeleteOlderThan removes terminal chunks (finished_at set) whose finished_at
+// is before cutoff, along with their input and result blobs. Queued and
+// running chunks are never touched. Returns the number of chunks deleted.
 //
-// The blobs go with the job via ON DELETE CASCADE, so unlike the SQLite version
-// this is one statement rather than three inside a transaction.
+// The blobs go with the chunk via ON DELETE CASCADE, so unlike the SQLite
+// version this is one statement rather than three inside a transaction.
 func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error) {
-	// The objects these jobs own — inputs and built results alike — read before
-	// their rows go.
+	// The objects these chunks own — inputs and built results alike — read
+	// before their rows go.
 	//
-	// job_input cascades from job, so deleting the row destroys the only record
-	// of where the object was — and an object nothing points at is invisible to
-	// everything short of listing the whole bucket. Without this, every VCF job
-	// that ages out leaves its input behind for good, and storage grows without
-	// limit while the table it was tracked in shrinks on schedule.
+	// chunk_input cascades from chunk, so deleting the row destroys the only
+	// record of where the object was — and an object nothing points at is
+	// invisible to everything short of listing the whole bucket. Without this,
+	// every VCF chunk that ages out leaves its input behind for good, and
+	// storage grows without limit while the table it was tracked in shrinks on
+	// schedule.
 	var owned []string
 	if rows, err := q.pool.Query(ctx, `
-		SELECT i.uri FROM job_input i JOIN job j ON j.id = i.job_id
+		SELECT i.uri FROM chunk_input i JOIN chunk j ON j.id = i.chunk_id
 		 WHERE i.uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1
 		UNION ALL
-		SELECT r.vcf_uri FROM job_result r JOIN job j ON j.id = r.job_id
+		SELECT r.vcf_uri FROM chunk_result r JOIN chunk j ON j.id = r.chunk_id
 		 WHERE r.vcf_uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
 		for rows.Next() {
@@ -1044,32 +1070,34 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		}
 		rows.Close()
 	} else {
-		// Not fatal: collecting the jobs matters more than collecting their
-		// objects, and a leaked object is recoverable by a listing while a table
-		// that never shrinks is not.
-		log.Printf("queue: could not list the objects of expiring jobs: %v", err)
+		// Not fatal: collecting the chunks matters more than collecting their
+		// objects, and a leaked object is recoverable by a listing while a
+		// table that never shrinks is not.
+		log.Printf("queue: could not list the objects of expiring chunks: %v", err)
 	}
 
 	tag, err := q.pool.Exec(ctx,
-		`DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
+		`DELETE FROM chunk WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
 	if err != nil {
 		return 0, err
 	}
 	// After the rows, deliberately. This order can leak an object when the
-	// disposal fails; the other order can leave a job that still looks complete
-	// with its input already gone, which is a wrong answer rather than waste.
+	// disposal fails; the other order can leave a chunk that still looks
+	// complete with its input already gone, which is a wrong answer rather
+	// than waste.
 	if len(owned) > 0 && q.disposeObjects != nil {
 		q.disposeObjects(ctx, owned)
 	}
 
-	// The fair-share timestamps age out with the jobs. Safe because the ordering
-	// reads GREATEST(created_at, last_finished_at): once the timestamp is older
-	// than any queued job could be, it never wins that comparison, so an absent
-	// row and a sufficiently old one give the same answer. Without this the table
-	// grows a row per anonymous address forever.
+	// The fair-share timestamps age out with the chunks. Safe because the
+	// ordering reads GREATEST(created_at, last_finished_at): once the
+	// timestamp is older than any queued chunk could be, it never wins that
+	// comparison, so an absent row and a sufficiently old one give the same
+	// answer. Without this the table grows a row per anonymous address
+	// forever.
 	//
 	// Best effort — this is housekeeping, and failing the sweep over it would
-	// leave the jobs themselves uncollected.
+	// leave the chunks themselves uncollected.
 	if _, err := q.pool.Exec(ctx,
 		`DELETE FROM queue_caller WHERE last_finished_at < $1`, cutoff); err != nil {
 		log.Printf("queue: prune fair-share timestamps: %v", err)
@@ -1077,9 +1105,9 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 	return tag.RowsAffected(), nil
 }
 
-// StartSweeper launches a goroutine that deletes terminal jobs older than ttl,
-// sweeping once immediately and then every interval until ctx is cancelled. A
-// ttl <= 0 disables GC (the goroutine is not started).
+// StartSweeper launches a goroutine that deletes terminal chunks older than
+// ttl, sweeping once immediately and then every interval until ctx is
+// cancelled. A ttl <= 0 disables GC (the goroutine is not started).
 func (q *Queue) StartSweeper(ctx context.Context, ttl, interval time.Duration) {
 	if ttl <= 0 {
 		return
@@ -1094,10 +1122,10 @@ func (q *Queue) StartSweeper(ctx context.Context, ttl, interval time.Duration) {
 			cutoff := q.nowFn() - int64(ttl.Seconds())
 			if n, err := q.DeleteOlderThan(ctx, cutoff); err != nil {
 				if ctx.Err() == nil {
-					log.Printf("queue: job GC: %v", err)
+					log.Printf("queue: chunk GC: %v", err)
 				}
 			} else if n > 0 {
-				log.Printf("queue: job GC removed %d job(s) older than %s", n, ttl)
+				log.Printf("queue: chunk GC removed %d chunk(s) older than %s", n, ttl)
 			}
 		}
 		sweep()
@@ -1114,8 +1142,8 @@ func (q *Queue) StartSweeper(ctx context.Context, ttl, interval time.Duration) {
 	}()
 }
 
-// StartWorkers launches n worker goroutines that claim and process queued jobs
-// until ctx is cancelled. Call Wait to block for their shutdown.
+// StartWorkers launches n worker goroutines that claim and process queued
+// chunks until ctx is cancelled. Call Wait to block for their shutdown.
 func (q *Queue) StartWorkers(ctx context.Context, n int, runner Runner) {
 	if n < 1 {
 		n = 1
@@ -1131,28 +1159,28 @@ func (q *Queue) Wait() { q.wg.Wait() }
 
 func (q *Queue) worker(ctx context.Context, runner Runner) {
 	defer q.wg.Done()
-	// Fallback poll: covers a missed NOTIFY and the multi-replica case where a job
-	// was enqueued by another process while this one held no listener.
+	// Fallback poll: covers a missed NOTIFY and the multi-replica case where a
+	// chunk was enqueued by another process while this one held no listener.
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
-		// Drain all currently-claimable jobs before sleeping.
+		// Drain all currently-claimable chunks before sleeping.
 		for {
 			if ctx.Err() != nil {
 				return
 			}
-			job, input, ok, err := q.claimNext(ctx)
+			chunk, input, ok, err := q.claimNext(ctx)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
 				}
-				log.Printf("queue: claim job: %v", err)
+				log.Printf("queue: claim chunk: %v", err)
 				break
 			}
 			if !ok {
 				break
 			}
-			q.process(ctx, job, input, runner)
+			q.process(ctx, chunk, input, runner)
 		}
 		select {
 		case <-ctx.Done():
@@ -1163,27 +1191,29 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 	}
 }
 
-// claimQuery claims the next job in a single statement.
+// claimQuery claims the next chunk in a single statement.
 //
 // Fairness has two terms, covering two different ways one caller can crowd out
 // another:
 //
-//   - fewest jobs *running* — stops one caller holding every slot at once.
+//   - fewest chunks *running* — stops one caller holding every slot at once.
 //   - longest since they were *served* — stops one caller taking every slot in
-//     sequence. A job's position is GREATEST(created_at, last_finished_at), so
-//     finishing a job pushes the rest of that caller's queue behind everyone who
-//     has been waiting.
+//     sequence. A chunk's position is GREATEST(created_at, last_finished_at),
+//     so finishing a chunk pushes the rest of that caller's queue behind
+//     everyone who has been waiting.
 //
-// The second exists because the first is blind at one slot. By the time a worker
-// claims, the job it just finished is already marked done, so with slots=1 every
-// caller has zero running, the term is a constant, and the ordering collapses to
-// plain FIFO — a caller who queued 400 jobs before anyone else arrived took all
-// 400 in a row. More generally a concurrency-based signal can only separate
-// callers up to the number of slots, and has nothing to say when there is one.
+// The second exists because the first is blind at one slot. By the time a
+// worker claims, the chunk it just finished is already marked done, so with
+// slots=1 every caller has zero running, the term is a constant, and the
+// ordering collapses to plain FIFO — a caller who queued 400 chunks before
+// anyone else arrived took all 400 in a row. More generally a
+// concurrency-based signal can only separate callers up to the number of
+// slots, and has nothing to say when there is one.
 //
-// Both are kept because each is blind where the other sees: last_finished_at only
-// advances on completion, so a caller with a six-hour job in flight looks idle by
-// that measure, and only the running count stops them taking more slots.
+// Both are kept because each is blind where the other sees: last_finished_at
+// only advances on completion, so a caller with a six-hour chunk in flight
+// looks idle by that measure, and only the running count stops them taking
+// more slots.
 //
 // Deliberately no DISTINCT ON to take one candidate per caller. It would change
 // nothing — LIMIT 1 already means a caller's 400 tied rows cannot outvote another
@@ -1195,38 +1225,41 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 // id.
 //
 // The timestamps are Unix seconds, so callers finishing inside the same second
-// tie and that burst drains FIFO. Deliberate: jobs completing that fast mean the
-// queue is not contended, so there is nothing for fairness to protect, and the
-// next tick resolves it. Finer resolution would buy ordering nobody is waiting
-// on, at the cost of widening three columns and everything that reads them.
+// tie and that burst drains FIFO. Deliberate: chunks completing that fast mean
+// the queue is not contended, so there is nothing for fairness to protect, and
+// the next tick resolves it. Finer resolution would buy ordering nobody is
+// waiting on, at the cost of widening three columns and everything that reads
+// them.
 //
-// FOR UPDATE OF j is required rather than a bare FOR UPDATE: Postgres refuses to
-// lock the nullable side of an outer join, and r is a LEFT JOIN subquery. Locking
-// only j is both legal and what we want. SKIP LOCKED is what lets N workers claim
-// N distinct jobs concurrently instead of serializing on the same head-of-queue row.
+// FOR UPDATE OF j is required rather than a bare FOR UPDATE: Postgres refuses
+// to lock the nullable side of an outer join, and r is a LEFT JOIN subquery.
+// Locking only j is both legal and what we want. SKIP LOCKED is what lets N
+// workers claim N distinct chunks concurrently instead of serializing on the
+// same head-of-queue row.
 //
-// An idle pool takes the next job whatever it weighs. Without that, a job heavier
-// than the entire budget is unclaimable rather than merely exclusive: on a
-// one-slot pool 0+2 <= 1 is false, so a weight-2 download waits behind nothing at
-// all, forever and silently. VHW_WORKERS=1 is an ordinary deployment and slots
-// follow workers, so that is a default configuration, not a corner. Weight is
-// there to stop jobs overlapping, not to make them unrunnable — one too big for
-// the pool should run alone, which is what an empty pool already guarantees.
+// An idle pool takes the next chunk whatever it weighs. Without that, a chunk
+// heavier than the entire budget is unclaimable rather than merely exclusive:
+// on a one-slot pool 0+2 <= 1 is false, so a weight-2 download waits behind
+// nothing at all, forever and silently. VHW_WORKERS=1 is an ordinary
+// deployment and slots follow workers, so that is a default configuration, not
+// a corner. Weight is there to stop chunks overlapping, not to make them
+// unrunnable — one too big for the pool should run alone, which is what an
+// empty pool already guarantees.
 const claimQuery = `
-UPDATE job SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7,
-               attempts = job.attempts + 1
+UPDATE chunk SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7,
+               attempts = chunk.attempts + 1
 WHERE id = (
   SELECT j.id
-  FROM job j
+  FROM chunk j
   LEFT JOIN (
     SELECT COALESCE(NULLIF(user_id,''), client_ip) AS who, COUNT(*) AS c
-      FROM job WHERE status = $1
+      FROM chunk WHERE status = $1
      GROUP BY COALESCE(NULLIF(user_id,''), client_ip)
   ) r ON r.who = COALESCE(NULLIF(j.user_id,''), j.client_ip)
   LEFT JOIN queue_caller f
     ON f.who = COALESCE(NULLIF(j.user_id,''), j.client_ip)
   CROSS JOIN (
-    SELECT COALESCE(SUM(weight),0) AS used FROM job WHERE status = $1
+    SELECT COALESCE(SUM(weight),0) AS used FROM chunk WHERE status = $1
   ) p
   WHERE j.status = $3
     AND COALESCE(r.c, 0) < (CASE WHEN j.max_concurrent > 0 THEN j.max_concurrent ELSE $4 END)
@@ -1237,11 +1270,11 @@ WHERE id = (
   FOR UPDATE OF j SKIP LOCKED
   LIMIT 1
 )
-RETURNING ` + jobCols
+RETURNING ` + chunkCols
 
-// claimNext atomically claims the next queued job, marking it running. ok=false
-// when there is nothing claimable.
-func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
+// claimNext atomically claims the next queued chunk, marking it running.
+// ok=false when there is nothing claimable.
+func (q *Queue) claimNext(ctx context.Context) (Chunk, []byte, bool, error) {
 	// <=0 means unlimited, expressed as a large sentinel so the predicate never filters.
 	maxPerIP := q.maxJobsPerIP
 	if maxPerIP <= 0 {
@@ -1262,85 +1295,86 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 	// prevent — two multi-hour downloads on one machine.
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
-		return Job{}, nil, false, err
+		return Chunk{}, nil, false, err
 	}
 	defer tx.Rollback(ctx)
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "varhub-job-claim"); err != nil {
-		return Job{}, nil, false, err
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1))`, "varhub-chunk-claim"); err != nil {
+		return Chunk{}, nil, false, err
 	}
 
 	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots,
 		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()))
-	job, err := scanJob(row)
+	chunk, err := scanChunk(row)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return Job{}, nil, false, nil
+		return Chunk{}, nil, false, nil
 	}
 	if err != nil {
-		return Job{}, nil, false, err
+		return Chunk{}, nil, false, err
 	}
-	// Open this attempt's history row in the claim transaction, so a claimed job
-	// always has one. Written apart, a crash in between would leave an attempt
-	// that ran and was never recorded — and the rows this table exists for are
-	// exactly the ones whose worker did not survive to write anything later.
+	// Open this attempt's history row in the claim transaction, so a claimed
+	// chunk always has one. Written apart, a crash in between would leave an
+	// attempt that ran and was never recorded — and the rows this table exists
+	// for are exactly the ones whose worker did not survive to write anything
+	// later.
 	//
 	// The attempt number is read back from the row the UPDATE just incremented
-	// rather than counted here, which is what keeps it equal to job.attempts
+	// rather than counted here, which is what keeps it equal to chunk.attempts
 	// instead of merely close to it.
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO job_attempt (job_id, attempt, worker, started_at)
-		SELECT id, attempts, $2, $3 FROM job WHERE id = $1
-		ON CONFLICT (job_id, attempt) DO NOTHING`,
-		job.ID, q.workerID, q.nowFn()); err != nil {
-		return Job{}, nil, false, err
+		INSERT INTO chunk_attempt (chunk_id, attempt, worker, started_at)
+		SELECT id, attempts, $2, $3 FROM chunk WHERE id = $1
+		ON CONFLICT (chunk_id, attempt) DO NOTHING`,
+		chunk.ID, q.workerID, q.nowFn()); err != nil {
+		return Chunk{}, nil, false, err
 	}
 	// Read the input inside the same transaction, so a claim and its input are
 	// one atomic step: committing the claim and then failing to read it would
-	// leave a job marked running that no worker is running.
+	// leave a chunk marked running that no worker is running.
 	//
-	// A stored input yields a URI and no bytes. The claim only needs to know it
-	// exists — staging it is the runner's job, and doing it here would hold the
-	// claim transaction open for the length of a download.
+	// A stored input yields a URI and no bytes. The claim only needs to know
+	// it exists — staging it is the runner's chunk, and doing it here would
+	// hold the claim transaction open for the length of a download.
 	var body []byte
 	var uri *string
 	if err := tx.QueryRow(ctx,
-		`SELECT body, uri FROM job_input WHERE job_id=$1`, job.ID).Scan(&body, &uri); err != nil {
-		return Job{}, nil, false, err
+		`SELECT body, uri FROM chunk_input WHERE chunk_id=$1`, chunk.ID).Scan(&body, &uri); err != nil {
+		return Chunk{}, nil, false, err
 	}
 	if uri != nil {
-		job.InputURI = *uri
+		chunk.InputURI = *uri
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return Job{}, nil, false, err
+		return Chunk{}, nil, false, err
 	}
-	return job, body, true, nil
+	return chunk, body, true, nil
 }
 
-// process runs the job's runner and records its outcome.
-// runningJob is a job executing in this process, and the handle to stop it.
-type runningJob struct {
+// process runs the chunk's runner and records its outcome. runningChunk is a
+// chunk executing in this process, and the handle to stop it.
+type runningChunk struct {
 	cancel    context.CancelFunc
 	cancelled bool // set when a cancel was requested, so the outcome says so
 }
 
-func (q *Queue) process(ctx context.Context, job Job, input []byte, runner Runner) {
+func (q *Queue) process(ctx context.Context, chunk Chunk, input []byte, runner Runner) {
 	start := time.Now()
-	log.Printf("queue: job %s running (kind=%s, ip=%s)", job.ID, job.Kind, job.ClientIP)
+	log.Printf("queue: chunk %s running (kind=%s, ip=%s)", chunk.ID, chunk.Kind, chunk.ClientIP)
 
-	// A context per job, so cancelling one does not touch the others this
+	// A context per chunk, so cancelling one does not touch the others this
 	// worker has run or will run.
 	runCtx, cancel := context.WithCancel(ctx)
-	rj := &runningJob{cancel: cancel}
+	rj := &runningChunk{cancel: cancel}
 	q.mu.Lock()
-	q.running[job.ID] = rj
+	q.running[chunk.ID] = rj
 	q.mu.Unlock()
 	defer func() {
 		cancel()
 		q.mu.Lock()
-		delete(q.running, job.ID)
+		delete(q.running, chunk.ID)
 		q.mu.Unlock()
 	}()
 
-	out, err := runner(runCtx, job, input)
+	out, err := runner(runCtx, chunk, input)
 
 	q.mu.Lock()
 	cancelled := rj.cancelled
@@ -1348,56 +1382,58 @@ func (q *Queue) process(ctx context.Context, job Job, input []byte, runner Runne
 	if cancelled {
 		// Whatever the subprocess reported on the way down, the reason it went
 		// down is known and is not a failure.
-		log.Printf("queue: job %s cancelled after %s",
-			job.ID, time.Since(start).Round(time.Millisecond))
-		q.finish(ctx, job.ID, StatusCancelled, "cancelled", Outcome{})
+		log.Printf("queue: chunk %s cancelled after %s",
+			chunk.ID, time.Since(start).Round(time.Millisecond))
+		q.finish(ctx, chunk.ID, StatusCancelled, "cancelled", Outcome{})
 		return
 	}
 	if err != nil {
-		log.Printf("queue: job %s failed after %s: %v",
-			job.ID, time.Since(start).Round(time.Millisecond), err)
-		q.finish(ctx, job.ID, StatusError, err.Error(), Outcome{})
+		log.Printf("queue: chunk %s failed after %s: %v",
+			chunk.ID, time.Since(start).Round(time.Millisecond), err)
+		q.finish(ctx, chunk.ID, StatusError, err.Error(), Outcome{})
 		return
 	}
-	q.finish(ctx, job.ID, StatusDone, "", out)
-	log.Printf("queue: job %s done (%d variant(s) in %s)",
-		job.ID, out.N, time.Since(start).Round(time.Millisecond))
+	q.finish(ctx, chunk.ID, StatusDone, "", out)
+	log.Printf("queue: chunk %s done (%d variant(s) in %s)",
+		chunk.ID, out.N, time.Since(start).Round(time.Millisecond))
 }
 
-// finish records a job's terminal state and its result (if any), then notifies
-// anyone blocked in WaitFor. Status, result and notification commit together, so
-// a waiter woken by the NOTIFY always finds the row already terminal.
+// finish records a chunk's terminal state and its result (if any), then
+// notifies anyone blocked in WaitFor. Status, result and notification commit
+// together, so a waiter woken by the NOTIFY always finds the row already
+// terminal.
 func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outcome) {
-	// Use a background context for the write: the job itself may have been
+	// Use a background context for the write: the chunk itself may have been
 	// cancelled, but its outcome still has to be persisted.
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
 	tx, err := q.pool.Begin(wctx)
 	if err != nil {
-		log.Printf("queue: finish job %s: %v", id, err)
+		log.Printf("queue: finish chunk %s: %v", id, err)
 		return
 	}
 	defer tx.Rollback(wctx) //nolint:errcheck // no-op after Commit
 
 	if out.Result != nil {
 		if _, err := tx.Exec(wctx,
-			`INSERT INTO job_result (job_id,json,vcf_uri) VALUES ($1,$2,$3)
-			 ON CONFLICT (job_id) DO UPDATE
+			`INSERT INTO chunk_result (chunk_id,json,vcf_uri) VALUES ($1,$2,$3)
+			 ON CONFLICT (chunk_id) DO UPDATE
 			    SET json = excluded.json, vcf_uri = excluded.vcf_uri`,
 			id, string(out.Result), nullable(out.VCFURI)); err != nil {
-			log.Printf("queue: store job %s result: %v", id, err)
+			log.Printf("queue: store chunk %s result: %v", id, err)
 			return
 		}
-		// Rows for querying. Same transaction as the blob and the status change, so
-		// a job is never observably "done" with results that are not yet queryable.
+		// Rows for querying. Same transaction as the blob and the status
+		// change, so a chunk is never observably "done" with results that are
+		// not yet queryable.
 		//
 		// Skipped for a download: its result is a file manifest, not variants, and
 		// forcing it through the variant projection would fail on a shape that was
 		// never meant to fit.
 		if out.Variants {
 			if err := insertVariants(wctx, tx, id, out.Result); err != nil {
-				log.Printf("queue: store job %s variants: %v", id, err)
+				log.Printf("queue: store chunk %s variants: %v", id, err)
 				return
 			}
 		}
@@ -1411,36 +1447,36 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		colArg = string(out.Columns)
 	}
 	if _, err := tx.Exec(wctx,
-		`UPDATE job SET status=$1, error=$2, n_variants=$3, finished_at=$4, columns=$5 WHERE id=$6`,
+		`UPDATE chunk SET status=$1, error=$2, n_variants=$3, finished_at=$4, columns=$5 WHERE id=$6`,
 		status, errArg, out.N, q.nowFn(), colArg, id); err != nil {
-		log.Printf("queue: finish job %s: %v", id, err)
+		log.Printf("queue: finish chunk %s: %v", id, err)
 		return
 	}
-	// Close this job's open attempt with the same outcome, in the same
+	// Close this chunk's open attempt with the same outcome, in the same
 	// transaction. Identified by "the one still open" rather than by number,
 	// because finish() is reached from paths that never saw the claim — and
-	// there is at most one, since claiming opens exactly one and every terminal
-	// path closes it.
+	// there is at most one, since claiming opens exactly one and every
+	// terminal path closes it.
 	//
-	// No row is a normal case, not an error: a queued job cancelled before any
-	// worker took it never had an attempt.
+	// No row is a normal case, not an error: a queued chunk cancelled before
+	// any worker took it never had an attempt.
 	if _, err := tx.Exec(wctx, `
-		UPDATE job_attempt SET ended_at=$2, outcome=$3, error=$4
-		 WHERE job_id=$1 AND outcome IS NULL`,
+		UPDATE chunk_attempt SET ended_at=$2, outcome=$3, error=$4
+		 WHERE chunk_id=$1 AND outcome IS NULL`,
 		id, q.nowFn(), status, errArg); err != nil {
-		log.Printf("queue: close attempt for job %s: %v", id, err)
+		log.Printf("queue: close attempt for chunk %s: %v", id, err)
 		return
 	}
-	// In the same transaction as the finish, so the scheduler can never see a job
-	// completed without the charge for it having landed. Apart, a crash between
-	// the two would leave that caller's next job holding a position it has
-	// already spent.
+	// In the same transaction as the finish, so the scheduler can never see a
+	// chunk completed without the charge for it having landed. Apart, a crash
+	// between the two would leave that caller's next chunk holding a position
+	// it has already spent.
 	if err := chargeCaller(wctx, tx, id, q.nowFn()); err != nil {
-		log.Printf("queue: charge caller for job %s: %v", id, err)
+		log.Printf("queue: charge caller for chunk %s: %v", id, err)
 		return
 	}
 	if err := tx.Commit(wctx); err != nil {
-		log.Printf("queue: commit job %s: %v", id, err)
+		log.Printf("queue: commit chunk %s: %v", id, err)
 		return
 	}
 }
@@ -1456,24 +1492,25 @@ func nullable(s string) any {
 	return s
 }
 
-// chargeCaller records that a job's caller has just been served, which pushes the
-// rest of their queue behind everyone who has been waiting.
+// chargeCaller records that a chunk's caller has just been served, which
+// pushes the rest of their queue behind everyone who has been waiting.
 //
-// The identity is derived from the job row in SQL rather than from a Go field,
-// so it is the same expression the claim query orders by. Written twice, the two
-// could disagree — and a job charged to one identity while ordered under another
-// is a scheduler that quietly stops being fair.
+// The identity is derived from the chunk row in SQL rather than from a Go
+// field, so it is the same expression the claim query orders by. Written
+// twice, the two could disagree — and a chunk charged to one identity while
+// ordered under another is a scheduler that quietly stops being fair.
 //
 // GREATEST, not assignment: a cancel and a completion can land out of order, and
 // moving the timestamp backwards would hand back a turn that was already taken.
 //
-// A job with neither an account nor an address has no caller to be fair between,
-// so the WHERE drops it rather than filing everything anonymous under one key.
+// A chunk with neither an account nor an address has no caller to be fair
+// between, so the WHERE drops it rather than filing everything anonymous under
+// one key.
 func chargeCaller(ctx context.Context, tx pgx.Tx, id string, now int64) error {
 	_, err := tx.Exec(ctx, `
 		INSERT INTO queue_caller (who, last_finished_at)
 		SELECT COALESCE(NULLIF(user_id,''), client_ip), $2
-		  FROM job
+		  FROM chunk
 		 WHERE id = $1 AND COALESCE(NULLIF(user_id,''), client_ip) <> ''
 		ON CONFLICT (who) DO UPDATE
 		   SET last_finished_at = GREATEST(queue_caller.last_finished_at, excluded.last_finished_at)`,
@@ -1485,26 +1522,26 @@ func chargeCaller(ctx context.Context, tx pgx.Tx, id string, now int64) error {
 // to say which worker did something.
 func (q *Queue) WorkerID() string { return q.workerID }
 
-// AppendLog adds to a job's recorded output without reading it back first.
+// AppendLog adds to a chunk's recorded output without reading it back first.
 //
 // Concatenated in SQL rather than read-modify-written, so two writers — the
-// worker streaming its run, and a peer noting that the job was abandoned —
+// worker streaming its run, and a peer noting that the chunk was abandoned —
 // cannot lose each other's lines.
 func (q *Queue) AppendLog(ctx context.Context, id, s string) error {
 	_, err := q.pool.Exec(ctx, `
-		INSERT INTO job_log (job_id, output) VALUES ($1,$2)
-		ON CONFLICT (job_id) DO UPDATE SET output = job_log.output || EXCLUDED.output`,
+		INSERT INTO chunk_log (chunk_id, output) VALUES ($1,$2)
+		ON CONFLICT (chunk_id) DO UPDATE SET output = chunk_log.output || EXCLUDED.output`,
 		id, s)
 	return err
 }
 
-// RunningIDs returns the ids of jobs currently claimed and running.
+// RunningIDs returns the ids of chunks currently claimed and running.
 //
 // The queue is authoritative about what is in flight, which is what lets a
-// worker reclaim another's leftovers without guessing: scratch named after a job
-// not in this set belongs to nobody.
+// worker reclaim another's leftovers without guessing: scratch named after a
+// chunk not in this set belongs to nobody.
 func (q *Queue) RunningIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := q.pool.Query(ctx, `SELECT id FROM job WHERE status=$1`, StatusRunning)
+	rows, err := q.pool.Query(ctx, `SELECT id FROM chunk WHERE status=$1`, StatusRunning)
 	if err != nil {
 		return nil, err
 	}

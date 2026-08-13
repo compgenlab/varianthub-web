@@ -99,7 +99,7 @@ func TestTheAdmittedCapIsStampedOnTheJob(t *testing.T) {
 	}
 	defer pool.Close()
 	var n int
-	if err := pool.QueryRow(ctx, `SELECT max_variants FROM job LIMIT 1`).Scan(&n); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT max_variants FROM chunk LIMIT 1`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 5000 {

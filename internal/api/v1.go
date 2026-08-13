@@ -275,7 +275,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			Source: src, Ref: src.Ref(), Annotations: anns,
 			NeedsData: src.NeedsData(), State: st,
 			RequiresReference: src.RequiresReference(), IsReference: src.IsReference(),
-			GeneListGTF:       src.GeneListGTF(),
+			GeneListGTF: src.GeneListGTF(),
 		})
 	}
 	writeJSON(w, http.StatusOK, SourcesResponse{Sources: out})
@@ -452,7 +452,7 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	if len(loci) > 1 {
 		label = fmt.Sprintf("%s +%d more", loci[0], len(loci)-1)
 	}
-	s.submit(w, r, queue.NewJob{
+	s.submit(w, r, queue.NewChunk{
 		Kind:      queue.KindLocus,
 		Snapshot:  snapshot,
 		Selection: sel,
@@ -629,14 +629,14 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Every uploaded VCF goes through the split, whatever its size. A small one
-	// produces a single chunk, which is a batch of one and travels the same path
-	// as a batch of two hundred.
+	// produces a single chunk, which is a job of one chunk and travels the same
+	// path as a job of two hundred.
 	//
 	// There is deliberately no threshold. A threshold means two ways a
 	// submission can be processed, only one of which is exercised by ordinary
 	// use — so the other is the one that breaks, and it breaks for the largest
 	// files, which are the ones nobody wants to resubmit.
-	if !s.submit(w, r, queue.NewJob{
+	if !s.submit(w, r, queue.NewChunk{
 		ID:        id,
 		Kind:      queue.KindSplit,
 		Snapshot:  snapshot,
@@ -673,7 +673,7 @@ func anyOf(s string) any {
 // The boolean exists for the upload path: when the row cannot be written, the
 // object already in storage has to be removed, and the caller is the only one
 // that still knows where it is.
-func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) bool {
+func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewChunk) bool {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
 
 	// Stamped at submit, not read at dispatch. The limit a job runs under is the
@@ -704,7 +704,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	limit := clampInt(q.Get("limit"), 50, 1, 500)
 	offset := clampInt(q.Get("offset"), 0, 0, 1<<30)
 
-	f := queue.JobFilter{Status: strings.TrimSpace(q.Get("status"))}
+	f := queue.ChunkFilter{Status: strings.TrimSpace(q.Get("status"))}
 
 	// Annotation jobs only, by default. A download is operational work — it has no
 	// variants and no results table — so listing it alongside someone's
@@ -740,7 +740,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			f.Session = sess
 		} else {
 			writeJSON(w, http.StatusOK, JobsResponse{
-				Jobs: []queue.Job{}, Limit: limit, Offset: offset, Scoped: true,
+				Jobs: []queue.Chunk{}, Limit: limit, Offset: offset, Scoped: true,
 			})
 			return
 		}
@@ -751,7 +751,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if jobs == nil {
-		jobs = []queue.Job{}
+		jobs = []queue.Chunk{}
 	}
 	writeJSON(w, http.StatusOK, JobsResponse{
 		Jobs: jobs, Limit: limit, Offset: offset, Scoped: scoped,
@@ -760,24 +760,24 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 
 // lookupJob loads a job by id, writing the error response itself. It enforces
 // nothing — the caller decides which permission applies.
-func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
 	// Guarded like the catalog handlers are. This was unreachable while every
 	// job route required a credential first: the 401 came before anything
 	// touched the queue. Reading a shared link needs no credential, so an
 	// installation without a queue would have answered with a panic.
 	if s.queue == nil {
 		writeError(w, http.StatusServiceUnavailable, "job queue unavailable")
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	id := r.PathValue("id")
 	job, ok, err := s.queue.Get(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	return job, true
 }
@@ -786,15 +786,15 @@ func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Job, b
 //
 // Reading, not changing: an anonymous job's id is enough to read it, and not
 // enough to cancel it. See canView and owns.
-func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
 	job, ok := s.lookupJob(w, r)
 	if !ok {
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	if !s.trustedCaller(r) && !s.canView(r, job) {
 		// 404 rather than 403: confirming a job exists is itself a small leak.
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	return job, true
 }
@@ -807,7 +807,7 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 // makes an anonymous result shareable — it can be sent to a colleague or
 // reopened on another machine, for work that was anonymous to begin with and
 // has no account to protect.
-func (s *Server) canView(r *http.Request, job queue.Job) bool {
+func (s *Server) canView(r *http.Request, job queue.Chunk) bool {
 	if job.UserID == "" {
 		return true
 	}
@@ -825,7 +825,7 @@ func (s *Server) canView(r *http.Request, job queue.Job) bool {
 // For a job with an account, the account is the whole answer: the session id on
 // it is client-asserted, so honouring that as well would let anyone who learned
 // the string act as a signed-in user.
-func (s *Server) owns(r *http.Request, job queue.Job) bool {
+func (s *Server) owns(r *http.Request, job queue.Chunk) bool {
 	if job.UserID != "" {
 		return callerOf(r).UserID() == job.UserID
 	}
@@ -852,14 +852,14 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 //
 // Separate from job because the two genuinely differ for anonymous work: its
 // link is readable by anyone holding it, and cancellation is not.
-func (s *Server) ownedJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
+func (s *Server) ownedJob(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
 	job, ok := s.lookupJob(w, r)
 	if !ok {
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	if !s.trustedCaller(r) && !s.owns(r, job) {
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Job{}, false
+		return queue.Chunk{}, false
 	}
 	return job, true
 }
@@ -880,7 +880,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 			Detail: "job had already finished",
 		})
 		return
-	case errors.Is(err, queue.ErrNoSuchJob):
+	case errors.Is(err, queue.ErrNoSuchChunk):
 		writeError(w, http.StatusNotFound, "no such job")
 		return
 	case err != nil:

@@ -39,7 +39,7 @@ import (
 // The upload handler classified it once, when the file arrived, and recorded the
 // answer in that name; this is a consumer being told, not a fifth place deciding
 // for itself.
-func (s *Server) openJobInput(r *http.Request, job queue.Job) (io.Reader, func(), bool) {
+func (s *Server) openJobInput(r *http.Request, job queue.Chunk) (io.Reader, func(), bool) {
 	noop := func() {}
 
 	uri, stored, err := s.queue.InputRef(r.Context(), job.ID)
@@ -82,7 +82,7 @@ func (s *Server) openJobInput(r *http.Request, job queue.Job) (io.Reader, func()
 // Reports false when there is no stored input to merge onto — a job old enough
 // to have been swept, say — so the caller can fall back to rendering from rows
 // rather than failing a download outright.
-func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job queue.Job,
+func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job queue.Chunk,
 	cols []queue.Column, qy queue.ResultQuery) bool {
 
 	// Built when the job finished, by the worker that already had the file

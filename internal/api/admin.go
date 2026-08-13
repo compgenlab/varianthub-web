@@ -786,7 +786,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if len(label) > 80 {
 		label = fmt.Sprintf("%d sources", len(labels))
 	}
-	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+	id, err := s.queue.Enqueue(r.Context(), queue.NewChunk{
 		Kind:    queue.KindDownload,
 		Session: sessionOf(r),
 		UserID:  callerOf(r).UserID(),
@@ -853,7 +853,7 @@ func (s *Server) handleDeleteSource(w http.ResponseWriter, r *http.Request) {
 		if mErr != nil {
 			continue
 		}
-		jobID, qErr := s.queue.Enqueue(r.Context(), queue.NewJob{
+		jobID, qErr := s.queue.Enqueue(r.Context(), queue.NewChunk{
 			Kind:    queue.KindCleanup,
 			Session: sessionOf(r),
 			UserID:  callerOf(r).UserID(),
@@ -1008,7 +1008,7 @@ func (s *Server) handleMoveSource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	id, err := s.queue.Enqueue(r.Context(), queue.NewJob{
+	id, err := s.queue.Enqueue(r.Context(), queue.NewChunk{
 		Kind:      queue.KindMove,
 		Session:   sessionOf(r),
 		UserID:    callerOf(r).UserID(),

@@ -6,20 +6,20 @@ import (
 	"testing"
 )
 
-// seedResults inserts a finished job with n annotated variants.
-func seedResults(t *testing.T, q *Queue, jobID string, body, columns string) {
+// seedResults inserts a finished chunk with n annotated variants.
+func seedResults(t *testing.T, q *Queue, chunkID string, body, columns string) {
 	t.Helper()
 	ctx := context.Background()
 	if _, err := q.pool.Exec(ctx, `
-		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
-		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2)`, jobID, columns); err != nil {
+		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
+		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2)`, chunkID, columns); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := insertVariants(ctx, tx, jobID, []byte(body)); err != nil {
+	if err := insertVariants(ctx, tx, chunkID, []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -157,7 +157,7 @@ func TestResultsRejectsUnknownSort(t *testing.T) {
 	// A SQL-shaped key is rejected by the same check, so it never gets near the
 	// query. Proven by the table still being queryable afterwards.
 	if _, err := q.Results(context.Background(), "j1",
-		ResultQuery{Sort: `idx; DROP TABLE job_variant --`}); err == nil {
+		ResultQuery{Sort: `idx; DROP TABLE chunk_variant --`}); err == nil {
 		t.Fatal("a SQL-shaped sort key should be rejected")
 	}
 	page, err := q.Results(context.Background(), "j1", ResultQuery{})
@@ -215,8 +215,8 @@ func TestStreamResultsCoversWholeSet(t *testing.T) {
 	}
 }
 
-// Deleting a job must take its variants with it, or GC would leave orphans.
-func TestVariantsCascadeOnJobDelete(t *testing.T) {
+// Deleting a chunk must take its variants with it, or GC would leave orphans.
+func TestVariantsCascadeOnChunkDelete(t *testing.T) {
 	q := testQueue(t)
 	seedResults(t, q, "j1", testBody, testColumns)
 	ctx := context.Background()
@@ -226,11 +226,11 @@ func TestVariantsCascadeOnJobDelete(t *testing.T) {
 	}
 	var n int
 	if err := q.pool.QueryRow(ctx,
-		`SELECT count(*) FROM job_variant WHERE job_id='j1'`).Scan(&n); err != nil {
+		`SELECT count(*) FROM chunk_variant WHERE chunk_id='j1'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {
-		t.Errorf("%d orphaned variant rows after job GC", n)
+		t.Errorf("%d orphaned variant rows after chunk GC", n)
 	}
 }
 

@@ -6,25 +6,25 @@ import (
 	"testing"
 )
 
-// expire makes a running job's lease look lapsed, which is what a killed worker
-// leaves behind: the row says running, and nothing is renewing it.
+// expire makes a running chunk's lease look lapsed, which is what a killed
+// worker leaves behind: the row says running, and nothing is renewing it.
 func expire(t *testing.T, q *Queue, id string) {
 	t.Helper()
 	if _, err := q.pool.Exec(context.Background(),
-		`UPDATE job SET lease_until = 1 WHERE id = $1`, id); err != nil {
+		`UPDATE chunk SET lease_until = 1 WHERE id = $1`, id); err != nil {
 		t.Fatal(err)
 	}
 }
 
-// An abandoned job's own log has to say which worker dropped it. The reclaim
+// An abandoned chunk's own log has to say which worker dropped it. The reclaim
 // clears claimed_by, so read after the fact the identity is simply gone — and
 // "abandoned 3 times" with no worker named cannot be turned into "worker-7 is
 // losing all of them", which is the question when a pod is being OOM-killed.
-func TestAnAbandonedJobRecordsWhichWorkerLostIt(t *testing.T) {
+func TestAnAbandonedChunkRecordsWhichWorkerLostIt(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
@@ -44,7 +44,7 @@ func TestAnAbandonedJobRecordsWhichWorkerLostIt(t *testing.T) {
 		t.Fatalf("log: %v", err)
 	}
 	if !strings.Contains(logText, "stopped renewing the lease") {
-		t.Fatalf("the abandonment is not in the job's log: %q", logText)
+		t.Fatalf("the abandonment is not in the chunk's log: %q", logText)
 	}
 	// The worker that claimed it, by name — not the generic phrasing used only
 	// when claimed_by was somehow empty.
@@ -53,14 +53,15 @@ func TestAnAbandonedJobRecordsWhichWorkerLostIt(t *testing.T) {
 	}
 }
 
-// Abandonment is counted apart from failure. A failure is the job going wrong; an
-// abandonment is the process running it disappearing, and folding them together
-// would hide a deployment losing capacity inside an ordinary error rate.
+// Abandonment is counted apart from failure. A failure is the chunk going
+// wrong; an abandonment is the process running it disappearing, and folding
+// them together would hide a deployment losing capacity inside an ordinary
+// error rate.
 func TestStatsCountAbandonmentApartFromFailure(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {

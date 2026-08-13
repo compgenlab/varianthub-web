@@ -6,10 +6,10 @@ import (
 	"time"
 )
 
-// StartListener runs a goroutine holding one dedicated connection that LISTENs on
-// the queue's notification channels, until ctx is cancelled. It is what picks a
-// queued job up promptly and what lets a cancellation reach the replica actually
-// running the job.
+// StartListener runs a goroutine holding one dedicated connection that LISTENs
+// on the queue's notification channels, until ctx is cancelled. It is what
+// picks a queued chunk up promptly and what lets a cancellation reach the
+// replica actually running the chunk.
 //
 // The worker calls this; the API server has no use for it, having nothing to be
 // woken about. Everything still works without it — wake-ups fall back to a 1s
@@ -62,11 +62,11 @@ func (q *Queue) listen(ctx context.Context) error {
 	}
 }
 
-// stopLocal cancels a job this process is running.
+// stopLocal cancels a chunk this process is running.
 //
-// A cancel for a job running in another replica finds nothing here and is
+// A cancel for a chunk running in another replica finds nothing here and is
 // ignored, which is correct: every replica listens, so the one holding it will
-// act. A cancel for a job that has already finished likewise does nothing.
+// act. A cancel for a chunk that has already finished likewise does nothing.
 func (q *Queue) stopLocal(id string) {
 	q.mu.Lock()
 	rj := q.running[id]
@@ -79,6 +79,6 @@ func (q *Queue) stopLocal(id string) {
 	if rj == nil {
 		return
 	}
-	log.Printf("queue: cancelling job %s", id)
+	log.Printf("queue: cancelling chunk %s", id)
 	rj.cancel()
 }

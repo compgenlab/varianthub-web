@@ -12,9 +12,9 @@ import (
 // worker treats it as abandoned.
 //
 // Generous, because the cost of being wrong in each direction is asymmetric: a
-// live build whose directory is removed loses one job, which requeues; a stale
-// one left behind is permanent. A build step that touches nothing under its own
-// workdir for half a day is not a step that is still running.
+// live build whose directory is removed loses one chunk, which requeues; a
+// stale one left behind is permanent. A build step that touches nothing under
+// its own workdir for half a day is not a step that is still running.
 const ScratchMaxAge = 12 * time.Hour
 
 // SweepScratch removes abandoned varhub workdirs from dir, returning how many it
@@ -98,28 +98,34 @@ func newestMTime(root string) (time.Time, int64, error) {
 	return newest, size, nil
 }
 
-// jobScratchPrefix marks a scratch directory as belonging to one job.
-const jobScratchPrefix = "vhw-job-"
-
-// JobScratchDir is where a job's varhub invocation stages its work.
+// chunkScratchPrefix marks a scratch directory as belonging to one chunk.
 //
-// Named after the job so that what it leaves behind can be attributed. varhub
+// The string still says "job", from when a chunk was called one. It is a name
+// on disk rather than a name in the code, and this sweep is the only thing that
+// reclaims these directories — the age-based one above matches "varhub-" and
+// would never see them. Changing it would strand every directory a running
+// deployment had already written.
+const chunkScratchPrefix = "vhw-job-"
+
+// ChunkScratchDir is where a chunk's varhub invocation stages its work.
+//
+// Named after the chunk so that what it leaves behind can be attributed. varhub
 // removes its own temp dirs on every path it can return from, and none where it
 // is killed — an OOM or a rolling restart orphans whatever it had staged. Age
 // alone cannot judge those: workers share this directory, so a recent orphan
 // and a peer's live build look identical.
-func JobScratchDir(jobID string) string {
-	return filepath.Join(os.TempDir(), jobScratchPrefix+jobID)
+func ChunkScratchDir(chunkID string) string {
+	return filepath.Join(os.TempDir(), chunkScratchPrefix+chunkID)
 }
 
-// SweepJobScratch removes job-scoped scratch for jobs that are no longer
+// SweepChunkScratch removes chunk-scoped scratch for chunks that are no longer
 // running, returning how many directories it removed and the bytes freed.
 //
-// live is the set of job ids the queue still has running. Anything else is
+// live is the set of chunk ids the queue still has running. Anything else is
 // finished, failed or abandoned, and its scratch is reclaimable immediately —
 // no age threshold, because the queue is authoritative about what is in flight
 // and a directory carries the id to check against it.
-func SweepJobScratch(dir string, live map[string]bool, logf func(string, ...any)) (int, int64, error) {
+func SweepChunkScratch(dir string, live map[string]bool, logf func(string, ...any)) (int, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return 0, 0, err
@@ -127,10 +133,10 @@ func SweepJobScratch(dir string, live map[string]bool, logf func(string, ...any)
 	var n int
 	var freed int64
 	for _, e := range entries {
-		if !e.IsDir() || !strings.HasPrefix(e.Name(), jobScratchPrefix) {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), chunkScratchPrefix) {
 			continue
 		}
-		id := strings.TrimPrefix(e.Name(), jobScratchPrefix)
+		id := strings.TrimPrefix(e.Name(), chunkScratchPrefix)
 		if live[id] {
 			continue // a worker somewhere is still running this
 		}
@@ -140,7 +146,7 @@ func SweepJobScratch(dir string, live map[string]bool, logf func(string, ...any)
 			size = 0
 		}
 		if err := os.RemoveAll(p); err != nil {
-			logf("could not remove scratch for job %s: %v", id, err)
+			logf("could not remove scratch for chunk %s: %v", id, err)
 			continue
 		}
 		n++

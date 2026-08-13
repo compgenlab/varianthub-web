@@ -6,14 +6,14 @@ import (
 	"testing"
 )
 
-// A small submission still travels inline. Round-tripping a few hundred bytes of
-// loci through object storage would cost more than it saves, and the vast
-// majority of jobs are that.
+// A small submission still travels inline. Round-tripping a few hundred bytes
+// of loci through object storage would cost more than it saves, and the vast
+// majority of chunks are that.
 func TestASmallInputIsCarriedInline(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
@@ -35,15 +35,15 @@ func TestASmallInputIsCarriedInline(t *testing.T) {
 	}
 }
 
-// A stored input is a URI and no bytes, and Input reporting "no body" for it is
-// the normal case — not an error, and not something a caller may treat as a job
-// with nothing in it.
+// A stored input is a URI and no bytes, and Input reporting "no body" for it
+// is the normal case — not an error, and not something a caller may treat as a
+// chunk with nothing in it.
 func TestAStoredInputIsAReferenceNotBytes(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/abc/input.vcf.gz"
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	})
 	if err != nil {
@@ -55,7 +55,7 @@ func TestAStoredInputIsAReferenceNotBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !stored {
-		t.Fatal("a job enqueued with a URI reports no stored input")
+		t.Fatal("a chunk enqueued with a URI reports no stored input")
 	}
 	if got != uri {
 		t.Errorf("InputRef = %q, want %q", got, uri)
@@ -63,7 +63,7 @@ func TestAStoredInputIsAReferenceNotBytes(t *testing.T) {
 
 	body, ok, err := q.Input(ctx, id)
 	if err != nil {
-		t.Fatalf("Input on a stored job errored: %v", err)
+		t.Fatalf("Input on a stored chunk errored: %v", err)
 	}
 	if ok || body != nil {
 		t.Errorf("Input returned %d bytes for a stored input; this process should "+
@@ -79,18 +79,18 @@ func TestAClaimCarriesTheInputLocation(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/def/input.vcf"
 
-	if _, err := q.Enqueue(ctx, NewJob{
+	if _, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	}); err != nil {
 		t.Fatal(err)
 	}
 
-	job, body, ok, err := q.claimNext(ctx)
+	chunk, body, ok, err := q.claimNext(ctx)
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	if job.InputURI != uri {
-		t.Errorf("claimed job has InputURI %q, want %q", job.InputURI, uri)
+	if chunk.InputURI != uri {
+		t.Errorf("claimed chunk has InputURI %q, want %q", chunk.InputURI, uri)
 	}
 	if len(body) != 0 {
 		t.Errorf("the claim returned %d bytes; a stored input must not be read here — "+
@@ -100,14 +100,14 @@ func TestAClaimCarriesTheInputLocation(t *testing.T) {
 
 // Exactly one source, enforced by the database rather than by convention.
 //
-// Neither is a job that can be claimed and then cannot run. Both is two inputs
-// with no rule about which one is the submission. Either would be found by a
-// worker rather than by the request that caused it.
-func TestAJobInputMustHaveExactlyOneSource(t *testing.T) {
+// Neither is a chunk that can be claimed and then cannot run. Both is two
+// inputs with no rule about which one is the submission. Either would be found
+// by a worker rather than by the request that caused it.
+func TestAChunkInputMustHaveExactlyOneSource(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
@@ -116,7 +116,7 @@ func TestAJobInputMustHaveExactlyOneSource(t *testing.T) {
 
 	// Both: rejected.
 	_, err = q.pool.Exec(ctx,
-		`UPDATE job_input SET uri = 's3://b/k' WHERE job_id = $1`, id)
+		`UPDATE chunk_input SET uri = 's3://b/k' WHERE chunk_id = $1`, id)
 	if err == nil {
 		t.Error("a row with both a body and a URI was accepted")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "job_input_one_source") {
@@ -125,7 +125,7 @@ func TestAJobInputMustHaveExactlyOneSource(t *testing.T) {
 
 	// Neither: rejected.
 	_, err = q.pool.Exec(ctx,
-		`UPDATE job_input SET body = NULL WHERE job_id = $1`, id)
+		`UPDATE chunk_input SET body = NULL WHERE chunk_id = $1`, id)
 	if err == nil {
 		t.Error("a row with neither a body nor a URI was accepted")
 	} else if !strings.Contains(strings.ToLower(err.Error()), "job_input_one_source") {
@@ -141,7 +141,7 @@ func TestAURIWinsWhenACallerSetsBoth(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/ghi/input.vcf"
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindVCF, Snapshot: "s", UserID: "u",
 		Body: []byte("stale"), InputURI: uri,
 	})
@@ -164,7 +164,7 @@ func TestAnEmptyBodyIsStillABody(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewJob{Kind: KindLocus, Snapshot: "s", UserID: "u"})
+	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", UserID: "u"})
 	if err != nil {
 		t.Fatalf("enqueue with no body: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestDroppingAnInputReportsTheObjectToDelete(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/jkl/input.vcf"
 
-	id, err := q.Enqueue(ctx, NewJob{
+	id, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	})
 	if err != nil {
@@ -207,18 +207,18 @@ func TestDroppingAnInputReportsTheObjectToDelete(t *testing.T) {
 	}
 
 	// Dropping an inline input is fine and reports no object.
-	id2, err := q.Enqueue(ctx, NewJob{
+	id2, err := q.Enqueue(ctx, NewChunk{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got, err := q.DropInput(ctx, id2); err != nil || got != "" {
-		t.Errorf("DropInput on an inline job = %q (err %v), want no object", got, err)
+		t.Errorf("DropInput on an inline chunk = %q (err %v), want no object", got, err)
 	}
 
 	// And dropping something already gone is not an error — the sweep and an
-	// explicit cleanup can both reach the same job.
+	// explicit cleanup can both reach the same chunk.
 	if got, err := q.DropInput(ctx, id); err != nil || got != "" {
 		t.Errorf("second DropInput = %q (err %v), want a quiet no-op", got, err)
 	}

@@ -204,8 +204,8 @@ func TestAMissingChunkFailsBeforeWritingAnything(t *testing.T) {
 	}
 }
 
-// Joining nothing is an error rather than an empty file, which would be a
-// batch reporting success with no results.
+// Joining nothing is an error rather than an empty file, which would be
+// a job reporting success with no results.
 func TestJoiningNothingIsAnError(t *testing.T) {
 	if err := Join(context.Background(), nil, filepath.Join(t.TempDir(), "x.vcf.gz")); err == nil {
 		t.Error("joining zero chunks produced a file")

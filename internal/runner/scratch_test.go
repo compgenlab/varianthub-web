@@ -113,12 +113,12 @@ func TestSweepTouchesNothingElse(t *testing.T) {
 
 // The case the age sweep structurally cannot handle: a job OOM-killed seconds
 // ago leaves a workdir that is both very recent and certainly dead.
-func TestJobScratchIsReclaimedImmediatelyWhenTheJobIsNotRunning(t *testing.T) {
+func TestChunkScratchIsReclaimedImmediatelyWhenTheChunkIsNotRunning(t *testing.T) {
 	dir := t.TempDir()
-	dead := filepath.Join(dir, jobScratchPrefix+"deadjob")
+	dead := filepath.Join(dir, chunkScratchPrefix+"deadjob")
 	mkTree(t, dead, 10*time.Second, 4096) // seconds old, not hours
 
-	n, freed, err := SweepJobScratch(dir, map[string]bool{}, func(string, ...any) {})
+	n, freed, err := SweepChunkScratch(dir, map[string]bool{}, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,12 +142,12 @@ func TestJobScratchIsReclaimedImmediatelyWhenTheJobIsNotRunning(t *testing.T) {
 
 // A running job's scratch is untouchable, however old it looks. A long
 // provisioning run is exactly the thing that looks stale and must not be.
-func TestRunningJobScratchIsLeftAlone(t *testing.T) {
+func TestRunningChunkScratchIsLeftAlone(t *testing.T) {
 	dir := t.TempDir()
-	live := filepath.Join(dir, jobScratchPrefix+"livejob")
+	live := filepath.Join(dir, chunkScratchPrefix+"livejob")
 	mkTree(t, live, 72*time.Hour, 4096) // three days old, still running
 
-	n, _, err := SweepJobScratch(dir, map[string]bool{"livejob": true}, func(string, ...any) {})
+	n, _, err := SweepChunkScratch(dir, map[string]bool{"livejob": true}, func(string, ...any) {})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,13 +161,13 @@ func TestRunningJobScratchIsLeftAlone(t *testing.T) {
 
 // The directory name has to round-trip, or the sweep compares ids that never
 // match and deletes live work.
-func TestJobScratchDirRoundTrips(t *testing.T) {
+func TestChunkScratchDirRoundTrips(t *testing.T) {
 	const id = "bae30d25b27072bd790dceed822382e0"
-	got := JobScratchDir(id)
-	if filepath.Base(got) != jobScratchPrefix+id {
-		t.Fatalf("JobScratchDir(%q) = %q", id, got)
+	got := ChunkScratchDir(id)
+	if filepath.Base(got) != chunkScratchPrefix+id {
+		t.Fatalf("ChunkScratchDir(%q) = %q", id, got)
 	}
-	if strings.TrimPrefix(filepath.Base(got), jobScratchPrefix) != id {
+	if strings.TrimPrefix(filepath.Base(got), chunkScratchPrefix) != id {
 		t.Fatalf("id does not survive the round trip through %q", got)
 	}
 }

@@ -126,7 +126,7 @@ func Join(ctx context.Context, chunks []string, dest string) error {
 	return nil
 }
 
-// ChunkName is where a chunk's annotated output is stored within a batch.
+// ChunkName is where a chunk's annotated output is stored within a job.
 //
 // Numbered from 1 and zero-padded, matching what cgkit vcf-split produces and
 // what vcf-concat --chunks looks for. Keeping the same shape means the series

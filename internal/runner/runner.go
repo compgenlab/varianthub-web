@@ -802,7 +802,7 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	// the rest, since a directory named after a job the queue no longer has
 	// running can be reclaimed by any worker without guessing at its age.
 	if req.JobID != "" {
-		scratch := JobScratchDir(req.JobID)
+		scratch := ChunkScratchDir(req.JobID)
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return DownloadResult{}, fmt.Errorf("scratch %s: %w", scratch, err)
 		}
@@ -825,7 +825,7 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		req.Sink("··· exec: " + bin + " " + strings.Join(args, " "))
 		req.Sink("··· VARHUB_HOME=" + home)
 		if req.JobID != "" {
-			req.Sink("··· TMPDIR=" + JobScratchDir(req.JobID))
+			req.Sink("··· TMPDIR=" + ChunkScratchDir(req.JobID))
 		}
 	}
 	if err := cmd.Start(); err != nil {

@@ -23,7 +23,7 @@ func TestWhoMayViewAndWhoMayCancel(t *testing.T) {
 	s := &Server{}
 
 	t.Run("anonymous job is readable by a stranger", func(t *testing.T) {
-		job := queue.Job{ID: "abc", UserID: "", Session: "submitters-session"}
+		job := queue.Chunk{ID: "abc", UserID: "", Session: "submitters-session"}
 		r := httptest.NewRequest("GET", "/api/v1/jobs/abc", nil)
 		if !s.canView(r, job) {
 			t.Error("a shared anonymous link could not be read")
@@ -31,7 +31,7 @@ func TestWhoMayViewAndWhoMayCancel(t *testing.T) {
 	})
 
 	t.Run("anonymous job is not cancellable by a stranger", func(t *testing.T) {
-		job := queue.Job{ID: "abc", UserID: "", Session: "submitters-session"}
+		job := queue.Chunk{ID: "abc", UserID: "", Session: "submitters-session"}
 		r := httptest.NewRequest("POST", "/api/v1/jobs/abc/cancel", nil)
 		if s.owns(r, job) {
 			t.Error("holding the link was enough to cancel someone else's run")
@@ -39,7 +39,7 @@ func TestWhoMayViewAndWhoMayCancel(t *testing.T) {
 	})
 
 	t.Run("signed-in job is private to its account", func(t *testing.T) {
-		job := queue.Job{ID: "abc", UserID: "user-1"}
+		job := queue.Chunk{ID: "abc", UserID: "user-1"}
 		r := httptest.NewRequest("GET", "/api/v1/jobs/abc", nil)
 		if s.canView(r, job) {
 			t.Error("a signed-in user's result was readable by an unauthenticated caller")
@@ -50,7 +50,7 @@ func TestWhoMayViewAndWhoMayCancel(t *testing.T) {
 		// The case that would quietly undo the split: a caller with no session
 		// matching a job whose session is also empty would make every anonymous
 		// job cancellable by anybody.
-		job := queue.Job{ID: "abc", UserID: "", Session: ""}
+		job := queue.Chunk{ID: "abc", UserID: "", Session: ""}
 		r := httptest.NewRequest("POST", "/api/v1/jobs/abc/cancel", nil)
 		if s.owns(r, job) {
 			t.Error("empty session matched empty session; anonymous jobs are cancellable by anyone")
