@@ -1,0 +1,358 @@
+package queue
+
+import (
+	"context"
+	"testing"
+)
+
+// enqueueOne queues a trivial locus job and returns its id.
+func enqueueOne(t *testing.T, q *Queue, user string) string {
+	t.Helper()
+	id, err := q.Enqueue(context.Background(), NewJob{
+		Kind: KindLocus, Snapshot: "s", UserID: user, Body: []byte("chr1:1:A:T"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+// claimAndAbandon simulates a worker being killed: it claims whatever is next,
+// lets that job's lease lapse, and sweeps — which is what a killed pod leaves
+// behind. Returns the job it actually claimed.
+//
+// It expires the claimed id rather than one the caller names, because an
+// abandoned job goes back on the queue: after the first abandonment the next
+// claim may well pick the same job up again rather than the one just enqueued.
+// Assuming otherwise expires a queued job, which the sweep correctly ignores,
+// and the test then measures nothing.
+func claimAndAbandon(t *testing.T, q *Queue) string {
+	t.Helper()
+	ctx := context.Background()
+	job, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+	expire(t, q, job.ID)
+	if _, err := q.ReclaimExpired(ctx); err != nil {
+		t.Fatal(err)
+	}
+	return job.ID
+}
+
+// Claiming opens an attempt; finishing closes it with the outcome.
+func TestAnAttemptIsOpenedOnClaimAndClosedOnFinish(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	job, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
+	}
+
+	open, err := q.JobAttempts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(open) != 1 {
+		t.Fatalf("claiming recorded %d attempts, want 1", len(open))
+	}
+	if open[0].Worker != q.WorkerID() {
+		t.Errorf("attempt worker = %q, want %q", open[0].Worker, q.WorkerID())
+	}
+	if open[0].StartedAt == 0 {
+		t.Error("attempt has no start time")
+	}
+	// Still in flight: an outcome now would mean the row is closed before the
+	// work is, and "how long has this attempt been running" is exactly the
+	// question asked of a job that seems stuck.
+	if open[0].Outcome != "" || open[0].EndedAt != 0 {
+		t.Errorf("attempt closed while still running: %+v", open[0])
+	}
+
+	q.finish(ctx, job.ID, StatusDone, "", Outcome{})
+
+	done, err := q.JobAttempts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(done) != 1 {
+		t.Fatalf("finishing changed the attempt count to %d", len(done))
+	}
+	if done[0].Outcome != OutcomeDone {
+		t.Errorf("outcome = %q, want %q", done[0].Outcome, OutcomeDone)
+	}
+	if done[0].EndedAt == 0 {
+		t.Error("a finished attempt has no end time")
+	}
+}
+
+// The attempt number tracks job.attempts, so the two records can be reconciled.
+// If they drift, one of them is wrong and there is no way to tell which.
+func TestTheAttemptNumberMatchesTheJobCounter(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	claimAndAbandon(t, q)
+	claimAndAbandon(t, q)
+
+	attempts, err := q.JobAttempts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("recorded %d attempts, want 2", len(attempts))
+	}
+	var counter int
+	if err := q.pool.QueryRow(ctx, `SELECT attempts FROM job WHERE id=$1`, id).
+		Scan(&counter); err != nil {
+		t.Fatal(err)
+	}
+	if got := attempts[len(attempts)-1].N; got != counter {
+		t.Errorf("last attempt is #%d but job.attempts = %d; the two records disagree",
+			got, counter)
+	}
+}
+
+// The row this table exists for: after the sweep, job.claimed_by is NULL and the
+// only surviving record of which process died is the attempt.
+func TestAnAbandonedAttemptKeepsTheWorkerTheJobRowLoses(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+	worker := q.WorkerID()
+
+	claimAndAbandon(t, q)
+
+	// The job row has genuinely forgotten.
+	var claimedBy *string
+	if err := q.pool.QueryRow(ctx, `SELECT claimed_by FROM job WHERE id=$1`, id).
+		Scan(&claimedBy); err != nil {
+		t.Fatal(err)
+	}
+	if claimedBy != nil && *claimedBy != "" {
+		t.Fatalf("claimed_by = %q; this test is not testing what it thinks", *claimedBy)
+	}
+
+	attempts, err := q.JobAttempts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 1 {
+		t.Fatalf("recorded %d attempts, want 1", len(attempts))
+	}
+	a := attempts[0]
+	if a.Worker != worker {
+		t.Errorf("the abandoned attempt names %q, want %q — the identity is lost", a.Worker, worker)
+	}
+	if !a.Abandoned() {
+		t.Errorf("outcome = %q, want %q", a.Outcome, OutcomeAbandoned)
+	}
+	if a.EndedAt == 0 {
+		t.Error("an abandoned attempt was left open; nothing would ever close it")
+	}
+}
+
+// Each attempt keeps its own error. A job that fails differently every time is a
+// different diagnosis from one that fails the same way three times, and job.error
+// holds only the last.
+func TestEachAttemptKeepsItsOwnError(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	// Abandoned once, then a genuine failure.
+	claimAndAbandon(t, q)
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("re-claim: %v ok=%v", err, ok)
+	}
+	q.finish(ctx, id, StatusError, "reference FASTA missing", Outcome{})
+
+	attempts, err := q.JobAttempts(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(attempts) != 2 {
+		t.Fatalf("recorded %d attempts, want 2", len(attempts))
+	}
+	if !attempts[0].Abandoned() {
+		t.Errorf("attempt 1 outcome = %q, want %q", attempts[0].Outcome, OutcomeAbandoned)
+	}
+	if attempts[0].Error != "" {
+		t.Errorf("an abandoned attempt reported an error (%q); its worker never got to",
+			attempts[0].Error)
+	}
+	if attempts[1].Outcome != OutcomeError {
+		t.Errorf("attempt 2 outcome = %q, want %q", attempts[1].Outcome, OutcomeError)
+	}
+	if attempts[1].Error != "reference FASTA missing" {
+		t.Errorf("attempt 2 error = %q, want the failure it reported", attempts[1].Error)
+	}
+}
+
+// The miscount the attempt record fixes.
+//
+// AbandonedExhausted used to be "status = error AND attempts >= MaxAttempts",
+// which cannot distinguish a job that ran out of attempts from one that was
+// abandoned a couple of times and then genuinely failed. The two want opposite
+// responses — more memory for the worker, versus a bad input — and the counter
+// reported them identically.
+func TestAJobThatFailsOnItsLastAttemptIsNotCountedAsAbandoned(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	// Lose MaxAttempts-1 workers, then fail for real on the last attempt.
+	for i := 0; i < MaxAttempts-1; i++ {
+		claimAndAbandon(t, q)
+	}
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("final claim: %v ok=%v", err, ok)
+	}
+	q.finish(ctx, id, StatusError, "bad VCF header", Outcome{})
+
+	// The precondition the old counter tripped on.
+	var counter int
+	if err := q.pool.QueryRow(ctx, `SELECT attempts FROM job WHERE id=$1`, id).
+		Scan(&counter); err != nil {
+		t.Fatal(err)
+	}
+	if counter < MaxAttempts {
+		t.Fatalf("attempts = %d; the old counter's predicate would not have fired", counter)
+	}
+
+	st, err := q.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.AbandonedExhausted != 0 {
+		t.Errorf("abandoned_exhausted = %d; this job failed on its own, it did not run out of attempts",
+			st.AbandonedExhausted)
+	}
+	if st.Failed != 1 {
+		t.Errorf("failed = %d, want 1", st.Failed)
+	}
+	// The abandonments still happened and are still counted as attempts — the
+	// job-level counter is what changed, not the history.
+	if st.AbandonedAttempts24h != int64(MaxAttempts-1) {
+		t.Errorf("abandoned_attempts_24h = %d, want %d", st.AbandonedAttempts24h, MaxAttempts-1)
+	}
+}
+
+// A rate, not a stock: a deployment losing an attempt regularly but retrying
+// successfully leaves no job in a bad state, so both job-level counters read
+// zero while something is plainly wrong.
+func TestAbandonmentsAreCountedEvenWhenTheJobLaterSucceeds(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	claimAndAbandon(t, q)
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("re-claim: %v ok=%v", err, ok)
+	}
+	q.finish(ctx, id, StatusDone, "", Outcome{})
+
+	st, err := q.Stats(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Succeeded != 1 {
+		t.Fatalf("succeeded = %d, want 1", st.Succeeded)
+	}
+	if st.AbandonedRetrying != 0 || st.AbandonedExhausted != 0 {
+		t.Errorf("the job-level counters should be clear: retrying=%d exhausted=%d",
+			st.AbandonedRetrying, st.AbandonedExhausted)
+	}
+	if st.AbandonedAttempts24h != 1 {
+		t.Errorf("abandoned_attempts_24h = %d, want 1 — the lost worker left no other trace",
+			st.AbandonedAttempts24h)
+	}
+}
+
+// "Is one worker losing all of them?" — the question job.attempts cannot answer,
+// because a counter of 2 looks the same whether one process lost both or two
+// processes lost one each.
+func TestWorkerHealthAttributesAbandonmentToTheProcessThatLostIt(t *testing.T) {
+	a, b := testQueuePair(t)
+	ctx := context.Background()
+
+	// "a" loses two attempts; "b" makes one and reports on it. Which job each
+	// picks up does not matter — the question is which *worker* the losses are
+	// attributed to.
+	enqueueOne(t, a, "u1")
+	claimAndAbandon(t, a)
+	enqueueOne(t, a, "u2")
+	claimAndAbandon(t, a)
+
+	enqueueOne(t, b, "u3")
+	claimed, _, ok, err := b.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("peer claim: %v ok=%v", err, ok)
+	}
+	// The job b actually claimed, not the one just enqueued: finishing some
+	// other job would close no attempt and leave b's own still open, and the
+	// assertion below would pass without meaning anything.
+	b.finish(ctx, claimed.ID, StatusDone, "", Outcome{})
+
+	health, err := a.WorkerHealthSince(ctx, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byWorker := map[string]WorkerHealth{}
+	for _, h := range health {
+		byWorker[h.Worker] = h
+	}
+	if got := byWorker[a.WorkerID()].Abandoned; got != 2 {
+		t.Errorf("worker a abandoned %d, want 2 (health: %+v)", got, health)
+	}
+	if got := byWorker[b.WorkerID()].Abandoned; got != 0 {
+		t.Errorf("worker b abandoned %d, want 0 — it reported on everything it took", got)
+	}
+	if got := byWorker[b.WorkerID()].Attempts; got != 1 {
+		t.Errorf("worker b made %d attempts, want 1", got)
+	}
+	// Worst first, so the process to look at is the one at the top.
+	if len(health) > 0 && health[0].Worker != a.WorkerID() {
+		t.Errorf("health is ordered %q first; the worst offender should lead", health[0].Worker)
+	}
+}
+
+// Attempts are history *of a job* and go when it does. Without the cascade the
+// TTL sweep would leave rows referencing jobs that no longer exist, growing
+// without bound.
+func TestAttemptsAreDeletedWithTheJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+	id := enqueueOne(t, q, "u")
+
+	// Abandoned once and then finished, so there are two attempts *and* the job
+	// is terminal. The sweep only collects jobs with a finished_at, so a job
+	// left queued after a reclaim keeps its history — correctly, since the job
+	// itself is still there.
+	claimAndAbandon(t, q)
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("re-claim: %v ok=%v", err, ok)
+	}
+	q.finish(ctx, id, StatusDone, "", Outcome{})
+
+	var n int
+	if err := q.pool.QueryRow(ctx, `SELECT count(*) FROM job_attempt`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n == 0 {
+		t.Fatal("no attempt was recorded; this test would pass vacuously")
+	}
+
+	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.pool.QueryRow(ctx, `SELECT count(*) FROM job_attempt`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Errorf("%d attempt row(s) outlived the job they describe", n)
+	}
+}

@@ -46,6 +46,16 @@ type Stats struct {
 	// deployment losing capacity; exhausted jobs are work that was thrown away.
 	AbandonedRetrying  int64 `json:"abandoned_retrying"`
 	AbandonedExhausted int64 `json:"abandoned_exhausted"`
+
+	// AbandonedAttempts24h counts abandonments rather than abandoned jobs, over
+	// the last day.
+	//
+	// The two counters above are stock levels — how many jobs are in that state
+	// right now — and a stock cannot show a rate. A deployment that loses an
+	// attempt every few minutes but retries successfully every time reads as
+	// zero on both, because no job is left sitting in a bad state; this is the
+	// number that moves.
+	AbandonedAttempts24h int64 `json:"abandoned_attempts_24h"`
 }
 
 // ActiveDownloads maps a source id to the download job currently working on it.
@@ -83,6 +93,14 @@ func (q *Queue) ActiveDownloads(ctx context.Context) (map[string]string, error) 
 // One query rather than six: the counters are read together for a dashboard, and
 // six round trips could disagree with each other while a job finished between
 // them.
+//
+// The abandonment counters read job_attempt rather than inferring from
+// job.attempts. Inferring was close but not correct: "status = error AND
+// attempts >= MaxAttempts" counts a job that was abandoned twice and then
+// genuinely failed on its last attempt as an abandonment, because a counter
+// records that a job was claimed three times without recording what happened on
+// any of them. Asking the attempt whose outcome is actually "abandoned" removes
+// the guess.
 func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 	now := q.nowFn()
 	var s Stats
@@ -97,13 +115,34 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		       coalesce(sum(n_variants) FILTER (WHERE status = $1), 0),
 		       count(*) FILTER (WHERE finished_at >= $5),
 		       count(*) FILTER (WHERE finished_at >= $6),
-		       count(*) FILTER (WHERE status = $3 AND attempts > 0),
-		       count(*) FILTER (WHERE status = $2 AND attempts >= $8)
-		  FROM job`,
+		       count(*) FILTER (WHERE status = $3 AND lost),
+		       count(*) FILTER (WHERE status = $2 AND last_lost)
+		  FROM (
+		    SELECT j.status, j.created_at, j.finished_at, j.n_variants,
+		           -- Any attempt was abandoned: this job has been retried after
+		           -- losing a worker.
+		           EXISTS (SELECT 1 FROM job_attempt a
+		                    WHERE a.job_id = j.id AND a.outcome = $8) AS lost,
+		           -- The *last* attempt was abandoned: the job ended because it
+		           -- ran out of attempts, not because it failed on its own.
+		           (SELECT a.outcome = $8 FROM job_attempt a
+		              WHERE a.job_id = j.id
+		              ORDER BY a.attempt DESC LIMIT 1) AS last_lost
+		      FROM job j
+		  ) t`,
 		StatusDone, StatusError, StatusQueued, StatusRunning,
-		now-24*3600, now-7*24*3600, StatusCancelled, MaxAttempts).
+		now-24*3600, now-7*24*3600, StatusCancelled, OutcomeAbandoned).
 		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Cancelled, &s.Queued, &s.Running,
 			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d,
 			&s.AbandonedRetrying, &s.AbandonedExhausted)
+	if err != nil {
+		return s, err
+	}
+	// Separate query because it counts a different thing: attempts, not jobs, so
+	// it cannot share the FROM above without either double-counting the job
+	// columns or duplicating rows across the join.
+	err = q.pool.QueryRow(ctx,
+		`SELECT count(*) FROM job_attempt WHERE outcome = $1 AND ended_at >= $2`,
+		OutcomeAbandoned, now-24*3600).Scan(&s.AbandonedAttempts24h)
 	return s, err
 }

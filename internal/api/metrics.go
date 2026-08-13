@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -177,7 +178,22 @@ type metricsResponse struct {
 	// sized, making RemoteBytes a floor.
 	RemoteMeasured bool  `json:"remote_measured"`
 	GeneratedAt    int64 `json:"generated_at"`
+
+	// Workers is each worker's recent attempt record, worst abandonment first.
+	//
+	// Here and not in the published API: a worker id names a process inside the
+	// deployment, which is an operator's business and nobody else's. This
+	// endpoint is admin-only, which is what makes it the right place for it.
+	Workers []queue.WorkerHealth `json:"workers,omitempty"`
 }
+
+// workerWindow is how far back handleMetrics summarises worker attempts.
+//
+// A day, matching the abandonment rate beside it. Long enough that an
+// intermittent problem is visible and short enough that a worker replaced this
+// morning does not keep a week-old failure on its record — the page is read to
+// answer "is something wrong now".
+const workerWindow = 24 * time.Hour
 
 // handleUsage reports who has been using the installation and how much.
 //
@@ -208,6 +224,15 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out.Jobs = jobs
+
+	// Best effort: an operator opening this page for the queue depth should not
+	// be handed an error because the per-worker roll-up failed.
+	if workers, wErr := s.queue.WorkerHealthSince(ctx,
+		time.Now().Add(-workerWindow).Unix()); wErr != nil {
+		log.Printf("api: worker health: %v", wErr)
+	} else {
+		out.Workers = workers
+	}
 
 	if s.catalog == nil {
 		writeJSON(w, http.StatusOK, out)

@@ -46,6 +46,24 @@ const (
 	StatusCancelled = "cancelled"
 )
 
+// How one attempt at a job ended, in job_attempt.outcome.
+//
+// Three of the four are the job statuses, deliberately: an attempt that
+// finished is an attempt that put the job into that state, and giving them
+// separate spellings would mean two vocabularies for one fact.
+//
+// The fourth has no status because it is not something a job can be. A job
+// abandoned twice and then completed is a done job; only the attempts remember
+// that anything went wrong, which is the whole reason they are recorded.
+const (
+	OutcomeDone      = StatusDone
+	OutcomeError     = StatusError
+	OutcomeCancelled = StatusCancelled
+	// OutcomeAbandoned is an attempt whose worker stopped renewing the lease —
+	// killed rather than failing, so it never reported anything.
+	OutcomeAbandoned = "abandoned"
+)
+
 // Job kinds.
 const (
 	KindLocus = "locus"
@@ -376,6 +394,26 @@ func (q *Queue) SetLease(ttl, renew time.Duration) {
 // A NULL lease is expired: rows claimed before leases existed have nobody
 // renewing them either, so they are abandoned by the same definition.
 func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
+	// Close the attempts of everything whose lease has lapsed, before either
+	// statement below changes the status they are selected by. One statement for
+	// both the retrying and the exhausted, because from the attempt's point of
+	// view they are the same event: a worker took this job and never came back.
+	// Whether the *job* gets another go is a separate decision, recorded on the
+	// job.
+	//
+	// This is the row nothing else preserves. finish() never ran for these — the
+	// process that would have called it is gone — so without this write the
+	// attempt's worker, its start and how long it survived are lost at the moment
+	// the reclaim clears claimed_by.
+	if _, err := q.pool.Exec(ctx, `
+		UPDATE job_attempt a
+		   SET ended_at=$1, outcome=$2
+		  FROM job j
+		 WHERE a.job_id = j.id AND a.outcome IS NULL
+		   AND j.status = $3 AND COALESCE(j.lease_until, 0) < $4`,
+		q.nowFn(), OutcomeAbandoned, StatusRunning, q.nowFn()); err != nil {
+		return 0, fmt.Errorf("close abandoned attempts: %w", err)
+	}
 	// Past MaxAttempts the job is failed rather than requeued. Without this a
 	// job that kills its worker every run came back forever, and each attempt
 	// cost whatever the previous one had produced — the scratch of a killed
@@ -945,6 +983,21 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 	if err != nil {
 		return Job{}, nil, false, err
 	}
+	// Open this attempt's history row in the claim transaction, so a claimed job
+	// always has one. Written apart, a crash in between would leave an attempt
+	// that ran and was never recorded — and the rows this table exists for are
+	// exactly the ones whose worker did not survive to write anything later.
+	//
+	// The attempt number is read back from the row the UPDATE just incremented
+	// rather than counted here, which is what keeps it equal to job.attempts
+	// instead of merely close to it.
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO job_attempt (job_id, attempt, worker, started_at)
+		SELECT id, attempts, $2, $3 FROM job WHERE id = $1
+		ON CONFLICT (job_id, attempt) DO NOTHING`,
+		job.ID, q.workerID, q.nowFn()); err != nil {
+		return Job{}, nil, false, err
+	}
 	// Read the body inside the same transaction, so a claim and its input are
 	// one atomic step: committing the claim and then failing to read the body
 	// would leave a job marked running that no worker is running.
@@ -1057,6 +1110,21 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		`UPDATE job SET status=$1, error=$2, n_variants=$3, finished_at=$4, columns=$5 WHERE id=$6`,
 		status, errArg, out.N, q.nowFn(), colArg, id); err != nil {
 		log.Printf("queue: finish job %s: %v", id, err)
+		return
+	}
+	// Close this job's open attempt with the same outcome, in the same
+	// transaction. Identified by "the one still open" rather than by number,
+	// because finish() is reached from paths that never saw the claim — and
+	// there is at most one, since claiming opens exactly one and every terminal
+	// path closes it.
+	//
+	// No row is a normal case, not an error: a queued job cancelled before any
+	// worker took it never had an attempt.
+	if _, err := tx.Exec(wctx, `
+		UPDATE job_attempt SET ended_at=$2, outcome=$3, error=$4
+		 WHERE job_id=$1 AND outcome IS NULL`,
+		id, q.nowFn(), status, errArg); err != nil {
+		log.Printf("queue: close attempt for job %s: %v", id, err)
 		return
 	}
 	// In the same transaction as the finish, so the scheduler can never see a job

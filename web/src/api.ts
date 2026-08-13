@@ -82,6 +82,33 @@ export interface JobStats {
   variants: number;
   last_24h: number;
   last_7d: number;
+  /**
+   * Jobs whose worker was killed rather than reporting: waiting on another
+   * attempt, and those that ran out of attempts. Apart from `failed`, because a
+   * failure is the job going wrong and this is the process running it
+   * disappearing — usually the container's memory limit.
+   */
+  abandoned_retrying: number;
+  abandoned_exhausted: number;
+  /**
+   * Abandonments over the last day, counted as attempts rather than jobs. The
+   * two counters above are stock levels, and a deployment that loses an attempt
+   * regularly but always succeeds on retry reads zero on both.
+   */
+  abandoned_attempts_24h: number;
+}
+
+/** One worker's recent record, for spotting a single bad process. */
+export interface WorkerHealth {
+  worker: string;
+  attempts: number;
+  abandoned: number;
+  /**
+   * Typical seconds an abandoned attempt survived. A worker killed partway
+   * through long jobs and one that dies on startup both show abandonments; this
+   * is what separates them.
+   */
+  median_abandoned_after?: number;
 }
 
 export interface StorageUsage {
@@ -123,6 +150,8 @@ export interface Metrics {
   remote_bytes: number;
   remote_measured: boolean;
   generated_at: number;
+  /** Per-worker attempt record over the last day; absent when nothing has run. */
+  workers?: WorkerHealth[];
 }
 
 export interface User {

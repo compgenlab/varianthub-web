@@ -135,14 +135,40 @@ type Config struct {
 	ElevatedConcurrent int
 	ElevatedPerHour    int
 
-	JobTimeout time.Duration // per-job wall clock
-	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
-	// default: a tool's one-time install fetches tens of gigabytes, and being
-	// killed partway leaves a half-populated data directory that the next
-	// attempt has to redo from the start.
+	// JobTimeout bounds a single annotation job's wall clock.
+	//
+	// Twelve hours by default, which is a ceiling rather than an expectation:
+	// an ordinary job finishes in seconds, and this is sized for the largest one
+	// the limits allow — a whole chromosome of a WGS cohort against several
+	// expensive sources. An hour used to be the figure, and it killed exactly
+	// the submissions that took longest to prepare and cost the most to redo.
+	//
+	// The queue's protection against a job occupying a worker forever is the
+	// weight budget and the concurrency cap, not this. Cutting a job off at an
+	// arbitrary hour does not free capacity, it wastes the capacity already
+	// spent.
+	JobTimeout time.Duration
+	// DownloadTimeout bounds a provisioning job. It shares JobTimeout's default
+	// but is configured separately, because the two are sized by different
+	// things: a tool's one-time install fetches tens of gigabytes over one TCP
+	// stream, and being killed partway leaves a half-populated data directory
+	// the next attempt has to redo from the start.
 	DownloadTimeout time.Duration
 	JobTTL          time.Duration // terminal jobs GC'd after this
-	MaxUploadBytes  int64         // cap on a POST /annotate/vcf body
+	// MaxUploadBytes caps a POST /annotate/vcf body.
+	//
+	// Held at 64 MB deliberately, below the size the limits will eventually
+	// allow. The upload is currently read into memory in one piece and stored
+	// as a Postgres BYTEA, so this figure is bounded by what the API process
+	// can hold rather than by what a caller should be able to send — and a
+	// whole chromosome of a WGS cohort is around 150 MB compressed. Raising it
+	// before the upload streams to object storage would turn a rejected request
+	// into an OOM.
+	//
+	// It is a backstop in any case, not the limit that matters: the variant
+	// count is. A byte cap alone cannot tell a large file of few richly-
+	// annotated variants from a small one holding millions.
+	MaxUploadBytes int64
 
 	RatePerMin   int      // per-IP submit rate
 	RateBurst    int      // per-IP burst
@@ -168,7 +194,7 @@ func Defaults() *Config {
 		DataDir:         "/var/lib/varianthub/data",
 		CacheDir:        "/var/lib/varianthub/cache",
 		StoragePaths:    []string{"default=/var/lib/varianthub/sources"},
-		JobTimeout:      time.Hour,
+		JobTimeout:      12 * time.Hour,
 		DownloadTimeout: 12 * time.Hour,
 		// Results are the thing a user comes back for, and a day is shorter
 		// than the gap between someone running an annotation and being asked
