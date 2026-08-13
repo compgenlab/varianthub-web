@@ -78,11 +78,16 @@ type SnapshotResponse struct {
 }
 
 // JobsResponse is GET /jobs.
+//
+// The same projection GET /jobs/{id} returns, not the rows: a list is a page of
+// statuses, and returning the row here while projecting it there would mean two
+// shapes for one thing — with the identity fields the projection exists to keep
+// out present in exactly one of them.
 type JobsResponse struct {
-	Jobs   []queue.Job `json:"jobs" doc:"Jobs, newest first."`
-	Limit  int         `json:"limit" doc:"The page size that produced this list."`
-	Offset int         `json:"offset" doc:"The offset that produced this list."`
-	Scoped bool        `json:"scoped" doc:"The list was narrowed to the caller's own jobs, as opposed to an administrator seeing everything."`
+	Jobs   []JobStatusResponse `json:"jobs" doc:"Jobs, newest first."`
+	Limit  int                 `json:"limit" doc:"The page size that produced this list."`
+	Offset int                 `json:"offset" doc:"The offset that produced this list."`
+	Scoped bool                `json:"scoped" doc:"The list was narrowed to the caller's own jobs, as opposed to an administrator seeing everything."`
 }
 
 // AcceptedResponse is a queued submission.
@@ -98,6 +103,10 @@ type AcceptedResponse struct {
 }
 
 // JobStatusResponse is GET /jobs/{id}: what a job is and how far it has got.
+//
+// A job, not a chunk. Every submission is one, with at least one chunk under
+// it; the chunks are at /jobs/{id}/chunks, and are where a split submission
+// says which piece of it went wrong.
 //
 // Its own type rather than queue.Job, which is the database row. The row also
 // carries client_ip, session and user_id, and this route is deliberately public
@@ -121,6 +130,34 @@ type JobStatusResponse struct {
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 	Label      string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
 	Error      string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+
+	// How the submission was cut up. One chunk of one for anything that was
+	// not split, which is what makes these safe to read without asking first.
+	//
+	// Total is 0 while a split is still running: not "nothing to do" but "not
+	// counted yet", and a caller shown 0/0 would reasonably read it as
+	// finished. Status is the field to believe.
+	Total  int `json:"chunks_total" doc:"How many chunks the submission became. 0 while a split is still deciding how many there will be."`
+	Done   int `json:"chunks_done" doc:"How many have finished successfully."`
+	Failed int `json:"chunks_failed" doc:"How many have failed."`
+}
+
+// JobResponse is GET /jobs/{id}: the status, plus the chunks behind it.
+//
+// The chunks are here rather than at an endpoint of their own. They are part of
+// what a job is, not a separate resource to go and fetch: a caller watching a
+// split submission wants the progress and the piece that failed in the same
+// answer, and a second round trip to learn which of twenty-six went wrong is a
+// round trip for something the first call already knew.
+//
+// Always populated — every job has at least one chunk — so there is no shape
+// where a client has to check before reading it. The list at GET /jobs returns
+// the status alone: a page of a hundred jobs carrying every chunk of each is
+// the one case where separating them is right, and there the counts are what a
+// table shows anyway.
+type JobResponse struct {
+	JobStatusResponse
+	Chunks []ChunkResponse `json:"chunks" doc:"Every chunk of the job, oldest first, with the pieces in split order. A submission that was not split has one."`
 }
 
 // jobStatus projects a queue row onto the published shape.
@@ -129,15 +166,58 @@ func jobStatus(j queue.Job) JobStatusResponse {
 		JobID: j.ID, Kind: j.Kind, Snapshot: j.Snapshot, Selection: j.Selection,
 		Status: j.Status, NVariants: j.NVariants, CreatedAt: j.CreatedAt,
 		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Label: j.Label,
-		Error: j.Error,
+		Error: j.Error, Total: j.Chunks, Done: j.Done, Failed: j.Failed,
+	}
+}
+
+// jobDetail is jobStatus plus the job's chunks.
+func jobDetail(j queue.Job, chunks []queue.Chunk) JobResponse {
+	out := JobResponse{JobStatusResponse: jobStatus(j),
+		Chunks: make([]ChunkResponse, 0, len(chunks))}
+	for _, c := range chunks {
+		out.Chunks = append(out.Chunks, chunkStatus(c))
+	}
+	return out
+}
+
+// ChunkResponse is one chunk of a job: a piece of work a worker claimed.
+//
+// Its own type rather than queue.Chunk, for the same reason JobStatusResponse
+// is not the job row — the row carries the submitter's address and session, and
+// a job is readable by anyone holding its link.
+//
+// What it is for: a split job that failed says so at the job, and this says
+// which of its twenty-six pieces failed and what the error was. Without it a
+// caller can see that something went wrong and nothing about where.
+type ChunkResponse struct {
+	ChunkID    string `json:"chunk_id" doc:"Stable identifier for this chunk, within its job."`
+	JobID      string `json:"job_id" doc:"The submission this chunk belongs to."`
+	Kind       string `json:"kind" doc:"locus | vcf for annotation; split and collect bracket a job that was cut up."`
+	Index      *int   `json:"index,omitempty" doc:"Its place in the split, counting from zero. Absent for the split and collect, which are not pieces of the file."`
+	Status     string `json:"status" doc:"queued | running | done | error | cancelled."`
+	NVariants  int64  `json:"n_variants" doc:"How many variants this chunk annotated."`
+	Error      string `json:"error,omitempty" doc:"Why this chunk failed, when it did."`
+	Label      string `json:"label,omitempty" doc:"A short human label."`
+	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
+	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
+	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
+}
+
+// chunkStatus projects a queue row onto the published shape.
+func chunkStatus(c queue.Chunk) ChunkResponse {
+	return ChunkResponse{
+		ChunkID: c.ID, JobID: c.JobID, Kind: c.Kind, Index: c.ChunkIndex,
+		Status: c.Status, NVariants: c.NVariants, Error: c.Error,
+		Label: c.Label, CreatedAt: c.CreatedAt, StartedAt: c.StartedAt,
+		FinishedAt: c.FinishedAt,
 	}
 }
 
 // CancelResponse is POST /jobs/{id}/cancel.
 type CancelResponse struct {
-	Job       queue.Job `json:"job" doc:"The job as it stands after the request."`
-	Cancelled bool      `json:"cancelled" doc:"False when the job had already finished, which is not an error — the caller's intent is satisfied either way."`
-	Detail    string    `json:"detail,omitempty" doc:"Explains a false cancelled."`
+	Job       JobStatusResponse `json:"job" doc:"The job as it stands after the request."`
+	Cancelled bool              `json:"cancelled" doc:"False when the job had already finished, which is not an error — the caller's intent is satisfied either way."`
+	Detail    string            `json:"detail,omitempty" doc:"Explains a false cancelled."`
 }
 
 // ErrorResponse is any 4xx or 5xx.

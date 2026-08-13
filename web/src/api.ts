@@ -82,6 +82,33 @@ export interface JobStats {
   variants: number;
   last_24h: number;
   last_7d: number;
+  /**
+   * Jobs whose worker was killed rather than reporting: waiting on another
+   * attempt, and those that ran out of attempts. Apart from `failed`, because a
+   * failure is the job going wrong and this is the process running it
+   * disappearing — usually the container's memory limit.
+   */
+  abandoned_retrying: number;
+  abandoned_exhausted: number;
+  /**
+   * Abandonments over the last day, counted as attempts rather than jobs. The
+   * two counters above are stock levels, and a deployment that loses an attempt
+   * regularly but always succeeds on retry reads zero on both.
+   */
+  abandoned_attempts_24h: number;
+}
+
+/** One worker's recent record, for spotting a single bad process. */
+export interface WorkerHealth {
+  worker: string;
+  attempts: number;
+  abandoned: number;
+  /**
+   * Typical seconds an abandoned attempt survived. A worker killed partway
+   * through long jobs and one that dies on startup both show abandonments; this
+   * is what separates them.
+   */
+  median_abandoned_after?: number;
 }
 
 export interface StorageUsage {
@@ -123,6 +150,8 @@ export interface Metrics {
   remote_bytes: number;
   remote_measured: boolean;
   generated_at: number;
+  /** Per-worker attempt record over the last day; absent when nothing has run. */
+  workers?: WorkerHealth[];
 }
 
 export interface User {
@@ -369,19 +398,63 @@ export interface SourceFile {
   modified_at: number;
 }
 
+/** A job's status: the chunk's five, plus two for a submission made of parts.
+ *
+ *  "partial" is a property of a thing made of parts, so a chunk never has one.
+ *  Nine of twenty-six pieces annotated is neither running nor queued in any
+ *  useful sense — partial_running means something finished and something is
+ *  running, partial_queued that something finished and nothing is running yet. */
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "partial_running"
+  | "partial_queued"
+  | "done"
+  | "error"
+  | "cancelled";
+
 export interface Job {
   job_id: string;
   kind: string;
   snapshot: string;
   selection?: string;
-  status: "queued" | "running" | "done" | "error" | "cancelled";
+  status: JobStatus;
   error?: string;
   n_variants: number;
   label?: string;
   created_at: number;
   started_at?: number;
   finished_at?: number;
+  /** How many chunks the job has, and how many have finished each way. A
+   *  submission that was not split has one; a split's pieces appear as they
+   *  are queued. */
+  chunks_total: number;
+  chunks_done: number;
+  chunks_failed: number;
+  /** Every chunk of the job. Present on a single-job read, absent from the
+   *  listing — a page of a hundred jobs carrying every chunk of each grows
+   *  with the wrong thing. */
+  chunks?: Chunk[];
   results?: Variant[];
+}
+
+/** One unit of work under a job. A submission that was not split has one; a
+ *  large VCF has a split, a piece per hundred thousand variants, and a collect
+ *  that joins them. This is where a split job says which piece failed. */
+export interface Chunk {
+  chunk_id: string;
+  job_id: string;
+  kind: string;
+  /** Its place in the split. Absent for the split and collect, which are not
+   *  pieces of the file. */
+  index?: number;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  n_variants: number;
+  error?: string;
+  label?: string;
+  created_at: number;
+  started_at?: number;
+  finished_at?: number;
 }
 
 export interface Column {
@@ -681,6 +754,50 @@ export const api = {
    *  validate against it. */
   geneModels: () => req<GeneModel[]>("/admin/genelists/models"),
 
+  /** Reads a stored list back into the builder's shape, plus whether it can be
+   *  edited — a list a snapshot pins is frozen. */
+  geneList: (id: string) =>
+    req<{
+      id: string;
+      ref: string;
+      name: string;
+      version: string;
+      title?: string;
+      description?: string;
+      gtf: string;
+      gene_field: "gene_name" | "gene_id";
+      genes: string[];
+      annotation_name?: string;
+      visibility: Visibility;
+      /** False when a snapshot pins it. */
+      editable: boolean;
+      /** The snapshots holding it, when it is not editable. */
+      pinned_by?: string[];
+    }>(`/admin/genelists/${encodeURIComponent(id)}`),
+
+  /** Rewrites a list's genes. Refuses one a snapshot pins (409) and re-validates
+   *  as strictly as creation does. Name and version are fixed — changing either
+   *  would make it a different list. */
+  updateGeneList: (
+    id: string,
+    body: {
+      gtf_source_id: string;
+      genes: string;
+      gene_field?: "gene_name" | "gene_id";
+      title?: string;
+      description?: string;
+      annotation_name?: string;
+    },
+  ) =>
+    req<{ id: string; ref: string; gtf: string; genes: number }>(
+      `/admin/genelists/${encodeURIComponent(id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+
   /** Checks a pasted list against a gene model without saving anything. */
   validateGeneList: (body: {
     gtf_source_id: string;
@@ -959,6 +1076,15 @@ export const api = {
   jobLog: (id: string) =>
     req<{ job_id: string; output: string; recorded: boolean }>(
       `/jobs/${encodeURIComponent(id)}/log`,
+    ),
+
+  /** One chunk's own output. A job comes back with its chunks, so this is the
+   *  only thing a chunk has that reading the job does not already tell you.
+   *  The job's log is its first chunk's — the run a caller submitted, or the
+   *  split that cut it up — so this is how the rest are read. */
+  chunkLog: (id: string, chunkId: string) =>
+    req<{ job_id: string; chunk_id: string; output: string; recorded: boolean }>(
+      `/jobs/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}/log`,
     ),
 
   sourceSettings: (id: string) =>

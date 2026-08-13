@@ -7,30 +7,30 @@ import (
 	"time"
 )
 
-// logFlushEvery is how often a running job's output reaches the database.
+// logFlushEvery is how often a running chunk's output reaches the database.
 //
-// The point of flushing at all is that the runs worth reading are the ones that
-// never finish: a worker killed by an OOM or a restart writes nothing on the way
-// out, so whatever is already stored is all there will ever be. A few seconds
-// bounds how much of the story is lost, and costs one small write per job per
-// interval.
+// The point of flushing at all is that the runs worth reading are the ones
+// that never finish: a worker killed by an OOM or a restart writes nothing on
+// the way out, so whatever is already stored is all there will ever be. A few
+// seconds bounds how much of the story is lost, and costs one small write per
+// chunk per interval.
 const logFlushEvery = 3 * time.Second
 
-// logMaxBytes caps what is retained per job.
+// logMaxBytes caps what is retained per chunk.
 //
-// Kept from the end: a run that fails does so at the end, and the first lines of
-// a provisioning job that downloaded 175 files are the least interesting bytes
-// in the file. A truncation marker says what happened, so a short log is not
-// mistaken for a quiet run.
+// Kept from the end: a run that fails does so at the end, and the first lines
+// of a provisioning chunk that downloaded 175 files are the least interesting
+// bytes in the file. A truncation marker says what happened, so a short log is
+// not mistaken for a quiet run.
 const logMaxBytes = 512 * 1024
 
-// LogWriter accumulates a job's output and flushes it periodically.
+// LogWriter accumulates a chunk's output and flushes it periodically.
 //
-// Safe for concurrent use: the runner writes from its stderr goroutine while the
-// flusher reads.
+// Safe for concurrent use: the runner writes from its stderr goroutine while
+// the flusher reads.
 type LogWriter struct {
-	q     *Queue
-	jobID string
+	q       *Queue
+	chunkID string
 
 	mu    sync.Mutex
 	buf   strings.Builder
@@ -40,9 +40,9 @@ type LogWriter struct {
 	done chan struct{}
 }
 
-// NewLogWriter starts flushing a job's output until Close is called.
-func NewLogWriter(ctx context.Context, q *Queue, jobID string) *LogWriter {
-	w := &LogWriter{q: q, jobID: jobID, stop: make(chan struct{}), done: make(chan struct{})}
+// NewLogWriter starts flushing a chunk's output until Close is called.
+func NewLogWriter(ctx context.Context, q *Queue, chunkID string) *LogWriter {
+	w := &LogWriter{q: q, chunkID: chunkID, stop: make(chan struct{}), done: make(chan struct{})}
 	go w.loop(ctx)
 	return w
 }
@@ -62,8 +62,9 @@ func (w *LogWriter) Line(s string) {
 	}
 }
 
-// Note records something the job did not print itself — an attempt starting, a
-// worker taking it over. Marked so it is not mistaken for the tool's own output.
+// Note records something the chunk did not print itself — an attempt starting,
+// a worker taking it over. Marked so it is not mistaken for the tool's own
+// output.
 func (w *LogWriter) Note(s string) { w.Line("··· " + s) }
 
 func (w *LogWriter) truncateLocked() {
@@ -107,9 +108,9 @@ func (w *LogWriter) flush(ctx context.Context) {
 	w.dirty = false
 	w.mu.Unlock()
 
-	// WithoutCancel: a job being cancelled or timing out is exactly when its
+	// WithoutCancel: a chunk being cancelled or timing out is exactly when its
 	// output matters, and its context is already dead by then.
-	_ = w.q.SetLog(context.WithoutCancel(ctx), w.jobID, out)
+	_ = w.q.SetLog(context.WithoutCancel(ctx), w.chunkID, out)
 }
 
 // Close stops flushing and writes whatever is left.

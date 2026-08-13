@@ -898,3 +898,8 @@ startup if still set.
 | `POST` | `/api/v1/admin/sources/{id}/grants` | grant |
 | `DELETE` | `/api/v1/admin/sources/{id}/grants/{team}` | revoke |
 | `PUT` | `/api/v1/admin/sources/{id}/visibility` | set `public` \| `signed_in` \| `restricted` |
+| `GET` | `/api/v1/admin/genelists/models` | GTF sources a list can be built on, with gene counts |
+| `POST` | `/api/v1/admin/genelists/validate` | check pasted genes against a gene model |
+| `POST` | `/api/v1/admin/genelists` | register a validated list as an ordinary source |
+| `GET` | `/api/v1/admin/genelists/{id}` | read one back for editing, with `editable` / `pinned_by` |
+| `PUT` | `/api/v1/admin/genelists/{id}` | rewrite its genes; `409` when a snapshot pins it |

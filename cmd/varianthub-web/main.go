@@ -1,16 +1,20 @@
-// Command varianthub-web is the VariantHub API server, its job worker, and its
-// migration runner — one binary, three subcommands, so a deployment ships a
-// single image and picks a role by argv.
+// Command varianthub-web is the VariantHub API server, its chunk worker, and
+// its migration runner — one binary, three subcommands, so a deployment ships
+// a single image and picks a role by argv.
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -22,11 +26,16 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/cacherunner"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/fanout"
 	"github.com/compgenlab/varianthub-web/internal/identity"
+	"github.com/compgenlab/varianthub-web/internal/jobstore"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
+
+	"github.com/compgenlab/cghts/vcf"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…".
@@ -81,13 +90,15 @@ func run(args []string) error {
 		return serve(ctx, cfg)
 	case "worker":
 		return worker(ctx, cfg)
+	case "sweep-storage":
+		return sweepStorage(ctx, cfg, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
 	}
 }
 
-// serve runs the HTTP API. It does not process jobs.
+// serve runs the HTTP API. It does not process chunks.
 func serve(ctx context.Context, cfg *config.Config) error {
 	q, err := queue.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -174,7 +185,7 @@ func announceBootstrap(ctx context.Context, ids *identity.Store) error {
 	return nil
 }
 
-// worker runs the job pool. It serves no HTTP.
+// worker runs the chunk pool. It serves no HTTP.
 func worker(ctx context.Context, cfg *config.Config) error {
 	q, err := queue.Open(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -182,32 +193,34 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	}
 	defer q.Close()
 
-	// Take back jobs whose holder stopped renewing — a worker that crashed, or
-	// one killed mid-run. Safe to do while other workers are busy, because a
-	// live one keeps its leases fresh; see ReclaimExpired.
+	// Take back chunks whose holder stopped renewing — a worker that crashed,
+	// or one killed mid-run. Safe to do while other workers are busy, because
+	// a live one keeps its leases fresh; see ReclaimExpired.
 	if n, rErr := q.ReclaimExpired(ctx); rErr != nil {
 		return rErr
 	} else if n > 0 {
-		log.Printf("worker: reclaimed %d abandoned job(s)", n)
+		log.Printf("worker: reclaimed %d abandoned chunk(s)", n)
 	}
-	// The same reclaim, for what those jobs left on disk. varhub removes its own
-	// scratch on every path it can return from, and on none where it is killed —
-	// which is what an OOM and a rolling restart both do to a build in progress.
+	// The same reclaim, for what those chunks left on disk. varhub removes its
+	// own scratch on every path it can return from, and on none where it is
+	// killed — which is what an OOM and a rolling restart both do to a build
+	// in progress.
 	//
-	// Job-scoped scratch first, and exactly: the queue says which jobs are
+	// Chunk-scoped scratch first, and exactly: the queue says which chunks are
 	// running, so a directory named after one that is not can go immediately.
-	// This is the case age could never handle — a job OOM-killed thirty seconds
-	// ago leaves a workdir that is both very recent and certainly dead.
+	// This is the case age could never handle — a chunk OOM-killed thirty
+	// seconds ago leaves a workdir that is both very recent and certainly
+	// dead.
 	if live, lErr := q.RunningIDs(ctx); lErr != nil {
-		log.Printf("worker: could not list running jobs, skipping scratch sweep: %v", lErr)
-	} else if n, freed, sErr := runner.SweepJobScratch(os.TempDir(), live, log.Printf); sErr != nil {
-		log.Printf("worker: could not sweep job scratch: %v", sErr)
+		log.Printf("worker: could not list running chunks, skipping scratch sweep: %v", lErr)
+	} else if n, freed, sErr := runner.SweepChunkScratch(os.TempDir(), live, log.Printf); sErr != nil {
+		log.Printf("worker: could not sweep chunk scratch: %v", sErr)
 	} else if n > 0 {
-		log.Printf("worker: reclaimed scratch for %d finished job(s), %.1f GB", n, float64(freed)/(1<<30))
+		log.Printf("worker: reclaimed scratch for %d finished chunk(s), %.1f GB", n, float64(freed)/(1<<30))
 	}
 	// Then the age-based sweep, which is now only a backstop: it catches work
-	// staged outside a job's own directory, and anything left by a version that
-	// did not name its scratch.
+	// staged outside a chunk's own directory, and anything left by a version
+	// that did not name its scratch.
 	if n, freed, sErr := runner.SweepScratch(os.TempDir(), runner.ScratchMaxAge, log.Printf); sErr != nil {
 		log.Printf("worker: could not sweep scratch: %v", sErr)
 	} else if n > 0 {
@@ -218,8 +231,16 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	q.StartLeaseKeeper(ctx)
 
 	q.SetMaxJobsPerIP(cfg.MaxJobsPerIP)
+	// What removes an expiring chunk's stored input. In the worker and not the
+	// API because only one process should be doing the collecting, and this is
+	// the one already running the sweep.
+	q.SetObjectDisposer(disposeChunkObjects)
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))
+	// And the files nothing in the database points at. Daily, because it lists
+	// the whole of job storage to find them and the things it collects are
+	// leftovers from a crash rather than a steady product.
+	jobstore.Start(ctx, q, cfg.JobStorage, 24*time.Hour)
 
 	home, err := homeProvider(ctx, cfg)
 	if err != nil {
@@ -250,7 +271,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin, cfg.JobStorage, chunkSizeFor(ctx, cfg, cat)))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -262,8 +283,8 @@ func worker(ctx context.Context, cfg *config.Config) error {
 // deployment wants one.
 //
 // The cache is here rather than inside varhub because varhub runs a source's
-// tool steps as bash: a DSN in the job's home would be readable by any code a
-// registered manifest chooses to run. Here it also gets to skip the process
+// tool steps as bash: a DSN in the chunk's home would be readable by any code
+// a registered manifest chooses to run. Here it also gets to skip the process
 // entirely, which is most of the saving.
 //
 // Returns the runner to use and a function to release the cache. Both are always
@@ -286,16 +307,16 @@ func withCache(ctx context.Context, cfg *config.Config, cat *catalog.Store,
 		return exec, noop, nil
 	}
 
-	// Settings that cannot be read are not a reason to refuse to start. A rollout
-	// applies the new deployments before the migration job runs, so a worker on a
-	// new release routinely comes up against a schema that is a minute behind it
-	// — and on a fresh cluster, against no schema at all. Failing here turns that
-	// window into CrashLoopBackOff, which reads as a broken image rather than as
-	// a migration that has not finished yet.
+	// Settings that cannot be read are not a reason to refuse to start. A
+	// rollout applies the new deployments before the migration chunk runs, so
+	// a worker on a new release routinely comes up against a schema that is a
+	// minute behind it — and on a fresh cluster, against no schema at all.
+	// Failing here turns that window into CrashLoopBackOff, which reads as a
+	// broken image rather than as a migration that has not finished yet.
 	//
-	// The configured defaults are the right thing to fall back on, and the per-job
-	// read below picks the stored values up as soon as they exist, without a
-	// restart.
+	// The configured defaults are the right thing to fall back on, and the
+	// per-chunk read below picks the stored values up as soon as they exist,
+	// without a restart.
 	site := catalog.SiteFromConfig(cfg)
 	if stored, err := cat.EffectiveSite(ctx, site); err != nil {
 		log.Printf("worker: site settings unavailable, using the configured defaults "+
@@ -304,9 +325,9 @@ func withCache(ctx context.Context, cfg *config.Config, cat *catalog.Store,
 		site = stored
 	}
 	if !site.CacheEnabled {
-		log.Printf("worker: annotation cache off by setting; jobs will compute every value")
-		// Still wrapped: the setting is read per job, so turning it back on takes
-		// effect on the next job rather than on the next restart.
+		log.Printf("worker: annotation cache off by setting; chunks will compute every value")
+		// Still wrapped: the setting is read per chunk, so turning it back on
+		// takes effect on the next chunk rather than on the next restart.
 	}
 
 	store, err := anncache.Open(ctx, cfg.DatabaseURL)
@@ -316,21 +337,21 @@ func withCache(ctx context.Context, cfg *config.Config, cat *catalog.Store,
 	log.Printf("worker: shared annotation cache on %s (max %d unit(s), max age %s)",
 		"postgres", site.CacheMaxEntries, orNever(site.CacheMaxAgeText))
 	return &cacherunner.Runner{
-			Inner:   exec,
-			Cache:   store,
-			Catalog: cat,
-			// Read per job rather than captured, so an administrator's change
-			// reaches a running worker.
-			Site: func(ctx context.Context) catalog.Site {
-				s, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
-				if err != nil {
-					// The configured default rather than a guess: a database blip
-					// should not silently change the cache policy.
-					return catalog.SiteFromConfig(cfg)
-				}
-				return s
-			},
-		}, func() { store.Close() }, nil
+		Inner:   exec,
+		Cache:   store,
+		Catalog: cat,
+		// Read per chunk rather than captured, so an administrator's change
+		// reaches a running worker.
+		Site: func(ctx context.Context) catalog.Site {
+			s, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+			if err != nil {
+				// The configured default rather than a guess: a database blip
+				// should not silently change the cache policy.
+				return catalog.SiteFromConfig(cfg)
+			}
+			return s
+		},
+	}, func() { store.Close() }, nil
 }
 
 func orNever(s string) string {
@@ -340,12 +361,12 @@ func orNever(s string) string {
 	return s
 }
 
-// homeProvider chooses where a job's annotation config comes from.
+// homeProvider chooses where a chunk's annotation config comes from.
 //
-// Normally it is materialized per job from the Postgres catalog, so the service
-// holds no annotation config locally. VHW_VARHUB_HOME overrides that with a
-// fixed directory on disk — useful for debugging against a hand-built tree, and
-// the only mode available before the catalog existed.
+// Normally it is materialized per chunk from the Postgres catalog, so the
+// service holds no annotation config locally. VHW_VARHUB_HOME overrides that
+// with a fixed directory on disk — useful for debugging against a hand-built
+// tree, and the only mode available before the catalog existed.
 func homeProvider(ctx context.Context, cfg *config.Config) (runner.HomeProvider, error) {
 	if cfg.VarhubHome != "" {
 		log.Printf("worker: using fixed annotation home %s (catalog bypassed)", cfg.VarhubHome)
@@ -420,63 +441,303 @@ func seed(ctx context.Context, cfg *config.Config) error {
 	return cat.Seed(ctx)
 }
 
-// adapt bridges runner.Runner to queue.Runner. The two are deliberately separate
-// types: the queue knows nothing about how annotation happens, and the runner
-// knows nothing about job persistence.
+// adapt bridges runner.Runner to queue.Runner. The two are deliberately
+// separate types: the queue knows nothing about how annotation happens, and
+// the runner knows nothing about chunk persistence.
 //
-// The queue is passed in as well, for the run's output. That is persistence, so
-// it belongs to the queue rather than to either of the two types this bridges —
-// and it is written outside the Outcome because an Outcome is the job's result,
-// while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin string) queue.Runner {
-	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
-		switch job.Kind {
+// The queue is passed in as well, for the run's output. That is persistence,
+// so it belongs to the queue rather than to either of the two types this
+// bridges — and it is written outside the Outcome because an Outcome is the
+// chunk's result, while a log exists for the runs that produced no result at
+// all.
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin, cfgJobStorage string, chunkSize func() int) queue.Runner {
+	return func(ctx context.Context, chunk queue.Chunk, input []byte) (queue.Outcome, error) {
+		switch chunk.Kind {
+		case queue.KindSplit:
+			return runSplitChunk(ctx, q, chunk, cfgJobStorage, chunkSize())
+		case queue.KindCollect:
+			return runCollectChunk(ctx, q, chunk, cfgJobStorage)
 		case queue.KindDownload:
-			return runDownload(ctx, q, r, cat, job, input)
+			return runDownload(ctx, q, r, cat, chunk, input)
 		case queue.KindCleanup:
-			return runCleanup(job, input)
+			return runCleanup(chunk, input)
 		case queue.KindMove:
-			return runMove(ctx, cat, job, input)
+			return runMove(ctx, cat, chunk, input)
 		}
 		// Same streaming as provisioning. An annotation is usually short enough
 		// that the log written at the end is sufficient — but the ones that are
 		// not are exactly the ones that get killed, and those wrote nothing.
-		alw := queue.NewLogWriter(ctx, q, job.ID)
+		alw := queue.NewLogWriter(ctx, q, chunk.ID)
 		defer alw.Close(context.WithoutCancel(ctx))
 		alw.Note("starting on worker " + q.WorkerID())
 
+		// A stored input is fetched to a local file, because that is what the
+		// engine takes. It is never read into this process: a chromosome's VCF
+		// is hundreds of megabytes, and holding it here only to write it
+		// straight back out is the copy this whole path exists to remove.
+		var inputPath string
+		if chunk.InputURI != "" {
+			dir, mkErr := os.MkdirTemp("", "vhw-input-")
+			if mkErr != nil {
+				return queue.Outcome{}, fmt.Errorf("staging directory: %w", mkErr)
+			}
+			// Removed however this returns, including the error paths below.
+			// Otherwise a worker that fails a few large chunks fills its disk
+			// and then fails every chunk after them, for a reason that looks
+			// nothing like the first failure.
+			defer os.RemoveAll(dir)
+
+			// Named as it is stored, ".gz" and all. What the file is called is
+			// how a later reader knows whether it is compressed, rather than
+			// each one deciding for itself from the bytes.
+			inputPath = filepath.Join(dir, path.Base(chunk.InputURI))
+			alw.Note("staging input from " + chunk.InputURI)
+			n, dlErr := blob.Download(ctx, chunk.InputURI, inputPath)
+			if dlErr != nil {
+				return queue.Outcome{}, fmt.Errorf("stage input: %w", dlErr)
+			}
+			alw.Note(fmt.Sprintf("staged %d bytes to %s", n, inputPath))
+		}
+
 		res, err := r.Annotate(ctx, runner.Request{
 			Sink:      alw.Line,
-			Kind:      job.Kind,
-			Snapshot:  job.Snapshot,
-			Selection: job.Selection,
+			Kind:      chunk.Kind,
+			Snapshot:  chunk.Snapshot,
+			Selection: chunk.Selection,
 			Body:      input,
+			InputPath: inputPath,
 		})
 		if err != nil {
-			// The full diagnostic goes to the log and to the job, so it can be
-			// read without shell access to this container — and survives the
-			// container being replaced, which the log does not.
+			// The full diagnostic goes to the log and to the chunk, so it can
+			// be read without shell access to this container — and survives
+			// the container being replaced, which the log does not.
 			var ee *runner.ExitError
 			if errors.As(err, &ee) {
-				log.Printf("worker: job %s: %s", job.ID, ee.Detail())
-				storeLog(ctx, q, job.ID, ee.Detail())
+				log.Printf("worker: chunk %s: %s", chunk.ID, ee.Detail())
+				storeLog(ctx, q, chunk.ID, ee.Detail())
 			}
 			return queue.Outcome{}, err
 		}
-		// Kept for a run that worked, as downloads already do. A job that
-		// annotated nothing succeeds by every check made here, and the progress
-		// output is the only thing that says whether the sources were consulted.
-		storeLog(ctx, q, job.ID, res.Log)
+		// Kept for a run that worked, as downloads already do. A chunk that
+		// annotated nothing succeeds by every check made here, and the
+		// progress output is the only thing that says whether the sources were
+		// consulted.
+		storeLog(ctx, q, chunk.ID, res.Log)
 
 		var cols []byte
 		if len(res.Columns) > 0 {
 			if b, mErr := json.Marshal(res.Columns); mErr == nil {
 				cols = b
 			} else {
-				log.Printf("worker: job %s: encode columns: %v", job.ID, mErr)
+				log.Printf("worker: chunk %s: encode columns: %v", chunk.ID, mErr)
 			}
 		}
-		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}, nil
+		out := queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}
+
+		// Assemble the answer-as-a-VCF here, while the submitted file is still
+		// staged. It used to be built on every download — the whole file parsed
+		// and rewritten per request — and that is why the input had to be kept
+		// for as long as the results were downloadable.
+		//
+		// Best effort: a merge that fails must not fail a chunk whose
+		// annotation succeeded. Without a stored VCF the export falls back to
+		// rendering from rows, which is the same answer more slowly and with
+		// less of the submitter's file in it.
+		if chunk.ChunkIndex != nil {
+			// A piece's output is part of a larger file: gzipped, and
+			// headerless unless it is the first. Stored under the job's
+			// prefix so the join can find every piece without asking about
+			// each one.
+			//
+			// Failing to store it fails the chunk, which is what makes the
+			// join refuse rather than produce a file missing a range of the
+			// genome — the one wrong answer here that looks like a right one.
+			if err := storePieceOutput(ctx, q, chunk, cfgJobStorage, inputPath, res, alw); err != nil {
+				return queue.Outcome{}, err
+			}
+			return out, nil
+		}
+		if chunk.Kind == queue.KindVCF && inputPath != "" {
+			uri, mErr := buildResultVCF(ctx, cfgJobStorage, chunk, inputPath, res, alw)
+			if mErr != nil {
+				log.Printf("worker: chunk %s: build result VCF: %v", chunk.ID, mErr)
+				alw.Note("··· could not pre-build the annotated VCF; downloads will " +
+					"render from the result rows instead")
+			} else {
+				out.VCFURI = uri
+				// The input existed to be annotated and to be merged onto. Both
+				// are done and the merged file is stored, so it is scrap —
+				// keeping it until expiry meant holding two copies of every
+				// submission for a week.
+				//
+				// After the result is stored, never before. Reversed, a
+				// failure in between would leave a chunk with neither the file
+				// it was sent nor the answer built from it.
+				dropInput(ctx, q, chunk.ID, alw)
+			}
+		}
+		return out, nil
+	}
+}
+
+// dropInput removes a chunk's submitted file, once something else holds its
+// content.
+//
+// Best effort and never fatal: the chunk succeeded, and failing it now over
+// housekeeping would throw away work that is finished. What is left behind is
+// collected by the TTL sweep, which reads the same row this deletes.
+func dropInput(ctx context.Context, q *queue.Queue, id string, alw *queue.LogWriter) {
+	// WithoutCancel because this often runs as a chunk is being torn down, and
+	// an input left behind because the process was stopping is exactly the
+	// kind nothing later goes looking for.
+	bg := context.WithoutCancel(ctx)
+	dropped, err := q.DropInput(bg, id)
+	if err != nil {
+		log.Printf("worker: chunk %s: drop input row: %v", id, err)
+		return
+	}
+	if dropped == "" {
+		return
+	}
+	if err := blob.Remove(bg, dropped); err != nil {
+		log.Printf("worker: chunk %s: remove input %s: %v", id, dropped, err)
+		return
+	}
+	alw.Note("··· submitted file removed; the annotated VCF stands in for it")
+}
+
+// buildResultVCF merges a chunk's annotations onto the file it was submitted
+// with and stores the result, returning where it went.
+//
+// Streamed from the staged input straight into the upload, so the merged file
+// is never held in memory or written to disk a second time — a chromosome's
+// worth of VCF would be hundreds of megabytes of both.
+func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
+	inputPath string, res runner.Result, alw *queue.LogWriter) (string, error) {
+
+	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
+	if err != nil {
+		return "", err
+	}
+	// runner.Column and queue.Column are the same struct declared twice — the
+	// runner describes what the engine reported, the queue describes what was
+	// stored — so this converts rather than translates. If they ever stop
+	// matching, this stops compiling, which is the right place to find out.
+	cols := make([]queue.Column, len(res.Columns))
+	for i, c := range res.Columns {
+		cols[i] = queue.Column(c)
+	}
+
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+
+	// The staged file keeps the name it was stored under, so whether it is
+	// compressed is something this is told rather than something it works out.
+	var src io.Reader = in
+	if strings.HasSuffix(inputPath, ".gz") {
+		gz, gzErr := gzip.NewReader(in)
+		if gzErr != nil {
+			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		return "", err
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		return "", err
+	}
+
+	// A pipe rather than a buffer: the merge writes as the upload reads, so
+	// neither side has to hold the file.
+	pr, pw := io.Pipe()
+	go func() {
+		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
+		pw.CloseWithError(mErr)
+	}()
+
+	// Under the job's prefix, not the chunk's. Storage is laid out by job and
+	// the sweep decides what to keep from the set of job ids; an object written
+	// under a chunk id belongs to no job it can see, so it would be collected
+	// as scrap on the next pass — a result that vanishes hours after the job
+	// reported done.
+	uri := queue.ObjectURI(jobStorage, chunk.JobID, queue.ResultName)
+	if err := blob.PutReader(ctx, uri, pr); err != nil {
+		pr.CloseWithError(err)
+		return "", err
+	}
+	alw.Note("··· annotated VCF stored at " + uri)
+	return uri, nil
+}
+
+// sweepStorage removes job-storage files that no job owns, on demand.
+//
+// The worker does this on a timer already. It is a subcommand as well because
+// the timer is invisible: an operator looking at a storage bill wants to see
+// what would go before it goes, and wants to run it now rather than wait a
+// day. It also makes the sweep usable as a scheduled chunk by anyone who would
+// rather schedule it than have the worker do it.
+func sweepStorage(ctx context.Context, cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("sweep-storage", flag.ContinueOnError)
+	dryRun := fs.Bool("dry-run", false, "report what would be removed, remove nothing")
+	grace := fs.Duration("grace", jobstore.DefaultGrace,
+		"leave objects newer than this alone; an upload is stored before its chunk row exists")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	q, err := queue.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	res, err := jobstore.Sweep(ctx, q, cfg.JobStorage, *grace, *dryRun)
+	if err != nil {
+		return err
+	}
+	verb := "removed"
+	if *dryRun {
+		verb = "would remove"
+	}
+	log.Printf("sweep-storage: %d object(s) under %s; %d belong to no chunk, %s %d (%.1f MB)",
+		res.Scanned, cfg.JobStorage, res.Orphans, verb, res.Removed, float64(res.Bytes)/(1<<20))
+	if res.Skipped > 0 {
+		log.Printf("sweep-storage: %d left alone as newer than %s — an upload exists "+
+			"before its chunk row does, so a recent orphan may be a chunk being submitted",
+			res.Skipped, *grace)
+	}
+	return nil
+}
+
+// disposeChunkObjects removes the stored files of chunks the sweep has
+// collected.
+//
+// Best effort, one at a time, and a failure on one does not stop the rest: the
+// rows are already gone by the time this runs, so the only thing left to do is
+// remove as much as possible and say what could not be. What survives is
+// recoverable — the layout is jobs/<chunk-id>/, so a listing can find prefixes
+// with no chunk — but it will not be found by anything keyed on the database.
+//
+// A background context because this runs during shutdown as often as not, and
+// an object left behind because the process was stopping is exactly the kind
+// that nothing later goes looking for.
+func disposeChunkObjects(ctx context.Context, uris []string) {
+	var failed int
+	for _, uri := range uris {
+		if err := blob.Remove(context.WithoutCancel(ctx), uri); err != nil {
+			failed++
+			log.Printf("worker: could not remove %s from job storage: %v", uri, err)
+		}
+	}
+	if n := len(uris) - failed; n > 0 {
+		log.Printf("worker: removed %d expired chunk input(s) from job storage", n)
 	}
 }
 
@@ -486,23 +747,23 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 // guaranteed to have the storage volume mounted — the API server may not.
 // storeLog persists a run's output, best effort.
 //
-// Never fails the job: a log that could not be written is a worse thing to
-// report than the outcome the job actually had, and the log is a diagnostic aid
-// rather than part of the result.
+// Never fails the chunk: a log that could not be written is a worse thing to
+// report than the outcome the chunk actually had, and the log is a diagnostic
+// aid rather than part of the result.
 func storeLog(ctx context.Context, q *queue.Queue, id, output string) {
 	if q == nil || output == "" {
 		return
 	}
-	// WithoutCancel because this often runs while the job's own context is
-	// already cancelled — a timeout, a shutdown — and those are exactly the runs
-	// whose output is most worth having.
+	// WithoutCancel because this often runs while the chunk's own context is
+	// already cancelled — a timeout, a shutdown — and those are exactly the
+	// runs whose output is most worth having.
 	if err := q.SetLog(context.WithoutCancel(ctx), id, output); err != nil {
-		log.Printf("worker: job %s: store log: %v", id, err)
+		log.Printf("worker: chunk %s: store log: %v", id, err)
 	}
 }
 
 func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *catalog.Store,
-	job queue.Job, input []byte) (queue.Outcome, error) {
+	chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 
 	// By capability, not by concrete type. The worker's runner is wrapped in the
 	// annotation cache, and asking for *ExecRunner refused every download on any
@@ -519,7 +780,7 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		NoStream  bool     `json:"no_stream"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
-		return queue.Outcome{}, fmt.Errorf("malformed download job: %w", err)
+		return queue.Outcome{}, fmt.Errorf("malformed download chunk: %w", err)
 	}
 
 	// Mark them in flight before the work starts, so the catalog says
@@ -528,23 +789,23 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 	if cat != nil {
 		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
 			catalog.StateInstalling, ""); sErr != nil {
-			log.Printf("worker: job %s: mark installing: %v", job.ID, sErr)
+			log.Printf("worker: chunk %s: mark installing: %v", chunk.ID, sErr)
 		}
 	}
 
-	// Stream this run's output into the job log as it happens.
+	// Stream this run's output into the chunk log as it happens.
 	//
 	// storeLog at the end covers a run that returns. Provisioning is dominated
 	// by runs that do not: an OOM or a rolling restart kills the process, the
-	// buffered output goes with it, and the job is left saying it was abandoned
-	// with nothing about what it was doing. Flushed every few seconds, the log
-	// holds everything up to the moment it died.
-	lw := queue.NewLogWriter(ctx, q, job.ID)
+	// buffered output goes with it, and the chunk is left saying it was
+	// abandoned with nothing about what it was doing. Flushed every few
+	// seconds, the log holds everything up to the moment it died.
+	lw := queue.NewLogWriter(ctx, q, chunk.ID)
 	defer lw.Close(context.WithoutCancel(ctx))
 	lw.Note("starting on worker " + q.WorkerID())
 
 	res, err := exec.Download(ctx, runner.DownloadRequest{
-		JobID:    job.ID,
+		JobID:    chunk.ID,
 		Sink:     lw.Line,
 		Sources:  req.Sources,
 		CacheDir: req.CacheDir,
@@ -554,15 +815,16 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 	if err != nil {
 		var ee *runner.ExitError
 		if errors.As(err, &ee) {
-			log.Printf("worker: download job %s: %s", job.ID, ee.Detail())
-			storeLog(ctx, q, job.ID, ee.Detail())
+			log.Printf("worker: download chunk %s: %s", chunk.ID, ee.Detail())
+			storeLog(ctx, q, chunk.ID, ee.Detail())
 		}
 		if cat != nil {
-			// WithoutCancel: a cancelled or timed-out job still has to leave the
-			// source describing itself accurately, and its context is dead.
+			// WithoutCancel: a cancelled or timed-out chunk still has to leave
+			// the source describing itself accurately, and its context is
+			// dead.
 			if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
 				catalog.StateFailed, err.Error()); sErr != nil {
-				log.Printf("worker: job %s: mark failed: %v", job.ID, sErr)
+				log.Printf("worker: chunk %s: mark failed: %v", chunk.ID, sErr)
 			}
 		}
 		return queue.Outcome{}, err
@@ -570,13 +832,13 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 	if cat != nil {
 		if sErr := cat.SetSourceStates(context.WithoutCancel(ctx), req.Sources,
 			catalog.StateReady, ""); sErr != nil {
-			log.Printf("worker: job %s: mark ready: %v", job.ID, sErr)
+			log.Printf("worker: chunk %s: mark ready: %v", chunk.ID, sErr)
 		}
 	}
 	// A successful download has output worth keeping too: which files it
 	// fetched, what it skipped as already present, how long a build recipe
-	// took. "It worked" is not the only question asked of a finished job.
-	storeLog(ctx, q, job.ID, res.Log)
+	// took. "It worked" is not the only question asked of a finished chunk.
+	storeLog(ctx, q, chunk.ID, res.Log)
 
 	// Attribute files to their source by the directory varhub lays out per
 	// source: <cache>/<name>/<version>/... A file outside that shape belongs to no
@@ -607,13 +869,13 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		if err := cat.ReplaceSourceFiles(ctx, src.ID, req.StorageID, mine); err != nil {
 			return queue.Outcome{}, fmt.Errorf("record files for %s: %w", src.Ref(), err)
 		}
-		log.Printf("worker: download job %s: %s → %d file(s)", job.ID, src.Ref(), len(mine))
+		log.Printf("worker: download chunk %s: %s → %d file(s)", chunk.ID, src.Ref(), len(mine))
 
-		cacheGTFGenes(ctx, r, cat, job.ID, src, lw.Note)
+		cacheGTFGenes(ctx, r, cat, chunk.ID, src, lw.Note)
 	}
 
-	// The job's "result" is the manifest of what landed, so the UI can show it
-	// without a second call.
+	// The chunk's "result" is the manifest of what landed, so the UI can show
+	// it without a second call.
 	body, err := json.Marshal(res.Files)
 	if err != nil {
 		return queue.Outcome{}, err
@@ -631,11 +893,11 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 // GTF, and a stale gene set would validate a list against genes that are no
 // longer there.
 //
-// Never fails the job. The download succeeded, the files are on disk, and the
-// source is usable for annotation; a gene cache that could not be built is a
-// missing convenience, not a broken provision. It is reported to the job log
-// rather than swallowed, because the gene-list form will otherwise refuse every
-// gene with no explanation, and this is the only place that says why.
+// Never fails the chunk. The download succeeded, the files are on disk, and
+// the source is usable for annotation; a gene cache that could not be built is
+// a missing convenience, not a broken provision. It is reported to the chunk
+// log rather than swallowed, because the gene-list form will otherwise refuse
+// every gene with no explanation, and this is the only place that says why.
 func cacheGTFGenes(ctx context.Context, r runner.Runner, cat *catalog.Store,
 	jobID string, src catalog.Source, note func(string)) {
 
@@ -646,14 +908,14 @@ func cacheGTFGenes(ctx context.Context, r runner.Runner, cat *catalog.Store,
 	if !ok {
 		return
 	}
-	// WithoutCancel for the same reason the state updates use it: a job that was
-	// cancelled after the files landed still provisioned them, and the gene cache
-	// belongs with the files.
+	// WithoutCancel for the same reason the state updates use it: a chunk that
+	// was cancelled after the files landed still provisioned them, and the
+	// gene cache belongs with the files.
 	ctx = context.WithoutCancel(ctx)
 
 	genes, err := lister.Genes(ctx, src.ID, src.Ref())
 	if err != nil {
-		log.Printf("worker: download job %s: read genes for %s: %v", jobID, src.Ref(), err)
+		log.Printf("worker: download chunk %s: read genes for %s: %v", jobID, src.Ref(), err)
 		note(fmt.Sprintf("could not read %s's genes, so gene lists cannot be validated "+
 			"against it yet: %v", src.Ref(), err))
 		return
@@ -663,27 +925,27 @@ func cacheGTFGenes(ctx context.Context, r runner.Runner, cat *catalog.Store,
 		out = append(out, catalog.Gene{GeneID: g.GeneID, GeneName: g.GeneName})
 	}
 	if err := cat.ReplaceGTFGenes(ctx, src.ID, out); err != nil {
-		log.Printf("worker: download job %s: store genes for %s: %v", jobID, src.Ref(), err)
+		log.Printf("worker: download chunk %s: store genes for %s: %v", jobID, src.Ref(), err)
 		note(fmt.Sprintf("could not store %s's genes: %v", src.Ref(), err))
 		return
 	}
-	log.Printf("worker: download job %s: %s → %d gene(s)", jobID, src.Ref(), len(out))
+	log.Printf("worker: download chunk %s: %s → %d gene(s)", jobID, src.Ref(), len(out))
 	note(fmt.Sprintf("%s: %d gene(s) available for gene lists", src.Ref(), len(out)))
 }
 
 // runCleanup reclaims a removed source's files.
 //
-// The source row is already gone by the time this runs — the API deletes it and
-// queues this — so there is nothing to reconcile afterwards; the job just frees
-// the bytes and reports how many.
-func runCleanup(job queue.Job, input []byte) (queue.Outcome, error) {
+// The source row is already gone by the time this runs — the API deletes it
+// and queues this — so there is nothing to reconcile afterwards; the chunk
+// just frees the bytes and reports how many.
+func runCleanup(chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 	var req struct {
 		Root    string `json:"root"`
 		Name    string `json:"name"`
 		Version string `json:"version"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
-		return queue.Outcome{}, fmt.Errorf("malformed cleanup job: %w", err)
+		return queue.Outcome{}, fmt.Errorf("malformed cleanup chunk: %w", err)
 	}
 	freed, err := runner.Cleanup(runner.CleanupRequest{
 		Root: req.Root, Name: req.Name, Version: req.Version,
@@ -691,8 +953,8 @@ func runCleanup(job queue.Job, input []byte) (queue.Outcome, error) {
 	if err != nil {
 		return queue.Outcome{}, err
 	}
-	log.Printf("worker: cleanup job %s: reclaimed %d bytes from %s/%s",
-		job.ID, freed, req.Name, req.Version)
+	log.Printf("worker: cleanup chunk %s: reclaimed %d bytes from %s/%s",
+		chunk.ID, freed, req.Name, req.Version)
 	body, err := json.Marshal(map[string]any{
 		"freed_bytes": freed, "name": req.Name, "version": req.Version,
 	})
@@ -703,8 +965,8 @@ func runCleanup(job queue.Job, input []byte) (queue.Outcome, error) {
 }
 
 // sweepInterval scales GC frequency to the TTL, clamped to a sane band: often
-// enough that expired jobs do not linger, rarely enough that a long TTL does not
-// mean a pointless hourly scan.
+// enough that expired chunks do not linger, rarely enough that a long TTL does
+// not mean a pointless hourly scan.
 func sweepInterval(ttl time.Duration) time.Duration {
 	const (
 		minSweep = time.Minute
@@ -728,9 +990,14 @@ usage: varianthub-web <command>
 
 commands:
   serve     run the HTTP API (/api/v1 plus /healthz and /version)
-  worker    run the annotation job pool (execs the varhub CLI)
+  worker    run the annotation chunk pool (execs the varhub CLI)
   migrate   apply pending SQL migrations, then exit
   seed      populate an empty catalog with a starter snapshot, then exit
+
+  sweep-storage [--dry-run] [--grace 1h]
+            remove job-storage files that no job owns. The worker does this
+            daily; this is for looking now, and for deployments that would
+            rather schedule it themselves.
 
 catalog administration:
   source add [flags] <source.toml>   register a source from a varhub fragment
@@ -756,7 +1023,7 @@ always required.
 // again from an upstream that may be slow, rate-limited, or gone. The catalog is
 // updated only once every file has arrived, so a half-finished move leaves the
 // source readable where it already was.
-func runMove(ctx context.Context, cat *catalog.Store, job queue.Job, input []byte) (queue.Outcome, error) {
+func runMove(ctx context.Context, cat *catalog.Store, chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 	var req struct {
 		SourceID string `json:"source_id"`
 		FromID   string `json:"from_storage"`
@@ -765,7 +1032,7 @@ func runMove(ctx context.Context, cat *catalog.Store, job queue.Job, input []byt
 		ToURI    string `json:"to_uri"`
 	}
 	if err := json.Unmarshal(input, &req); err != nil {
-		return queue.Outcome{}, fmt.Errorf("malformed move job: %w", err)
+		return queue.Outcome{}, fmt.Errorf("malformed move chunk: %w", err)
 	}
 	if cat == nil {
 		return queue.Outcome{}, errors.New("catalog unavailable")
@@ -829,4 +1096,174 @@ func joinLoc(root, rel string) string {
 		return root + "/" + rel
 	}
 	return filepath.Join(root, rel)
+}
+
+// storeChunkVCF merges a chunk's annotations onto the chunk itself and stores
+// the result.
+//
+// The same merge an unsplit chunk does, written to the job's prefix instead of
+// the chunk's, and headerless unless this is the first chunk. What must not be
+// stored here is the engine's JSON: it is individually well-formed, so a join
+// concatenates it without complaint into a file no VCF reader accepts.
+func storeChunkVCF(ctx context.Context, prefix string, chunk queue.Chunk, inputPath string,
+	res runner.Result, alw *queue.LogWriter) (string, error) {
+
+	if inputPath == "" {
+		return "", errors.New("a chunk needs its staged input to merge onto")
+	}
+	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
+	if err != nil {
+		return "", err
+	}
+	cols := make([]queue.Column, len(res.Columns))
+	for i, c := range res.Columns {
+		cols[i] = queue.Column(c)
+	}
+
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+	var src io.Reader = in
+	if strings.HasSuffix(inputPath, ".gz") {
+		gz, gzErr := gzip.NewReader(in)
+		if gzErr != nil {
+			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		return "", err
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		return "", err
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
+		pw.CloseWithError(mErr)
+	}()
+	uri, err := fanout.StoreChunkResult(ctx, prefix, *chunk.ChunkIndex, pr, alw.Note)
+	if err != nil {
+		pr.CloseWithError(err)
+		return "", err
+	}
+	return uri, nil
+}
+
+// runSplitChunk cuts a submitted VCF into pieces and queues a chunk for each.
+//
+// The first chunk of a VCF job, and the only one that exists when the caller is
+// handed their job id. It produces no variants of its own: what it produces is
+// the rest of the job, and the answer arrives when the collect chunk that
+// follows the last piece finishes.
+func runSplitChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
+	jobStorage string, chunkSize int) (queue.Outcome, error) {
+
+	alw := queue.NewLogWriter(ctx, q, chunk.ID)
+	defer alw.Close(context.WithoutCancel(ctx))
+	alw.Note("starting on worker " + q.WorkerID())
+
+	if chunk.InputURI == "" {
+		return queue.Outcome{}, errors.New("a split chunk needs a stored input")
+	}
+	dir, err := os.MkdirTemp("", "vhw-split-in-")
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	local := filepath.Join(dir, path.Base(chunk.InputURI))
+	if _, err := blob.Download(ctx, chunk.InputURI, local); err != nil {
+		return queue.Outcome{}, fmt.Errorf("stage input: %w", err)
+	}
+
+	n, err := fanout.RunSplit(ctx, q, chunk, local, jobStorage,
+		fanout.DefaultCgkitBin, chunkSize, alw.Note)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	alw.Note(fmt.Sprintf("··· %d chunk(s) queued; this chunk is done when they are", n))
+
+	// The submitted file has been cut up and every piece stored, so it is no
+	// longer the only copy of anything. Dropped here rather than at expiry,
+	// for the same reason a merged result lets an ordinary VCF chunk drop its
+	// input.
+	dropInput(ctx, q, chunk.ID, alw)
+	return queue.Outcome{}, nil
+}
+
+// runCollectChunk joins a finished job's chunks into the answer.
+func runCollectChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
+	jobStorage string) (queue.Outcome, error) {
+
+	alw := queue.NewLogWriter(ctx, q, chunk.ID)
+	defer alw.Close(context.WithoutCancel(ctx))
+	alw.Note("starting on worker " + q.WorkerID())
+
+	if chunk.JobID == "" {
+		return queue.Outcome{}, errors.New("a collect chunk needs a job")
+	}
+	uri, err := fanout.RunCollect(ctx, q, chunk.JobID, jobStorage, alw.Note)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	alw.Note("··· joined file stored at " + uri)
+
+	// Returned rather than filed anywhere by hand. This chunk completes its job
+	// (see queue.Chunk.CompletesJob), so recording its outcome is what points
+	// the job at this file — which is how a caller holding only the job id
+	// reaches an answer produced by a chunk they never saw.
+	alw.Note("··· available from job " + chunk.JobID)
+	return queue.Outcome{VCFURI: uri}, nil
+}
+
+// storePieceOutput stores one piece's annotated output under its job's prefix,
+// where the collect will look for it.
+//
+// It does not have to tell anyone. The join is already queued and waiting on
+// these — see fanout.RunSplit — so finishing here is the whole of this piece's
+// obligation, and a worker will pick the join up once the last of them is done.
+//
+// A failure to store is reported by failing the chunk. The alternative is a
+// joined file missing a range of the genome, which reads exactly like one where
+// those variants had nothing to say.
+func storePieceOutput(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
+	jobStorage, inputPath string, res runner.Result, alw *queue.LogWriter) error {
+
+	bg := context.WithoutCancel(ctx)
+	prefix := queue.JobPrefix(jobStorage, chunk.JobID)
+	if b, ok, err := q.GetJob(bg, chunk.JobID); err == nil && ok && b.Prefix != "" {
+		prefix = b.Prefix
+	}
+	if _, err := storeChunkVCF(bg, prefix, chunk, inputPath, res, alw); err != nil {
+		alw.Note("··· could not store this chunk's output; the job cannot be joined")
+		return fmt.Errorf("store chunk result: %w", err)
+	}
+	return nil
+}
+
+// chunkSizeFor resolves the split chunk size at the moment a split runs.
+//
+// Read per chunk rather than captured at boot, matching how the cache setting
+// is resolved: an administrator changing it should reach a running worker
+// rather than wait for a redeploy. A database that cannot be read falls back
+// to the configured default instead of guessing, so a blip cannot silently
+// change how a submission is cut.
+func chunkSizeFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() int {
+	return func() int {
+		if cat == nil {
+			return catalog.SiteFromConfig(cfg).ChunkSize()
+		}
+		site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+		if err != nil {
+			return catalog.SiteFromConfig(cfg).ChunkSize()
+		}
+		return site.ChunkSize()
+	}
 }

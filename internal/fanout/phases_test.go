@@ -1,0 +1,321 @@
+package fanout
+
+import (
+	"compress/gzip"
+	"context"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/compgenlab/cghts/vcf"
+
+	"github.com/compgenlab/varianthub-web/internal/queue"
+)
+
+// fakeQueue records what the phases asked of it, in order.
+type fakeQueue struct {
+	jobID    string
+	prefix   string
+	count    int
+	countSet bool
+	enqueued []queue.NewChunk
+	chunks   []queue.Chunk
+	job      queue.Job
+	// order records the sequence of calls, so a test can assert that the chunk
+	// count was written after the chunks were queued rather than before.
+	order []string
+}
+
+func (f *fakeQueue) SetPrefix(_ context.Context, jobID, prefix string) error {
+	f.jobID, f.prefix = jobID, prefix
+	f.job = queue.Job{ID: jobID, Prefix: prefix}
+	f.order = append(f.order, "prefix")
+	return nil
+}
+
+func (f *fakeQueue) Enqueue(_ context.Context, j queue.NewChunk) (string, error) {
+	f.enqueued = append(f.enqueued, j)
+	f.order = append(f.order, "enqueue")
+	f.count++
+	return "chunk-" + j.Label, nil
+}
+
+func (f *fakeQueue) SplitChunks(context.Context, string) ([]queue.Chunk, error) {
+	return f.chunks, nil
+}
+
+func (f *fakeQueue) GetJob(context.Context, string) (queue.Job, bool, error) {
+	return f.job, true, nil
+}
+
+// A split queues one chunk per piece, in order, each pointing at its own
+// stored piece — and records the count only once they all exist.
+func TestSplitQueuesAChunkPerPiece(t *testing.T) {
+	bin := cgkitBin(t)
+	dir := t.TempDir()
+	store := t.TempDir()
+
+	in := filepath.Join(dir, "in.vcf")
+	if err := os.WriteFile(in, []byte(chunk(100, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	q := &fakeQueue{}
+	submitted := queue.Chunk{ID: "chunk-1", JobID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
+	n, err := RunSplit(context.Background(), q, submitted, in, store, bin, 4, nil)
+	if err != nil {
+		t.Fatalf("RunSplit: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("split into %d chunks, want 3", n)
+	}
+	const jobID = "abc123"
+	if len(q.enqueued) != 4 {
+		t.Fatalf("queued %d chunks, want three pieces and the join", len(q.enqueued))
+	}
+
+	for i, j := range q.enqueued[:3] {
+		if j.ChunkIndex == nil || *j.ChunkIndex != i {
+			t.Errorf("chunk %d has index %v, want %d", i, j.ChunkIndex, i)
+		}
+		if j.JobID != jobID {
+			t.Errorf("chunk %d belongs to %q, want %q", i, j.JobID, jobID)
+		}
+		if j.Kind != queue.KindVCF {
+			t.Errorf("chunk %d is kind %q; a chunk is an ordinary VCF chunk", i, j.Kind)
+		}
+		// Its own chunk, not the whole submission.
+		want := ChunkName(i + 1)
+		if !strings.HasSuffix(j.InputURI, want) {
+			t.Errorf("chunk %d reads %q, want it to end in %s", i, j.InputURI, want)
+		}
+		if _, err := os.Stat(strings.TrimPrefix(j.InputURI, "")); err != nil {
+			t.Errorf("chunk %d was not stored: %v", i, err)
+		}
+	}
+
+	// The join is queued here, with the pieces, rather than by whichever of
+	// them finishes last — so the work the job still owes is a row from the
+	// moment there is any. It waits for them, and it holds the answer.
+	join := q.enqueued[3]
+	if join.Kind != queue.KindCollect {
+		t.Fatalf("the last chunk queued is %q, want the join", join.Kind)
+	}
+	if !join.AwaitsPieces {
+		t.Error("the join does not wait for its pieces; a worker would claim it " +
+			"and join files that are still being written")
+	}
+	if !join.CompletesJob {
+		t.Error("the join does not hold the job's answer; nothing would point at it")
+	}
+	// Queued last, so it never waits on a set of pieces still being written.
+	if last := q.order[len(q.order)-1]; last != "enqueue" {
+		t.Errorf("the join was queued at %q, not last: %v", last, q.order)
+	}
+}
+
+// The chunks a split stores are what a collect joins: same prefix, same names.
+// If these two disagree the job produces nothing and says nothing about why.
+func TestSplitAndCollectAgreeOnWhereChunksLive(t *testing.T) {
+	bin := cgkitBin(t)
+	dir := t.TempDir()
+	store := t.TempDir()
+	ctx := context.Background()
+
+	in := filepath.Join(dir, "in.vcf")
+	if err := os.WriteFile(in, []byte(chunk(100, 6)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	q := &fakeQueue{}
+	submitted := queue.Chunk{ID: "chunk-1", JobID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
+	if _, err := RunSplit(ctx, q, submitted, in, store, bin, 3, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each piece annotated and stored, as the chunk runs would do. The join is
+	// the last thing queued and produces no piece of its own.
+	for i := range q.enqueued[:len(q.enqueued)-1] {
+		body := chunk(100+i*3, 3)
+		if _, err := StoreChunkResult(ctx, q.prefix, i, strings.NewReader(body), nil); err != nil {
+			t.Fatalf("store chunk %d: %v", i, err)
+		}
+		idx := i
+		q.chunks = append(q.chunks, queue.Chunk{ChunkIndex: &idx})
+	}
+	q.job.Failed = 0
+
+	dest, err := RunCollect(ctx, q, q.jobID, store, nil)
+	if err != nil {
+		t.Fatalf("RunCollect: %v", err)
+	}
+
+	f, err := os.Open(dest)
+	if err != nil {
+		t.Fatalf("the joined file is not where collect said: %v", err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	rd, err := vcf.NewVcfReader(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.Header(); err != nil {
+		t.Fatalf("the joined file has no header: %v", err)
+	}
+	var n int
+	for {
+		if _, err := rd.NextRecord(); err != nil {
+			break
+		}
+		n++
+	}
+	if n != 6 {
+		t.Errorf("the joined file holds %d records, want 6", n)
+	}
+}
+
+// A job with a failed chunk is not joined.
+//
+// The result would be a VCF missing a range of the genome, which reads exactly
+// like one where those variants had nothing to say — a wrong answer that looks
+// like a right one.
+func TestCollectRefusesAJobWithAFailedChunk(t *testing.T) {
+	q := &fakeQueue{jobID: "b"}
+	q.job = queue.Job{ID: "b", Chunks: 3, Done: 2, Failed: 1, Prefix: "/tmp/x"}
+
+	_, err := RunCollect(context.Background(), q, "b", "/tmp", nil)
+	if err == nil {
+		t.Fatal("a job with a failed chunk was joined")
+	}
+	if !strings.Contains(err.Error(), "gap") {
+		t.Errorf("the error should say why it refused: %v", err)
+	}
+}
+
+// Only chunk 0 keeps its header; the rest are stored headerless.
+func TestOnlyTheFirstChunkResultKeepsItsHeader(t *testing.T) {
+	ctx := context.Background()
+	prefix := t.TempDir()
+
+	firstURI, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(chunk(100, 2)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restURI, err := StoreChunkResult(ctx, prefix, 1, strings.NewReader(chunk(200, 2)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(readGz(t, firstURI), "#CHROM") {
+		t.Error("chunk 0 lost its header; the joined file would have none")
+	}
+	if strings.Contains(readGz(t, restURI), "#") {
+		t.Error("a later chunk kept its header; it would appear mid-file")
+	}
+}
+
+func readGz(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+	var b strings.Builder
+	buf := make([]byte, 4096)
+	for {
+		n, err := gz.Read(buf)
+		b.Write(buf[:n])
+		if err != nil {
+			break
+		}
+	}
+	return b.String()
+}
+
+// What a chunk stores has to be a VCF.
+//
+// The seam this covers is the one that had the bug: the caller had the engine's
+// JSON to hand and passed that. Each piece was individually well-formed, so the
+// join concatenated them without complaint into a file no VCF reader accepts —
+// and every unit test still passed, because they all fed this a real VCF.
+//
+// Reading the stored chunk back through a parser is what makes the difference
+// visible: gzipped JSON is a perfectly good gzip stream, and only a parser
+// objects to it.
+func TestAStoredChunkIsAVCFAndNotWhateverItWasGiven(t *testing.T) {
+	ctx := context.Background()
+	prefix := t.TempDir()
+
+	uri, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(chunk(100, 3)), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer gz.Close()
+
+	rd, err := vcf.NewVcfReader(gz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rd.Header(); err != nil {
+		t.Fatalf("the stored chunk has no VCF header — it is not a VCF: %v", err)
+	}
+	var n int
+	for {
+		if _, err := rd.NextRecord(); err != nil {
+			break
+		}
+		n++
+	}
+	if n != 3 {
+		t.Errorf("the stored chunk holds %d records, want 3", n)
+	}
+}
+
+// The engine's JSON is not a VCF, and storing it must not quietly succeed.
+//
+// Pinning the shape of the mistake rather than trusting it not to recur: a JSON
+// array has no header lines, so it survives stripping intact and gzips into
+// something a reader only rejects at parse time.
+func TestJSONStoredAsAChunkDoesNotParseAsAVCF(t *testing.T) {
+	ctx := context.Background()
+	prefix := t.TempDir()
+
+	engineJSON := `[{"chrom":"chr1","pos":100,"ref":"A","alt":"T","annotations":{"GENE":"KRAS"}}]`
+	uri, err := StoreChunkResult(ctx, prefix, 0, strings.NewReader(engineJSON), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := os.Open(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	gz, _ := gzip.NewReader(f)
+	defer gz.Close()
+	rd, _ := vcf.NewVcfReader(gz)
+	if _, err := rd.Header(); err == nil {
+		t.Error("JSON stored as a chunk parsed as a VCF; the join would produce garbage silently")
+	}
+}

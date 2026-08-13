@@ -21,20 +21,39 @@ func seedJob(t *testing.T, h *harness, id, kind, columns string, rows [][4]any, 
 	}
 	defer pool.Close()
 
+	// A job and the one chunk that produced its answer, which is the shape
+	// every read goes through: the job carries what was submitted, the chunk
+	// carries how it went, and the status comes back through the job_state
+	// view. Writing "done" on the job would write nothing — there is no column
+	// for it, deliberately.
+	chunk := chunkOf(id)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
-		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3)`, id, kind, columns); err != nil {
+		INSERT INTO job (id,kind,snapshot,selection,client_ip,created_at,input_chunk_id)
+		VALUES ($1,$2,'s','','1.1.1.1',1,$3)`, id, kind, chunk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,
+		                   started_at,finished_at,columns,job_id,chunk_index,completes_job)
+		VALUES ($1,$2,'s','','done','1.1.1.1',1,1,2,$3,$4,0,TRUE)`,
+		chunk, kind, columns, id); err != nil {
 		t.Fatal(err)
 	}
 	for i, r := range rows {
 		if _, err := pool.Exec(ctx, `
-			INSERT INTO job_variant (job_id,idx,chrom,pos,ref,alt,annotations)
+			INSERT INTO chunk_variant (chunk_id,idx,chrom,pos,ref,alt,annotations)
 			VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-			id, i, r[0], r[1], r[2], r[3], anns[i]); err != nil {
+			chunk, i, r[0], r[1], r[2], r[3], anns[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
+
+// chunkOf names the chunk a seeded job's work hangs off.
+//
+// A job id and a chunk id are separate strings now, and a test that stores an
+// input or a result against the job's own id writes a row nothing will read.
+func chunkOf(jobID string) string { return jobID + "-c0" }
 
 const vcfCols = `[
   {"key":"GENE","label":"Gene","type":"text","source":"GENCODE","source_ref":"gencode:48"},
@@ -178,7 +197,7 @@ func storeJobInput(t *testing.T, h *harness, id, body string) {
 	}
 	defer pool.Close()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO job_input (job_id, body) VALUES ($1,$2)`, id, []byte(body)); err != nil {
+		`INSERT INTO chunk_input (chunk_id, body) VALUES ($1,$2)`, chunkOf(id), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 }

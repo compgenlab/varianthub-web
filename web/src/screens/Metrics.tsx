@@ -10,6 +10,7 @@ import {
   Hourglass,
   Loader,
   Ban,
+  Skull,
 } from "lucide-react";
 
 import { api, type Metrics as MetricsData } from "../api";
@@ -119,6 +120,11 @@ export default function Metrics() {
   // because someone stopped a job on purpose is not a rate worth watching.
   const decided = Math.max(0, j.total - (j.cancelled ?? 0));
   const failRate = decided > 0 ? (j.failed / decided) * 100 : 0;
+  // The worker table is hidden while nothing has been abandoned. A row per
+  // healthy pod is noise on a page read to find out whether anything is wrong,
+  // and this section only says anything when something is.
+  const workers = m.workers ?? [];
+  const abandoned = j.abandoned_attempts_24h ?? 0;
 
   return (
     <div className="page page-wide" style={{ paddingTop: 30 }}>
@@ -204,6 +210,23 @@ export default function Metrics() {
           value={humanCount(j.queued + j.running)}
           sub="queued and running"
         />
+        {/* Only when it is not zero. A permanent "Abandoned 0" trains the eye to
+            skip it, which is the one thing this counter must not do. */}
+        {abandoned > 0 && (
+          <Stat
+            icon={<Skull size={13} />}
+            label="Abandoned"
+            value={humanCount(abandoned)}
+            sub={
+              j.abandoned_exhausted > 0
+                ? `attempts in 24h · ${humanCount(j.abandoned_exhausted)} job${
+                    j.abandoned_exhausted === 1 ? "" : "s"
+                  } gave up`
+                : "attempts in 24h · all retried successfully"
+            }
+            tone={j.abandoned_exhausted > 0 ? "bad" : "warn"}
+          />
+        )}
         <Stat
           icon={<Database size={13} />}
           label="Sources"
@@ -215,6 +238,50 @@ export default function Metrics() {
           }
         />
       </div>
+
+      {/* Workers, and only when something has gone wrong with one. An
+          abandonment is a worker killed mid-job rather than a job failing, so
+          the usual cause is the container's memory limit — and the counters
+          above cannot say whether one process lost everything or the losses are
+          spread, which is the difference between fixing a pod and fixing a job. */}
+      {abandoned > 0 && (
+        <>
+          <h2 className="label" style={{ margin: "26px 0 10px" }}>
+            Workers
+          </h2>
+          <p className="lede" style={{ fontSize: 13.5, margin: "0 0 12px" }}>
+            {humanCount(abandoned)} attempt{abandoned === 1 ? "" : "s"} in the last
+            24h ended with the worker gone rather than reporting. A single worker
+            accounting for most of them points at that process — commonly its
+            memory limit; spread evenly, it points at the jobs instead.
+          </p>
+          <div className="card">
+            <div className="thead rowgrid metric-worker-row">
+              <span>Worker</span>
+              <span style={{ textAlign: "right" }}>Attempts</span>
+              <span style={{ textAlign: "right" }}>Abandoned</span>
+              <span style={{ textAlign: "right" }}>Typically after</span>
+            </div>
+            {workers.map((wk) => (
+              <div key={wk.worker} className="rowgrid metric-worker-row">
+                <span className="mono">{wk.worker}</span>
+                <span style={{ textAlign: "right" }}>{humanCount(wk.attempts)}</span>
+                <span
+                  style={{ textAlign: "right" }}
+                  className={wk.abandoned > 0 ? "bad" : undefined}
+                >
+                  {humanCount(wk.abandoned)}
+                </span>
+                <span style={{ textAlign: "right" }}>
+                  {wk.abandoned > 0 && wk.median_abandoned_after
+                    ? `${wk.median_abandoned_after}s`
+                    : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       <h2 className="label" style={{ margin: "26px 0 10px" }}>
         Storage

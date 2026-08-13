@@ -65,6 +65,7 @@ type fileConfig struct {
 		VarhubHome      string `toml:"varhub_home"`
 		DataDir         string `toml:"data_dir"`
 		CacheDir        string `toml:"cache_dir"`
+		JobStorage      string `toml:"job_storage"`
 		JobTimeout      string `toml:"job_timeout"`
 		DownloadTimeout string `toml:"download_timeout"`
 		JobTTL          string `toml:"job_ttl"`
@@ -91,9 +92,9 @@ type fileConfig struct {
 	S3Sites []S3Site `toml:"s3"`
 
 	Limits struct {
-		RatePerMin     *int   `toml:"rate_per_min"`
-		RateBurst      *int   `toml:"rate_burst"`
-		MaxJobsPerIP   *int   `toml:"max_jobs_per_ip"`
+		RatePerMin   *int `toml:"rate_per_min"`
+		RateBurst    *int `toml:"rate_burst"`
+		MaxJobsPerIP *int `toml:"max_jobs_per_ip"`
 
 		// Per-tier service limits. Concurrent running jobs, and submissions per
 		// hour; 0 is unbounded. An administrator can override each from the
@@ -105,6 +106,14 @@ type fileConfig struct {
 		StandardPerHour    *int `toml:"standard_per_hour"`
 		ElevatedConcurrent *int `toml:"elevated_concurrent"`
 		ElevatedPerHour    *int `toml:"elevated_per_hour"`
+
+		// The most variants one submission may carry, per tier; 0 is unbounded.
+		AnonMaxVariants     *int `toml:"anon_max_variants"`
+		StandardMaxVariants *int `toml:"standard_max_variants"`
+		ElevatedMaxVariants *int `toml:"elevated_max_variants"`
+		// Variants per chunk of a split VCF. Sized by per-chunk fixed cost, not
+		// by fairness — see catalog.Site.VCFChunkSize.
+		VCFChunkSize   *int   `toml:"vcf_chunk_size"`
 		MaxUploadBytes *int64 `toml:"max_upload_bytes"`
 	} `toml:"limits"`
 }
@@ -175,6 +184,7 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setStr(&c.VarhubHome, f.Worker.VarhubHome)
 	setStr(&c.DataDir, f.Worker.DataDir)
 	setStr(&c.CacheDir, f.Worker.CacheDir)
+	setStr(&c.JobStorage, f.Worker.JobStorage)
 	if f.Cache.Enabled != nil {
 		c.CacheEnabled = *f.Cache.Enabled
 	}
@@ -215,6 +225,10 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setInt(&c.StandardPerHour, f.Limits.StandardPerHour)
 	setInt(&c.ElevatedConcurrent, f.Limits.ElevatedConcurrent)
 	setInt(&c.ElevatedPerHour, f.Limits.ElevatedPerHour)
+	setInt(&c.AnonMaxVariants, f.Limits.AnonMaxVariants)
+	setInt(&c.StandardMaxVariants, f.Limits.StandardMaxVariants)
+	setInt(&c.ElevatedMaxVariants, f.Limits.ElevatedMaxVariants)
+	setInt(&c.VCFChunkSize, f.Limits.VCFChunkSize)
 	if f.Limits.MaxUploadBytes != nil {
 		c.MaxUploadBytes = *f.Limits.MaxUploadBytes
 	}

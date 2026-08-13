@@ -122,6 +122,10 @@ func (s *Server) Routes() http.Handler {
 	// Jobs. Reads are ownership-enforced, not throttled.
 	v1.Handle("GET /api/v1/jobs/{id}/log",
 		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleJobLog))))
+	// A chunk's own log. Web-only for the same reason the job's is: it is a
+	// screen for looking into one run, not something a client polls.
+	v1.Handle("GET /api/v1/jobs/{id}/chunks/{chunkId}/log",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleChunkLog))))
 	// Web-only: this is the table feed, paged and sorted for a screen. An
 	// external caller wants the whole result, which is what export is.
 	v1.Handle("GET /api/v1/jobs/{id}/results",
@@ -171,6 +175,8 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("GET /api/v1/admin/genelists/models", s.handleListGeneModels)
 	m.HandleFunc("POST /api/v1/admin/genelists/validate", s.handleValidateGeneList)
 	m.HandleFunc("POST /api/v1/admin/genelists", s.handleCreateGeneList)
+	m.HandleFunc("GET /api/v1/admin/genelists/{id}", s.handleGetGeneList)
+	m.HandleFunc("PUT /api/v1/admin/genelists/{id}", s.handleUpdateGeneList)
 	m.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
 	m.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
 	m.HandleFunc("PATCH /api/v1/admin/snapshots/{id}", s.handleUpdateSnapshotMeta)

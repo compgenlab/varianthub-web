@@ -22,6 +22,21 @@ import (
 	"time"
 )
 
+// DefaultVCFChunkSize is how many variants one chunk of a split VCF carries
+// when nothing says otherwise.
+//
+// Defined here rather than in catalog because catalog imports this package, and
+// the value has to be one number: config supplies the default and catalog's
+// stored override falls back to it, so two definitions would let a cleared
+// setting revert to something other than the configured default.
+//
+// Not the interactive submission cap, though both started at 10,000. That one
+// bounds what a caller may ask for; this bounds how much work one process does,
+// and it is set by fixed per-chunk cost — a claim, a stage from storage, a
+// varhub start, a snapshot load, then an upload and a merge. Chromosome 22 of a
+// WGS cohort is 2.6M variants: 260 chunks at 10,000, 26 at this.
+const DefaultVCFChunkSize = 100_000
+
 // Config is the resolved service configuration.
 type Config struct {
 	Addr string // listen address, e.g. ":8080" or "10.0.0.5:8080"
@@ -72,6 +87,18 @@ type Config struct {
 	VarhubHome     string // fixed VARHUB_HOME; empty = materialize per job from the catalog
 	DataDir        string // shared, persistent: downloaded source files
 	CacheDir       string // shared, persistent: built indexes and the annotation cache
+	// JobStorage is where a job's input and result files live: an "s3://bucket/prefix"
+	// or an absolute filesystem path. Both the API and the worker write here, so
+	// on a multi-node deployment it must be a bucket or a shared mount — a
+	// pod-local path means the worker cannot read what the API accepted.
+	//
+	// Deliberately not one of the catalog's storage locations. Those hold source
+	// data: an administrator browses them, they are reconciled from config at
+	// startup, and their contents are the installation's asset. This holds
+	// per-job scratch that is deleted when the job expires, and mixing the two
+	// would put a week of transient uploads into the storage browser and into
+	// every usage total.
+	JobStorage string
 	// StoragePaths are filesystem download targets declared by the deployment, as
 	// "name=/abs/path" entries. The first is the default. They are reconciled into
 	// the catalog at startup so the config file stays authoritative for them.
@@ -135,14 +162,54 @@ type Config struct {
 	ElevatedConcurrent int
 	ElevatedPerHour    int
 
-	JobTimeout time.Duration // per-job wall clock
-	// DownloadTimeout bounds a provisioning job. Longer than JobTimeout by
-	// default: a tool's one-time install fetches tens of gigabytes, and being
-	// killed partway leaves a half-populated data directory that the next
-	// attempt has to redo from the start.
+	// The most variants one submission may carry, per tier; 0 is unbounded.
+	AnonMaxVariants     int
+	StandardMaxVariants int
+	ElevatedMaxVariants int
+	// VCFChunkSize is variants per chunk of a split VCF. A different question
+	// from the caps above and sized differently — see catalog.Site.VCFChunkSize.
+	VCFChunkSize int
+
+	// JobTimeout bounds a single annotation job's wall clock.
+	//
+	// Twelve hours by default, which is a ceiling rather than an expectation:
+	// an ordinary job finishes in seconds, and this is sized for the largest one
+	// the limits allow — a whole chromosome of a WGS cohort against several
+	// expensive sources. An hour used to be the figure, and it killed exactly
+	// the submissions that took longest to prepare and cost the most to redo.
+	//
+	// The queue's protection against a job occupying a worker forever is the
+	// weight budget and the concurrency cap, not this. Cutting a job off at an
+	// arbitrary hour does not free capacity, it wastes the capacity already
+	// spent.
+	JobTimeout time.Duration
+	// DownloadTimeout bounds a provisioning job.
+	//
+	// Longer than JobTimeout, and it has to stay longer: the two are sized by
+	// different things. An annotation is bounded by how much work one
+	// submission may carry; a tool's one-time install is bounded by how long it
+	// takes to fetch tens of gigabytes down a single TCP stream. A measured VEP
+	// install took about 17 hours, so the 12h this used to default to would have
+	// killed it five hours from done — and being killed partway is worse than
+	// being slow, because it leaves a half-populated data directory with no
+	// sentinel and the next attempt starts from nothing.
 	DownloadTimeout time.Duration
 	JobTTL          time.Duration // terminal jobs GC'd after this
-	MaxUploadBytes  int64         // cap on a POST /annotate/vcf body
+	// MaxUploadBytes caps a POST /annotate/vcf body.
+	//
+	// A backstop against someone streaming us a terabyte, not the limit that
+	// decides how much work a job is. That is the variant count, checked
+	// separately: a byte cap cannot tell a large file of few richly-annotated
+	// variants from a small one holding millions, and it is the millions that
+	// cost something.
+	//
+	// 512 MB clears a whole chromosome of a WGS cohort — around 26 MB
+	// compressed for chr22, and well under this uncompressed. It only became
+	// safe once nothing held the upload whole: the API streams it to storage,
+	// the worker stages it to a file, the cache reads that file, and the export
+	// streams it back. While any of those buffered it, this number was bounded
+	// by what a process could hold rather than by what a caller should send.
+	MaxUploadBytes int64
 
 	RatePerMin   int      // per-IP submit rate
 	RateBurst    int      // per-IP burst
@@ -160,16 +227,22 @@ type Config struct {
 // without anything noticing.
 func Defaults() *Config {
 	return &Config{
-		Addr:            ":8080",
-		Workers:         2,
-		JobSlots:        0, // 0 = follow Workers
-		DownloadWeight:  2,
-		VarhubBin:       "varhub",
-		DataDir:         "/var/lib/varianthub/data",
-		CacheDir:        "/var/lib/varianthub/cache",
+		Addr:           ":8080",
+		Workers:        2,
+		JobSlots:       0, // 0 = follow Workers
+		DownloadWeight: 2,
+		VarhubBin:      "varhub",
+		DataDir:        "/var/lib/varianthub/data",
+		CacheDir:       "/var/lib/varianthub/cache",
+		// A filesystem default, not a bucket: a single-node installation should
+		// come up without object storage configured. It sits beside the other
+		// var directories rather than inside DataDir, because that one holds
+		// source data an administrator keeps and this holds job scratch that is
+		// deleted on a timer — the two should not be one `rm -rf` apart.
+		JobStorage:      "/var/lib/varianthub/jobs",
 		StoragePaths:    []string{"default=/var/lib/varianthub/sources"},
-		JobTimeout:      time.Hour,
-		DownloadTimeout: 12 * time.Hour,
+		JobTimeout:      12 * time.Hour,
+		DownloadTimeout: 48 * time.Hour,
 		// Results are the thing a user comes back for, and a day is shorter
 		// than the gap between someone running an annotation and being asked
 		// about it. A week covers that without storing every result an
@@ -179,7 +252,7 @@ func Defaults() *Config {
 		// the JSON blob that backs export and once as rows that back paging and
 		// sorting, so this multiplies the larger of those by seven.
 		JobTTL:         7 * 24 * time.Hour,
-		MaxUploadBytes: 64 << 20,
+		MaxUploadBytes: 512 << 20,
 		RatePerMin:     30,
 		RateBurst:      10,
 		MaxJobsPerIP:   2,
@@ -207,6 +280,15 @@ func Defaults() *Config {
 		StandardPerHour:    60,
 		ElevatedConcurrent: 5,
 		ElevatedPerHour:    600,
+
+		// Ten thousand for anyone who has not been given more. It is what a
+		// person pastes into a box, and past it the VCF path is the right tool.
+		// Elevated is uncapped: that tier exists for cohort work, where a whole
+		// chromosome in one submission is the point.
+		AnonMaxVariants:     10_000,
+		StandardMaxVariants: 10_000,
+		ElevatedMaxVariants: 0,
+		VCFChunkSize:        DefaultVCFChunkSize,
 
 		References: map[string]string{},
 		TrustedProxy: []string{
@@ -250,8 +332,51 @@ func Load() (*Config, error) {
 	if c.JobSlots <= 0 {
 		c.JobSlots = c.Workers
 	}
+	if err := c.checkJobStorage(configHint(path)); err != nil {
+		return nil, err
+	}
 	c.applyPublicURL()
 	return c, nil
+}
+
+// checkJobStorage refuses a job storage location that cannot be shared.
+//
+// The API writes a job's input and the worker reads it, so they must see the
+// same bytes — a bucket, or a directory both processes have mounted. Whether it
+// is object storage or a filesystem does not matter; whether it is *shared*
+// does, and only one of the two ways to get that wrong is visible from in here.
+//
+// A relative path is the visible one, and it is always wrong: it resolves
+// against each process's working directory, so the API and the worker would
+// each get their own. That fails at the first upload with "no such file",
+// pointing at the worker rather than at the configuration.
+//
+// The other way — an absolute path that is pod-local rather than a shared mount
+// — cannot be detected from a single process, since it looks identical to a
+// correct shared mount. The deployment files are where that is settled, and the
+// error below says so rather than implying this check is complete.
+func (c *Config) checkJobStorage(hint string) error {
+	s := strings.TrimSpace(c.JobStorage)
+	if s == "" {
+		return fmt.Errorf("no job storage configured: set worker.job_storage in %s, "+
+			"or VHW_JOB_STORAGE. It holds job inputs and results, and the API and "+
+			"the worker must both reach it — an s3:// bucket, or a directory mounted "+
+			"into both", hint)
+	}
+	if strings.HasPrefix(s, "s3://") {
+		if strings.TrimPrefix(s, "s3://") == "" {
+			return fmt.Errorf("worker.job_storage %q names no bucket", s)
+		}
+		c.JobStorage = strings.TrimRight(s, "/")
+		return nil
+	}
+	if !filepath.IsAbs(s) {
+		return fmt.Errorf("worker.job_storage %q must be absolute or an s3:// URI: a "+
+			"relative path resolves against each process's working directory, so the "+
+			"API and the worker would not share one", s)
+	}
+	c.JobStorage = filepath.Clean(s)
+	return nil
 }
 
 // applyPublicURL fills in what the site's address implies.
@@ -309,6 +434,7 @@ func applyEnv(c *Config) {
 	envStr("VHW_VARHUB_HOME", &c.VarhubHome)
 	envStr("VHW_DATA_DIR", &c.DataDir)
 	envStr("VHW_CACHE_DIR", &c.CacheDir)
+	envStr("VHW_JOB_STORAGE", &c.JobStorage)
 	envDurInto("VHW_JOB_TIMEOUT", &c.JobTimeout)
 	envDurInto("VHW_DOWNLOAD_TIMEOUT", &c.DownloadTimeout)
 	envDurInto("VHW_JOB_TTL", &c.JobTTL)
@@ -340,6 +466,10 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_STANDARD_PER_HOUR", &c.StandardPerHour)
 	envIntInto("VHW_ELEVATED_CONCURRENT", &c.ElevatedConcurrent)
 	envIntInto("VHW_ELEVATED_PER_HOUR", &c.ElevatedPerHour)
+	envIntInto("VHW_ANON_MAX_VARIANTS", &c.AnonMaxVariants)
+	envIntInto("VHW_STANDARD_MAX_VARIANTS", &c.StandardMaxVariants)
+	envIntInto("VHW_ELEVATED_MAX_VARIANTS", &c.ElevatedMaxVariants)
+	envIntInto("VHW_VCF_CHUNK_SIZE", &c.VCFChunkSize)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n

@@ -60,7 +60,20 @@
   varhub_home = ""                                  # VHW_VARHUB_HOME
   data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
   cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
-  job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Job inputs and results. The API writes an upload here and the worker reads
+  # it back, so unlike the two directories above this one is *shared*: the
+  # compose file mounts the varhub-jobs volume into both. A path only one of
+  # them can see is a job that is accepted and then cannot run.
+  #
+  # This deviates from the built-in default (/var/lib/varianthub/jobs), which is
+  # right for a single-process install and wrong here, where the API and the
+  # worker are separate containers.
+  #
+  # On a deployment spread over more than one host, make it a bucket instead —
+  # the setting takes either, and nothing else changes:
+  #   job_storage = "s3://my-bucket/varianthub/jobs"
+  job_storage = "/mnt/jobs"                         # VHW_JOB_STORAGE
+  job_timeout = "12h"                               # VHW_JOB_TIMEOUT
   # Provisioning is bounded separately, and generously. An annotation answers a
   # query in seconds; a tool's one-time install is a different kind of work —
   # VEP fetches a species cache measured in days, not hours. The default 12h
@@ -115,5 +128,11 @@ max_age     = "2160h"
   rate_per_min = 30                                 # VHW_RATE_PER_MIN
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
-  max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+  # A backstop against someone streaming us a terabyte, not the limit that says
+  # how much work a job is — that is the variant count below. A byte cap cannot
+  # tell a large file of few richly-annotated variants from a small one holding
+  # millions, and it is the millions that cost something.
+  #
+  # 512 MB clears a whole chromosome of a WGS cohort with room to spare.
+  max_upload_bytes = 536870912                      # VHW_MAX_UPLOAD_BYTES
   submit_wait_cap = "10s"                           # VHW_SUBMIT_WAIT_CAP

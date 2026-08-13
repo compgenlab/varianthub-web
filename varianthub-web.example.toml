@@ -65,13 +65,36 @@
   # cache_setup below for the case where there is no shared mount.
   data_dir = "/var/lib/varianthub/data"             # VHW_DATA_DIR
   cache_dir = "/var/lib/varianthub/cache"           # VHW_CACHE_DIR
-  job_timeout = "1h"                                # VHW_JOB_TIMEOUT
+  # Job inputs and results. Unlike the two directories above, this one is
+  # *shared*: the API writes an upload here and the worker reads it back, so
+  # both have to reach it. An absolute path works when they run on one host; on
+  # more than one, make it a bucket:
+  #
+  #   job_storage = "s3://my-bucket/varianthub/jobs"
+  #
+  # A relative path is refused at startup, because it would resolve against each
+  # process's working directory and give the two of them different locations.
+  job_storage = "/var/lib/varianthub/jobs"          # VHW_JOB_STORAGE
+  # A ceiling, not an expectation: an ordinary annotation finishes in seconds,
+  # and this is sized for the largest job the limits allow — a chromosome of a
+  # WGS cohort against several expensive sources. It used to be an hour, which
+  # killed exactly the submissions that cost the most to redo. Cutting a job off
+  # does not give back capacity already spent; the slot budget and the
+  # concurrency cap are what protect the pool.
+  job_timeout = "12h"                               # VHW_JOB_TIMEOUT
   # Provisioning is a different scale of work: a source can be tens of
   # gigabytes and a tool's one-time install larger still. Being killed partway
   # is worse than being slow — it leaves a half-populated data directory with
   # no sentinel, so the next attempt starts from nothing.
-  download_timeout = "12h"                          # VHW_DOWNLOAD_TIMEOUT
-  job_ttl = "24h"                                   # VHW_JOB_TTL
+  #
+  # 48h because a measured VEP install took about 17 hours, limited by a single
+  # TCP stream rather than by disk. The previous 12h would have killed it at
+  # hour 12 — five hours short — every time.
+  download_timeout = "48h"                          # VHW_DOWNLOAD_TIMEOUT
+  # How long a finished job's results are kept. A result is stored twice, as the
+  # JSON blob export reads and as the rows that back paging and sorting, so this
+  # multiplies the larger of the two by seven.
+  job_ttl = "168h"                                  # VHW_JOB_TTL
 
 # Where downloaded source data goes. Filesystem entries come first and the first
 # of those is the default target. Both take "name=<target>" entries.
@@ -132,7 +155,13 @@ max_age     = "2160h"
   rate_per_min = 30                                 # VHW_RATE_PER_MIN
   rate_burst = 10                                   # VHW_RATE_BURST
   max_jobs_per_ip = 2                               # VHW_MAX_JOBS_PER_IP
-  max_upload_bytes = 67108864                       # VHW_MAX_UPLOAD_BYTES
+  # A backstop against someone streaming us a terabyte, not the limit that says
+  # how much work a job is — that is the variant count below. A byte cap cannot
+  # tell a large file of few richly-annotated variants from a small one holding
+  # millions, and it is the millions that cost something.
+  #
+  # 512 MB clears a whole chromosome of a WGS cohort with room to spare.
+  max_upload_bytes = 536870912                      # VHW_MAX_UPLOAD_BYTES
 
   # What one caller may ask of the service, by tier.
   #

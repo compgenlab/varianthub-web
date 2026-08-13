@@ -127,10 +127,10 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		{
 			Method: "GET", Path: "/api/v1/jobs/{id}", OpID: "getJob",
 			Public: true,
-			Summary: "Fetch a job's status. Results are a separate call, " +
-				"GET /jobs/{id}/export.",
+			Summary: "Fetch a job's status and its chunks. Results are a " +
+				"separate call, GET /jobs/{id}/export.",
 			Handler:  s.handleGetJob,
-			Response: JobStatusResponse{},
+			Response: JobResponse{},
 			Params: []param{{
 				Name: "id", In: "path", Required: true, Type: "string",
 				Doc: "The job identifier returned by a submission.",

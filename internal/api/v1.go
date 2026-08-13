@@ -14,6 +14,8 @@ package api
 // anyway — so export ships now and results waits for the schema work.
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,20 +25,11 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
-
-// maxVariantsPerRequest caps a JSON locus submission.
-//
-// The engine receives loci as argv (runner.ExecRunner splits Body on whitespace
-// and appends each as an argument), so a large batch does not fail cleanly — it
-// trips the kernel's ARG_MAX somewhere north of a couple of megabytes and the
-// exec fails for a reason that looks nothing like "too many variants". Cap it
-// well below that and point callers at the VCF path, which streams through a file
-// and has no such ceiling.
-const maxVariantsPerRequest = 10000
 
 // normalizeLocus accepts the dash-delimited variant form docs/api.md uses in its
 // examples and rewrites it to the colon-delimited form the engine parses.
@@ -282,7 +275,7 @@ func (s *Server) handleSources(w http.ResponseWriter, r *http.Request) {
 			Source: src, Ref: src.Ref(), Annotations: anns,
 			NeedsData: src.NeedsData(), State: st,
 			RequiresReference: src.RequiresReference(), IsReference: src.IsReference(),
-			GeneListGTF:       src.GeneListGTF(),
+			GeneListGTF: src.GeneListGTF(),
 		})
 	}
 	writeJSON(w, http.StatusOK, SourcesResponse{Sources: out})
@@ -429,10 +422,14 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "`variants` is required and must be non-empty")
 		return
 	}
-	if len(loci) > maxVariantsPerRequest {
+	// The caller's own cap, not a fixed number. Checked here because a locus
+	// list's variant count is the length of a slice — the VCF path cannot do
+	// this at the door, since counting a compressed file means decompressing it.
+	_, lim := s.callerLimits(r, limit.ClientIP(r, s.trusted))
+	if !lim.AllowsVariants(len(loci)) {
 		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"%d variants exceeds the %d-variant limit for this endpoint; use POST /api/v1/annotate/vcf for bulk submissions",
-			len(loci), maxVariantsPerRequest))
+			"%d variants exceeds the %d-variant limit for this account; use POST /api/v1/annotate/vcf for bulk submissions",
+			len(loci), lim.MaxVariants))
 		return
 	}
 	sel, err := selection(in.Annotations)
@@ -466,72 +463,191 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// maxFormField bounds one non-file part of an upload. Snapshot names and
+// annotation lists are tens of bytes; anything approaching this is not one.
+const maxFormField = 1 << 20
+
+// maxFormFields bounds how many non-file parts one request may carry, so a
+// client cannot make the server accumulate an unbounded number of small
+// strings while claiming to be uploading a VCF.
+const maxFormFields = 32
+
 func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	max := s.cfg.MaxUploadBytes
 	if max <= 0 {
 		max = 64 << 20
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, max)
-	// ParseMultipartForm's argument is the in-memory threshold, not the total
-	// cap; MaxBytesReader above is what actually bounds the upload.
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"could not read upload (limit %d bytes): %v", max, err))
+
+	// Read the parts as they arrive rather than through ParseMultipartForm.
+	//
+	// That one buffers the whole request before any of it can be looked at — a
+	// few megabytes in memory and the rest spilled to a temp file — so the API
+	// needed local scratch proportional to the upload cap, and the file was
+	// written to disk once on the way to being written to storage.
+	//
+	// Streaming removes both. The trade is that a part is available only when
+	// it arrives, so a request whose file comes before its metadata is stored
+	// before it can be validated. That is a smaller cost than it looks:
+	// buffering did not avoid *receiving* the bytes either, it only delayed
+	// them, and what is wasted here is the hop to job storage, which is
+	// internal and undone by a delete.
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "expected a multipart form upload")
 		return
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
 
-	file, hdr, err := r.FormFile("vcf")
-	if err != nil {
+	var (
+		fields   = map[string]string{}
+		filename string
+		id       string
+		uri      string
+	)
+	// Whatever was stored before an error, so every failure path below can undo
+	// it. Without this an upload that arrives before a metadata field it turns
+	// out to conflict with would be left in storage with nothing pointing at it.
+	discard := func() {
+		if uri == "" {
+			return
+		}
+		if rmErr := blob.Remove(context.WithoutCancel(r.Context()), uri); rmErr != nil {
+			log.Printf("api: upload at %s was not turned into a job and could not be "+
+				"removed: %v", uri, rmErr)
+		}
+	}
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			discard()
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"could not read the upload (limit %d bytes): %v", max, err))
+			return
+		}
+
+		if part.FormName() != "vcf" {
+			if len(fields) >= maxFormFields {
+				part.Close()
+				discard()
+				writeError(w, http.StatusBadRequest, "too many form fields")
+				return
+			}
+			v, err := io.ReadAll(io.LimitReader(part, maxFormField))
+			part.Close()
+			if err != nil {
+				discard()
+				writeError(w, http.StatusBadRequest, "could not read a form field")
+				return
+			}
+			fields[part.FormName()] = string(v)
+			continue
+		}
+
+		if uri != "" {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "only one `vcf` part is allowed")
+			return
+		}
+		filename = part.FileName()
+
+		// Classify the compression once, here, and record it in the object's
+		// name. This is the only place that looks at the bytes to decide; every
+		// later reader is told by the filename instead of working it out again.
+		// The process that received the file is the one that knows, and four
+		// consumers each sniffing for themselves is four chances to disagree
+		// about one file.
+		//
+		// Buffered rather than seeked, because a streamed part cannot rewind —
+		// the two bytes are read and then put back in front of the stream.
+		buf := bufio.NewReader(part)
+		magic, err := buf.Peek(2)
+		if len(magic) == 0 {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
+			return
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
+			return
+		}
+		compressed := len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b
+
+		// The id is minted before the object because the object is stored under
+		// it, which is what makes a bucket listing say which job every object
+		// belongs to.
+		if id, err = queue.NewID(); err != nil {
+			part.Close()
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		dest := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(compressed))
+		if err := blob.PutReader(r.Context(), dest, buf); err != nil {
+			part.Close()
+			// dest is not assigned to uri until it exists, so discard() has
+			// nothing to undo — PutReader leaves no partial object behind.
+			log.Printf("api: store upload for job %s at %s: %v", id, dest, err)
+			writeError(w, http.StatusInternalServerError, "could not store the uploaded VCF")
+			return
+		}
+		part.Close()
+		uri = dest
+	}
+
+	if uri == "" {
 		writeError(w, http.StatusBadRequest, "a `vcf` file part is required")
 		return
 	}
-	defer file.Close()
 
-	// MaxBytesReader above already bounds this; ParseMultipartForm has spilled
-	// anything over the in-memory threshold to a temp file that RemoveAll clears.
-	body, err := io.ReadAll(file)
+	sel, err := selection(anyOf(strings.TrimSpace(fields["annotations"])))
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
-		return
-	}
-	if len(body) == 0 {
-		writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
-		return
-	}
-
-	sel, err := selection(anyOf(r.FormValue("annotations")))
-	if err != nil {
+		discard()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var sources []string
-	if v := strings.TrimSpace(r.FormValue("sources")); v != "" {
-		for _, id := range strings.Split(v, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				sources = append(sources, id)
+	if v := strings.TrimSpace(fields["sources"]); v != "" {
+		for _, sid := range strings.Split(v, ",") {
+			if sid = strings.TrimSpace(sid); sid != "" {
+				sources = append(sources, sid)
 			}
 		}
 	}
-	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(r.FormValue("snapshot")),
-		sources, strings.TrimSpace(r.FormValue("build")), splitSelection(sel))
+	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(fields["snapshot"]),
+		sources, strings.TrimSpace(fields["build"]), splitSelection(sel))
 	if err != nil {
+		discard()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.submit(w, r, queue.NewJob{
-		Kind:      queue.KindVCF,
+
+	// Every uploaded VCF goes through the split, whatever its size. A small one
+	// produces a single chunk, which is a job of one chunk and travels the same
+	// path as a job of two hundred.
+	//
+	// There is deliberately no threshold. A threshold means two ways a
+	// submission can be processed, only one of which is exercised by ordinary
+	// use — so the other is the one that breaks, and it breaks for the largest
+	// files, which are the ones nobody wants to resubmit.
+	if !s.submit(w, r, queue.NewJob{
+		ID:        id,
+		Kind:      queue.KindSplit,
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
 		UserID:    callerOf(r).UserID(),
-		Label:     hdr.Filename,
-		Body:      body,
-	})
+		Label:     filename,
+		InputURI:  uri,
+	}) {
+		discard()
+	}
 }
 
 // anyOf lifts an empty form value to nil so selection() reads it as "unset"
@@ -551,7 +667,13 @@ func anyOf(s string) any {
 // client had to handle both regardless, because the window was never a
 // guarantee — so the shape that was always required is now the only one, and
 // each of status, results and cancellation is its own call.
-func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) {
+// submit records the job and writes the response, reporting whether it was
+// accepted.
+//
+// The boolean exists for the upload path: when the row cannot be written, the
+// object already in storage has to be removed, and the caller is the only one
+// that still knows where it is.
+func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) bool {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
 
 	// Stamped at submit, not read at dispatch. The limit a job runs under is the
@@ -561,16 +683,18 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 	c := callerOf(r)
 	_, lim := s.callerLimits(r, nj.ClientIP)
 	nj.MaxConcurrent = lim.Concurrent
+	nj.MaxVariants = lim.MaxVariants
 	nj.Origin = queue.OriginWeb
 	if c.ViaToken {
 		nj.Origin = queue.OriginAPI
 	}
-	id, err := s.queue.Enqueue(r.Context(), nj)
+	id, err := s.queue.Submit(r.Context(), nj)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return false
 	}
 	writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id})
+	return true
 }
 
 // --- jobs ---
@@ -616,21 +740,22 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			f.Session = sess
 		} else {
 			writeJSON(w, http.StatusOK, JobsResponse{
-				Jobs: []queue.Job{}, Limit: limit, Offset: offset, Scoped: true,
+				Jobs: []JobStatusResponse{}, Limit: limit, Offset: offset, Scoped: true,
 			})
 			return
 		}
 	}
-	jobs, err := s.queue.List(r.Context(), f, limit, offset)
+	jobs, err := s.queue.ListJobs(r.Context(), f, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if jobs == nil {
-		jobs = []queue.Job{}
+	out := make([]JobStatusResponse, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobStatus(j))
 	}
 	writeJSON(w, http.StatusOK, JobsResponse{
-		Jobs: jobs, Limit: limit, Offset: offset, Scoped: scoped,
+		Jobs: out, Limit: limit, Offset: offset, Scoped: scoped,
 	})
 }
 
@@ -646,7 +771,7 @@ func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Job, b
 		return queue.Job{}, false
 	}
 	id := r.PathValue("id")
-	job, ok, err := s.queue.Get(r.Context(), id)
+	job, ok, err := s.queue.GetJob(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return queue.Job{}, false
@@ -714,7 +839,15 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, jobStatus(job))
+	// The chunks come back with it. See JobResponse: which piece of a split
+	// submission failed is part of the job's status, not a separate thing to go
+	// and ask about.
+	chunks, err := s.queue.JobChunks(r.Context(), job.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, jobDetail(job, chunks))
 }
 
 // handleCancelJob stops a job.
@@ -746,13 +879,13 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := s.queue.Cancel(r.Context(), job.ID)
+	out, err := s.queue.CancelJob(r.Context(), job.ID)
 	switch {
 	case errors.Is(err, queue.ErrNotCancellable):
 		// Not an error worth a failure status: the caller wanted it stopped and
 		// it is stopped. Report the state so the UI can settle on it.
 		writeJSON(w, http.StatusOK, CancelResponse{
-			Job: out, Cancelled: false,
+			Job: jobStatus(out), Cancelled: false,
 			Detail: "job had already finished",
 		})
 		return
@@ -764,7 +897,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("api: job %s cancelled by %s", job.ID, callerOf(r).Label())
-	writeJSON(w, http.StatusOK, CancelResponse{Job: out, Cancelled: true})
+	writeJSON(w, http.StatusOK, CancelResponse{Job: jobStatus(out), Cancelled: true})
 }
 
 // handleJobLog serves what a job's run printed.
@@ -789,6 +922,59 @@ func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
 		// Distinguishes "nothing was recorded" from "it printed nothing", which
 		// look identical in an empty string and mean different things: the first
 		// is a job from before logs were kept, the second is a quiet run.
+		"recorded": found,
+	})
+}
+
+// --- chunks ---
+
+// jobChunk loads one chunk of a job the caller may read.
+//
+// Underneath the job, never beside it: a chunk id means nothing on its own, and
+// a route that took one directly would need its own entitlement check over a
+// row that carries no owner. Reaching it through the job means the job's rule
+// is the only rule.
+func (s *Server) jobChunk(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return queue.Chunk{}, false
+	}
+	c, found, err := s.queue.JobChunk(r.Context(), job.ID, r.PathValue("chunkId"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return queue.Chunk{}, false
+	}
+	if !found {
+		// 404 for a chunk of another job as much as for one that never existed:
+		// the lookup is scoped to this job, so "not yours" and "not there" are
+		// the same answer and neither confirms anything.
+		writeError(w, http.StatusNotFound, "no such chunk")
+		return queue.Chunk{}, false
+	}
+	return c, true
+}
+
+// handleChunkLog serves what one chunk printed.
+//
+// The only thing a chunk has that GET /jobs/{id} does not already return, which
+// is why it is the only route under a chunk id. The job's own log is its first
+// chunk's — the run a caller submitted, or the split that cut it up — and this
+// is how the other twenty-five are read, one at a time, which a job log that
+// concatenated them would make impossible to avoid.
+func (s *Server) handleChunkLog(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.jobChunk(w, r)
+	if !ok {
+		return
+	}
+	out, found, err := s.queue.ChunkLog(r.Context(), c.JobID, c.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id":   c.JobID,
+		"chunk_id": c.ID,
+		"output":   out,
 		"recorded": found,
 	})
 }

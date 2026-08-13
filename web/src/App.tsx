@@ -31,6 +31,7 @@ import JobDetail from "./screens/JobDetail";
 import SystemJobs from "./screens/SystemJobs";
 import Files from "./screens/Files";
 import StorageBrowser from "./screens/StorageBrowser";
+import SiteSettings from "./screens/SiteSettings";
 
 /** Steps are shown only during the annotation flow, per the handoff. */
 function StepHeader() {
@@ -180,6 +181,11 @@ function Shell({
           <NavLink to="/admin/groups">
             <UsersRound /> Users &amp; groups
           </NavLink>
+          {/* Last because it is the least often opened, and because everything
+              above it is a thing you look at while this is a thing you change. */}
+          <NavLink to="/admin/settings">
+            <Settings /> Settings
+          </NavLink>
           </>
           )}
         </nav>
@@ -327,6 +333,7 @@ export default function App() {
                 should land on the page that absorbed it, not on a 404. */}
             <Route path="/admin/usage" element={<Navigate to="/admin/metrics" replace />} />
             <Route path="/admin/groups" element={<Groups me={me ?? anonymousMe} />} />
+            <Route path="/admin/settings" element={<SiteSettings />} />
             <Route path="/account" element={<Account me={me ?? anonymousMe} />} />
             <Route path="*" element={<Navigate to="/annotate/sources" replace />} />
           </Routes>

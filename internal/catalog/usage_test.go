@@ -21,13 +21,24 @@ func insertJob(t *testing.T, s *Store, kind, userID, session, origin string, var
 	t.Helper()
 	jobSeq++
 	id := fmt.Sprintf("job-%d", jobSeq)
-	_, err := s.pool.Exec(context.Background(), `
-		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,
-		                 label,weight,origin,n_variants,created_at)
-		VALUES ($1,$2,'snap','','done','10.0.0.1',$3,NULLIF($4,''),'',1,$5,$6,$7)`,
-		id, kind, session, userID, origin, variants, created)
-	if err != nil {
+	ctx := context.Background()
+	// A job and its chunk. Usage counts submissions, and how a submission went
+	// is read from its chunks — see the job_state view — so a seeded job
+	// without one has no status to count.
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO job (id,kind,snapshot,selection,client_ip,session_id,user_id,
+		                 label,origin,created_at,input_chunk_id)
+		VALUES ($1,$2,'snap','','10.0.0.1',$3,NULLIF($4,''),'',$5,$6,$7)`,
+		id, kind, session, userID, origin, created, id+"-c0"); err != nil {
 		t.Fatalf("insert job: %v", err)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,
+		                   label,weight,origin,n_variants,created_at,started_at,
+		                   finished_at,job_id,completes_job)
+		VALUES ($1,$2,'snap','','done','10.0.0.1',$3,NULLIF($4,''),'',1,$5,$6,$7,$7,$7,$8,TRUE)`,
+		id+"-c0", kind, session, userID, origin, variants, created, id); err != nil {
+		t.Fatalf("insert chunk: %v", err)
 	}
 }
 

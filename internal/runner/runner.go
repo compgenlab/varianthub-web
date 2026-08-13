@@ -53,6 +53,18 @@ type Request struct {
 	Snapshot  string // snapshot name; "" uses the config default
 	Selection string // "" (snapshot defaults) | "all" | "a,b,c"
 	Body      []byte // the locus string, or the VCF file's bytes
+
+	// InputPath is a VCF already on disk, used instead of Body when set.
+	//
+	// A large submission is staged from job storage by the caller, which is why
+	// this is a path and not a reader: the engine takes a filename, so anything
+	// else would only be copied to one. Staging is the caller's job because
+	// this package execs a binary and knows nothing about where inputs live —
+	// giving it a storage client to keep that true would be the wrong trade.
+	//
+	// The name is kept as stored, ".gz" and all, so a reader that wants to know
+	// whether it is compressed can be told rather than have to look.
+	InputPath string
 }
 
 // Result is a completed annotation.
@@ -232,30 +244,39 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		args = append(args, "-a", req.Selection)
 	}
 
-	// "--" terminates flag parsing. Job input is user-controlled and lands in
-	// argv, so without it a locus beginning with "-" is read as a flag: the CLI
-	// exits with "flag provided but not defined" and the job fails for a reason
-	// that has nothing to do with the variant.
-	args = append(args, "--")
-
 	switch req.Kind {
 	case KindVCF:
-		in := filepath.Join(work, "input.vcf")
-		if err := os.WriteFile(in, req.Body, 0o600); err != nil {
-			return Result{}, fmt.Errorf("stage VCF: %w", err)
+		in := req.InputPath
+		if in == "" {
+			in = filepath.Join(work, "input.vcf")
+			if err := os.WriteFile(in, req.Body, 0o600); err != nil {
+				return Result{}, fmt.Errorf("stage VCF: %w", err)
+			}
 		}
-		args = append(args, in)
+		// "--" terminates flag parsing, so a path beginning with "-" is read as a
+		// path rather than as an unknown flag.
+		args = append(args, "--", in)
 	case KindLocus:
 		loci := strings.Fields(string(req.Body))
 		if len(loci) == 0 {
 			return Result{}, errors.New("empty locus input")
 		}
 		for _, l := range loci {
-			if err := safeArg(l); err != nil {
+			if err := safeLocus(l); err != nil {
 				return Result{}, fmt.Errorf("locus %q: %w", truncate(l, 40), err)
 			}
 		}
-		args = append(args, loci...)
+		// Loci go through a file, not argv. As arguments they were bounded by the
+		// kernel's ARG_MAX — a few hundred thousand short loci — and the failure
+		// mode there is not a refusal but "fork/exec: argument list too long",
+		// which names neither the limit nor the input. The file has no such
+		// ceiling, so how many variants a job may carry becomes a policy the
+		// server states rather than a property of exec.
+		in := filepath.Join(work, "loci.txt")
+		if err := os.WriteFile(in, []byte(strings.Join(loci, "\n")+"\n"), 0o600); err != nil {
+			return Result{}, fmt.Errorf("stage loci: %w", err)
+		}
+		args = append(args, "--loci-file", in)
 	default:
 		return Result{}, fmt.Errorf("unknown job kind %q", req.Kind)
 	}
@@ -466,6 +487,28 @@ func fallbackColumns(present map[string]bool) []Column {
 // shorter; anything longer is malformed input, and argv as a whole is capped by
 // the kernel.
 const maxArgLen = 4096
+
+// safeLocus rejects a locus the file form would silently change the meaning of.
+//
+// Loci no longer reach the engine through argv — they are written one per line
+// and read back with --loci-file — but that form has an edge argv did not: the
+// reader skips blank lines and treats a leading "#" as a comment. A locus of
+// either shape would be *dropped* rather than refused, and the job would
+// annotate fewer variants than were submitted without saying so. Refuse it here,
+// where the message can name the input.
+//
+// The control-character check carries over from the argv days for a different
+// reason than it was written for: a NUL or an escape sequence in a locus is
+// malformed whatever it is passed through.
+func safeLocus(s string) error {
+	if s == "" {
+		return errors.New("is empty")
+	}
+	if strings.HasPrefix(s, "#") {
+		return errors.New(`starts with "#", which the loci file reads as a comment`)
+	}
+	return safeArg(s)
+}
 
 // safeArg rejects a string that cannot be passed safely as an argv entry.
 //
@@ -759,7 +802,7 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 	// the rest, since a directory named after a job the queue no longer has
 	// running can be reclaimed by any worker without guessing at its age.
 	if req.JobID != "" {
-		scratch := JobScratchDir(req.JobID)
+		scratch := ChunkScratchDir(req.JobID)
 		if err := os.MkdirAll(scratch, 0o755); err != nil {
 			return DownloadResult{}, fmt.Errorf("scratch %s: %w", scratch, err)
 		}
@@ -782,7 +825,7 @@ func (r *ExecRunner) Download(ctx context.Context, req DownloadRequest) (Downloa
 		req.Sink("··· exec: " + bin + " " + strings.Join(args, " "))
 		req.Sink("··· VARHUB_HOME=" + home)
 		if req.JobID != "" {
-			req.Sink("··· TMPDIR=" + JobScratchDir(req.JobID))
+			req.Sink("··· TMPDIR=" + ChunkScratchDir(req.JobID))
 		}
 	}
 	if err := cmd.Start(); err != nil {

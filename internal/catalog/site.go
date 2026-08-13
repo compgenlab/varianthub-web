@@ -39,6 +39,35 @@ type Site struct {
 	StandardPerHour    int `json:"standard_per_hour"`
 	ElevatedConcurrent int `json:"elevated_concurrent"`
 	ElevatedPerHour    int `json:"elevated_per_hour"`
+
+	// The most variants one submission may carry, per tier. 0 is unlimited.
+	AnonMaxVariants     int `json:"anon_max_variants"`
+	StandardMaxVariants int `json:"standard_max_variants"`
+	ElevatedMaxVariants int `json:"elevated_max_variants"`
+
+	// VCFChunkSize is how many variants one chunk of a split VCF carries.
+	//
+	// Emphatically not the same number as MaxVariants, though both began life
+	// as 10,000. That one answers "how much may a caller ask for at once",
+	// which is about fairness and is bounded by what a person will paste into a
+	// box. This one answers "how much work should one process do", which is
+	// bounded by fixed per-chunk cost: every chunk pays a claim, a stage from
+	// storage, a varhub start, a snapshot load and index opens, then an upload
+	// and a merge. Chromosome 22 of a WGS cohort is 2.6M variants — 260 chunks
+	// at 10,000, and 260 payments of that fixed cost.
+	//
+	// 100,000 makes it 26. Larger would amortize better still, and the limit on
+	// that direction is not throughput but blast radius: a chunk is the unit of
+	// retry, so an abandoned worker loses a whole one.
+	//
+	// Counted in *records*, because cgkit vcf-split counts records. The caps
+	// above count variants, and a multi-allelic record is several — so a chunk
+	// of 100,000 records may hold a few percent more variants than that. The
+	// difference is immaterial for sizing work and would not be for a limit: if
+	// a tier cap is ever enforced against a VCF, it has to count alleles, or
+	// somebody promised 10,000 variants gets a different number depending on
+	// which endpoint they used.
+	VCFChunkSize int `json:"vcf_chunk_size"`
 }
 
 // SiteFromConfig is the deployment as configured, before any stored override.
@@ -59,6 +88,11 @@ func SiteFromConfig(cfg *config.Config) Site {
 		StandardPerHour:    cfg.StandardPerHour,
 		ElevatedConcurrent: cfg.ElevatedConcurrent,
 		ElevatedPerHour:    cfg.ElevatedPerHour,
+
+		AnonMaxVariants:     cfg.AnonMaxVariants,
+		StandardMaxVariants: cfg.StandardMaxVariants,
+		ElevatedMaxVariants: cfg.ElevatedMaxVariants,
+		VCFChunkSize:        cfg.VCFChunkSize,
 	}
 	// Through the same parser the overrides use, so "2160h" cannot mean one thing
 	// in the file and another in the form.
@@ -80,6 +114,11 @@ const (
 	KeyStandardPerHour    = "standard_per_hour"
 	KeyElevatedConcurrent = "elevated_concurrent"
 	KeyElevatedPerHour    = "elevated_per_hour"
+
+	KeyAnonMaxVariants     = "anon_max_variants"
+	KeyStandardMaxVariants = "standard_max_variants"
+	KeyElevatedMaxVariants = "elevated_max_variants"
+	KeyVCFChunkSize        = "vcf_chunk_size"
 )
 
 // Service tiers: how much of the pool an account may occupy.
@@ -95,6 +134,29 @@ const (
 
 // Tiers is every assignable tier, for a form that should not keep its own list.
 var Tiers = []string{TierStandard, TierElevated, TierUnlimited}
+
+// DefaultVCFChunkSize is what an unset chunk size resolves to.
+//
+// Aliased from config rather than restated, so "unset" and "as configured by
+// default" cannot come to mean two different numbers.
+const DefaultVCFChunkSize = config.DefaultVCFChunkSize
+
+// ChunkSize is VCFChunkSize with the default filled in.
+//
+// Resolved here rather than when the setting is parsed, because ApplySetting
+// must invert Values exactly — a form that saves 0 and reads back 100,000 is a
+// form nobody can trust. So the stored value stays what was written, and the
+// substitution happens at the one place that acts on it.
+//
+// Zero means unset, the same as everywhere else here. It cannot mean what it
+// means for the caps — "no limit" — because a chunk size of zero is not one
+// enormous chunk, it is a splitter that never advances.
+func (s Site) ChunkSize() int {
+	if s.VCFChunkSize <= 0 {
+		return DefaultVCFChunkSize
+	}
+	return s.VCFChunkSize
+}
 
 // ValidTier reports whether a tier is one this server knows.
 //
@@ -122,10 +184,24 @@ type Limits struct {
 	// PerHour caps submissions. Enforced at the door, because a request that
 	// will be refused should not become a row first.
 	PerHour int
+	// MaxVariants caps how many variants one submission may carry. 0 is
+	// unlimited.
+	//
+	// Not enforced at the door for an uploaded VCF, unlike the two above.
+	// Counting the variants in a compressed file means decompressing it, and
+	// doing that in the request handler is the work this design moved into a
+	// worker. A locus list is counted at the door, because there the count is
+	// the length of a slice.
+	MaxVariants int
 }
 
 // Unlimited reports whether nothing is capped.
-func (l Limits) Unlimited() bool { return l.Concurrent <= 0 && l.PerHour <= 0 }
+func (l Limits) Unlimited() bool {
+	return l.Concurrent <= 0 && l.PerHour <= 0 && l.MaxVariants <= 0
+}
+
+// AllowsVariants reports whether n variants are within this tier's cap.
+func (l Limits) AllowsVariants(n int) bool { return l.MaxVariants <= 0 || n <= l.MaxVariants }
 
 // LimitsFor resolves what a tier allows. An unrecognized tier gets the standard
 // limits — the safe direction, since the alternative is that a typo grants more
@@ -135,9 +211,15 @@ func (s Site) LimitsFor(tier string) Limits {
 	case TierUnlimited:
 		return Limits{}
 	case TierElevated:
-		return Limits{Concurrent: s.ElevatedConcurrent, PerHour: s.ElevatedPerHour}
+		return Limits{
+			Concurrent: s.ElevatedConcurrent, PerHour: s.ElevatedPerHour,
+			MaxVariants: s.ElevatedMaxVariants,
+		}
 	default:
-		return Limits{Concurrent: s.StandardConcurrent, PerHour: s.StandardPerHour}
+		return Limits{
+			Concurrent: s.StandardConcurrent, PerHour: s.StandardPerHour,
+			MaxVariants: s.StandardMaxVariants,
+		}
 	}
 }
 
@@ -147,7 +229,10 @@ func (s Site) LimitsFor(tier string) Limits {
 // is not a tier an administrator assigns — there is nobody to assign it to. It
 // is what the absence of an account gets.
 func (s Site) AnonLimits() Limits {
-	return Limits{Concurrent: s.AnonConcurrent, PerHour: s.AnonPerHour}
+	return Limits{
+		Concurrent: s.AnonConcurrent, PerHour: s.AnonPerHour,
+		MaxVariants: s.AnonMaxVariants,
+	}
 }
 
 // SettingKeys is every overridable key, in the order a form should show them.
@@ -160,6 +245,8 @@ var SettingKeys = []string{
 	KeyAnonConcurrent, KeyAnonPerHour,
 	KeyStandardConcurrent, KeyStandardPerHour,
 	KeyElevatedConcurrent, KeyElevatedPerHour,
+	KeyAnonMaxVariants, KeyStandardMaxVariants, KeyElevatedMaxVariants,
+	KeyVCFChunkSize,
 }
 
 // Values renders a Site as the override map, the inverse of apply.
@@ -176,6 +263,11 @@ func (s Site) Values() map[string]string {
 		KeyStandardPerHour:    strconv.Itoa(s.StandardPerHour),
 		KeyElevatedConcurrent: strconv.Itoa(s.ElevatedConcurrent),
 		KeyElevatedPerHour:    strconv.Itoa(s.ElevatedPerHour),
+
+		KeyAnonMaxVariants:     strconv.Itoa(s.AnonMaxVariants),
+		KeyStandardMaxVariants: strconv.Itoa(s.StandardMaxVariants),
+		KeyElevatedMaxVariants: strconv.Itoa(s.ElevatedMaxVariants),
+		KeyVCFChunkSize:        strconv.Itoa(s.VCFChunkSize),
 	}
 }
 
@@ -208,7 +300,9 @@ func (s *Site) ApplySetting(key, value string) error {
 		s.CacheMaxEntries = n
 	case KeyAnonConcurrent, KeyAnonPerHour,
 		KeyStandardConcurrent, KeyStandardPerHour,
-		KeyElevatedConcurrent, KeyElevatedPerHour:
+		KeyElevatedConcurrent, KeyElevatedPerHour,
+		KeyAnonMaxVariants, KeyStandardMaxVariants, KeyElevatedMaxVariants,
+		KeyVCFChunkSize:
 		// 0 is unbounded rather than "refuse everything", so an operator cannot
 		// take the service down by clearing a field.
 		n, err := strconv.Atoi(value)
@@ -231,6 +325,14 @@ func (s *Site) ApplySetting(key, value string) error {
 			s.ElevatedConcurrent = n
 		case KeyElevatedPerHour:
 			s.ElevatedPerHour = n
+		case KeyAnonMaxVariants:
+			s.AnonMaxVariants = n
+		case KeyStandardMaxVariants:
+			s.StandardMaxVariants = n
+		case KeyElevatedMaxVariants:
+			s.ElevatedMaxVariants = n
+		case KeyVCFChunkSize:
+			s.VCFChunkSize = n
 		}
 	case KeyCacheMaxAge:
 		if value == "" {
