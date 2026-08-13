@@ -81,6 +81,19 @@ func Presign(ctx context.Context, uri string, ttl time.Duration, d Disposition) 
 	return req.URL, true, nil
 }
 
+// envIsTrue reads a boolean setting from the environment.
+//
+// Only an explicit yes counts. Anything else — unset, empty, "no", or a typo —
+// leaves presigning off, which is the direction where being wrong costs
+// bandwidth rather than every download at once.
+func envIsTrue(name string) bool {
+	switch strings.ToLower(firstEnv(name)) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
+}
+
 // sanitizeFilename keeps a filename from ending the header value it is quoted
 // inside. A job id is hex and a format is from a fixed set, so this guards
 // against a future caller rather than a present one.
@@ -111,31 +124,36 @@ var (
 // So a link is minted only against an endpoint someone has said is externally
 // reachable:
 //
-//   - the site's public_endpoint, or VHW_S3_PUBLIC_ENDPOINT;
-//   - failing that, no custom endpoint at all, which means AWS itself and is
+//   - the site declares public_endpoint = true, or VHW_S3_PUBLIC_ENDPOINT is
+//     set, which asserts that the address this service uses is the address a
+//     caller can use;
+//   - or there is no custom endpoint at all, which means AWS itself and is
 //     public by construction.
 //
-// A gateway with no public endpoint declared yields no link, and the download
-// streams through this service exactly as it did before. Refusing is the safe
-// direction: a missing setting costs bandwidth, while guessing costs every
-// download on the deployment at once, for a reason that looks like a network
-// fault rather than a configuration one.
+// A gateway not declared reachable yields no link, and the download streams
+// through this service exactly as it did before. Refusing is the safe direction:
+// a missing setting costs bandwidth, while guessing costs every download on the
+// deployment at once, for a reason that looks like a network fault rather than a
+// configuration one.
+//
+// This assumes one address, not two. A deployment whose store is at one name
+// inside and another outside — split-horizon DNS, or an internal service name
+// beside a CDN — cannot be described by a flag, and would need the public
+// address written down. Nobody has that arrangement here, so it is not built.
 func presignClientFor(ctx context.Context, uri string) (*s3.Client, bool, error) {
 	site, declared := siteFor(uri)
 
-	public := strings.TrimSpace(site.PublicEndpoint)
-	if public == "" {
-		public = firstEnv("VHW_S3_PUBLIC_ENDPOINT")
-	}
-	internal := site.Endpoint
+	endpoint, public := site.Endpoint, site.PublicEndpoint
 	if !declared {
-		internal = firstEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+		endpoint = firstEnv("AWS_ENDPOINT_URL_S3", "AWS_ENDPOINT_URL")
+		public = envIsTrue("VHW_S3_PUBLIC_ENDPOINT")
 	}
-	if public == "" && internal != "" {
-		return nil, false, nil // a gateway nobody has vouched for
+	// No custom endpoint at all means AWS, which needs no vouching for.
+	if endpoint != "" && !public {
+		return nil, false, nil // a gateway nobody has said is reachable
 	}
 
-	cacheKey := site.Name + "\x00" + public
+	cacheKey := site.Name + "\x00" + endpoint
 	presignMu.Lock()
 	c := presignClients[cacheKey]
 	presignMu.Unlock()
@@ -161,8 +179,8 @@ func presignClientFor(ctx context.Context, uri string) (*s3.Client, bool, error)
 		cfg.Region = "us-east-1"
 	}
 	c = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		if public != "" {
-			o.BaseEndpoint = aws.String(public)
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
 			o.UsePathStyle = true
 		}
 	})

@@ -52,16 +52,18 @@ func Compressed(uri string) bool { return strings.HasSuffix(uri, ".gz") }
 
 // ResultName is the object a job's answer-as-a-VCF is stored as.
 //
-// Gzipped, and gzipped whether the job was split or not. It was not always: a
-// split job's collect wrote result.vcf.gz while an unsplit job wrote a plain
+// BGZF, and BGZF whether the job was split or not. It was not always: a split
+// job's collect wrote result.vcf.gz while an unsplit job wrote a plain
 // result.vcf under this name, and the export streamed whichever it found
 // straight to the caller as text/plain. A split submission's download was
-// therefore gzip bytes in a file called .vcf, and nothing said so — the two
-// paths had each chosen sensibly and never compared answers.
+// therefore compressed bytes in a file called .vcf, and nothing said so — the
+// two paths had each chosen sensibly and never compared answers.
 //
 // So the name carries the compression, as the input's does, and one name means
 // there is one thing for a reader to be told rather than two for it to guess
-// between. Gzip rather than plain because an annotated chromosome is hundreds
-// of megabytes and this is the copy that is kept for the job's whole life; the
-// export pays a decompression it was already paying for split jobs.
+// between. Compressed because an annotated chromosome is hundreds of megabytes
+// and this is the copy kept for the job's whole life — and BGZF specifically
+// because the file is a VCF, which is a thing people index. Plain gzip reads
+// fine and cannot be indexed, and the difference does not surface until someone
+// runs tabix over a file this produced.
 const ResultName = "result.vcf.gz"

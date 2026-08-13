@@ -2,7 +2,6 @@ package fanout
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/compgenlab/cghts/htsio/bgzf"
 	"github.com/compgenlab/cghts/vcf"
 )
 
@@ -30,10 +30,15 @@ func chunk(from, n int) string {
 	return b.String()
 }
 
-func gzipped(t *testing.T, s string) []byte {
+// bgzipped compresses s the way a chunk is actually stored.
+//
+// BGZF, not plain gzip: the join concatenates members and has to trim each one's
+// EOF block, so a test feeding it plain gzip would exercise a shape the worker
+// never writes — and would not notice if the trimming were wrong.
+func bgzipped(t *testing.T, s string) []byte {
 	t.Helper()
 	var buf bytes.Buffer
-	zw := gzip.NewWriter(&buf)
+	zw := bgzf.NewWriter(&buf)
 	if _, err := zw.Write([]byte(s)); err != nil {
 		t.Fatal(err)
 	}
@@ -66,11 +71,11 @@ func TestJoinedChunksReadBackAsOneVCF(t *testing.T) {
 	ctx := context.Background()
 
 	// Chunk 1 keeps its header; the rest are stripped, as the upload does.
-	first := writeFile(t, dir, "c1.vcf.gz", gzipped(t, chunk(100, 3)))
+	first := writeFile(t, dir, "c1.vcf.gz", bgzipped(t, chunk(100, 3)))
 	var rest []string
 	for i, c := range []string{chunk(200, 3), chunk(300, 4)} {
 		var out bytes.Buffer
-		n, err := StripHeader(bytes.NewReader(gzipped(t, c)), &out)
+		n, err := StripHeader(bytes.NewReader(bgzipped(t, c)), &out)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -90,11 +95,11 @@ func TestJoinedChunksReadBackAsOneVCF(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	gz, err := gzip.NewReader(f)
-	if err != nil {
-		t.Fatalf("the joined file is not gzip: %v", err)
-	}
-	defer gz.Close()
+	// Read as BGZF, not as plain gzip. gzip is lenient about a multi-member
+	// stream and would decompress straight past an EOF block sitting between two
+	// chunks; htslib stops there, so a file that looked whole here would be
+	// truncated for tabix and bcftools. This is the reader that has an opinion.
+	gz := bgzf.NewReader(f)
 
 	rd, err := vcf.NewVcfReader(gz)
 	if err != nil {
@@ -134,14 +139,10 @@ func TestJoinedChunksReadBackAsOneVCF(t *testing.T) {
 // the first did not.
 func TestOnlyTheFirstChunkKeepsItsHeader(t *testing.T) {
 	var out bytes.Buffer
-	if _, err := StripHeader(bytes.NewReader(gzipped(t, chunk(200, 2))), &out); err != nil {
+	if _, err := StripHeader(bytes.NewReader(bgzipped(t, chunk(200, 2))), &out); err != nil {
 		t.Fatal(err)
 	}
-	gz, err := gzip.NewReader(&out)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(gz)
+	body, err := io.ReadAll(bgzf.NewReader(&out))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,15 +171,14 @@ func TestAWideRecordSurvivesStripping(t *testing.T) {
 	}
 
 	var out bytes.Buffer
-	n, err := StripHeader(bytes.NewReader(gzipped(t, b.String())), &out)
+	n, err := StripHeader(bytes.NewReader(bgzipped(t, b.String())), &out)
 	if err != nil {
 		t.Fatalf("a wide record failed: %v", err)
 	}
 	if n != 1 {
 		t.Fatalf("kept %d records, want 1", n)
 	}
-	gz, _ := gzip.NewReader(&out)
-	body, _ := io.ReadAll(gz)
+	body, _ := io.ReadAll(bgzf.NewReader(&out))
 	if len(body) < 64<<10 {
 		t.Errorf("the record came back as %d bytes; it was truncated", len(body))
 	}
@@ -192,7 +192,7 @@ func TestAWideRecordSurvivesStripping(t *testing.T) {
 func TestAMissingChunkFailsBeforeWritingAnything(t *testing.T) {
 	dir := t.TempDir()
 	ctx := context.Background()
-	first := writeFile(t, dir, "c1.vcf.gz", gzipped(t, chunk(100, 2)))
+	first := writeFile(t, dir, "c1.vcf.gz", bgzipped(t, chunk(100, 2)))
 	dest := filepath.Join(dir, "joined.vcf.gz")
 
 	err := Join(ctx, []string{first, filepath.Join(dir, "gone.vcf.gz")}, dest)

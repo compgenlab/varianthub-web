@@ -2,12 +2,13 @@ package fanout
 
 import (
 	"bufio"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+
+	"github.com/compgenlab/cghts/htsio/bgzf"
 
 	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -189,7 +190,7 @@ func StoreChunkResult(ctx context.Context, prefix string, index int, vcfIn io.Re
 
 	pr, pw := io.Pipe()
 	go func() {
-		zw := gzip.NewWriter(pw)
+		zw := bgzf.NewWriter(pw)
 		out := bufio.NewWriterSize(zw, 1<<20)
 		sc := bufio.NewScanner(vcfIn)
 		// A cohort record grows with its sample count; the 64 KB default would

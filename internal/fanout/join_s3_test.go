@@ -29,7 +29,7 @@ func TestJoinStreamsBetweenObjects(t *testing.T) {
 
 	var uris []string
 	for i, body := range []string{chunk(100, 3), chunk(200, 2)} {
-		raw := gzipped(t, body)
+		raw := bgzipped(t, body)
 		if i > 0 {
 			var stripped bytes.Buffer
 			if _, err := StripHeader(bytes.NewReader(raw), &stripped); err != nil {

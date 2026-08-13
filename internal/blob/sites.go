@@ -27,11 +27,11 @@ type Site struct {
 	Name      string
 	URI       string
 	Endpoint string
-	// PublicEndpoint is the same store as Endpoint reaches, named as something
-	// outside the deployment can reach it. Set only when the two differ — an
-	// in-cluster gateway address is no use in a URL handed to a browser. Empty
-	// means no presigned link is minted for this site; see presignClientFor.
-	PublicEndpoint string
+	// PublicEndpoint says Endpoint is reachable by a caller outside the
+	// deployment, and so may be signed into a download link. False — the
+	// default — means no link is minted for this site and results are relayed
+	// through the API instead. See presignClientFor.
+	PublicEndpoint bool
 	Region         string
 	AccessKey      string
 	SecretKey      string

@@ -1,10 +1,11 @@
 package api
 
 import (
-	"compress/gzip"
 	"io"
 	"log"
 	"net/http"
+
+	"github.com/compgenlab/cghts/htsio/bgzf"
 
 	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -21,14 +22,14 @@ import (
 // open for as long as the client is slow, and multiplied by everyone downloading
 // at once.
 //
-// Three sources, and every one of them produces the same thing: a gzipped VCF.
-// That matters more than it looks. The stored object is gzipped, so a redirect
-// can only ever deliver gzip; if the relayed path decompressed and the redirect
-// did not, one endpoint would return two different files depending on how the
-// deployment happened to be configured. That is the divergence this whole change
-// exists to remove, so the answer is gzip whichever path served it — which is
-// also the form every downstream tool wants, since a VCF worth this much is one
-// somebody is going to index.
+// Three sources, and every one of them produces the same thing: a BGZF VCF.
+// That matters more than it looks. The stored object is compressed, so a
+// redirect can only ever deliver it compressed; if the relayed path decompressed
+// and the redirect did not, one endpoint would return two different files
+// depending on how the deployment happened to be configured. That is the
+// divergence this whole change exists to remove, so the answer is BGZF whichever
+// path served it — which is also the form every downstream tool wants, since a
+// VCF worth this much is one somebody is going to index.
 
 // gzipContentType is what a stored result is, and what all three paths emit.
 const gzipContentType = "application/gzip"
@@ -122,13 +123,14 @@ func (s *Server) relayStoredResult(w http.ResponseWriter, r *http.Request,
 	return true
 }
 
-// gzipTo runs write against a compressor over w and closes it.
+// gzipTo runs write against a BGZF compressor over w and closes it.
 //
-// Closing is what flushes the final block, and it is separate from any error
-// write returned: a body that stops early is at least a truncated gzip stream,
-// which a reader detects, rather than one that looks complete.
+// Closing is what flushes the final block and writes the EOF marker, and it is
+// separate from any error write returned: a body that stops early is at least an
+// unterminated stream, which a reader detects, rather than one that looks
+// complete.
 func gzipTo(w io.Writer, write func(io.Writer) error) error {
-	z := gzip.NewWriter(w)
+	z := bgzf.NewWriter(w)
 	if err := write(z); err != nil {
 		z.Close()
 		return err

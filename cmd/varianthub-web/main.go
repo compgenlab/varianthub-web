@@ -35,6 +35,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
 
+	"github.com/compgenlab/cghts/htsio/bgzf"
 	"github.com/compgenlab/cghts/vcf"
 )
 
@@ -669,12 +670,13 @@ func buildResultVCF(ctx context.Context, jobStorage, version string, chunk queue
 func writeResultVCF(w io.Writer, meta vcfmerge.Meta, cols []queue.Column,
 	inputPath string, res runner.Result) error {
 
-	zw := gzip.NewWriter(w)
+	zw := bgzf.NewWriter(w)
 	if err := writeAnnotated(zw, meta, cols, inputPath, res); err != nil {
 		return err
 	}
-	// Closing the gzip writer is what flushes its final block. Skipped, the
-	// object uploads cleanly and is truncated garbage on the way back.
+	// Closing is what flushes the final block and writes the BGZF EOF marker.
+	// Skipped, the object uploads cleanly and is truncated garbage on the way
+	// back — and without the marker htslib reports the file as unterminated.
 	return zw.Close()
 }
 

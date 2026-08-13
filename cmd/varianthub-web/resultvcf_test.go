@@ -79,12 +79,15 @@ chr1	100	rs1	A	G	40	PASS	DP=88	GT	0/1	0/0
 	}
 }
 
-// The stored object is gzipped, because its name says it is.
+// The stored object is BGZF, and its name says it is compressed.
 //
-// A reader is told what it is holding rather than sniffing for it. Writing this
-// one plain is what made a split job's download — which was always gzipped —
-// arrive as compressed bytes in a file called .vcf.
-func TestAStoredResultIsGzippedAsItsNameSays(t *testing.T) {
+// BGZF rather than plain gzip because the result is a VCF, and a VCF this size
+// is one somebody will run tabix over. The two are indistinguishable to anything
+// that merely decompresses — a BGZF file opens fine with gzip -d — so the only
+// check that catches a plain-gzip writer is looking for the block structure
+// itself. It is also what lets the fan-out concatenate pieces into an indexable
+// whole; see fanout.Join.
+func TestAStoredResultIsBGZF(t *testing.T) {
 	if !strings.HasSuffix(queue.ResultName, ".gz") {
 		t.Fatalf("ResultName = %q, and this test is about what that suffix promises",
 			queue.ResultName)
@@ -96,9 +99,22 @@ func TestAStoredResultIsGzippedAsItsNameSays(t *testing.T) {
 		t.Fatal(err)
 	}
 	b := buf.Bytes()
-	if len(b) < 2 || b[0] != 0x1f || b[1] != 0x8b {
-		t.Fatalf("the stored object does not start with the gzip magic number: %x",
-			b[:min(8, len(b))])
+	if len(b) < 18 || b[0] != 0x1f || b[1] != 0x8b {
+		t.Fatalf("the stored object is not gzip at all: %x", b[:min(8, len(b))])
+	}
+	// FEXTRA set, carrying the "BC" block-size subfield. That pair is the whole
+	// difference between BGZF and gzip.
+	if b[3]&0x04 == 0 || b[12] != 'B' || b[13] != 'C' {
+		t.Error("the stored result is plain gzip, not BGZF; it cannot be indexed")
+	}
+	// And it is terminated. Without the EOF block htslib reports the file as
+	// truncated even when every record is present.
+	if !bytes.HasSuffix(b, []byte{
+		0x1f, 0x8b, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+		0x06, 0x00, 0x42, 0x43, 0x02, 0x00, 0x1b, 0x00, 0x03, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+	}) {
+		t.Error("the stored result does not end with a BGZF EOF block")
 	}
 }
 

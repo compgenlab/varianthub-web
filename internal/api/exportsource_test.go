@@ -199,7 +199,7 @@ func TestAVCFDownloadRedirectsToStorageWhenItIsReachable(t *testing.T) {
 	pointResultAt(t, h, "signed", "s3://results/jobs/signed/"+queue.ResultName)
 	blob.RegisterSites([]blob.Site{{
 		Name: "results", URI: "s3://results",
-		Endpoint: "http://s3:7070", PublicEndpoint: "https://files.example.org",
+		Endpoint: "https://files.example.org", PublicEndpoint: true,
 		Region: "us-east-1", AccessKey: "k", SecretKey: "s",
 	}})
 	t.Cleanup(func() { blob.RegisterSites(nil) })
@@ -213,7 +213,7 @@ func TestAVCFDownloadRedirectsToStorageWhenItIsReachable(t *testing.T) {
 		t.Fatalf("Location does not parse: %v", err)
 	}
 	if loc.Host != "files.example.org" {
-		t.Errorf("redirected to %q, not the public endpoint", loc.Host)
+		t.Errorf("redirected to %q, not the endpoint declared reachable", loc.Host)
 	}
 	if loc.Query().Get("X-Amz-Signature") == "" {
 		t.Error("the redirect target is unsigned; it is not a capability, just a " +

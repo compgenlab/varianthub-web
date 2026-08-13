@@ -39,11 +39,11 @@ func TestAPrivateGatewayMintsNoLink(t *testing.T) {
 	}
 }
 
-// Declaring the public name is what turns it on, and the link names that host.
+// Declaring the endpoint reachable is what turns it on, and the link names it.
 func TestAPublicEndpointMintsALinkAgainstItself(t *testing.T) {
 	withSites(t, Site{
 		Name: "results", URI: "s3://results",
-		Endpoint: "http://s3:7070", PublicEndpoint: "https://files.example.org",
+		Endpoint: "https://files.example.org", PublicEndpoint: true,
 		Region: "us-east-1", AccessKey: "k", SecretKey: "s",
 	})
 
@@ -60,8 +60,7 @@ func TestAPublicEndpointMintsALinkAgainstItself(t *testing.T) {
 		t.Fatalf("the minted link does not parse: %v", err)
 	}
 	if u.Host != "files.example.org" {
-		t.Errorf("link points at %q; it must name the public endpoint, not the "+
-			"one this service talks to", u.Host)
+		t.Errorf("link points at %q, not the endpoint declared reachable", u.Host)
 	}
 	if !strings.Contains(u.Path, "jobs/j1/result.vcf.gz") {
 		t.Errorf("link does not name the object: %s", u.Path)
@@ -104,7 +103,7 @@ func TestRegisteringSitesAgainForgetsTheOldSigner(t *testing.T) {
 	const uri = "s3://results/jobs/j1/result.vcf.gz"
 	withSites(t, Site{
 		Name: "results", URI: "s3://results",
-		PublicEndpoint: "https://old.example.org", Region: "us-east-1",
+		Endpoint: "https://old.example.org", PublicEndpoint: true, Region: "us-east-1",
 		AccessKey: "k", SecretKey: "s",
 	})
 	if _, ok, err := Presign(context.Background(), uri, time.Minute, Disposition{}); err != nil || !ok {
@@ -113,7 +112,7 @@ func TestRegisteringSitesAgainForgetsTheOldSigner(t *testing.T) {
 
 	withSites(t, Site{
 		Name: "results", URI: "s3://results",
-		PublicEndpoint: "https://new.example.org", Region: "us-east-1",
+		Endpoint: "https://new.example.org", PublicEndpoint: true, Region: "us-east-1",
 		AccessKey: "k", SecretKey: "s",
 	})
 	raw, ok, err := Presign(context.Background(), uri, time.Minute, Disposition{})
