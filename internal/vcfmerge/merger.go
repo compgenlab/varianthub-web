@@ -1,6 +1,7 @@
 package vcfmerge
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 
@@ -119,4 +120,28 @@ func Merge(rd *vcf.VcfReader, w io.Writer, hdr *vcf.VcfHeader, cols []queue.Colu
 		return 0, err
 	}
 	return m.WriteRecords(rd, w, ann)
+}
+
+// DecodeAnnotations reads the engine's JSON output into the form Merge wants.
+//
+// Here rather than in the worker because the key must be built by VariantKey —
+// a second spelling of "chrom:pos:ref:alt" would file annotations under keys the
+// merge never looks up, and the result would be a VCF with every annotation
+// silently missing rather than an error.
+func DecodeAnnotations(b []byte) (Annotations, error) {
+	var rows []struct {
+		Chrom       string         `json:"chrom"`
+		Pos         int64          `json:"pos"`
+		Ref         string         `json:"ref"`
+		Alt         string         `json:"alt"`
+		Annotations map[string]any `json:"annotations"`
+	}
+	if err := json.Unmarshal(b, &rows); err != nil {
+		return nil, fmt.Errorf("parse engine output: %w", err)
+	}
+	out := make(Annotations, len(rows))
+	for _, r := range rows {
+		out[VariantKey(r.Chrom, r.Pos, r.Ref, r.Alt)] = r.Annotations
+	}
+	return out, nil
 }

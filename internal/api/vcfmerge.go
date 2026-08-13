@@ -85,6 +85,26 @@ func (s *Server) openJobInput(r *http.Request, job queue.Job) (io.Reader, func()
 func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job queue.Job,
 	cols []queue.Column, qy queue.ResultQuery) bool {
 
+	// Built when the job finished, by the worker that already had the file
+	// staged. The merge is the same either way; this is the copy that did not
+	// have to parse and rewrite the whole submission to answer one download.
+	if uri, ok, err := s.queue.ResultVCF(r.Context(), job.ID); err == nil && ok {
+		rc, oErr := blob.Open(r.Context(), uri)
+		if oErr == nil {
+			defer rc.Close()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			if _, cErr := io.Copy(w, rc); cErr != nil {
+				log.Printf("api: streaming stored result vcf for %s: %v", job.ID, cErr)
+			}
+			return true
+		}
+		// Gone or unreachable. Merging again is slower but still correct, so
+		// fall through rather than fail a download over a missing shortcut.
+		log.Printf("api: job %s: stored result vcf %s unreadable, merging again: %v",
+			job.ID, uri, oErr)
+	}
+
 	src, closeSrc, ok := s.openJobInput(r, job)
 	if !ok {
 		return false

@@ -42,3 +42,10 @@ func JobPrefix(base, jobID string) string {
 
 // Compressed reports whether a stored input's name says it is gzipped.
 func Compressed(uri string) bool { return strings.HasSuffix(uri, ".gz") }
+
+// ResultName is the object a job's answer-as-a-VCF is stored as.
+//
+// Uncompressed, unlike the input. The input's name records what the submitter
+// sent; this one is ours to choose, and a plain file is what an export streams
+// straight to a caller without deciding whether they asked for gzip.
+const ResultName = "result.vcf"

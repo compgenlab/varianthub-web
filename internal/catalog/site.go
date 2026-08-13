@@ -59,6 +59,14 @@ type Site struct {
 	// 100,000 makes it 26. Larger would amortize better still, and the limit on
 	// that direction is not throughput but blast radius: a chunk is the unit of
 	// retry, so an abandoned worker loses a whole one.
+	//
+	// Counted in *records*, because cgkit vcf-split counts records. The caps
+	// above count variants, and a multi-allelic record is several — so a chunk
+	// of 100,000 records may hold a few percent more variants than that. The
+	// difference is immaterial for sizing work and would not be for a limit: if
+	// a tier cap is ever enforced against a VCF, it has to count alleles, or
+	// somebody promised 10,000 variants gets a different number depending on
+	// which endpoint they used.
 	VCFChunkSize int `json:"vcf_chunk_size"`
 }
 

@@ -302,6 +302,11 @@ type Outcome struct {
 	// Variants says whether Result is an annotated-variant array that should be
 	// projected into job_variant. A download's result is a file manifest.
 	Variants bool
+	// VCFURI is the job's answer already assembled as a VCF, when the worker
+	// was able to build one. Empty for a locus job, which has no submitted file
+	// to merge onto, and for a merge that did not succeed — in both cases the
+	// export renders from rows instead.
+	VCFURI string
 }
 
 // Runner annotates one job's input. An error marks the job failed (its message
@@ -775,6 +780,27 @@ func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	return body, true, nil
 }
 
+// ResultVCF returns where a job's answer-as-a-VCF is stored, and whether one
+// was built at all.
+//
+// False is the ordinary case, not a failure: a locus job has no submitted file
+// to merge onto, and a job that finished before this existed has no object. The
+// caller renders from rows instead.
+func (q *Queue) ResultVCF(ctx context.Context, id string) (string, bool, error) {
+	var uri *string
+	err := q.pool.QueryRow(ctx, `SELECT vcf_uri FROM job_result WHERE job_id=$1`, id).Scan(&uri)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if uri == nil || *uri == "" {
+		return "", false, nil
+	}
+	return *uri, true, nil
+}
+
 // InputRef returns where a job's input is stored, and whether it is stored at
 // all rather than carried inline.
 func (q *Queue) InputRef(ctx context.Context, id string) (string, bool, error) {
@@ -909,7 +935,8 @@ func (q *Queue) List(ctx context.Context, f JobFilter, limit, offset int) ([]Job
 // The blobs go with the job via ON DELETE CASCADE, so unlike the SQLite version
 // this is one statement rather than three inside a transaction.
 func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error) {
-	// The objects these jobs own, read before their rows go.
+	// The objects these jobs own — inputs and built results alike — read before
+	// their rows go.
 	//
 	// job_input cascades from job, so deleting the row destroys the only record
 	// of where the object was — and an object nothing points at is invisible to
@@ -920,6 +947,10 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 	if rows, err := q.pool.Query(ctx, `
 		SELECT i.uri FROM job_input i JOIN job j ON j.id = i.job_id
 		 WHERE i.uri IS NOT NULL
+		   AND j.finished_at IS NOT NULL AND j.finished_at < $1
+		UNION ALL
+		SELECT r.vcf_uri FROM job_result r JOIN job j ON j.id = r.job_id
+		 WHERE r.vcf_uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
 		for rows.Next() {
 			var uri string
@@ -1267,9 +1298,10 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 
 	if out.Result != nil {
 		if _, err := tx.Exec(wctx,
-			`INSERT INTO job_result (job_id,json) VALUES ($1,$2)
-			 ON CONFLICT (job_id) DO UPDATE SET json = excluded.json`,
-			id, string(out.Result)); err != nil {
+			`INSERT INTO job_result (job_id,json,vcf_uri) VALUES ($1,$2,$3)
+			 ON CONFLICT (job_id) DO UPDATE
+			    SET json = excluded.json, vcf_uri = excluded.vcf_uri`,
+			id, string(out.Result), nullable(out.VCFURI)); err != nil {
 			log.Printf("queue: store job %s result: %v", id, err)
 			return
 		}
@@ -1327,6 +1359,17 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		log.Printf("queue: commit job %s: %v", id, err)
 		return
 	}
+}
+
+// nullable renders an empty string as SQL NULL.
+//
+// A column that means "there is no such thing" should hold NULL rather than "",
+// so a reader can ask IS NULL instead of knowing that empty is the sentinel.
+func nullable(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // chargeCaller records that a job's caller has just been served, which pushes the

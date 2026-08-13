@@ -4,10 +4,12 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -27,7 +29,10 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
+
+	"github.com/compgenlab/cghts/vcf"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…".
@@ -255,7 +260,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin, cfg.JobStorage))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -433,7 +438,7 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // it belongs to the queue rather than to either of the two types this bridges —
 // and it is written outside the Outcome because an Outcome is the job's result,
 // while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin string) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin, cfgJobStorage string) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
 		case queue.KindDownload:
@@ -510,8 +515,129 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 				log.Printf("worker: job %s: encode columns: %v", job.ID, mErr)
 			}
 		}
-		return queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}, nil
+		out := queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}
+
+		// Assemble the answer-as-a-VCF here, while the submitted file is still
+		// staged. It used to be built on every download — the whole file parsed
+		// and rewritten per request — and that is why the input had to be kept
+		// for as long as the results were downloadable.
+		//
+		// Best effort: a merge that fails must not fail a job whose annotation
+		// succeeded. Without a stored VCF the export falls back to rendering
+		// from rows, which is the same answer more slowly and with less of the
+		// submitter's file in it.
+		if job.Kind == queue.KindVCF && inputPath != "" {
+			uri, mErr := buildResultVCF(ctx, cfgJobStorage, job, inputPath, res, alw)
+			if mErr != nil {
+				log.Printf("worker: job %s: build result VCF: %v", job.ID, mErr)
+				alw.Note("··· could not pre-build the annotated VCF; downloads will " +
+					"render from the result rows instead")
+			} else {
+				out.VCFURI = uri
+				// The input existed to be annotated and to be merged onto. Both
+				// are done and the merged file is stored, so it is scrap —
+				// keeping it until expiry meant holding two copies of every
+				// submission for a week.
+				//
+				// After the result is stored, never before. Reversed, a failure
+				// in between would leave a job with neither the file it was sent
+				// nor the answer built from it.
+				dropInput(ctx, q, job.ID, alw)
+			}
+		}
+		return out, nil
 	}
+}
+
+// dropInput removes a job's submitted file, once something else holds its
+// content.
+//
+// Best effort and never fatal: the job succeeded, and failing it now over
+// housekeeping would throw away work that is finished. What is left behind is
+// collected by the TTL sweep, which reads the same row this deletes.
+func dropInput(ctx context.Context, q *queue.Queue, id string, alw *queue.LogWriter) {
+	// WithoutCancel because this often runs as a job is being torn down, and an
+	// input left behind because the process was stopping is exactly the kind
+	// nothing later goes looking for.
+	bg := context.WithoutCancel(ctx)
+	dropped, err := q.DropInput(bg, id)
+	if err != nil {
+		log.Printf("worker: job %s: drop input row: %v", id, err)
+		return
+	}
+	if dropped == "" {
+		return
+	}
+	if err := blob.Remove(bg, dropped); err != nil {
+		log.Printf("worker: job %s: remove input %s: %v", id, dropped, err)
+		return
+	}
+	alw.Note("··· submitted file removed; the annotated VCF stands in for it")
+}
+
+// buildResultVCF merges a job's annotations onto the file it was submitted with
+// and stores the result, returning where it went.
+//
+// Streamed from the staged input straight into the upload, so the merged file
+// is never held in memory or written to disk a second time — a chromosome's
+// worth of VCF would be hundreds of megabytes of both.
+func buildResultVCF(ctx context.Context, jobStorage string, job queue.Job,
+	inputPath string, res runner.Result, alw *queue.LogWriter) (string, error) {
+
+	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
+	if err != nil {
+		return "", err
+	}
+	// runner.Column and queue.Column are the same struct declared twice — the
+	// runner describes what the engine reported, the queue describes what was
+	// stored — so this converts rather than translates. If they ever stop
+	// matching, this stops compiling, which is the right place to find out.
+	cols := make([]queue.Column, len(res.Columns))
+	for i, c := range res.Columns {
+		cols[i] = queue.Column(c)
+	}
+
+	in, err := os.Open(inputPath)
+	if err != nil {
+		return "", err
+	}
+	defer in.Close()
+
+	// The staged file keeps the name it was stored under, so whether it is
+	// compressed is something this is told rather than something it works out.
+	var src io.Reader = in
+	if strings.HasSuffix(inputPath, ".gz") {
+		gz, gzErr := gzip.NewReader(in)
+		if gzErr != nil {
+			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		return "", err
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		return "", err
+	}
+
+	// A pipe rather than a buffer: the merge writes as the upload reads, so
+	// neither side has to hold the file.
+	pr, pw := io.Pipe()
+	go func() {
+		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
+		pw.CloseWithError(mErr)
+	}()
+
+	uri := queue.ObjectURI(jobStorage, job.ID, queue.ResultName)
+	if err := blob.PutReader(ctx, uri, pr); err != nil {
+		pr.CloseWithError(err)
+		return "", err
+	}
+	alw.Note("··· annotated VCF stored at " + uri)
+	return uri, nil
 }
 
 // disposeJobObjects removes the stored files of jobs the sweep has collected.
