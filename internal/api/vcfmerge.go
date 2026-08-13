@@ -79,31 +79,13 @@ func (s *Server) openJobInput(r *http.Request, job queue.Job) (io.Reader, func()
 
 // exportMergedVCF writes the submitted VCF back with the annotations added.
 //
-// Reports false when there is no stored input to merge onto — a job old enough
-// to have been swept, say — so the caller can fall back to rendering from rows
-// rather than failing a download outright.
+// Only reached when the worker's stored result is gone or unreadable — the
+// ordinary answer is that object, copied straight out. Merging again is slower
+// but still correct, so this exists rather than failing a download over a
+// missing shortcut. It reports false when there is no stored input to merge
+// onto either, and the caller renders from rows.
 func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job queue.Job,
 	cols []queue.Column, qy queue.ResultQuery) bool {
-
-	// Built when the job finished, by the worker that already had the file
-	// staged. The merge is the same either way; this is the copy that did not
-	// have to parse and rewrite the whole submission to answer one download.
-	if uri, ok, err := s.queue.ResultVCF(r.Context(), job.ID); err == nil && ok {
-		rc, oErr := blob.Open(r.Context(), uri)
-		if oErr == nil {
-			defer rc.Close()
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			if _, cErr := io.Copy(w, rc); cErr != nil {
-				log.Printf("api: streaming stored result vcf for %s: %v", job.ID, cErr)
-			}
-			return true
-		}
-		// Gone or unreachable. Merging again is slower but still correct, so
-		// fall through rather than fail a download over a missing shortcut.
-		log.Printf("api: job %s: stored result vcf %s unreadable, merging again: %v",
-			job.ID, uri, oErr)
-	}
 
 	src, closeSrc, ok := s.openJobInput(r, job)
 	if !ok {

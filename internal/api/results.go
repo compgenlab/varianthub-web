@@ -4,11 +4,13 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/queue"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 )
 
 // resultsReady checks a job is finished and returns the right status otherwise.
@@ -118,38 +120,60 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	filename := "variants-" + job.ID[:min(8, len(job.ID))] + "." + format
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 
+	// A VCF download is the stored object itself, decompressed on the way out.
+	// No parse, no render, no column model — the bytes the worker wrote are the
+	// answer, and for a submitted file they are that file with the annotations
+	// added, samples and all.
+	if format == "vcf" {
+		if rc, ok := s.openStoredResult(r, job); ok {
+			defer rc.Close()
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			if _, err := io.Copy(w, rc); err != nil {
+				logExportFailure(job.ID, err)
+			}
+			return
+		}
+		// Nothing stored, so this will be rendered from rows below. Coordinate
+		// order, whatever was asked for: a VCF sorted by CADD is not a VCF
+		// anything can index, and it would look perfectly fine until someone ran
+		// tabix on it. The search filter is still honoured — that changes which
+		// records appear, not their order.
+		qy.Sort, qy.Desc = "locus", false
+	}
+
+	rows, release := s.rowSource(r, job, qy)
+	defer release()
+
 	// Headers go out before the first row, so a mid-stream database error cannot
 	// be turned into a clean error response. Nothing is buffered — a large export
 	// must not be held in memory to preserve that option.
 	switch format {
 	case "json":
-		s.exportJSON(w, r, job, cols, qy)
+		s.exportJSON(w, job, rows)
 	case "tsv":
-		s.exportDelimited(w, r, job, cols, qy, '\t')
+		s.exportDelimited(w, job, cols, rows, '\t')
 	case "csv":
-		s.exportDelimited(w, r, job, cols, qy, ',')
+		s.exportDelimited(w, job, cols, rows, ',')
 	case "vcf":
-		// A submitted VCF is answered with its own file annotated, which keeps
-		// the ID, QUAL, FILTER, existing INFO, FORMAT and sample columns the
-		// caller sent. Falls back to rendering from rows when there is no
-		// stored input to merge onto — a job old enough to have been swept —
-		// so a download degrades rather than fails.
+		// Nothing stored to serve. A submitted VCF is still answered with its
+		// own file annotated, which keeps the ID, QUAL, FILTER, existing INFO,
+		// FORMAT and sample columns the caller sent; anything else is rendered
+		// from rows. So a download degrades rather than fails.
 		if job.Kind == queue.KindVCF && s.exportMergedVCF(w, r, job, cols, qy) {
 			return
 		}
-		s.exportVCF(w, r, job, cols, qy)
+		s.exportVCF(w, job, cols, rows)
 	}
 }
 
-func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Job,
-	cols []queue.Column, qy queue.ResultQuery) {
-
+func (s *Server) exportJSON(w http.ResponseWriter, job queue.Job, rows vcfmerge.Stream) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 
 	first := true
 	fmt.Fprint(w, "[")
-	err := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
+	err := rows(func(v queue.Variant) error {
 		if !first {
 			fmt.Fprint(w, ",")
 		}
@@ -169,8 +193,8 @@ func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Jo
 	}
 }
 
-func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job queue.Job,
-	cols []queue.Column, qy queue.ResultQuery, sep rune) {
+func (s *Server) exportDelimited(w http.ResponseWriter, job queue.Job,
+	cols []queue.Column, rows vcfmerge.Stream, sep rune) {
 
 	if sep == '\t' {
 		w.Header().Set("Content-Type", "text/tab-separated-values; charset=utf-8")
@@ -192,7 +216,7 @@ func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job que
 		return
 	}
 
-	err := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
+	err := rows(func(v queue.Variant) error {
 		row := []string{v.Chrom, fmt.Sprint(v.Pos), v.Ref, v.Alt}
 		// Iterate the column model, not the map: column order must match the
 		// header, and map iteration order does not.

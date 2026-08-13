@@ -1,6 +1,8 @@
 package api
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"net/http"
 	"os"
@@ -9,17 +11,29 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // storeResultVCF puts a pre-built answer in job storage and points the job's
 // result row at it, which is what the worker does when a VCF job finishes.
 func storeResultVCF(t *testing.T, h *harness, root, id, body string) string {
 	t.Helper()
-	p := filepath.Join(root, "jobs", id, "result.vcf")
+	p := filepath.Join(root, "jobs", id, queue.ResultName)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+	// Gzipped, as the worker writes it and as the name says. Storing it plain
+	// would test a file the server never produces.
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, buf.Bytes(), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -29,10 +43,10 @@ func storeResultVCF(t *testing.T, h *harness, root, id, body string) string {
 	}
 	defer pool.Close()
 	// Insert-or-update: the seeded job has result rows but not necessarily a
-	// job_result row, and an UPDATE that matches nothing would leave vcf_uri
+	// chunk_result row, and an UPDATE that matches nothing would leave vcf_uri
 	// unset while looking like it had worked.
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO chunk_result (chunk_id, json, vcf_uri) VALUES ($1, NULL, $2)
+		INSERT INTO chunk_result (chunk_id, vcf_uri) VALUES ($1, $2)
 		ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, chunkOf(id), p); err != nil {
 		t.Fatal(err)
 	}

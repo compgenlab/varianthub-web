@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { Ban, RefreshCw } from "lucide-react";
+import { Ban, Download, RefreshCw } from "lucide-react";
 
 import { api, type Chunk, type Job } from "../api";
 
@@ -68,6 +68,7 @@ export default function JobDetail() {
   const [log, setLog] = useState<{ output: string; recorded: boolean } | null>(null);
   const [err, setErr] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   // The chunk whose own output is open, and what it printed. One at a time:
   // a split chromosome has twenty-eight, and opening them all would be a page
   // of logs nobody asked for.
@@ -110,6 +111,23 @@ export default function JobDetail() {
   useEffect(() => {
     load();
   }, [jobId]);
+
+  // The annotated VCF, from here rather than only from the results table.
+  //
+  // A submission large enough to be split is one nobody is going to page
+  // through, and this is the screen they are on while it runs — so this is
+  // where the finished file has to be reachable. It is also the one format
+  // served without conversion: the object the worker stored is the download.
+  async function downloadVCF() {
+    setDownloading(true);
+    try {
+      await api.downloadExport(jobId, "vcf");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setDownloading(false);
+    }
+  }
 
   async function cancel() {
     if (!confirm("Cancel this job? Work already done is not undone.")) return;
@@ -171,6 +189,11 @@ export default function JobDetail() {
           #{job.job_id.slice(0, 12)}
         </h1>
         <div className="row gap-8">
+          {job.status === "done" && (
+            <button className="btn" onClick={downloadVCF} disabled={downloading}>
+              <Download size={14} /> {downloading ? "Preparing…" : "Download VCF"}
+            </button>
+          )}
           {live && (
             <button className="btn secondary" onClick={cancel} disabled={cancelling}>
               <Ban size={14} /> {cancelling ? "Cancelling…" : "Cancel job"}

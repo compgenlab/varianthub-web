@@ -155,7 +155,7 @@ func RunCollect(ctx context.Context, q Queue, jobID, jobStorage string,
 		uris = append(uris, b.Prefix+"/"+ChunkResultName(*c.ChunkIndex))
 	}
 
-	dest := b.Prefix + "/" + queue.ResultName + ".gz"
+	dest := b.Prefix + "/" + queue.ResultName
 	note.say("··· joining %d chunk(s) into %s", len(uris), dest)
 	if err := Join(ctx, uris, dest); err != nil {
 		return "", err
