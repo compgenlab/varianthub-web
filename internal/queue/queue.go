@@ -120,6 +120,15 @@ type Job struct {
 	// off somebody's job.
 	MaxVariants int `json:"-"`
 
+	// BatchID names the split submission this job belongs to, and ChunkIndex
+	// its place in it. Empty and nil for an ordinary job.
+	//
+	// Not serialized here: what a caller needs is the batch's progress, which
+	// GET /batches/{id} answers, rather than an internal id hanging off every
+	// job in a list.
+	BatchID    string `json:"-"`
+	ChunkIndex *int   `json:"-"`
+
 	// InputURI is where this job's input is stored, set only on the Job a claim
 	// returns — Get and List do not fill it, because nothing reading a job's
 	// status needs it.
@@ -169,6 +178,11 @@ type NewJob struct {
 	// Recorded on the row so the worker enforcing it does not have to resolve
 	// an account that may not exist.
 	MaxVariants int
+	// BatchID and ChunkIndex place this job in a split submission. ChunkIndex
+	// is a pointer because 0 is a real chunk — the one carrying the header —
+	// and "not a chunk" has to be distinguishable from "the first chunk".
+	BatchID    string
+	ChunkIndex *int
 
 	// Body is the input itself, for submissions small enough to be worth
 	// carrying: a locus list is a few hundred bytes and a round trip through
@@ -207,13 +221,13 @@ func weightOf(w int) int {
 // more ceremony.
 const jobCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
-	`COALESCE(origin,''), COALESCE(max_variants,0), created_at, ` +
+	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(batch_id,''), chunk_index, created_at, ` +
 	`COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // jobColsJ is jobCols qualified with the "j" alias, for the claim query's join.
 const jobColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
-	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), j.created_at, ` +
+	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.batch_id,''), j.chunk_index, j.created_at, ` +
 	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a job has already finished.
@@ -691,11 +705,12 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
-		                  weight,max_concurrent,origin,max_variants,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+		                  weight,max_concurrent,origin,max_variants,batch_id,chunk_index,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
 		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
 		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
-		j.MaxConcurrent, j.Origin, j.MaxVariants, q.nowFn()); err != nil {
+		j.MaxConcurrent, j.Origin, j.MaxVariants,
+		nullable(j.BatchID), j.ChunkIndex, q.nowFn()); err != nil {
 		return "", err
 	}
 	// One of the two, never both — matching the CHECK rather than trusting it.
@@ -917,7 +932,8 @@ func scanJob(row rowScanner) (Job, error) {
 	var j Job
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.Origin, &j.MaxVariants, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
+		&j.Origin, &j.MaxVariants, &j.BatchID, &j.ChunkIndex,
+		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Job{}, err
 	}
 	return j, nil
