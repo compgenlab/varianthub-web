@@ -26,6 +26,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/cacherunner"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
+	"github.com/compgenlab/varianthub-web/internal/fanout"
 	"github.com/compgenlab/varianthub-web/internal/identity"
 	"github.com/compgenlab/varianthub-web/internal/jobstore"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -268,7 +269,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin, cfg.JobStorage))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.DataDir, cfg.VarhubBin, cfg.JobStorage, chunkSizeFor(ctx, cfg, cat)))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -446,9 +447,13 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // it belongs to the queue rather than to either of the two types this bridges —
 // and it is written outside the Outcome because an Outcome is the job's result,
 // while a log exists for the runs that produced no result at all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin, cfgJobStorage string) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgVarhubBin, cfgJobStorage string, chunkSize func() int) queue.Runner {
 	return func(ctx context.Context, job queue.Job, input []byte) (queue.Outcome, error) {
 		switch job.Kind {
+		case queue.KindSplit:
+			return runSplitJob(ctx, q, job, cfgJobStorage, chunkSize())
+		case queue.KindCollect:
+			return runCollectJob(ctx, q, job, cfgJobStorage)
 		case queue.KindDownload:
 			return runDownload(ctx, q, r, cat, job, input)
 		case queue.KindCleanup:
@@ -534,6 +539,14 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 		// succeeded. Without a stored VCF the export falls back to rendering
 		// from rows, which is the same answer more slowly and with less of the
 		// submitter's file in it.
+		if job.Kind == queue.KindVCF && job.BatchID != "" && job.ChunkIndex != nil {
+			// A chunk's output is a piece of a larger file: gzipped, and
+			// headerless unless it is the first. Stored under the batch's
+			// prefix, which is the split job's, so collect knows where to look
+			// without asking about each chunk job.
+			finishChunk(ctx, q, job, cfgJobStorage, res, alw)
+			return out, nil
+		}
 		if job.Kind == queue.KindVCF && inputPath != "" {
 			uri, mErr := buildResultVCF(ctx, cfgJobStorage, job, inputPath, res, alw)
 			if mErr != nil {
@@ -1066,4 +1079,138 @@ func joinLoc(root, rel string) string {
 		return root + "/" + rel
 	}
 	return filepath.Join(root, rel)
+}
+
+// runSplitJob cuts a submitted VCF into chunks and queues a job for each.
+//
+// The job the submitter was given and polls. It produces no variants of its
+// own: what it produces is the batch, and the answer arrives when the collect
+// job that follows the last chunk finishes.
+func runSplitJob(ctx context.Context, q *queue.Queue, job queue.Job,
+	jobStorage string, chunkSize int) (queue.Outcome, error) {
+
+	alw := queue.NewLogWriter(ctx, q, job.ID)
+	defer alw.Close(context.WithoutCancel(ctx))
+	alw.Note("starting on worker " + q.WorkerID())
+
+	if job.InputURI == "" {
+		return queue.Outcome{}, errors.New("a split job needs a stored input")
+	}
+	dir, err := os.MkdirTemp("", "vhw-split-in-")
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	local := filepath.Join(dir, path.Base(job.InputURI))
+	if _, err := blob.Download(ctx, job.InputURI, local); err != nil {
+		return queue.Outcome{}, fmt.Errorf("stage input: %w", err)
+	}
+
+	_, n, err := fanout.RunSplit(ctx, q, job, local, jobStorage,
+		fanout.DefaultCgkitBin, chunkSize, alw.Note)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	alw.Note(fmt.Sprintf("··· %d chunk(s) queued; this job is done when they are", n))
+
+	// The submitted file has been cut up and every piece stored, so it is no
+	// longer the only copy of anything. Dropped here rather than at expiry, for
+	// the same reason a merged result lets an ordinary VCF job drop its input.
+	dropInput(ctx, q, job.ID, alw)
+	return queue.Outcome{}, nil
+}
+
+// runCollectJob joins a finished batch's chunks into the answer.
+func runCollectJob(ctx context.Context, q *queue.Queue, job queue.Job,
+	jobStorage string) (queue.Outcome, error) {
+
+	alw := queue.NewLogWriter(ctx, q, job.ID)
+	defer alw.Close(context.WithoutCancel(ctx))
+	alw.Note("starting on worker " + q.WorkerID())
+
+	if job.BatchID == "" {
+		return queue.Outcome{}, errors.New("a collect job needs a batch")
+	}
+	uri, err := fanout.RunCollect(ctx, q, job.BatchID, jobStorage, alw.Note)
+	if err != nil {
+		return queue.Outcome{}, err
+	}
+	alw.Note("··· joined file stored at " + uri)
+	return queue.Outcome{VCFURI: uri}, nil
+}
+
+// finishChunk stores a chunk's annotated output and tells its batch.
+//
+// Whoever finishes last queues the collect job, and exactly one caller is told
+// it was last — the count is bumped and read in one statement precisely so two
+// chunks finishing together cannot both start a collect.
+func finishChunk(ctx context.Context, q *queue.Queue, job queue.Job, jobStorage string,
+	res runner.Result, alw *queue.LogWriter) {
+
+	bg := context.WithoutCancel(ctx)
+	prefix := queue.JobPrefix(jobStorage, "")
+	if b, ok, err := q.GetBatch(bg, job.BatchID); err == nil && ok {
+		prefix = b.Prefix
+	}
+
+	ok := true
+	if _, err := fanout.StoreChunkResult(bg, prefix, *job.ChunkIndex,
+		res.Variants, alw.Note); err != nil {
+		// The chunk annotated but its output could not be stored, so the joined
+		// file would have a hole. Reported as a failed chunk, which is what
+		// makes collect refuse rather than produce a file missing a range.
+		log.Printf("worker: job %s: store chunk result: %v", job.ID, err)
+		alw.Note("··· could not store this chunk's output; the batch cannot be joined")
+		ok = false
+	}
+
+	last, err := q.ChunkFinished(bg, job.BatchID, ok)
+	if err != nil {
+		log.Printf("worker: job %s: report chunk to batch: %v", job.ID, err)
+		return
+	}
+	if !last {
+		return
+	}
+	b, found, err := q.GetBatch(bg, job.BatchID)
+	if err != nil || !found {
+		log.Printf("worker: job %s: read batch after the last chunk: %v", job.ID, err)
+		return
+	}
+	if _, err := q.Enqueue(bg, queue.NewJob{
+		Kind:     queue.KindCollect,
+		Snapshot: job.Snapshot,
+		ClientIP: job.ClientIP,
+		Session:  job.Session,
+		UserID:   job.UserID,
+		Label:    "joining " + fmt.Sprint(b.Chunks) + " chunk(s)",
+		Origin:   job.Origin,
+		BatchID:  job.BatchID,
+		Body:     []byte{},
+	}); err != nil {
+		log.Printf("worker: job %s: queue the collect step: %v", job.ID, err)
+		return
+	}
+	alw.Note("··· last chunk; the joining step is queued")
+}
+
+// chunkSizeFor resolves the split chunk size at the moment a split runs.
+//
+// Read per job rather than captured at boot, matching how the cache setting is
+// resolved: an administrator changing it should reach a running worker rather
+// than wait for a redeploy. A database that cannot be read falls back to the
+// configured default instead of guessing, so a blip cannot silently change how
+// a submission is cut.
+func chunkSizeFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() int {
+	return func() int {
+		if cat == nil {
+			return catalog.SiteFromConfig(cfg).ChunkSize()
+		}
+		site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+		if err != nil {
+			return catalog.SiteFromConfig(cfg).ChunkSize()
+		}
+		return site.ChunkSize()
+	}
 }

@@ -499,10 +499,11 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var (
-		fields   = map[string]string{}
-		filename string
-		id       string
-		uri      string
+		fields      = map[string]string{}
+		filename    string
+		id          string
+		uri         string
+		storedBytes int64
 	)
 	// Whatever was stored before an error, so every failure path below can undo
 	// it. Without this an upload that arrives before a metadata field it turns
@@ -589,7 +590,8 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		dest := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(compressed))
-		if err := blob.PutReader(r.Context(), dest, buf); err != nil {
+		counted := &countingReader{r: buf}
+		if err := blob.PutReader(r.Context(), dest, counted); err != nil {
 			part.Close()
 			// dest is not assigned to uri until it exists, so discard() has
 			// nothing to undo — PutReader leaves no partial object behind.
@@ -598,7 +600,7 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		part.Close()
-		uri = dest
+		uri, storedBytes = dest, counted.n
 	}
 
 	if uri == "" {
@@ -628,9 +630,20 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Past the chunk size this becomes a split job: the same submission, cut up
+	// by a worker into pieces that annotate independently. The decision is made
+	// on the stored size rather than the variant count, because counting means
+	// decompressing and that is the work being moved into a worker in the first
+	// place — a file this big is one the splitter should look at, and a split
+	// that turns out to need one chunk is a batch of one.
+	kind := queue.KindVCF
+	if s.splitThreshold() > 0 && storedBytes >= s.splitThreshold() {
+		kind = queue.KindSplit
+	}
+
 	if !s.submit(w, r, queue.NewJob{
 		ID:        id,
-		Kind:      queue.KindVCF,
+		Kind:      kind,
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
@@ -921,4 +934,34 @@ func clampInt(raw string, def, lo, hi int) int {
 		return hi
 	}
 	return n
+}
+
+// countingReader counts what passes through it.
+//
+// The upload is streamed, so its size is not known until it has gone by — and
+// the size is what decides whether the submission is split. Reading it back
+// from storage afterwards would be a round trip for a number we just handled.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// splitThreshold is the stored size past which a VCF is split into chunks.
+//
+// A byte size rather than a variant count, because the count is not known until
+// something has read the file — which is the work a split job exists to do. It
+// only has to be low enough that anything genuinely large is split and high
+// enough that ordinary submissions are not.
+func (s *Server) splitThreshold() int64 {
+	const defaultThreshold = 32 << 20
+	if s.cfg == nil {
+		return defaultThreshold
+	}
+	return defaultThreshold
 }
