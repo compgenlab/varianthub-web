@@ -80,6 +80,16 @@ const (
 	// because it moves the same volume of data a download does, and because
 	// only the worker can reach both ends.
 	KindMove = "move"
+	// KindSplit cuts a submitted VCF into chunks and queues one job per chunk.
+	//
+	// A job rather than work done in the request handler: cutting a chromosome
+	// means reading hundreds of megabytes and writing them back, which is a
+	// worker's business. It is also the job the submitter was given, so it is
+	// what they poll while the split is running.
+	KindSplit = "split"
+	// KindCollect joins a batch's annotated chunks into the final file. Queued
+	// by whichever chunk finishes last.
+	KindCollect = "collect"
 )
 
 // Postgres NOTIFY channels.

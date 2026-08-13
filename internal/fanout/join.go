@@ -139,3 +139,12 @@ func ChunkName(n int) string {
 // SplitBase is the local name vcf-split is pointed at. Its chunks land beside
 // it as BASE.1.vcf.gz, BASE.2.vcf.gz and so on.
 func SplitBase(dir string) string { return strings.TrimRight(dir, "/") + "/part" }
+
+// gzipInto compresses b into w as a single gzip member.
+func gzipInto(w io.Writer, b []byte) error {
+	zw := gzip.NewWriter(w)
+	if _, err := zw.Write(b); err != nil {
+		return err
+	}
+	return zw.Close()
+}
