@@ -236,3 +236,36 @@ func TestVarhubRefusesAnIllegalINFOKey(t *testing.T) {
 		t.Errorf("the refusal does not say what is wrong:\n%s", out)
 	}
 }
+
+// A numeric annotation is declared Float in the VCF header.
+//
+// This service reads types out of a stored result VCF to decide whether a value
+// is a number or text — see vcfmerge.Rows — so a score declared String comes back
+// as the string "0.125" and the json export stops emitting numbers. varhub used
+// to declare everything String because the annotator API had nowhere to put a
+// type (cghts#40, varianthub-cli#27); this pins the guarantee now that it does.
+func TestANumericAnnotationIsDeclaredFloat(t *testing.T) {
+	h := Build(t, Fixture{
+		Annotations: []Annotation{
+			{Name: "sig", Field: "SIG", Type: "categorical"},
+			{Name: "gnomad_af", Field: "AF", Type: "numeric"},
+		},
+		Records: []Record{{Chrom: "chr1", Pos: 100, Ref: "A", Alt: "G",
+			Info: map[string]string{"SIG": "pathogenic", "AF": "0.125"}}},
+	})
+
+	out, err := exec.Command(h.Bin, "-home", h.Dir, "annotate", "--format", "vcf",
+		"chr1:100:A:G").Output()
+	if err != nil {
+		t.Fatalf("annotate --format vcf: %v", err)
+	}
+	got := string(out)
+	if !strings.Contains(got, "ID=gnomad_af,Number=1,Type=Float") {
+		t.Errorf("a numeric annotation was not declared Float:\n%s", got)
+	}
+	// And a categorical one is still a String, so the type is being read from
+	// the manifest rather than applied to everything.
+	if !strings.Contains(got, "ID=sig,Number=1,Type=String") {
+		t.Errorf("a categorical annotation was not declared String:\n%s", got)
+	}
+}
