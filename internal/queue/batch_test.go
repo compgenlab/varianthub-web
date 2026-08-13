@@ -209,3 +209,39 @@ func TestChunkZeroIsDistinctFromNotAChunk(t *testing.T) {
 		t.Errorf("an ordinary job has chunk index %d", *plain.ChunkIndex)
 	}
 }
+
+// The joined answer is filed against the job the submitter was given.
+//
+// They polled the split job and have never heard of the collect job. Filing it
+// anywhere else means a batch that finishes with its file in storage and no id
+// that reaches it — a download that returns nothing for a job reporting done.
+func TestTheJoinedAnswerIsReachableFromTheSubmittedJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	submitted := enqueueOne(t, q, "u")
+	batchID, err := q.CreateBatch(ctx, submitted, "/tmp/jobs/"+submitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, ok, err := q.GetBatch(ctx, batchID)
+	if err != nil || !ok {
+		t.Fatalf("GetBatch: %v ok=%v", err, ok)
+	}
+
+	const joined = "s3://varhub-dev/jobs/x/result.vcf.gz"
+	if err := q.SetResultVCF(ctx, b.JobID, joined); err != nil {
+		t.Fatal(err)
+	}
+
+	got, found, err := q.ResultVCF(ctx, submitted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the job the caller holds has no answer; the file is unreachable")
+	}
+	if got != joined {
+		t.Errorf("ResultVCF = %q, want %q", got, joined)
+	}
+}

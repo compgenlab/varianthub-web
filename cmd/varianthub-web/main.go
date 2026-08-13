@@ -1137,6 +1137,18 @@ func runCollectJob(ctx context.Context, q *queue.Queue, job queue.Job,
 		return queue.Outcome{}, err
 	}
 	alw.Note("··· joined file stored at " + uri)
+
+	// Filed against the job the submitter was given, not this one. They polled
+	// the split job and have never heard of the collect job — leaving the answer
+	// here would mean a batch that finishes with its file in storage and no id
+	// that reaches it.
+	if b, ok, gErr := q.GetBatch(ctx, job.BatchID); gErr == nil && ok {
+		if sErr := q.SetResultVCF(ctx, b.JobID, uri); sErr != nil {
+			return queue.Outcome{}, fmt.Errorf("record the answer against job %s: %w",
+				b.JobID, sErr)
+		}
+		alw.Note("··· available from job " + b.JobID)
+	}
 	return queue.Outcome{VCFURI: uri}, nil
 }
 

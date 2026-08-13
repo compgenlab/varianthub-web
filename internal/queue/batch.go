@@ -133,3 +133,17 @@ func (q *Queue) BatchChunks(ctx context.Context, batchID string) ([]Job, error) 
 	}
 	return out, rows.Err()
 }
+
+// SetResultVCF records where a job's answer-as-a-VCF ended up, for a job that
+// did not build it itself.
+//
+// The collect step's output belongs to the job the submitter was given, not to
+// the collect job they never saw. Without this a batch finishes with its answer
+// filed under an id nobody has: the split job reports done, its export finds
+// nothing, and the file sits in storage unreachable.
+func (q *Queue) SetResultVCF(ctx context.Context, jobID, uri string) error {
+	_, err := q.pool.Exec(ctx, `
+		INSERT INTO job_result (job_id, json, vcf_uri) VALUES ($1, NULL, $2)
+		ON CONFLICT (job_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, jobID, uri)
+	return err
+}
