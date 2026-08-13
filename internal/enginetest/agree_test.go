@@ -23,10 +23,13 @@ func TestTheJSONAndVCFPathsAgree(t *testing.T) {
 	h := Build(t, Fixture{
 		Annotations: []Annotation{
 			{Name: "sig", Field: "SIG"},
-			// A key that is not a legal VCF INFO id. varhub uses the annotation
-			// name as the id verbatim, so this is where the two paths are most
-			// likely to part company.
-			{Name: "gnomAD-AF", Field: "AF", Type: "numeric"},
+			// A numeric field, read from a source field of a different name.
+			// It used to be "gnomAD-AF" here, to see what varhub did with a name
+			// that is not a legal INFO id — the answer was that it wrote the
+			// hyphen straight into the header. varhub refuses such a name at
+			// manifest-validation time now, so the case cannot be built; see
+			// TestVarhubRefusesAnIllegalINFOKey.
+			{Name: "gnomad_af", Field: "AF", Type: "numeric"},
 		},
 		Records: []Record{
 			{Chrom: "chr1", Pos: 100, Ref: "A", Alt: "G",
@@ -211,4 +214,25 @@ func trimFloat(f float64) string {
 func formatFloat(f float64) string {
 	b, _ := json.Marshal(f)
 	return string(b)
+}
+
+// varhub refuses an annotation name that cannot be a VCF INFO key.
+//
+// Pinned here because this service depends on it. A name is written into the
+// output as an INFO id verbatim, so this guarantee is what makes a stored result
+// VCF parseable by a strict reader — and it is a guarantee made in another
+// repository, which is exactly the kind that goes quietly missing.
+func TestVarhubRefusesAnIllegalINFOKey(t *testing.T) {
+	bin := Binary(t)
+	dir := t.TempDir()
+	WriteIllegalFixture(t, dir)
+
+	out, err := exec.Command(bin, "-home", dir, "annotation", "list", "--format", "json",
+		"--", "testsnap").CombinedOutput()
+	if err == nil {
+		t.Fatalf("a manifest declaring \"gnomAD-AF\" was accepted:\n%s", out)
+	}
+	if !strings.Contains(string(out), "INFO key") {
+		t.Errorf("the refusal does not say what is wrong:\n%s", out)
+	}
 }

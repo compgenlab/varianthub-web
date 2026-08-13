@@ -221,6 +221,42 @@ localpath = %q
 	return written.String()
 }
 
+// WriteIllegalFixture writes a home whose manifest declares a name that cannot
+// be a VCF INFO key, for asserting that varhub refuses it.
+//
+// Built by hand rather than through Build, which validates the home before
+// returning and would fail here — the refusal is the thing under test.
+func WriteIllegalFixture(t *testing.T, dir string) {
+	t.Helper()
+	srcDir := filepath.Join(dir, "annotations", "sources", "fixture", "1")
+	mustMkdir(t, srcDir)
+	mustMkdir(t, filepath.Join(dir, "annotations", "snapshots"))
+
+	write(t, filepath.Join(dir, "config.toml"), fmt.Sprintf(`data_dir = %q
+cache_dir = %q
+annotations_dir = "./annotations"
+default_snapshot = "testsnap"
+`, dir, dir))
+	write(t, filepath.Join(dir, "annotations", "snapshots", "testsnap.toml"),
+		`title = "fixture"
+assembly = "GRCh38"
+sources = ["fixture:1"]
+default_annotations = ["gnomAD-AF"]
+`)
+	write(t, filepath.Join(srcDir, "fixture-1.toml"), fmt.Sprintf(`[[sources]]
+name      = "fixture"
+version   = "1"
+assembly  = "GRCh38"
+format    = "vcf"
+localpath = %q
+
+  [[sources.annotations]]
+  name = "gnomAD-AF"
+  field = "AF"
+  type = "numeric"
+`, filepath.Join(srcDir, "fixture.vcf.gz")))
+}
+
 // escapeInfo percent-encodes the characters an INFO value cannot carry.
 func escapeInfo(s string) string {
 	return strings.NewReplacer(
