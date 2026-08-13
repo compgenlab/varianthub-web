@@ -384,12 +384,27 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 	// The error text says what happened, because "attempt 3 of 3" is the part
 	// an operator needs and the raw truth ("no worker ever reported on this")
 	// is not otherwise visible anywhere.
+	// Charged here and nowhere else. An abandoned job's worker died rather than
+	// reporting, so finish() never ran for it — but it held a slot for a lease's
+	// worth of time on every attempt, and a caller whose jobs keep dying would
+	// otherwise retry at everyone else's expense for free.
+	//
+	// DISTINCT because ON CONFLICT cannot touch the same row twice in one
+	// statement, and a caller with several exhausted jobs would otherwise fail
+	// the whole sweep.
 	if _, err := q.pool.Exec(ctx, `
+		WITH failed AS (
 		UPDATE job
 		   SET status=$1, claimed_by=NULL, lease_until=NULL, finished_at=$4,
 		       error=$5
 		 WHERE status=$2 AND COALESCE(lease_until, 0) < $3
-		   AND attempts >= $6`,
+		   AND attempts >= $6
+		RETURNING COALESCE(NULLIF(user_id,''), client_ip) AS who
+		)
+		INSERT INTO queue_caller (who, last_finished_at)
+		SELECT DISTINCT who, $4 FROM failed WHERE who <> ''
+		ON CONFLICT (who) DO UPDATE
+		   SET last_finished_at = GREATEST(queue_caller.last_finished_at, excluded.last_finished_at)`,
 		StatusError, StatusRunning, q.nowFn(), q.nowFn(),
 		fmt.Sprintf("abandoned %d times without completing — its worker was killed "+
 			"each time rather than reporting a failure; see the job log for what it "+
@@ -697,6 +712,19 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 	if err != nil {
 		return 0, err
 	}
+
+	// The fair-share timestamps age out with the jobs. Safe because the ordering
+	// reads GREATEST(created_at, last_finished_at): once the timestamp is older
+	// than any queued job could be, it never wins that comparison, so an absent
+	// row and a sufficiently old one give the same answer. Without this the table
+	// grows a row per anonymous address forever.
+	//
+	// Best effort — this is housekeeping, and failing the sweep over it would
+	// leave the jobs themselves uncollected.
+	if _, err := q.pool.Exec(ctx,
+		`DELETE FROM queue_caller WHERE last_finished_at < $1`, cutoff); err != nil {
+		log.Printf("queue: prune fair-share timestamps: %v", err)
+	}
 	return tag.RowsAffected(), nil
 }
 
@@ -788,9 +816,34 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 
 // claimQuery claims the next job in a single statement.
 //
-// Fairness is unchanged from the SQLite version: among queued jobs prefer the
-// client IP with the fewest already running (round-robin), skip any IP at the
-// per-IP cap, and break ties by oldest created_at then id.
+// Fairness has two terms, covering two different ways one caller can crowd out
+// another:
+//
+//   - fewest jobs *running* — stops one caller holding every slot at once.
+//   - longest since they were *served* — stops one caller taking every slot in
+//     sequence. A job's position is GREATEST(created_at, last_finished_at), so
+//     finishing a job pushes the rest of that caller's queue behind everyone who
+//     has been waiting.
+//
+// The second exists because the first is blind at one slot. By the time a worker
+// claims, the job it just finished is already marked done, so with slots=1 every
+// caller has zero running, the term is a constant, and the ordering collapses to
+// plain FIFO — a caller who queued 400 jobs before anyone else arrived took all
+// 400 in a row. More generally a concurrency-based signal can only separate
+// callers up to the number of slots, and has nothing to say when there is one.
+//
+// Both are kept because each is blind where the other sees: last_finished_at only
+// advances on completion, so a caller with a six-hour job in flight looks idle by
+// that measure, and only the running count stops them taking more slots.
+//
+// Deliberately no DISTINCT ON to take one candidate per caller. It would change
+// nothing — LIMIT 1 already means a caller's 400 tied rows cannot outvote another
+// caller's one — and FOR UPDATE cannot be combined with DISTINCT, so it would
+// force the whole statement into CTEs and put the locking, which is the part with
+// teeth, on new ground for no gain.
+//
+// Skip any caller at the per-caller cap, and break ties by oldest created_at then
+// id.
 //
 // FOR UPDATE OF j is required rather than a bare FOR UPDATE: Postgres refuses to
 // lock the nullable side of an outer join, and r is a LEFT JOIN subquery. Locking
@@ -815,13 +868,17 @@ WHERE id = (
       FROM job WHERE status = $1
      GROUP BY COALESCE(NULLIF(user_id,''), client_ip)
   ) r ON r.who = COALESCE(NULLIF(j.user_id,''), j.client_ip)
+  LEFT JOIN queue_caller f
+    ON f.who = COALESCE(NULLIF(j.user_id,''), j.client_ip)
   CROSS JOIN (
     SELECT COALESCE(SUM(weight),0) AS used FROM job WHERE status = $1
   ) p
   WHERE j.status = $3
     AND COALESCE(r.c, 0) < (CASE WHEN j.max_concurrent > 0 THEN j.max_concurrent ELSE $4 END)
     AND (p.used = 0 OR p.used + j.weight <= $5)
-  ORDER BY COALESCE(r.c, 0) ASC, j.created_at ASC, j.id ASC
+  ORDER BY COALESCE(r.c, 0) ASC,
+           GREATEST(j.created_at, COALESCE(f.last_finished_at, 0)) ASC,
+           j.created_at ASC, j.id ASC
   FOR UPDATE OF j SKIP LOCKED
   LIMIT 1
 )
@@ -980,10 +1037,43 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		log.Printf("queue: finish job %s: %v", id, err)
 		return
 	}
+	// In the same transaction as the finish, so the scheduler can never see a job
+	// completed without the charge for it having landed. Apart, a crash between
+	// the two would leave that caller's next job holding a position it has
+	// already spent.
+	if err := chargeCaller(wctx, tx, id, q.nowFn()); err != nil {
+		log.Printf("queue: charge caller for job %s: %v", id, err)
+		return
+	}
 	if err := tx.Commit(wctx); err != nil {
 		log.Printf("queue: commit job %s: %v", id, err)
 		return
 	}
+}
+
+// chargeCaller records that a job's caller has just been served, which pushes the
+// rest of their queue behind everyone who has been waiting.
+//
+// The identity is derived from the job row in SQL rather than from a Go field,
+// so it is the same expression the claim query orders by. Written twice, the two
+// could disagree — and a job charged to one identity while ordered under another
+// is a scheduler that quietly stops being fair.
+//
+// GREATEST, not assignment: a cancel and a completion can land out of order, and
+// moving the timestamp backwards would hand back a turn that was already taken.
+//
+// A job with neither an account nor an address has no caller to be fair between,
+// so the WHERE drops it rather than filing everything anonymous under one key.
+func chargeCaller(ctx context.Context, tx pgx.Tx, id string, now int64) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO queue_caller (who, last_finished_at)
+		SELECT COALESCE(NULLIF(user_id,''), client_ip), $2
+		  FROM job
+		 WHERE id = $1 AND COALESCE(NULLIF(user_id,''), client_ip) <> ''
+		ON CONFLICT (who) DO UPDATE
+		   SET last_finished_at = GREATEST(queue_caller.last_finished_at, excluded.last_finished_at)`,
+		id, now)
+	return err
 }
 
 // WorkerID identifies this process in the claims it holds, for logs that need
