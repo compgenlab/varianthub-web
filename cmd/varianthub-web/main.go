@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -26,6 +27,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
+	"github.com/compgenlab/varianthub-web/internal/jobstore"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 	"github.com/compgenlab/varianthub-web/internal/store"
@@ -87,6 +89,8 @@ func run(args []string) error {
 		return serve(ctx, cfg)
 	case "worker":
 		return worker(ctx, cfg)
+	case "sweep-storage":
+		return sweepStorage(ctx, cfg, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -230,6 +234,10 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	q.SetObjectDisposer(disposeJobObjects)
 	q.StartListener(ctx)
 	q.StartSweeper(ctx, cfg.JobTTL, sweepInterval(cfg.JobTTL))
+	// And the files nothing in the database points at. Daily, because it lists
+	// the whole of job storage to find them and the things it collects are
+	// leftovers from a crash rather than a steady product.
+	jobstore.Start(ctx, q, cfg.JobStorage, 24*time.Hour)
 
 	home, err := homeProvider(ctx, cfg)
 	if err != nil {
@@ -640,6 +648,46 @@ func buildResultVCF(ctx context.Context, jobStorage string, job queue.Job,
 	return uri, nil
 }
 
+// sweepStorage removes job-storage files that no job owns, on demand.
+//
+// The worker does this on a timer already. It is a subcommand as well because
+// the timer is invisible: an operator looking at a storage bill wants to see
+// what would go before it goes, and wants to run it now rather than wait a day.
+// It also makes the sweep usable as a scheduled job by anyone who would rather
+// schedule it than have the worker do it.
+func sweepStorage(ctx context.Context, cfg *config.Config, args []string) error {
+	fs := flag.NewFlagSet("sweep-storage", flag.ContinueOnError)
+	dryRun := fs.Bool("dry-run", false, "report what would be removed, remove nothing")
+	grace := fs.Duration("grace", jobstore.DefaultGrace,
+		"leave objects newer than this alone; an upload is stored before its job row exists")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	q, err := queue.Open(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer q.Close()
+
+	res, err := jobstore.Sweep(ctx, q, cfg.JobStorage, *grace, *dryRun)
+	if err != nil {
+		return err
+	}
+	verb := "removed"
+	if *dryRun {
+		verb = "would remove"
+	}
+	log.Printf("sweep-storage: %d object(s) under %s; %d belong to no job, %s %d (%.1f MB)",
+		res.Scanned, cfg.JobStorage, res.Orphans, verb, res.Removed, float64(res.Bytes)/(1<<20))
+	if res.Skipped > 0 {
+		log.Printf("sweep-storage: %d left alone as newer than %s — an upload exists "+
+			"before its job row does, so a recent orphan may be a job being submitted",
+			res.Skipped, *grace)
+	}
+	return nil
+}
+
 // disposeJobObjects removes the stored files of jobs the sweep has collected.
 //
 // Best effort, one at a time, and a failure on one does not stop the rest: the
@@ -915,6 +963,11 @@ commands:
   worker    run the annotation job pool (execs the varhub CLI)
   migrate   apply pending SQL migrations, then exit
   seed      populate an empty catalog with a starter snapshot, then exit
+
+  sweep-storage [--dry-run] [--grace 1h]
+            remove job-storage files that no job owns. The worker does this
+            daily; this is for looking now, and for deployments that would
+            rather schedule it themselves.
 
 catalog administration:
   source add [flags] <source.toml>   register a source from a varhub fragment

@@ -780,6 +780,64 @@ func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	return body, true, nil
 }
 
+// KnownJobIDs returns every job id the database still has a row for.
+//
+// For the storage sweep, which decides what to delete by what is *absent* — so
+// this has to be the whole set, not a page of it. A job whose id is missing from
+// a partial answer would have its files collected while it was still queued.
+//
+// The whole table, because a job's files are owned for as long as its row
+// exists, whatever state it is in. Filtering to terminal jobs here would delete
+// the input of everything currently queued.
+func (q *Queue) KnownJobIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := q.pool.Query(ctx, `SELECT id FROM job`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
+// TryLock takes a session-scoped advisory lock, reporting whether it got it.
+//
+// For work that should happen on one replica at a time and can simply be
+// skipped by the others — a full bucket listing run by three workers is three
+// listings for one answer. Non-blocking on purpose: the loser has nothing to
+// wait for, since by the time the winner is done the work is done.
+//
+// The returned release must be called; it is a no-op when the lock was not
+// taken.
+func (q *Queue) TryLock(ctx context.Context, name string) (ok bool, release func(), err error) {
+	conn, err := q.pool.Acquire(ctx)
+	if err != nil {
+		return false, func() {}, err
+	}
+	// One connection held for the lock's lifetime: an advisory lock belongs to a
+	// session, and a pool is free to hand the unlock to a different one.
+	if err := conn.QueryRow(ctx,
+		`SELECT pg_try_advisory_lock(hashtext($1))`, name).Scan(&ok); err != nil {
+		conn.Release()
+		return false, func() {}, err
+	}
+	if !ok {
+		conn.Release()
+		return false, func() {}, nil
+	}
+	return true, func() {
+		_, _ = conn.Exec(context.WithoutCancel(ctx),
+			`SELECT pg_advisory_unlock(hashtext($1))`, name)
+		conn.Release()
+	}, nil
+}
+
 // ResultVCF returns where a job's answer-as-a-VCF is stored, and whether one
 // was built at all.
 //
