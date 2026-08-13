@@ -1,5 +1,4 @@
 import { useEffect, useState } from "react";
-import SiteSettingsTab from "./SiteSettings";
 import GeneListsTab from "./GeneLists";
 import {
   LEVEL_HELP,
@@ -67,7 +66,12 @@ const CODE_STYLE: React.CSSProperties = {
 // completely different way, by pasting genes rather than by writing a manifest,
 // and folding that into the source form would mean one screen with two unrelated
 // halves.
-type Tab = "sources" | "genelists" | "snapshots" | "builds" | "settings";
+//
+// Site settings used to be a tab here and is now its own page. Nothing about
+// anonymous access, the cache budget or the tier limits is a fact about a source
+// or a snapshot, and filing it here put it behind a heading describing something
+// else.
+type Tab = "sources" | "genelists" | "snapshots" | "builds";
 
 export default function Admin() {
   const [tab, setTab] = useState<Tab>("sources");
@@ -139,9 +143,7 @@ export default function Admin() {
           borderBottom: "1px solid rgba(22,24,29,.1)",
         }}
       >
-        {(
-          ["sources", "genelists", "snapshots", "builds", "settings"] as Tab[]
-        ).map((t) => (
+        {(["sources", "genelists", "snapshots", "builds"] as Tab[]).map((t) => (
           <button
             key={t}
             onClick={() => setTab(t)}
@@ -162,18 +164,14 @@ export default function Admin() {
                 ? "Gene lists"
                 : t === "snapshots"
                   ? "Snapshots"
-                  : t === "builds"
-                    ? "Genome builds"
-                    : "Settings"}
+                  : "Genome builds"}
           </button>
         ))}
       </div>
 
       {err && <p className="err">{err}</p>}
 
-      {tab === "settings" ? (
-        <SiteSettingsTab />
-      ) : tab === "builds" ? (
+      {tab === "builds" ? (
         <BuildList />
       ) : tab === "genelists" ? (
         <GeneListsTab sources={sources} onChange={load} />

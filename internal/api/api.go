@@ -171,6 +171,8 @@ func (s *Server) adminRoutes() http.Handler {
 	m.HandleFunc("GET /api/v1/admin/genelists/models", s.handleListGeneModels)
 	m.HandleFunc("POST /api/v1/admin/genelists/validate", s.handleValidateGeneList)
 	m.HandleFunc("POST /api/v1/admin/genelists", s.handleCreateGeneList)
+	m.HandleFunc("GET /api/v1/admin/genelists/{id}", s.handleGetGeneList)
+	m.HandleFunc("PUT /api/v1/admin/genelists/{id}", s.handleUpdateGeneList)
 	m.HandleFunc("POST /api/v1/admin/snapshots", s.handleCreateSnapshot)
 	m.HandleFunc("POST /api/v1/admin/snapshots/{id}/publish", s.handlePublishSnapshot)
 	m.HandleFunc("PATCH /api/v1/admin/snapshots/{id}", s.handleUpdateSnapshotMeta)

@@ -50,7 +50,12 @@ const TIER_LIMITS: { key: keyof Settings & string; label: string; hint: string }
  * edit config.toml or clear an override, and an effective value alone cannot
  * tell them.
  */
-export default function SiteSettingsTab() {
+// Its own page rather than a tab under Sources & snapshots, where it used to
+// live. Nothing here is about a source or a snapshot — anonymous access, the
+// cache budget and the tier limits are properties of the deployment — and
+// filing it there put the one screen an operator reaches for behind a heading
+// describing something else.
+export default function SiteSettings() {
   const [defaults, setDefaults] = useState<Settings | null>(null);
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [form, setForm] = useState<Record<string, string>>({});
@@ -128,8 +133,9 @@ export default function SiteSettingsTab() {
   const overridden = (k: string) => k in overrides;
 
   return (
-    <div style={{ maxWidth: 620 }}>
-      <p className="lede" style={{ fontSize: 13.5, marginTop: 0 }}>
+    <div className="page" style={{ paddingTop: 30, maxWidth: 620 }}>
+      <h1 className="title">Settings</h1>
+      <p className="lede" style={{ fontSize: 13.5, marginTop: 6 }}>
         Settings for this installation. config.toml supplies the defaults; a
         change here overrides one until you revert it.
       </p>

@@ -248,6 +248,156 @@ func (s *Server) handleCreateGeneList(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleGetGeneList reads a stored list back into the shape the builder collects,
+// so editing one starts from what is there rather than from an empty form.
+//
+// Reports whether it can be edited and why not, rather than leaving the caller to
+// discover it on save. A list a snapshot pins is frozen — a snapshot is a promise
+// about what an annotation ran against — and finding that out after retyping a
+// panel is the wrong moment.
+func (s *Server) handleGetGeneList(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	src, err := s.catalog.GetSource(r.Context(), r.PathValue("id"))
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	spec, ok := src.GeneListSpecOf()
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf(
+			"%s is not an editable gene list — a list whose genes come from a "+
+				"genes_file is edited by changing that file", src.Ref()))
+		return
+	}
+	pinned, err := s.catalog.SourceInUse(r.Context(), src.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": src.ID, "ref": src.Ref(),
+		"name": spec.Name, "version": spec.Version,
+		"title": spec.Title, "description": spec.Description,
+		"gtf": spec.GTFRef, "gene_field": fieldName(strings.EqualFold(spec.GeneField, "gene_id")),
+		"genes": spec.Genes, "annotation_name": spec.AnnotationName,
+		"visibility": src.Visibility,
+		"editable":   len(pinned) == 0,
+		"pinned_by":  pinned,
+	})
+}
+
+// handleUpdateGeneList rewrites a list's genes, refusing one a snapshot pins.
+//
+// Goes through catalog.UpdateSourceTOML rather than PutSource, because changing
+// the gene set changes what the source emits: that path refuses a pinned source,
+// drops the ad-hoc snapshots built from the old manifest, and purges the cached
+// values computed from it — all in one transaction. Writing the manifest alone
+// would leave answers cached from the previous gene set, which is not a stale
+// cache but a wrong one, and it looks exactly like a correct one.
+func (s *Server) handleUpdateGeneList(w http.ResponseWriter, r *http.Request) {
+	if s.catalog == nil {
+		writeError(w, http.StatusServiceUnavailable, "catalog unavailable")
+		return
+	}
+	id := r.PathValue("id")
+	cur, err := s.catalog.GetSource(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, catalog.ErrNotFound) {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !cur.IsGeneList() {
+		writeError(w, http.StatusBadRequest, cur.Ref()+" is not a gene list")
+		return
+	}
+
+	var req geneListRequest
+	if err := decodeJSON(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
+		return
+	}
+	// Name and version identify the source and are where its files would live, so
+	// changing either makes it a different list. Taken from the stored source
+	// rather than the request, so a form that echoes them back cannot rename
+	// anything by accident.
+	ann := strings.TrimSpace(req.AnnotationName)
+	if ann == "" {
+		ann = cur.Name
+	}
+	if !nameRE.MatchString(ann) {
+		writeError(w, http.StatusBadRequest,
+			"the annotation name becomes a VCF INFO key: letters, digits and underscores "+
+				"only, starting with a letter")
+		return
+	}
+
+	check, err := s.checkGeneList(r, req)
+	if err != nil {
+		writeGeneListError(w, err)
+		return
+	}
+	if len(check.Unknown) > 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": fmt.Sprintf("%d of %d genes are not in %s",
+				len(check.Unknown), check.Total, check.GTF),
+			"check": check,
+		})
+		return
+	}
+
+	gtf, err := s.catalog.GetSource(r.Context(), strings.TrimSpace(req.GTFSourceID))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	next, err := catalog.SourceFromTOML(catalog.GeneListTOML(catalog.GeneListSpec{
+		Name:           cur.Name,
+		Version:        cur.Version,
+		Title:          strings.TrimSpace(req.Title),
+		Description:    strings.TrimSpace(req.Description),
+		GTFRef:         gtf.Ref(),
+		Build:          gtf.Build,
+		GeneField:      check.GeneField,
+		Genes:          check.Genes,
+		AnnotationName: ann,
+	}))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "generated an invalid manifest: "+err.Error())
+		return
+	}
+	// Left empty so UpdateSourceTOML carries the stored level forward. Editing a
+	// list's genes says nothing about who may use it.
+	next.Visibility = ""
+
+	updated, err := s.catalog.UpdateSourceTOML(r.Context(), id, next)
+	if err != nil {
+		switch {
+		case errors.Is(err, catalog.ErrNotFound):
+			writeError(w, http.StatusNotFound, err.Error())
+		default:
+			// Pinned by a snapshot: the caller's to resolve, and the message
+			// names the snapshots holding it.
+			writeError(w, http.StatusConflict, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"id": updated.ID, "ref": updated.Ref(),
+		"gtf": gtf.Ref(), "genes": len(check.Genes),
+	})
+}
+
 // handleListGeneModels lists the GTF sources a gene list can be built on, with
 // how many genes each has available.
 //

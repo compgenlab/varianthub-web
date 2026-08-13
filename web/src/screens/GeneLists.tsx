@@ -34,17 +34,26 @@ export default function GeneLists({
   onChange: () => void;
 }) {
   const [adding, setAdding] = useState(false);
+  // The list being edited, or "" for none. One form serves both: editing is the
+  // same screen with the genes already in it, so a correction is the same work
+  // as the first entry rather than a different feature.
+  const [editing, setEditing] = useState("");
   const lists = useMemo(
     () => sources.filter((s) => s.kind === "genelist"),
     [sources],
   );
 
-  if (adding)
+  if (adding || editing)
     return (
       <BuildGeneList
-        onCancel={() => setAdding(false)}
+        editID={editing}
+        onCancel={() => {
+          setAdding(false);
+          setEditing("");
+        }}
         onDone={() => {
           setAdding(false);
+          setEditing("");
           onChange();
         }}
       />
@@ -97,15 +106,23 @@ export default function GeneLists({
                 {s.genelist_gtf ? ` · via ${s.genelist_gtf}` : ""}
               </span>
             </span>
-            {/* A gene list is a source, so this is the same toggle the sources
-                table uses and the same endpoint behind it. */}
-            <VisibilityPicker
-              level={s.visibility}
-              onChange={async (next) => {
-                await api.setSourceVisibility(s.id, next);
-                onChange();
-              }}
-            />
+            <span className="row gap-8">
+              {/* A gene list is a source, so this is the same toggle the sources
+                  table uses and the same endpoint behind it. */}
+              <VisibilityPicker
+                level={s.visibility}
+                onChange={async (next) => {
+                  await api.setSourceVisibility(s.id, next);
+                  onChange();
+                }}
+              />
+              <button
+                className="btn secondary sm"
+                onClick={() => setEditing(s.id)}
+              >
+                Edit
+              </button>
+            </span>
           </div>
         ))}
       </div>
@@ -114,12 +131,16 @@ export default function GeneLists({
 }
 
 function BuildGeneList({
+  editID,
   onCancel,
   onDone,
 }: {
+  /** The list being edited, or "" to create a new one. */
+  editID: string;
   onCancel: () => void;
   onDone: () => void;
 }) {
+  const editingExisting = !!editID;
   const [models, setModels] = useState<GeneModel[] | null>(null);
   const [gtf, setGtf] = useState("");
   const [text, setText] = useState("");
@@ -135,6 +156,12 @@ function BuildGeneList({
   // been restricted has already been readable by everyone who could reach the
   // server.
   const [visibility, setVisibility] = useState<Visibility>("restricted");
+
+  // Why an existing list cannot be changed, when it cannot. Known before the
+  // form is touched, so nobody retypes a panel and learns on save.
+  const [pinnedBy, setPinnedBy] = useState<string[]>([]);
+  const [loaded, setLoaded] = useState(!editID);
+  const [wantGTF, setWantGTF] = useState("");
 
   const [check, setCheck] = useState<GeneListCheck | null>(null);
   const [checkErr, setCheckErr] = useState("");
@@ -152,12 +179,50 @@ function BuildGeneList({
       });
   }, []);
 
+  // Load the stored list into the form. The genes come back as an array and go
+  // into the textarea one per line, which is also the shape somebody editing
+  // them wants to see — a 300-gene panel on one comma-joined line is not
+  // reviewable.
+  useEffect(() => {
+    if (!editID) return;
+    api
+      .geneList(editID)
+      .then((g) => {
+        setText(g.genes.join("\n"));
+        setByID(g.gene_field === "gene_id");
+        setName(g.name);
+        setVersion(g.version);
+        setTitle(g.title ?? "");
+        setDescription(g.description ?? "");
+        setAnnName(g.annotation_name ?? "");
+        setVisibility(g.visibility);
+        setWantGTF(g.gtf);
+        setPinnedBy(g.editable ? [] : (g.pinned_by ?? []));
+        setLoaded(true);
+      })
+      .catch((e) => {
+        setErr(e instanceof Error ? e.message : String(e));
+        setLoaded(true);
+      });
+  }, [editID]);
+
+  // A stored list names its gene model by ref ("gencode:48"); the picker holds a
+  // source id. Resolve one to the other once both have arrived.
+  useEffect(() => {
+    if (!models || !wantGTF) return;
+    const found = models.find((m) => m.ref === wantGTF);
+    if (found) setGtf(found.id);
+    setWantGTF("");
+  }, [models, wantGTF]);
+
   // Pick the first model that actually has genes. One with none cannot validate
   // anything, and defaulting to it would make a correct list look entirely wrong.
+  // Skipped while an edit is still resolving its own model, or the default would
+  // win the race and silently repoint the list.
   useEffect(() => {
-    if (!models || gtf) return;
+    if (!models || gtf || wantGTF || !loaded) return;
     setGtf(models.find((m) => m.genes > 0)?.id ?? models[0]?.id ?? "");
-  }, [models, gtf]);
+  }, [models, gtf, wantGTF, loaded]);
 
   // Validate as they type, debounced. Checking on submit alone would mean the
   // first thing a long paste tells you is that it failed.
@@ -192,25 +257,42 @@ function BuildGeneList({
   }, [gtf, text, byID]);
 
   const model = models?.find((m) => m.id === gtf);
+  const frozen = pinnedBy.length > 0;
   const clean =
     !!check && (check.unknown?.length ?? 0) === 0 && check.total > 0;
-  const canSave = clean && !!name.trim() && !!version.trim() && !busy;
+  const canSave =
+    clean && !!name.trim() && !!version.trim() && !busy && !frozen && loaded;
 
   async function save() {
     setBusy(true);
     setErr("");
     try {
-      await api.createGeneList({
-        gtf_source_id: gtf,
-        genes: text,
-        gene_field: byID ? "gene_id" : "gene_name",
-        name: name.trim(),
-        version: version.trim(),
-        title: title.trim() || undefined,
-        description: description.trim() || undefined,
-        annotation_name: annName.trim() || undefined,
-        visibility,
-      });
+      if (editingExisting) {
+        // Name and version are not sent: they identify the source, and the
+        // server takes them from the stored row so a form echoing them back
+        // cannot rename anything. Visibility is left alone too — changing which
+        // genes are in a list says nothing about who may use it.
+        await api.updateGeneList(editID, {
+          gtf_source_id: gtf,
+          genes: text,
+          gene_field: byID ? "gene_id" : "gene_name",
+          title: title.trim() || undefined,
+          description: description.trim() || undefined,
+          annotation_name: annName.trim() || undefined,
+        });
+      } else {
+        await api.createGeneList({
+          gtf_source_id: gtf,
+          genes: text,
+          gene_field: byID ? "gene_id" : "gene_name",
+          name: name.trim(),
+          version: version.trim(),
+          title: title.trim() || undefined,
+          description: description.trim() || undefined,
+          annotation_name: annName.trim() || undefined,
+          visibility,
+        });
+      }
       onDone();
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -225,7 +307,7 @@ function BuildGeneList({
         ← Back to gene lists
       </button>
       <h1 style={{ fontSize: 24, fontWeight: 600, margin: "14px 0 6px" }}>
-        New gene list
+        {editingExisting ? `Edit ${name || "gene list"}` : "New gene list"}
       </h1>
       <p className="lede" style={{ fontSize: 13.5 }}>
         Paste the genes and pick the gene model to resolve them through. Every
@@ -234,6 +316,17 @@ function BuildGeneList({
       </p>
 
       {err && <p className="err">{err}</p>}
+
+      {/* Said before the form is touched, not on save. A snapshot is a promise
+          about what an annotation ran against, so a pinned list is frozen — and
+          finding that out after retyping a panel is the wrong moment. */}
+      {frozen && (
+        <p className="err" style={{ fontSize: 13 }}>
+          This list is pinned by {pinnedBy.join(", ")} and cannot be changed —
+          a snapshot records what an annotation ran against. Remove it from
+          those snapshots, or register a new version alongside it.
+        </p>
+      )}
 
       <div
         style={{
@@ -331,12 +424,15 @@ function BuildGeneList({
             className="input mono"
             placeholder="cancer_genes"
             value={name}
+            disabled={editingExisting}
             onChange={(e) => setName(e.target.value)}
           />
           <p
             style={{ fontSize: 12, color: "var(--text-3)", margin: "4px 0 0" }}
           >
-            Letters, digits and underscores. This becomes the source name.
+            {editingExisting
+              ? "Fixed. Name and version identify the list and are where its files would live, so changing either would make it a different one — register that alongside instead."
+              : "Letters, digits and underscores. This becomes the source name."}
           </p>
 
           <label className="label" style={{ marginTop: 12 }}>
@@ -345,6 +441,7 @@ function BuildGeneList({
           <input
             className="input mono"
             value={version}
+            disabled={editingExisting}
             onChange={(e) => setVersion(e.target.value)}
           />
 
@@ -409,7 +506,11 @@ function BuildGeneList({
             disabled={!canSave}
             onClick={save}
           >
-            {busy ? "Saving…" : "Create gene list"}
+            {busy
+              ? "Saving…"
+              : editingExisting
+                ? "Save changes"
+                : "Create gene list"}
           </button>
           {!clean && !!text.trim() && (
             <p

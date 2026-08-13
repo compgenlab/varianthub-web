@@ -681,6 +681,50 @@ export const api = {
    *  validate against it. */
   geneModels: () => req<GeneModel[]>("/admin/genelists/models"),
 
+  /** Reads a stored list back into the builder's shape, plus whether it can be
+   *  edited — a list a snapshot pins is frozen. */
+  geneList: (id: string) =>
+    req<{
+      id: string;
+      ref: string;
+      name: string;
+      version: string;
+      title?: string;
+      description?: string;
+      gtf: string;
+      gene_field: "gene_name" | "gene_id";
+      genes: string[];
+      annotation_name?: string;
+      visibility: Visibility;
+      /** False when a snapshot pins it. */
+      editable: boolean;
+      /** The snapshots holding it, when it is not editable. */
+      pinned_by?: string[];
+    }>(`/admin/genelists/${encodeURIComponent(id)}`),
+
+  /** Rewrites a list's genes. Refuses one a snapshot pins (409) and re-validates
+   *  as strictly as creation does. Name and version are fixed — changing either
+   *  would make it a different list. */
+  updateGeneList: (
+    id: string,
+    body: {
+      gtf_source_id: string;
+      genes: string;
+      gene_field?: "gene_name" | "gene_id";
+      title?: string;
+      description?: string;
+      annotation_name?: string;
+    },
+  ) =>
+    req<{ id: string; ref: string; gtf: string; genes: number }>(
+      `/admin/genelists/${encodeURIComponent(id)}`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+
   /** Checks a pasted list against a gene model without saving anything. */
   validateGeneList: (body: {
     gtf_source_id: string;

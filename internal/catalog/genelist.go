@@ -37,6 +37,65 @@ func (s Source) GeneListGTF() string {
 // IsGeneList reports whether the source flags variants by gene membership.
 func (s Source) IsGeneList() bool { return s.Kind == "genelist" }
 
+// GeneListSpecOf reads a stored gene list back into the shape the builder
+// collects, so an existing list can be edited rather than rewritten from
+// scratch.
+//
+// Parsed from toml_text like GeneListGTF, rather than from a projection: the
+// manifest is the source of truth, and a list registered by hand on the sources
+// page is as editable here as one the builder made. That is the whole reason
+// generated manifests are ordinary text — nothing downstream knows which is
+// which, and this must not either.
+func (s Source) GeneListSpecOf() (GeneListSpec, bool) {
+	if !s.IsGeneList() {
+		return GeneListSpec{}, false
+	}
+	var f struct {
+		Sources []struct {
+			Name      string   `toml:"name"`
+			Version   string   `toml:"version"`
+			Title     string   `toml:"title"`
+			Desc      string   `toml:"desc"`
+			Assembly  string   `toml:"assembly"`
+			GTF       string   `toml:"gtf"`
+			GeneField string   `toml:"gene_field"`
+			Genes     []string `toml:"genes"`
+			// genes_file is not read: the builder has no file to point at, and
+			// silently dropping it on save would delete genes the manifest
+			// declared. A list using one is reported as not editable here.
+			GenesFile   string `toml:"genes_file"`
+			Annotations []struct {
+				Name        string `toml:"name"`
+				Description string `toml:"description"`
+			} `toml:"annotations"`
+		} `toml:"sources"`
+	}
+	if _, err := toml.Decode(s.TOML, &f); err != nil || len(f.Sources) == 0 {
+		return GeneListSpec{}, false
+	}
+	src := f.Sources[0]
+	if src.GenesFile != "" {
+		return GeneListSpec{}, false
+	}
+	spec := GeneListSpec{
+		Name:        src.Name,
+		Version:     src.Version,
+		Title:       src.Title,
+		Description: src.Desc,
+		GTFRef:      strings.TrimSpace(src.GTF),
+		Build:       src.Assembly,
+		GeneField:   strings.TrimSpace(src.GeneField),
+		Genes:       src.Genes,
+	}
+	if len(src.Annotations) > 0 {
+		spec.AnnotationName = src.Annotations[0].Name
+		if spec.Description == "" {
+			spec.Description = src.Annotations[0].Description
+		}
+	}
+	return spec, true
+}
+
 // matchesRef reports whether src is the source a "name" or "name:version"
 // reference names.
 //
