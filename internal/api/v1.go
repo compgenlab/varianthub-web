@@ -30,12 +30,15 @@ import (
 
 // maxVariantsPerRequest caps a JSON locus submission.
 //
-// The engine receives loci as argv (runner.ExecRunner splits Body on whitespace
-// and appends each as an argument), so a large batch does not fail cleanly — it
-// trips the kernel's ARG_MAX somewhere north of a couple of megabytes and the
-// exec fails for a reason that looks nothing like "too many variants". Cap it
-// well below that and point callers at the VCF path, which streams through a file
-// and has no such ceiling.
+// This is a policy, not a workaround. It used to be one: loci reached the engine
+// as argv, so a large batch tripped the kernel's ARG_MAX and failed with
+// "argument list too long" — and the cap existed to keep submissions well below
+// a ceiling nobody chose. Loci now travel in a file (runner.ExecRunner writes
+// loci.txt and passes --loci-file), which removed that ceiling entirely.
+//
+// The number stays because the real limit is what a shared annotation service
+// will do for one caller in one request, which is a decision about capacity
+// rather than about exec. It is the default; a tier can raise it or lift it.
 const maxVariantsPerRequest = 10000
 
 // normalizeLocus accepts the dash-delimited variant form docs/api.md uses in its

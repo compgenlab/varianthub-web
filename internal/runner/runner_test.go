@@ -157,9 +157,14 @@ func asExitError(err error, target **ExitError) bool {
 	return false
 }
 
-// A locus beginning with "-" must reach the CLI as a positional argument, not be
-// swallowed as a flag. Without the "--" terminator this fails with "flag provided
-// but not defined", which is a confusing way to report a bad variant.
+// A locus beginning with "-" must reach the CLI as input, not be swallowed as a
+// flag — the failure being guarded against is "flag provided but not defined",
+// which is a confusing way to report a bad variant.
+//
+// Loci now travel in a file, which makes this structurally true rather than
+// dependent on a "--" terminator being in the right place. The test stays
+// because the property is what matters, not the mechanism: it would fail again
+// the moment anything put user input back into argv.
 func TestLeadingDashLocusIsNotAFlag(t *testing.T) {
 	bin, home := testHome(t)
 	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
