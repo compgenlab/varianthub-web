@@ -150,6 +150,14 @@ type Chunk struct {
 	JobID      string `json:"-"`
 	ChunkIndex *int   `json:"-"`
 
+	// CompletesJob says that finishing this chunk finishes its job.
+	//
+	// True for the single chunk of an unsplit submission and for the collect
+	// that joins a split one; false for a split, and for each piece it
+	// produced. Recorded when the chunk is created rather than worked out at
+	// finish time, because the only code that knows is the code that queued it.
+	CompletesJob bool `json:"-"`
+
 	// InputURI is where this chunk's input is stored, set only on the Chunk a
 	// claim returns — Get and List do not fill it, because nothing reading a
 	// chunk's status needs it.
@@ -206,6 +214,9 @@ type NewChunk struct {
 	// and "not a chunk" has to be distinguishable from "the first chunk".
 	JobID      string
 	ChunkIndex *int
+	// CompletesJob says that finishing this chunk finishes its job. See
+	// Chunk.CompletesJob.
+	CompletesJob bool
 
 	// Body is the input itself, for submissions small enough to be worth
 	// carrying: a locus list is a few hundred bytes and a round trip through
@@ -244,15 +255,15 @@ func weightOf(w int) int {
 // same thing with more ceremony.
 const chunkCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
-	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(job_id,''), chunk_index, created_at, ` +
-	`COALESCE(started_at,0), COALESCE(finished_at,0)`
+	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(job_id,''), chunk_index, ` +
+	`completes_job, created_at, COALESCE(started_at,0), COALESCE(finished_at,0)`
 
 // chunkColsJ is chunkCols qualified with the "j" alias, for the claim query's
 // join.
 const chunkColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
-	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.job_id,''), j.chunk_index, j.created_at, ` +
-	`COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
+	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.job_id,''), j.chunk_index, ` +
+	`j.completes_job, j.created_at, COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a chunk has already finished.
 var ErrNotCancellable = errors.New("chunk is not running")
@@ -260,14 +271,18 @@ var ErrNotCancellable = errors.New("chunk is not running")
 // ErrNoSuchChunk is returned for an unknown id.
 var ErrNoSuchChunk = errors.New("no such chunk")
 
-// Cancel stops a chunk.
+// cancelChunk stops one chunk.
 //
 // A queued chunk is settled here and never starts. A running one is signalled
 // over NOTIFY, because the worker executing it is usually in another process —
 // that is the whole reason this goes through the database rather than a method
 // call. Its worker records the outcome, so a cancel does not race the run to
 // write the row.
-func (q *Queue) Cancel(ctx context.Context, id string) (Chunk, error) {
+//
+// Unexported: a caller cancels a job, and CancelJob does this to each chunk of
+// it. Cancelling one chunk of a split submission on its own would leave a job
+// that cannot finish and cannot be joined, with nothing saying why.
+func (q *Queue) cancelChunk(ctx context.Context, id string) (Chunk, error) {
 	// Settle it here if it has not started: no worker is involved, so there is
 	// nothing to signal and nothing to wait for.
 	row := q.pool.QueryRow(ctx, `
@@ -314,10 +329,18 @@ func (q *Queue) SetLog(ctx context.Context, id, output string) error {
 	return err
 }
 
-// Log returns what a chunk's run printed, and whether anything was recorded.
-func (q *Queue) Log(ctx context.Context, id string) (string, bool, error) {
+// Log returns what a job's own run printed, and whether anything was recorded.
+//
+// The job's first chunk: the run a caller submitted, or — for a split — the
+// split itself, which is the one that says how the file was cut and what went
+// wrong if it could not be. Each piece keeps its own log, reachable at
+// /jobs/{id}/chunks/{chunkID}/log; concatenating them here would make a status
+// page download twenty-six logs to show one.
+func (q *Queue) Log(ctx context.Context, jobID string) (string, bool, error) {
 	var out string
-	err := q.pool.QueryRow(ctx, `SELECT output FROM chunk_log WHERE chunk_id=$1`, id).Scan(&out)
+	err := q.pool.QueryRow(ctx, `
+		SELECT output FROM chunk_log
+		 WHERE chunk_id = (SELECT input_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&out)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return "", false, nil
 	}
@@ -546,6 +569,25 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		MaxAttempts); err != nil {
 		return 0, fmt.Errorf("fail exhausted chunks: %w", err)
 	}
+	// And their jobs. finish() is what usually carries a chunk's outcome up to
+	// its job, and it never ran for these — the process that would have called
+	// it is gone. Without this a submission whose worker was killed three times
+	// sits at "running" for ever while the chunk under it has given up.
+	//
+	// Written as "any job with a failed chunk has failed" rather than as a list
+	// of the ids just failed, so it also reconciles anything an earlier crash
+	// left half-recorded. The direction is safe: a failed chunk means there is
+	// no answer to assemble, and the guard leaves an already-terminal job
+	// alone, so a cancel or an earlier failure keeps its own explanation.
+	if _, err := q.pool.Exec(ctx, `
+		UPDATE job j
+		   SET status=$1, error=c.error, finished_at=$2
+		  FROM chunk c
+		 WHERE c.job_id = j.id AND c.status = $1
+		   AND j.status NOT IN ($1,$3,$4)`,
+		StatusError, q.nowFn(), StatusDone, StatusCancelled); err != nil {
+		return 0, fmt.Errorf("fail the jobs of exhausted chunks: %w", err)
+	}
 	// Which chunks are about to be reclaimed, so each can be told in its own
 	// log that this happened. Without it an abandoned chunk carries no record
 	// of the abandonment: the worker died without writing anything, and
@@ -708,10 +750,10 @@ func NewID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// idPattern is what NewID produces, and the only shape Enqueue accepts.
+// idPattern is what NewID produces, and the only shape Submit accepts.
 //
-// Checked rather than trusted because a chunk id becomes a path segment in
-// chunk storage. An id containing a slash or a "…/../…" would place the object
+// Checked rather than trusted because a job id becomes a path segment in job
+// storage. An id containing a slash or a "…/../…" would place the object
 // somewhere other than the prefix it was meant for — silently, since writing
 // to a valid-looking key succeeds. Every other reason to validate is secondary
 // to that one.
@@ -729,39 +771,17 @@ func (q *Queue) Enqueue(ctx context.Context, j NewChunk) (string, error) {
 	} else if !idPattern.MatchString(id) {
 		return "", fmt.Errorf("chunk id %q is not one NewID produced", id)
 	}
+	if j.JobID == "" {
+		return "", errors.New("a chunk must belong to a job")
+	}
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
 
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
-		                  weight,max_concurrent,origin,max_variants,job_id,chunk_index,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`,
-		id, j.Kind, j.Snapshot, j.Selection, StatusQueued,
-		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
-		j.MaxConcurrent, j.Origin, j.MaxVariants,
-		nullable(j.JobID), j.ChunkIndex, q.nowFn()); err != nil {
-		return "", err
-	}
-	// One of the two, never both — matching the CHECK rather than trusting it.
-	// A URI wins when set, so a caller that filled in both by mistake gets the
-	// one it went to the trouble of uploading rather than a stale body.
-	var body, uri any
-	if j.InputURI != "" {
-		uri = j.InputURI
-	} else {
-		body = j.Body
-		if j.Body == nil {
-			// An empty body is still a body: NULL would trip the constraint and
-			// fail the insert with a message about neither column being set,
-			// which says nothing about the empty submission that caused it.
-			body = []byte{}
-		}
-	}
-	if _, err := tx.Exec(ctx,
-		`INSERT INTO chunk_input (chunk_id,body,uri) VALUES ($1,$2,$3)`, id, body, uri); err != nil {
+	j.ID = id
+	if err := insertChunk(ctx, tx, q.nowFn(), j); err != nil {
 		return "", err
 	}
 	// NOTIFY fires on commit, so a listener never sees a chunk it cannot yet
@@ -780,6 +800,44 @@ func (q *Queue) Enqueue(ctx context.Context, j NewChunk) (string, error) {
 		id, j.Kind, j.ClientIP, j.Session, j.Selection, where)
 	q.poke()
 	return id, nil
+}
+
+// insertChunk writes a chunk row and its input inside an open transaction.
+//
+// Shared by Submit, which creates a job's first chunk, and Enqueue, which adds
+// the rest. One implementation because the row is the same row: two would be
+// two column lists to keep in step, and the one that drifts is the one used by
+// whichever path is exercised less.
+func insertChunk(ctx context.Context, tx pgx.Tx, now int64, j NewChunk) error {
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
+		                  weight,max_concurrent,origin,max_variants,job_id,chunk_index,
+		                  completes_job,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		j.ID, j.Kind, j.Snapshot, j.Selection, StatusQueued,
+		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
+		j.MaxConcurrent, j.Origin, j.MaxVariants,
+		j.JobID, j.ChunkIndex, j.CompletesJob, now); err != nil {
+		return err
+	}
+	// One of the two, never both — matching the CHECK rather than trusting it.
+	// A URI wins when set, so a caller that filled in both by mistake gets the
+	// one it went to the trouble of uploading rather than a stale body.
+	var body, uri any
+	if j.InputURI != "" {
+		uri = j.InputURI
+	} else {
+		body = j.Body
+		if j.Body == nil {
+			// An empty body is still a body: NULL would trip the constraint and
+			// fail the insert with a message about neither column being set,
+			// which says nothing about the empty submission that caused it.
+			body = []byte{}
+		}
+	}
+	_, err := tx.Exec(ctx,
+		`INSERT INTO chunk_input (chunk_id,body,uri) VALUES ($1,$2,$3)`, j.ID, body, uri)
+	return err
 }
 
 // poke wakes one waiting worker in this process (non-blocking).
@@ -815,10 +873,12 @@ func (q *Queue) Get(ctx context.Context, id string) (Chunk, bool, error) {
 // callers must not treat it as one: it is the ordinary case for anything
 // large, and the point of storing it there is that this process never holds
 // it. Use InputRef and stream it.
-func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
+func (q *Queue) Input(ctx context.Context, jobID string) ([]byte, bool, error) {
 	var body []byte
-	err := q.pool.QueryRow(ctx,
-		`SELECT body FROM chunk_input WHERE chunk_id=$1 AND body IS NOT NULL`, id).Scan(&body)
+	err := q.pool.QueryRow(ctx, `
+		SELECT body FROM chunk_input
+		 WHERE chunk_id = (SELECT input_chunk_id FROM job WHERE id=$1)
+		   AND body IS NOT NULL`, jobID).Scan(&body)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
@@ -828,18 +888,22 @@ func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	return body, true, nil
 }
 
-// KnownChunkIDs returns every chunk id the database still has a row for.
+// KnownJobIDs returns every job id the database still has a row for.
 //
 // For the storage sweep, which decides what to delete by what is *absent* — so
-// this has to be the whole set, not a page of it. A chunk whose id is missing
+// this has to be the whole set, not a page of it. A job whose id is missing
 // from a partial answer would have its files collected while it was still
 // queued.
 //
-// The whole table, because a chunk's files are owned for as long as its row
-// exists, whatever state it is in. Filtering to terminal chunks here would
-// delete the input of everything currently queued.
-func (q *Queue) KnownChunkIDs(ctx context.Context) (map[string]bool, error) {
-	rows, err := q.pool.Query(ctx, `SELECT id FROM chunk`)
+// Jobs rather than chunks because storage is laid out by job: everything a
+// submission owns — its input, its pieces, their answers, the joined result —
+// lives under jobs/<job-id>/. A chunk has no prefix of its own to sweep.
+//
+// The whole table, because a job's files are owned for as long as its row
+// exists, whatever state it is in. Filtering to terminal jobs here would delete
+// the input of everything currently queued.
+func (q *Queue) KnownJobIDs(ctx context.Context) (map[string]bool, error) {
+	rows, err := q.pool.Query(ctx, `SELECT id FROM job`)
 	if err != nil {
 		return nil, err
 	}
@@ -853,6 +917,21 @@ func (q *Queue) KnownChunkIDs(ctx context.Context) (map[string]bool, error) {
 		out[id] = true
 	}
 	return out, rows.Err()
+}
+
+// ChunkLog returns what one chunk of a job printed.
+func (q *Queue) ChunkLog(ctx context.Context, jobID, chunkID string) (string, bool, error) {
+	var out string
+	err := q.pool.QueryRow(ctx, `
+		SELECT l.output FROM chunk_log l JOIN chunk c ON c.id = l.chunk_id
+		 WHERE c.job_id=$1 AND c.id=$2`, jobID, chunkID).Scan(&out)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return out, true, nil
 }
 
 // TryLock takes a session-scoped advisory lock, reporting whether it got it.
@@ -887,15 +966,21 @@ func (q *Queue) TryLock(ctx context.Context, name string) (ok bool, release func
 	}, nil
 }
 
-// ResultVCF returns where a chunk's answer-as-a-VCF is stored, and whether one
+// ResultVCF returns where a job's answer-as-a-VCF is stored, and whether one
 // was built at all.
 //
-// False is the ordinary case, not a failure: a locus chunk has no submitted
-// file to merge onto, and a chunk that finished before this existed has no
-// object. The caller renders from rows instead.
-func (q *Queue) ResultVCF(ctx context.Context, id string) (string, bool, error) {
+// False is the ordinary case, not a failure: a locus job has no submitted file
+// to merge onto, and a job that finished before this existed has no object. The
+// caller renders from rows instead.
+//
+// The answer belongs to whichever chunk produced it — the only chunk of an
+// unsplit job, the collect of a split one — and the job names it once it is
+// done, so this reads through result_chunk_id rather than guessing.
+func (q *Queue) ResultVCF(ctx context.Context, jobID string) (string, bool, error) {
 	var uri *string
-	err := q.pool.QueryRow(ctx, `SELECT vcf_uri FROM chunk_result WHERE chunk_id=$1`, id).Scan(&uri)
+	err := q.pool.QueryRow(ctx, `
+		SELECT vcf_uri FROM chunk_result
+		 WHERE chunk_id = (SELECT result_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&uri)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
@@ -908,11 +993,13 @@ func (q *Queue) ResultVCF(ctx context.Context, id string) (string, bool, error) 
 	return *uri, true, nil
 }
 
-// InputRef returns where a chunk's input is stored, and whether it is stored
-// at all rather than carried inline.
-func (q *Queue) InputRef(ctx context.Context, id string) (string, bool, error) {
+// InputRef returns where a job's submitted input is stored, and whether it is
+// stored at all rather than carried inline.
+func (q *Queue) InputRef(ctx context.Context, jobID string) (string, bool, error) {
 	var uri *string
-	err := q.pool.QueryRow(ctx, `SELECT uri FROM chunk_input WHERE chunk_id=$1`, id).Scan(&uri)
+	err := q.pool.QueryRow(ctx, `
+		SELECT uri FROM chunk_input
+		 WHERE chunk_id = (SELECT input_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&uri)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
@@ -948,9 +1035,12 @@ func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 	return *uri, nil
 }
 
-func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
+// Result returns a done job's result JSON.
+func (q *Queue) Result(ctx context.Context, jobID string) ([]byte, bool, error) {
 	var js string
-	err := q.pool.QueryRow(ctx, `SELECT json FROM chunk_result WHERE chunk_id=$1`, id).Scan(&js)
+	err := q.pool.QueryRow(ctx, `
+		SELECT json FROM chunk_result
+		 WHERE chunk_id = (SELECT result_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&js)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -966,7 +1056,7 @@ func scanChunk(row rowScanner) (Chunk, error) {
 	var j Chunk
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex,
+		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex, &j.CompletesJob,
 		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Chunk{}, err
 	}
@@ -1037,29 +1127,37 @@ func (q *Queue) List(ctx context.Context, f ChunkFilter, limit, offset int) ([]C
 	return out, rows.Err()
 }
 
-// DeleteOlderThan removes terminal chunks (finished_at set) whose finished_at
-// is before cutoff, along with their input and result blobs. Queued and
-// running chunks are never touched. Returns the number of chunks deleted.
+// DeleteOlderThan removes terminal jobs (finished_at set) whose finished_at is
+// before cutoff, along with their chunks and every blob those own. Queued and
+// running jobs are never touched. Returns the number of jobs deleted.
 //
-// The blobs go with the chunk via ON DELETE CASCADE, so unlike the SQLite
-// version this is one statement rather than three inside a transaction.
+// Jobs rather than chunks, since 0037: a chunk belongs to a job and goes when
+// it does. Ageing chunks out on their own would leave a split job whose pieces
+// had been collected while the job still claimed to have twenty-six of them.
+//
+// The chunks go with the job, and the blobs with the chunks, via ON DELETE
+// CASCADE — so unlike the SQLite version this is one statement rather than
+// several inside a transaction.
 func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error) {
-	// The objects these chunks own — inputs and built results alike — read
-	// before their rows go.
+	// The objects these jobs own — inputs and built results alike — read before
+	// their rows go.
 	//
-	// chunk_input cascades from chunk, so deleting the row destroys the only
-	// record of where the object was — and an object nothing points at is
-	// invisible to everything short of listing the whole bucket. Without this,
-	// every VCF chunk that ages out leaves its input behind for good, and
-	// storage grows without limit while the table it was tracked in shrinks on
-	// schedule.
+	// chunk_input cascades, so deleting the row destroys the only record of
+	// where the object was — and an object nothing points at is invisible to
+	// everything short of listing the whole bucket. Without this, every VCF job
+	// that ages out leaves its input behind for good, and storage grows without
+	// limit while the table it was tracked in shrinks on schedule.
 	var owned []string
 	if rows, err := q.pool.Query(ctx, `
-		SELECT i.uri FROM chunk_input i JOIN chunk j ON j.id = i.chunk_id
+		SELECT i.uri FROM chunk_input i
+		  JOIN chunk c ON c.id = i.chunk_id
+		  JOIN job j ON j.id = c.job_id
 		 WHERE i.uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1
 		UNION ALL
-		SELECT r.vcf_uri FROM chunk_result r JOIN chunk j ON j.id = r.chunk_id
+		SELECT r.vcf_uri FROM chunk_result r
+		  JOIN chunk c ON c.id = r.chunk_id
+		  JOIN job j ON j.id = c.job_id
 		 WHERE r.vcf_uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
 		for rows.Next() {
@@ -1070,19 +1168,19 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		}
 		rows.Close()
 	} else {
-		// Not fatal: collecting the chunks matters more than collecting their
+		// Not fatal: collecting the jobs matters more than collecting their
 		// objects, and a leaked object is recoverable by a listing while a
 		// table that never shrinks is not.
-		log.Printf("queue: could not list the objects of expiring chunks: %v", err)
+		log.Printf("queue: could not list the objects of expiring jobs: %v", err)
 	}
 
 	tag, err := q.pool.Exec(ctx,
-		`DELETE FROM chunk WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
+		`DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
 	if err != nil {
 		return 0, err
 	}
 	// After the rows, deliberately. This order can leak an object when the
-	// disposal fails; the other order can leave a chunk that still looks
+	// disposal fails; the other order can leave a job that still looks
 	// complete with its input already gone, which is a wrong answer rather
 	// than waste.
 	if len(owned) > 0 && q.disposeObjects != nil {
@@ -1343,6 +1441,15 @@ func (q *Queue) claimNext(ctx context.Context) (Chunk, []byte, bool, error) {
 	if uri != nil {
 		chunk.InputURI = *uri
 	}
+	// The job starts when its first chunk does. Guarded on "still queued" so a
+	// later chunk cannot restart the clock, and so a job cancelled while its
+	// chunks were still being claimed does not come back to life.
+	if _, err := tx.Exec(ctx, `
+		UPDATE job SET status=$2, started_at=COALESCE(started_at,$3)
+		 WHERE id=$1 AND status=$4`,
+		chunk.JobID, StatusRunning, q.nowFn(), StatusQueued); err != nil {
+		return Chunk{}, nil, false, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return Chunk{}, nil, false, err
 	}
@@ -1384,16 +1491,16 @@ func (q *Queue) process(ctx context.Context, chunk Chunk, input []byte, runner R
 		// down is known and is not a failure.
 		log.Printf("queue: chunk %s cancelled after %s",
 			chunk.ID, time.Since(start).Round(time.Millisecond))
-		q.finish(ctx, chunk.ID, StatusCancelled, "cancelled", Outcome{})
+		q.finish(ctx, chunk, StatusCancelled, "cancelled", Outcome{})
 		return
 	}
 	if err != nil {
 		log.Printf("queue: chunk %s failed after %s: %v",
 			chunk.ID, time.Since(start).Round(time.Millisecond), err)
-		q.finish(ctx, chunk.ID, StatusError, err.Error(), Outcome{})
+		q.finish(ctx, chunk, StatusError, err.Error(), Outcome{})
 		return
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", out)
+	q.finish(ctx, chunk, StatusDone, "", out)
 	log.Printf("queue: chunk %s done (%d variant(s) in %s)",
 		chunk.ID, out.N, time.Since(start).Round(time.Millisecond))
 }
@@ -1402,7 +1509,8 @@ func (q *Queue) process(ctx context.Context, chunk Chunk, input []byte, runner R
 // notifies anyone blocked in WaitFor. Status, result and notification commit
 // together, so a waiter woken by the NOTIFY always finds the row already
 // terminal.
-func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outcome) {
+func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, out Outcome) {
+	id := chunk.ID
 	// Use a background context for the write: the chunk itself may have been
 	// cancelled, but its outcome still has to be persisted.
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
@@ -1475,10 +1583,81 @@ func (q *Queue) finish(ctx context.Context, id, status, errMsg string, out Outco
 		log.Printf("queue: charge caller for chunk %s: %v", id, err)
 		return
 	}
+	if err := rollUp(wctx, tx, chunk, status, errArg, colArg, out.N, q.nowFn()); err != nil {
+		log.Printf("queue: roll chunk %s up to job %s: %v", id, chunk.JobID, err)
+		return
+	}
 	if err := tx.Commit(wctx); err != nil {
 		log.Printf("queue: commit chunk %s: %v", id, err)
 		return
 	}
+}
+
+// rollUp carries a chunk's outcome up to its job, in the transaction that
+// recorded it.
+//
+// Two rules, and between them they cover every shape of submission:
+//
+//   - Anything other than success ends the job. A chunk that failed, or was
+//     cancelled, means there is no answer to assemble — a split that failed
+//     produced no pieces, and a piece that failed leaves a gap that collect
+//     refuses to join. Reporting the job as still running while a caller waits
+//     for a result nobody will produce is the worse of the two mistakes.
+//   - Success ends the job only if the chunk said it would. See
+//     Chunk.CompletesJob: the split does not, its pieces do not, the collect
+//     does — which is what keeps a job out of "done" in the window between its
+//     last piece finishing and the collect being queued.
+//
+// Both writes are guarded on the job not already being terminal, so the first
+// failure is the one recorded and a later chunk reporting in cannot overwrite
+// it — nor can a chunk finishing after a cancel undo the cancel.
+//
+// A completed job's variant count is the sum over its pieces, falling back to
+// the finishing chunk's own count for a job that was never split. SUM over no
+// rows is NULL, which is what makes one expression serve both.
+func rollUp(ctx context.Context, tx pgx.Tx, chunk Chunk, status string,
+	errArg, colArg any, n int, now int64) error {
+
+	if chunk.JobID == "" {
+		return nil
+	}
+	// A chunk that is not part of a fan-out is its job's only one, so its
+	// outcome is also the job's tally. The pieces of a split job are counted by
+	// ChunkFinished instead, and the split and collect that bracket them are
+	// not counted at all — they are how the job is done, not part of what it
+	// was asked to do.
+	sole := chunk.ChunkIndex == nil && chunk.Kind != KindSplit && chunk.Kind != KindCollect
+	if status != StatusDone {
+		failed := "failed"
+		if sole {
+			failed = "1"
+		}
+		_, err := tx.Exec(ctx, fmt.Sprintf(`
+			UPDATE job SET status=$2, error=$3, finished_at=$4, failed=%s
+			 WHERE id=$1 AND status NOT IN ($5,$6,$7)`, failed),
+			chunk.JobID, status, errArg, now,
+			StatusDone, StatusError, StatusCancelled)
+		return err
+	}
+	if !chunk.CompletesJob {
+		return nil
+	}
+	done := "done"
+	if sole {
+		done = "1"
+	}
+	_, err := tx.Exec(ctx, fmt.Sprintf(`
+		UPDATE job
+		   SET status=$2,
+		       n_variants = COALESCE(
+		           (SELECT SUM(n_variants) FROM chunk
+		             WHERE job_id=$1 AND chunk_index IS NOT NULL), $3),
+		       finished_at=$4, result_chunk_id=$5, columns=COALESCE($6, columns),
+		       done=%s
+		 WHERE id=$1 AND status NOT IN ($7,$8,$9)`, done),
+		chunk.JobID, StatusDone, n, now, chunk.ID, colArg,
+		StatusDone, StatusError, StatusCancelled)
+	return err
 }
 
 // nullable renders an empty string as SQL NULL.

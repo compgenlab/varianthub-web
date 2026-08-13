@@ -137,6 +137,35 @@ func (s *Server) publishedRoutes() []publishedRoute {
 			}},
 		},
 		{
+			Method: "GET", Path: "/api/v1/jobs/{id}/chunks", OpID: "listJobChunks",
+			Public: true,
+			Summary: "List the chunks a job was cut into. A submission that was " +
+				"not split has one.",
+			Handler:  s.handleJobChunks,
+			Response: ChunksResponse{},
+			Params: []param{{
+				Name: "id", In: "path", Required: true, Type: "string",
+				Doc: "The job identifier returned by a submission.",
+			}},
+		},
+		{
+			Method: "GET", Path: "/api/v1/jobs/{id}/chunks/{chunkId}", OpID: "getJobChunk",
+			Public:   true,
+			Summary:  "Fetch one chunk of a job.",
+			Handler:  s.handleJobChunk,
+			Response: ChunkResponse{},
+			Params: []param{
+				{
+					Name: "id", In: "path", Required: true, Type: "string",
+					Doc: "The job identifier.",
+				},
+				{
+					Name: "chunkId", In: "path", Required: true, Type: "string",
+					Doc: "The chunk identifier, from GET /jobs/{id}/chunks.",
+				},
+			},
+		},
+		{
 			Method: "POST", Path: "/api/v1/jobs/{id}/cancel", OpID: "cancelJob",
 			Summary:  "Stop a queued or running job.",
 			Handler:  s.handleCancelJob,

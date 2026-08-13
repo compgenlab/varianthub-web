@@ -22,9 +22,9 @@ func insertJob(t *testing.T, s *Store, kind, userID, session, origin string, var
 	jobSeq++
 	id := fmt.Sprintf("job-%d", jobSeq)
 	_, err := s.pool.Exec(context.Background(), `
-		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,
-		                 label,weight,origin,n_variants,created_at)
-		VALUES ($1,$2,'snap','','done','10.0.0.1',$3,NULLIF($4,''),'',1,$5,$6,$7)`,
+		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,session_id,user_id,
+		                 label,origin,n_variants,created_at)
+		VALUES ($1,$2,'snap','','done','10.0.0.1',$3,NULLIF($4,''),'',$5,$6,$7)`,
 		id, kind, session, userID, origin, variants, created)
 	if err != nil {
 		t.Fatalf("insert job: %v", err)

@@ -14,7 +14,7 @@ import (
 // resultsReady checks a job is finished and returns the right status otherwise.
 // Queued/running is 409 and failure is 422 — the caller asked for something that
 // does not exist yet versus something that never will.
-func (s *Server) resultsReady(w http.ResponseWriter, job queue.Chunk) bool {
+func (s *Server) resultsReady(w http.ResponseWriter, job queue.Job) bool {
 	switch job.Status {
 	case queue.StatusQueued, queue.StatusRunning:
 		writeError(w, http.StatusConflict,
@@ -141,7 +141,7 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Chunk,
+func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Job,
 	cols []queue.Column, qy queue.ResultQuery) {
 
 	w.Header().Set("Content-Type", "application/json")
@@ -169,7 +169,7 @@ func (s *Server) exportJSON(w http.ResponseWriter, r *http.Request, job queue.Ch
 	}
 }
 
-func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job queue.Chunk,
+func (s *Server) exportDelimited(w http.ResponseWriter, r *http.Request, job queue.Job,
 	cols []queue.Column, qy queue.ResultQuery, sep rune) {
 
 	if sep == '\t' {

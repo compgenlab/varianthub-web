@@ -15,7 +15,7 @@ type fakeStore struct {
 	took   bool
 }
 
-func (f *fakeStore) KnownChunkIDs(context.Context) (map[string]bool, error) {
+func (f *fakeStore) KnownJobIDs(context.Context) (map[string]bool, error) {
 	return f.known, nil
 }
 

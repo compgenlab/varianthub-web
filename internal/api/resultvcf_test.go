@@ -33,7 +33,7 @@ func storeResultVCF(t *testing.T, h *harness, root, id, body string) string {
 	// unset while looking like it had worked.
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO chunk_result (chunk_id, json, vcf_uri) VALUES ($1, NULL, $2)
-		ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, id, p); err != nil {
+		ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`, chunkOf(id), p); err != nil {
 		t.Fatal(err)
 	}
 	return p

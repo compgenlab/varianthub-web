@@ -452,7 +452,7 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	if len(loci) > 1 {
 		label = fmt.Sprintf("%s +%d more", loci[0], len(loci)-1)
 	}
-	s.submit(w, r, queue.NewChunk{
+	s.submit(w, r, queue.NewJob{
 		Kind:      queue.KindLocus,
 		Snapshot:  snapshot,
 		Selection: sel,
@@ -636,7 +636,7 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	// submission can be processed, only one of which is exercised by ordinary
 	// use — so the other is the one that breaks, and it breaks for the largest
 	// files, which are the ones nobody wants to resubmit.
-	if !s.submit(w, r, queue.NewChunk{
+	if !s.submit(w, r, queue.NewJob{
 		ID:        id,
 		Kind:      queue.KindSplit,
 		Snapshot:  snapshot,
@@ -673,7 +673,7 @@ func anyOf(s string) any {
 // The boolean exists for the upload path: when the row cannot be written, the
 // object already in storage has to be removed, and the caller is the only one
 // that still knows where it is.
-func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewChunk) bool {
+func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) bool {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
 
 	// Stamped at submit, not read at dispatch. The limit a job runs under is the
@@ -688,7 +688,7 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewChun
 	if c.ViaToken {
 		nj.Origin = queue.OriginAPI
 	}
-	id, err := s.queue.Enqueue(r.Context(), nj)
+	id, err := s.queue.Submit(r.Context(), nj)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return false
@@ -704,7 +704,7 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 	limit := clampInt(q.Get("limit"), 50, 1, 500)
 	offset := clampInt(q.Get("offset"), 0, 0, 1<<30)
 
-	f := queue.ChunkFilter{Status: strings.TrimSpace(q.Get("status"))}
+	f := queue.JobFilter{Status: strings.TrimSpace(q.Get("status"))}
 
 	// Annotation jobs only, by default. A download is operational work — it has no
 	// variants and no results table — so listing it alongside someone's
@@ -740,44 +740,45 @@ func (s *Server) handleListJobs(w http.ResponseWriter, r *http.Request) {
 			f.Session = sess
 		} else {
 			writeJSON(w, http.StatusOK, JobsResponse{
-				Jobs: []queue.Chunk{}, Limit: limit, Offset: offset, Scoped: true,
+				Jobs: []JobStatusResponse{}, Limit: limit, Offset: offset, Scoped: true,
 			})
 			return
 		}
 	}
-	jobs, err := s.queue.List(r.Context(), f, limit, offset)
+	jobs, err := s.queue.ListJobs(r.Context(), f, limit, offset)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if jobs == nil {
-		jobs = []queue.Chunk{}
+	out := make([]JobStatusResponse, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, jobStatus(j))
 	}
 	writeJSON(w, http.StatusOK, JobsResponse{
-		Jobs: jobs, Limit: limit, Offset: offset, Scoped: scoped,
+		Jobs: out, Limit: limit, Offset: offset, Scoped: scoped,
 	})
 }
 
 // lookupJob loads a job by id, writing the error response itself. It enforces
 // nothing — the caller decides which permission applies.
-func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
+func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	// Guarded like the catalog handlers are. This was unreachable while every
 	// job route required a credential first: the 401 came before anything
 	// touched the queue. Reading a shared link needs no credential, so an
 	// installation without a queue would have answered with a panic.
 	if s.queue == nil {
 		writeError(w, http.StatusServiceUnavailable, "job queue unavailable")
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	id := r.PathValue("id")
-	job, ok, err := s.queue.Get(r.Context(), id)
+	job, ok, err := s.queue.GetJob(r.Context(), id)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	return job, true
 }
@@ -786,15 +787,15 @@ func (s *Server) lookupJob(w http.ResponseWriter, r *http.Request) (queue.Chunk,
 //
 // Reading, not changing: an anonymous job's id is enough to read it, and not
 // enough to cancel it. See canView and owns.
-func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
+func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	job, ok := s.lookupJob(w, r)
 	if !ok {
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	if !s.trustedCaller(r) && !s.canView(r, job) {
 		// 404 rather than 403: confirming a job exists is itself a small leak.
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	return job, true
 }
@@ -807,7 +808,7 @@ func (s *Server) job(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool)
 // makes an anonymous result shareable — it can be sent to a colleague or
 // reopened on another machine, for work that was anonymous to begin with and
 // has no account to protect.
-func (s *Server) canView(r *http.Request, job queue.Chunk) bool {
+func (s *Server) canView(r *http.Request, job queue.Job) bool {
 	if job.UserID == "" {
 		return true
 	}
@@ -825,7 +826,7 @@ func (s *Server) canView(r *http.Request, job queue.Chunk) bool {
 // For a job with an account, the account is the whole answer: the session id on
 // it is client-asserted, so honouring that as well would let anyone who learned
 // the string act as a signed-in user.
-func (s *Server) owns(r *http.Request, job queue.Chunk) bool {
+func (s *Server) owns(r *http.Request, job queue.Job) bool {
 	if job.UserID != "" {
 		return callerOf(r).UserID() == job.UserID
 	}
@@ -852,14 +853,14 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 //
 // Separate from job because the two genuinely differ for anonymous work: its
 // link is readable by anyone holding it, and cancellation is not.
-func (s *Server) ownedJob(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
+func (s *Server) ownedJob(w http.ResponseWriter, r *http.Request) (queue.Job, bool) {
 	job, ok := s.lookupJob(w, r)
 	if !ok {
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	if !s.trustedCaller(r) && !s.owns(r, job) {
 		writeError(w, http.StatusNotFound, "no such job")
-		return queue.Chunk{}, false
+		return queue.Job{}, false
 	}
 	return job, true
 }
@@ -870,17 +871,17 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	out, err := s.queue.Cancel(r.Context(), job.ID)
+	out, err := s.queue.CancelJob(r.Context(), job.ID)
 	switch {
 	case errors.Is(err, queue.ErrNotCancellable):
 		// Not an error worth a failure status: the caller wanted it stopped and
 		// it is stopped. Report the state so the UI can settle on it.
 		writeJSON(w, http.StatusOK, CancelResponse{
-			Job: out, Cancelled: false,
+			Job: jobStatus(out), Cancelled: false,
 			Detail: "job had already finished",
 		})
 		return
-	case errors.Is(err, queue.ErrNoSuchChunk):
+	case errors.Is(err, queue.ErrNoSuchJob):
 		writeError(w, http.StatusNotFound, "no such job")
 		return
 	case err != nil:
@@ -888,7 +889,7 @@ func (s *Server) handleCancelJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("api: job %s cancelled by %s", job.ID, callerOf(r).Label())
-	writeJSON(w, http.StatusOK, CancelResponse{Job: out, Cancelled: true})
+	writeJSON(w, http.StatusOK, CancelResponse{Job: jobStatus(out), Cancelled: true})
 }
 
 // handleJobLog serves what a job's run printed.
@@ -913,6 +914,84 @@ func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
 		// Distinguishes "nothing was recorded" from "it printed nothing", which
 		// look identical in an empty string and mean different things: the first
 		// is a job from before logs were kept, the second is a quiet run.
+		"recorded": found,
+	})
+}
+
+// --- chunks ---
+
+// handleJobChunks lists the chunks of one job.
+//
+// Underneath the job, never beside it: a chunk id means nothing on its own, and
+// a route that took one directly would need its own entitlement check over a
+// row that carries no owner of its own. Reaching it through the job means the
+// job's rule is the only rule.
+func (s *Server) handleJobChunks(w http.ResponseWriter, r *http.Request) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return
+	}
+	chunks, err := s.queue.JobChunks(r.Context(), job.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]ChunkResponse, 0, len(chunks))
+	for _, c := range chunks {
+		out = append(out, chunkStatus(c))
+	}
+	writeJSON(w, http.StatusOK, ChunksResponse{JobID: job.ID, Chunks: out})
+}
+
+// jobChunk loads one chunk of a job the caller may read.
+func (s *Server) jobChunk(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
+	job, ok := s.job(w, r)
+	if !ok {
+		return queue.Chunk{}, false
+	}
+	c, found, err := s.queue.JobChunk(r.Context(), job.ID, r.PathValue("chunkId"))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return queue.Chunk{}, false
+	}
+	if !found {
+		// 404 for a chunk of another job as much as for one that never existed:
+		// the lookup is scoped to this job, so "not yours" and "not there" are
+		// the same answer and neither confirms anything.
+		writeError(w, http.StatusNotFound, "no such chunk")
+		return queue.Chunk{}, false
+	}
+	return c, true
+}
+
+func (s *Server) handleJobChunk(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.jobChunk(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, chunkStatus(c))
+}
+
+// handleChunkLog serves what one chunk printed.
+//
+// The job's own log is the first chunk's — the run a caller submitted, or the
+// split that cut it up. This is how the other twenty-five are read, one at a
+// time, which is what a job log that concatenated them would make impossible to
+// avoid.
+func (s *Server) handleChunkLog(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.jobChunk(w, r)
+	if !ok {
+		return
+	}
+	out, found, err := s.queue.ChunkLog(r.Context(), c.JobID, c.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"job_id":   c.JobID,
+		"chunk_id": c.ID,
+		"output":   out,
 		"recorded": found,
 	})
 }

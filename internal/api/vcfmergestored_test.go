@@ -52,7 +52,7 @@ func storeJobInputAt(t *testing.T, h *harness, root, id string, gzipped bool, bo
 	}
 	defer pool.Close()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO chunk_input (chunk_id, uri) VALUES ($1,$2)`, id, p); err != nil {
+		`INSERT INTO chunk_input (chunk_id, uri) VALUES ($1,$2)`, chunkOf(id), p); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -168,7 +168,7 @@ func TestAMisnamedStoredInputFallsBackRatherThanServingGarbage(t *testing.T) {
 	}
 	defer pool.Close()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO chunk_input (chunk_id, uri) VALUES ($1,$2)`, "misnamed", p); err != nil {
+		`INSERT INTO chunk_input (chunk_id, uri) VALUES ($1,$2)`, chunkOf("misnamed"), p); err != nil {
 		t.Fatal(err)
 	}
 

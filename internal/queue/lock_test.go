@@ -65,39 +65,43 @@ func TestDifferentLockNamesDoNotContend(t *testing.T) {
 	releaseB()
 }
 
-// Every chunk, whatever state it is in.
+// Every job, whatever state it is in.
 //
 // The sweep deletes what is *absent* from this set, so a filter here becomes a
-// deletion there: narrowing it to finished chunks would collect the input of
+// deletion there: narrowing it to finished jobs would collect the input of
 // everything currently queued.
-func TestKnownChunkIDsCoversEveryState(t *testing.T) {
+//
+// Jobs rather than chunks because storage is laid out by job — everything a
+// submission owns lives under jobs/<job-id>/ — so a set of chunk ids would
+// match no prefix at all and the sweep would delete every one of them.
+func TestKnownJobIDsCoversEveryState(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	queued := enqueueOne(t, q, "u")
-	enqueueOne(t, q, "u")
-	enqueueOne(t, q, "u")
+	var jobs []string
+	for i := 0; i < 3; i++ {
+		jobs = append(jobs, submitOne(t, q, "u"))
+	}
 
 	// One left running, one finished, one still queued. Which chunk the queue
 	// hands back is its business — what matters is that all three states are
 	// represented.
-	running, _, ok, err := q.claimNext(ctx)
-	if err != nil || !ok {
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
 	done, _, ok, err := q.claimNext(ctx)
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, done.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, done, StatusDone, "", Outcome{})
 
-	ids, err := q.KnownChunkIDs(ctx)
+	ids, err := q.KnownJobIDs(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{queued, running.ID, done.ID} {
+	for _, id := range jobs {
 		if !ids[id] {
-			t.Errorf("chunk %s is missing; the sweep would delete its files", id)
+			t.Errorf("job %s is missing; the sweep would delete its files", id)
 		}
 	}
 }

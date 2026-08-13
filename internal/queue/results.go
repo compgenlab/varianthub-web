@@ -94,11 +94,16 @@ type Column struct {
 	Default   bool   `json:"default"`
 }
 
-// Columns returns a chunk's stored column model. Nil when the chunk predates
-// the column model or produced no rows.
-func (q *Queue) Columns(ctx context.Context, chunkID string) ([]Column, error) {
+// Columns returns a job's stored column model. Nil when the job predates the
+// column model or produced no rows.
+//
+// Read from the job, which takes them from whichever chunk completed it. Every
+// chunk of a split job describes the same columns — they annotated one file
+// against one snapshot — so there is nothing to reconcile, only somewhere to
+// put the one answer.
+func (q *Queue) Columns(ctx context.Context, jobID string) ([]Column, error) {
 	var raw []byte
-	err := q.pool.QueryRow(ctx, `SELECT columns FROM chunk WHERE id=$1`, chunkID).Scan(&raw)
+	err := q.pool.QueryRow(ctx, `SELECT columns FROM job WHERE id=$1`, jobID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) || len(raw) == 0 {
 		return nil, nil
 	}
@@ -117,7 +122,7 @@ func (q *Queue) Columns(ctx context.Context, chunkID string) ([]Column, error) {
 // whereArgs and orderArgs are returned separately because the count query has
 // a WHERE but no ORDER BY: handing it the sort argument too makes Postgres
 // reject the statement for an argument it was never given a placeholder for.
-// Placeholders are numbered assuming the chunk id is $1, then whereArgs, then
+// Placeholders are numbered assuming the job id is $1, then whereArgs, then
 // orderArgs.
 //
 // Sort keys are never interpolated raw: an annotation key reaches SQL only as a
@@ -131,7 +136,7 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 		// Match the locus text or any annotation value. jsonb_each_text over
 		// one chunk's rows is cheap at this scale and needs no per-key index.
 		whereArgs = append(whereArgs, "%"+strings.ToLower(s)+"%")
-		n := len(whereArgs) + 1 // +1 for the chunk id at $1
+		n := len(whereArgs) + 1 // +1 for the job id at $1
 		where = fmt.Sprintf(`AND (
 			lower(chrom || ':' || pos || ':' || ref || ':' || alt) LIKE $%d
 			OR EXISTS (
@@ -146,7 +151,11 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 	}
 	switch qy.Sort {
 	case "", "idx":
-		order = "ORDER BY idx " + dir
+		// Across the job's chunks, so the piece a row came from leads: idx is
+		// only unique within one chunk, and ordering by it alone interleaves
+		// twenty-six pieces into a file whose positions jump backwards every
+		// hundred thousand rows.
+		order = "ORDER BY chunk_index " + dir + " NULLS FIRST, idx " + dir
 	case "locus":
 		// Natural chromosome order, not lexical. Sorted as text, chr10 lands
 		// between chr1 and chr2 and chr7 lands after chr13 — which a reader of
@@ -162,7 +171,7 @@ func buildResultSQL(qy ResultQuery) (where, order string, whereArgs, orderArgs [
 			return "", "", nil, nil, fmt.Errorf("unknown sort key %q", qy.Sort)
 		}
 		orderArgs = append(orderArgs, qy.Sort)
-		n := 1 + len(whereArgs) + len(orderArgs) // chunk id, where args, then this
+		n := 1 + len(whereArgs) + len(orderArgs) // job id, where args, then this
 		// Sort numerically when the value parses as a number, else textually. A
 		// numeric annotation sorted as text puts 10 before 9, which is wrong in a
 		// way readers notice immediately. NULLS LAST keeps empty cells at the end
@@ -185,9 +194,10 @@ func contains(list []string, want string) bool {
 	return false
 }
 
-// Results returns one page of a chunk's annotated variants.
-func (q *Queue) Results(ctx context.Context, chunkID string, qy ResultQuery) (ResultPage, error) {
-	cols, err := q.Columns(ctx, chunkID)
+// Results returns one page of a job's annotated variants, across every chunk of
+// it.
+func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (ResultPage, error) {
+	cols, err := q.Columns(ctx, jobID)
 	if err != nil {
 		return ResultPage{}, err
 	}
@@ -212,18 +222,18 @@ func (q *Queue) Results(ctx context.Context, chunkID string, qy ResultQuery) (Re
 	}
 
 	// The count has a WHERE but no ORDER BY, so it takes only the where args.
-	countArgs := append([]any{chunkID}, whereArgs...)
+	countArgs := append([]any{jobID}, whereArgs...)
 	var total int
 	if err := q.pool.QueryRow(ctx,
-		`SELECT count(*) FROM chunk_variant WHERE chunk_id=$1 `+where, countArgs...).
+		`SELECT count(*) FROM `+variantsOfJob+` `+where, countArgs...).
 		Scan(&total); err != nil {
 		return ResultPage{}, err
 	}
 
-	pageArgs := append(append(append([]any{chunkID}, whereArgs...), orderArgs...),
+	pageArgs := append(append(append([]any{jobID}, whereArgs...), orderArgs...),
 		qy.Limit, qy.Offset)
 	sql := fmt.Sprintf(
-		`SELECT chrom,pos,ref,alt,annotations FROM chunk_variant WHERE chunk_id=$1 %s %s LIMIT $%d OFFSET $%d`,
+		`SELECT chrom,pos,ref,alt,annotations FROM `+variantsOfJob+` %s %s LIMIT $%d OFFSET $%d`,
 		where, order, len(pageArgs)-1, len(pageArgs))
 
 	rows, err := q.pool.Query(ctx, sql, pageArgs...)
@@ -248,12 +258,21 @@ func (q *Queue) Results(ctx context.Context, chunkID string, qy ResultQuery) (Re
 	return page, rows.Err()
 }
 
-// StreamResults calls fn for every matching variant in order, in jobs, so an
+// variantsOfJob is the FROM clause every result query shares: a job's rows are
+// its chunks' rows.
+//
+// One string rather than three copies, because the count, the page and the
+// stream have to select from exactly the same set — a count taken over a
+// different set than the page is a paginator that runs off the end.
+const variantsOfJob = `chunk_variant v JOIN chunk c ON c.id = v.chunk_id
+	 WHERE c.job_id = $1 `
+
+// StreamResults calls fn for every matching variant in order, in batches, so an
 // export never holds a whole result set in memory.
-func (q *Queue) StreamResults(ctx context.Context, chunkID string, qy ResultQuery,
+func (q *Queue) StreamResults(ctx context.Context, jobID string, qy ResultQuery,
 	fn func(Variant) error) error {
 
-	cols, err := q.Columns(ctx, chunkID)
+	cols, err := q.Columns(ctx, jobID)
 	if err != nil {
 		return err
 	}
@@ -266,10 +285,10 @@ func (q *Queue) StreamResults(ctx context.Context, chunkID string, qy ResultQuer
 	if err != nil {
 		return err
 	}
-	all := append(append([]any{chunkID}, whereArgs...), orderArgs...)
+	all := append(append([]any{jobID}, whereArgs...), orderArgs...)
 
 	rows, err := q.pool.Query(ctx, fmt.Sprintf(
-		`SELECT chrom,pos,ref,alt,annotations FROM chunk_variant WHERE chunk_id=$1 %s %s`,
+		`SELECT chrom,pos,ref,alt,annotations FROM `+variantsOfJob+` %s %s`,
 		where, order), all...)
 	if err != nil {
 		return err

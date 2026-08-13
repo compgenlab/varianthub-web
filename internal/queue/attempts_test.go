@@ -5,16 +5,73 @@ import (
 	"testing"
 )
 
-// enqueueOne queues a trivial locus chunk and returns its id.
-func enqueueOne(t *testing.T, q *Queue, user string) string {
+// submitOne submits a trivial locus job and returns the job's id.
+func submitOne(t *testing.T, q *Queue, user string) string {
 	t.Helper()
-	id, err := q.Enqueue(context.Background(), NewChunk{
+	id, err := q.Submit(context.Background(), NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: user, Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	return id
+}
+
+// enqueueOne submits a trivial locus job and returns its one chunk's id.
+//
+// Most of this package's tests are about what a worker claims, which is a
+// chunk; the job around it is scaffolding they need to exist and not to name.
+func enqueueOne(t *testing.T, q *Queue, user string) string {
+	t.Helper()
+	chunks, err := q.JobChunks(context.Background(), submitOne(t, q, user))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("a locus submission became %d chunks, want 1", len(chunks))
+	}
+	return chunks[0].ID
+}
+
+// submitJob submits n and returns both ids: the job's, which a caller holds,
+// and its one chunk's, which is what a worker claims and what the lease,
+// attempt and log rows hang off.
+//
+// Both, because the two are separate strings now and a test that reaches for
+// the wrong one fails in a way that looks like the behaviour under test.
+func submitJob(t *testing.T, q *Queue, n NewJob) (jobID, chunkID string) {
+	t.Helper()
+	ctx := context.Background()
+	jobID, err := q.Submit(ctx, n)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chunks, err := q.JobChunks(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(chunks) != 1 {
+		t.Fatalf("the submission became %d chunks, want 1", len(chunks))
+	}
+	return jobID, chunks[0].ID
+}
+
+// getChunk reads a chunk row by id.
+func getChunk(t *testing.T, q *Queue, id string) Chunk {
+	t.Helper()
+	c, err := scanChunk(q.pool.QueryRow(context.Background(),
+		`SELECT `+chunkCols+` FROM chunk WHERE id=$1`, id))
+	if err != nil {
+		t.Fatalf("read chunk %s: %v", id, err)
+	}
+	return c
+}
+
+// finishByID records an outcome for a chunk named by id, the way a worker's
+// process would for one it is holding.
+func finishByID(t *testing.T, q *Queue, id, status, errMsg string, out Outcome) {
+	t.Helper()
+	q.finish(context.Background(), getChunk(t, q, id), status, errMsg, out)
 }
 
 // claimAndAbandon simulates a worker being killed: it claims whatever is next,
@@ -71,7 +128,7 @@ func TestAnAttemptIsOpenedOnClaimAndClosedOnFinish(t *testing.T) {
 		t.Errorf("attempt closed while still running: %+v", open[0])
 	}
 
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	done, err := q.ChunkAttempts(ctx, id)
 	if err != nil {
@@ -169,7 +226,7 @@ func TestEachAttemptKeepsItsOwnError(t *testing.T) {
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("re-claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, id, StatusError, "reference FASTA missing", Outcome{})
+	finishByID(t, q, id, StatusError, "reference FASTA missing", Outcome{})
 
 	attempts, err := q.ChunkAttempts(ctx, id)
 	if err != nil {
@@ -212,7 +269,7 @@ func TestAChunkThatFailsOnItsLastAttemptIsNotCountedAsAbandoned(t *testing.T) {
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("final claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, id, StatusError, "bad VCF header", Outcome{})
+	finishByID(t, q, id, StatusError, "bad VCF header", Outcome{})
 
 	// The precondition the old counter tripped on.
 	var counter int
@@ -254,7 +311,7 @@ func TestAbandonmentsAreCountedEvenWhenTheChunkLaterSucceeds(t *testing.T) {
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("re-claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, id, StatusDone, "", Outcome{})
+	finishByID(t, q, id, StatusDone, "", Outcome{})
 
 	st, err := q.Stats(ctx)
 	if err != nil {
@@ -296,7 +353,7 @@ func TestWorkerHealthAttributesAbandonmentToTheProcessThatLostIt(t *testing.T) {
 	// The chunk b actually claimed, not the one just enqueued: finishing some
 	// other chunk would close no attempt and leave b's own still open, and the
 	// assertion below would pass without meaning anything.
-	b.finish(ctx, claimed.ID, StatusDone, "", Outcome{})
+	b.finish(ctx, claimed, StatusDone, "", Outcome{})
 
 	health, err := a.WorkerHealthSince(ctx, 0)
 	if err != nil {
@@ -337,7 +394,7 @@ func TestAttemptsAreDeletedWithTheChunk(t *testing.T) {
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("re-claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, id, StatusDone, "", Outcome{})
+	finishByID(t, q, id, StatusDone, "", Outcome{})
 
 	var n int
 	if err := q.pool.QueryRow(ctx, `SELECT count(*) FROM chunk_attempt`).Scan(&n); err != nil {

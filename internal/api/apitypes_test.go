@@ -38,9 +38,15 @@ func TestPublishedResponseKeys(t *testing.T) {
 		{"accepted", AcceptedResponse{}, []string{"job_id"}},
 		{"cancel", CancelResponse{}, []string{"cancelled", "job"}},
 		{"error", ErrorResponse{}, []string{"error"}},
+		// chunks/chunks_done/chunks_failed are always present: a submission
+		// that was not split is a job of one chunk, so there is no shape where
+		// they are absent and a client has to handle both.
 		{"job status", JobStatusResponse{}, []string{
-			"created_at", "job_id", "kind", "n_variants", "selection",
-			"snapshot", "status"}},
+			"chunks", "chunks_done", "chunks_failed", "created_at", "job_id",
+			"kind", "n_variants", "selection", "snapshot", "status"}},
+		{"chunks", ChunksResponse{}, []string{"chunks", "job_id"}},
+		{"chunk", ChunkResponse{}, []string{
+			"chunk_id", "created_at", "job_id", "kind", "n_variants", "status"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -104,7 +110,7 @@ func TestListingItemsCarryTheirAdditions(t *testing.T) {
 // Asserted on the projection rather than on a live response so it fails at the
 // moment someone widens the type, which is when it is cheap to notice.
 func TestJobStatusDoesNotCarryTheSubmittersIdentity(t *testing.T) {
-	full := queue.Chunk{
+	full := queue.Job{
 		ID: "j1", Kind: "locus", Snapshot: "snap", Selection: "af",
 		Status: "done", NVariants: 3, Label: "chr1:100:A:T",
 		ClientIP: "203.0.113.7", Session: "sess-secret", UserID: "user-42",

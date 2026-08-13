@@ -26,7 +26,7 @@ import (
 // to be that.
 
 // exportVCF streams the job's results as a VCF.
-func (s *Server) exportVCF(w http.ResponseWriter, r *http.Request, job queue.Chunk,
+func (s *Server) exportVCF(w http.ResponseWriter, r *http.Request, job queue.Job,
 	cols []queue.Column, qy queue.ResultQuery) {
 
 	// Coordinate order, whatever was asked for. A VCF sorted by CADD is not a

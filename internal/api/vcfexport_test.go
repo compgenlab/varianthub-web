@@ -21,20 +21,39 @@ func seedJob(t *testing.T, h *harness, id, kind, columns string, rows [][4]any, 
 	}
 	defer pool.Close()
 
+	// A job and the one chunk that produced its answer, which is the shape
+	// every read goes through: results belong to chunks, and the job names the
+	// chunk holding its input and the chunk holding its result.
+	chunk := chunkOf(id)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
-		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3)`, id, kind, columns); err != nil {
+		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,
+		                 finished_at,columns,input_chunk_id,result_chunk_id,chunks,done)
+		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3,$4,$4,1,1)`,
+		id, kind, columns, chunk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,
+		                   finished_at,columns,job_id,chunk_index,completes_job)
+		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3,$4,0,TRUE)`,
+		chunk, kind, columns, id); err != nil {
 		t.Fatal(err)
 	}
 	for i, r := range rows {
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO chunk_variant (chunk_id,idx,chrom,pos,ref,alt,annotations)
 			VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-			id, i, r[0], r[1], r[2], r[3], anns[i]); err != nil {
+			chunk, i, r[0], r[1], r[2], r[3], anns[i]); err != nil {
 			t.Fatal(err)
 		}
 	}
 }
+
+// chunkOf names the chunk a seeded job's work hangs off.
+//
+// A job id and a chunk id are separate strings now, and a test that stores an
+// input or a result against the job's own id writes a row nothing will read.
+func chunkOf(jobID string) string { return jobID + "-c0" }
 
 const vcfCols = `[
   {"key":"GENE","label":"Gene","type":"text","source":"GENCODE","source_ref":"gencode:48"},
@@ -178,7 +197,7 @@ func storeJobInput(t *testing.T, h *harness, id, body string) {
 	}
 	defer pool.Close()
 	if _, err := pool.Exec(ctx,
-		`INSERT INTO chunk_input (chunk_id, body) VALUES ($1,$2)`, id, []byte(body)); err != nil {
+		`INSERT INTO chunk_input (chunk_id, body) VALUES ($1,$2)`, chunkOf(id), []byte(body)); err != nil {
 		t.Fatal(err)
 	}
 }

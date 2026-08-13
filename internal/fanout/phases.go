@@ -19,10 +19,9 @@ import (
 // part of this that decides how a submission becomes many chunks, and that is
 // worth being able to check directly.
 type Queue interface {
-	CreateJob(ctx context.Context, chunkID, prefix string) (string, error)
-	SetChunkCount(ctx context.Context, jobID string, n int) error
+	SetChunkCount(ctx context.Context, jobID, prefix string, n int) error
 	Enqueue(ctx context.Context, j queue.NewChunk) (string, error)
-	JobChunks(ctx context.Context, jobID string) ([]queue.Chunk, error)
+	SplitChunks(ctx context.Context, jobID string) ([]queue.Chunk, error)
 	GetJob(ctx context.Context, id string) (queue.Job, bool, error)
 }
 
@@ -35,33 +34,30 @@ func (n Note) say(format string, args ...any) {
 	}
 }
 
-// RunSplit cuts a staged VCF into chunks, stores them, and queues one
+// RunSplit cuts a staged VCF into pieces, stores them, and queues one
 // annotation chunk for each.
 //
-// The pieces live under the split chunk's own prefix rather than each new
-// chunk's, so one prefix names everything the job owns and the storage sweep
-// needs no special case for a piece whose chunk was collected.
+// The pieces live under the job's prefix rather than each chunk's, so one
+// prefix names everything the submission owns and the storage sweep needs no
+// special case for a piece whose chunk was collected.
 func RunSplit(ctx context.Context, q Queue, chunk queue.Chunk, inputPath, jobStorage,
-	cgkitBin string, chunkSize int, note Note) (jobID string, chunks int, err error) {
+	cgkitBin string, chunkSize int, note Note) (chunks int, err error) {
 
 	work, err := os.MkdirTemp("", "vhw-split-")
 	if err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	defer os.RemoveAll(work)
 
 	note.say("··· splitting into chunks of %d record(s)", chunkSize)
 	paths, err := Split(ctx, cgkitBin, inputPath, SplitBase(work), chunkSize)
 	if err != nil {
-		return "", 0, err
+		return 0, err
 	}
 	note.say("··· split into %d chunk(s)", len(paths))
 
-	prefix := queue.JobPrefix(jobStorage, chunk.ID)
-	jobID, err = q.CreateJob(ctx, chunk.ID, prefix)
-	if err != nil {
-		return "", 0, err
-	}
+	jobID := chunk.JobID
+	prefix := queue.JobPrefix(jobStorage, jobID)
 
 	// Every chunk is stored and queued before the count is written. The count
 	// is what lets a chunk's completion complete the job, so writing it early
@@ -71,12 +67,12 @@ func RunSplit(ctx context.Context, q Queue, chunk queue.Chunk, inputPath, jobSto
 		uri := prefix + "/" + ChunkName(i+1)
 		f, oErr := os.Open(p)
 		if oErr != nil {
-			return "", 0, oErr
+			return 0, oErr
 		}
 		putErr := blob.PutReader(ctx, uri, f)
 		f.Close()
 		if putErr != nil {
-			return "", 0, fmt.Errorf("store chunk %d: %w", i+1, putErr)
+			return 0, fmt.Errorf("store chunk %d: %w", i+1, putErr)
 		}
 
 		idx := i
@@ -94,14 +90,14 @@ func RunSplit(ctx context.Context, q Queue, chunk queue.Chunk, inputPath, jobSto
 			JobID:         jobID,
 			ChunkIndex:    &idx,
 		}); eErr != nil {
-			return "", 0, fmt.Errorf("queue chunk %d: %w", i+1, eErr)
+			return 0, fmt.Errorf("queue chunk %d: %w", i+1, eErr)
 		}
 	}
 
-	if err := q.SetChunkCount(ctx, jobID, len(paths)); err != nil {
-		return "", 0, err
+	if err := q.SetChunkCount(ctx, jobID, prefix, len(paths)); err != nil {
+		return 0, err
 	}
-	return jobID, len(paths), nil
+	return len(paths), nil
 }
 
 // RunCollect joins a finished job's chunks into the answer.
@@ -125,7 +121,7 @@ func RunCollect(ctx context.Context, q Queue, jobID, jobStorage string,
 			"with a gap in it", b.Failed, b.Chunks)
 	}
 
-	chunks, err := q.JobChunks(ctx, jobID)
+	chunks, err := q.SplitChunks(ctx, jobID)
 	if err != nil {
 		return "", err
 	}

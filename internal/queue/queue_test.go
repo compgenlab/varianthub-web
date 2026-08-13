@@ -112,7 +112,7 @@ func TestEnqueueProcessDone(t *testing.T) {
 		}, nil
 	})
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "2026-07", Selection: "clinvar_sig",
 		ClientIP: "1.2.3.4", Body: []byte("chr1:100:A:G"),
 	})
@@ -121,11 +121,11 @@ func TestEnqueueProcessDone(t *testing.T) {
 	}
 
 	waitFor(t, 5*time.Second, func() bool {
-		chunk, ok, _ := q.Get(ctx, id)
+		chunk, ok, _ := q.GetJob(ctx, id)
 		return ok && chunk.Status == StatusDone
 	})
 
-	chunk, _, _ := q.Get(ctx, id)
+	chunk, _, _ := q.GetJob(ctx, id)
 	if chunk.NVariants != 1 {
 		t.Errorf("n_variants = %d, want 1", chunk.NVariants)
 	}
@@ -171,13 +171,13 @@ func TestRunnerErrorMarksChunkFailed(t *testing.T) {
 	q.StartWorkers(ctx, 1, func(_ context.Context, _ Chunk, _ []byte) (Outcome, error) {
 		return Outcome{}, context.DeadlineExceeded
 	})
-	id, _ := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Body: []byte("bad")})
+	id, _ := q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("bad")})
 
 	waitFor(t, 5*time.Second, func() bool {
-		chunk, ok, _ := q.Get(ctx, id)
+		chunk, ok, _ := q.GetJob(ctx, id)
 		return ok && chunk.Status == StatusError
 	})
-	chunk, _, _ := q.Get(ctx, id)
+	chunk, _, _ := q.GetJob(ctx, id)
 	if chunk.Error == "" {
 		t.Errorf("expected an error message on the failed chunk")
 	}
@@ -187,7 +187,7 @@ func TestCrashRecoveryRequeuesRunning(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, _ := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Body: []byte("x")})
+	id, _ := q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("x")})
 	// Forcibly mark it running, simulating a crash mid-chunk.
 	if _, err := q.pool.Exec(ctx, `UPDATE chunk SET status=$1 WHERE id=$2`, StatusRunning, id); err != nil {
 		t.Fatalf("force running: %v", err)
@@ -197,7 +197,7 @@ func TestCrashRecoveryRequeuesRunning(t *testing.T) {
 		`UPDATE chunk SET status=$1, started_at=NULL WHERE status=$2`, StatusQueued, StatusRunning); err != nil {
 		t.Fatalf("recovery: %v", err)
 	}
-	chunk, ok, _ := q.Get(ctx, id)
+	chunk, ok, _ := q.GetJob(ctx, id)
 	if !ok || chunk.Status != StatusQueued {
 		t.Fatalf("after recovery status = %q (ok=%v), want queued", chunk.Status, ok)
 	}
@@ -208,13 +208,18 @@ func TestQueueListAndGC(t *testing.T) {
 	q.nowFn = monotonicNow()
 	ctx := context.Background()
 
-	oldID, _ := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.1.1.1", Body: []byte("a")})
-	newID, _ := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "2.2.2.2", Body: []byte("b")})
-	queuedID, _ := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "3.3.3.3", Body: []byte("c")})
+	oldID, oldChunk := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.1.1.1", Body: []byte("a")})
+	newID, _ := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "2.2.2.2", Body: []byte("b")})
+	queuedID, _ := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "3.3.3.3", Body: []byte("c")})
 
-	// Give the old chunk a result blob so the cascade delete is exercised.
+	// Give the old job a result blob so the cascade delete is exercised. It
+	// hangs off the chunk that produced it, which is what the job points at.
 	if _, err := q.pool.Exec(ctx,
-		`INSERT INTO chunk_result (chunk_id,json) VALUES ($1,'[]')`, oldID); err != nil {
+		`INSERT INTO chunk_result (chunk_id,json) VALUES ($1,'[]')`, oldChunk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.pool.Exec(ctx,
+		`UPDATE job SET result_chunk_id=$1 WHERE id=$2`, oldChunk, oldID); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
@@ -222,19 +227,19 @@ func TestQueueListAndGC(t *testing.T) {
 		fin int64
 	}{{oldID, 10}, {newID, 100}} {
 		if _, err := q.pool.Exec(ctx,
-			`UPDATE chunk SET status=$1, finished_at=$2 WHERE id=$3`, StatusDone, tc.fin, tc.id); err != nil {
+			`UPDATE job SET status=$1, finished_at=$2 WHERE id=$3`, StatusDone, tc.fin, tc.id); err != nil {
 			t.Fatal(err)
 		}
 	}
 
-	done, err := q.List(ctx, ChunkFilter{Status: StatusDone}, 50, 0)
+	done, err := q.ListJobs(ctx, JobFilter{Status: StatusDone}, 50, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(done) != 2 {
 		t.Fatalf("List(done) = %d chunks, want 2", len(done))
 	}
-	if qd, _ := q.List(ctx, ChunkFilter{Status: StatusQueued}, 50, 0); len(qd) != 1 {
+	if qd, _ := q.ListJobs(ctx, JobFilter{Status: StatusQueued}, 50, 0); len(qd) != 1 {
 		t.Fatalf("List(queued) = %d, want 1", len(qd))
 	}
 
@@ -245,13 +250,13 @@ func TestQueueListAndGC(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("DeleteOlderThan removed %d, want 1", n)
 	}
-	if _, ok, _ := q.Get(ctx, oldID); ok {
+	if _, ok, _ := q.GetJob(ctx, oldID); ok {
 		t.Errorf("old done chunk should be gone")
 	}
-	if _, ok, _ := q.Get(ctx, newID); !ok {
+	if _, ok, _ := q.GetJob(ctx, newID); !ok {
 		t.Errorf("recent done chunk should remain")
 	}
-	if _, ok, _ := q.Get(ctx, queuedID); !ok {
+	if _, ok, _ := q.GetJob(ctx, queuedID); !ok {
 		t.Errorf("queued chunk must never be GC'd")
 	}
 	if _, ok, _ := q.Result(ctx, oldID); ok {
@@ -265,11 +270,11 @@ func TestListScopedBySession(t *testing.T) {
 	ctx := context.Background()
 
 	for i := 0; i < 2; i++ {
-		q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Session: "alice", Label: "a", Body: []byte("x")})
+		q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Session: "alice", Label: "a", Body: []byte("x")})
 	}
-	q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Session: "bob", Label: "b", Body: []byte("x")})
+	q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Session: "bob", Label: "b", Body: []byte("x")})
 
-	mine, err := q.List(ctx, ChunkFilter{Session: "alice"}, 50, 0)
+	mine, err := q.ListJobs(ctx, JobFilter{Session: "alice"}, 50, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -281,7 +286,7 @@ func TestListScopedBySession(t *testing.T) {
 			t.Errorf("leaked a chunk from session %q", j.Session)
 		}
 	}
-	all, _ := q.List(ctx, ChunkFilter{}, 50, 0)
+	all, _ := q.ListJobs(ctx, JobFilter{}, 50, 0)
 	if len(all) != 3 {
 		t.Errorf("unfiltered List = %d, want 3 (admin sees all)", len(all))
 	}
@@ -295,10 +300,10 @@ func TestFairClaimRoundRobin(t *testing.T) {
 
 	// IP A enqueues 3 chunks before IP B enqueues 3.
 	for i := 0; i < 3; i++ {
-		q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0.1", Body: []byte("a")})
+		q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0.1", Body: []byte("a")})
 	}
 	for i := 0; i < 3; i++ {
-		q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0.2", Body: []byte("b")})
+		q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0.2", Body: []byte("b")})
 	}
 
 	// Claim without completing — chunks stay running, deprioritizing the
@@ -330,7 +335,7 @@ func TestFairClaimPerIPCap(t *testing.T) {
 	ctx := context.Background()
 
 	for _, ip := range []string{"10.0.0.1", "10.0.0.1", "10.0.0.2", "10.0.0.2"} {
-		q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: ip, Body: []byte("x")})
+		q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: ip, Body: []byte("x")})
 	}
 
 	// First two claims: one per IP. Third: both IPs at cap → nothing claimable.
@@ -357,7 +362,7 @@ func TestConcurrentClaimsAreDistinct(t *testing.T) {
 
 	const n = 20
 	for i := 0; i < n; i++ {
-		if _, err := q.Enqueue(ctx, NewChunk{
+		if _, err := q.Submit(ctx, NewJob{
 			Kind: KindLocus, Snapshot: "s",
 			ClientIP: fmt.Sprintf("10.0.0.%d", i), Body: []byte("x"),
 		}); err != nil {
@@ -424,7 +429,7 @@ func TestOpeningTheQueueLeavesRunningChunksAlone(t *testing.T) {
 	q, other := testQueuePair(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	id, err := q.Submit(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -440,7 +445,7 @@ func TestOpeningTheQueueLeavesRunningChunksAlone(t *testing.T) {
 		t.Errorf("another process reclaimed %d chunk(s) held by a live worker", n)
 	}
 
-	chunk, ok, err := q.Get(ctx, id)
+	chunk, ok, err := q.GetJob(ctx, id)
 	if err != nil || !ok {
 		t.Fatalf("get: ok=%v err=%v", ok, err)
 	}
@@ -462,26 +467,21 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 	// Short enough to watch expire, with renew well inside the TTL.
 	q.SetLease(2*time.Second, 200*time.Millisecond)
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	_, id := submitJob(t, q, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("claim: ok=%v err=%v", ok, err)
 	}
 
+	// The chunk's status, not the job's: a lease is held over a chunk, and
+	// requeueing one leaves its job running throughout.
 	statusOf := func() string {
 		t.Helper()
-		chunk, ok, err := q.Get(ctx, id)
-		if err != nil || !ok {
-			t.Fatalf("get: ok=%v err=%v", ok, err)
-		}
-		return chunk.Status
+		return getChunk(t, q, id).Status
 	}
 
 	// The claim records who holds it, which is what renewal is matched on.
 	var holder string
-	if err = q.pool.QueryRow(ctx,
+	if err := q.pool.QueryRow(ctx,
 		`SELECT COALESCE(claimed_by,'') FROM chunk WHERE id=$1`, id).Scan(&holder); err != nil {
 		t.Fatal(err)
 	}
@@ -498,7 +498,7 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 
 	deadline := time.Now().Add(3 * time.Second) // past the 2s TTL
 	for time.Now().Before(deadline) {
-		if err = q.renewLeases(ctx); err != nil {
+		if err := q.renewLeases(ctx); err != nil {
 			t.Fatal(err)
 		}
 		if n, rErr := peer.ReclaimExpired(ctx); rErr != nil {
@@ -527,7 +527,7 @@ func TestLeaseDistinguishesAbandonedFromBusy(t *testing.T) {
 
 	// Reclaiming clears the stale holder, so the next claim starts clean.
 	var claimed *string
-	if err = q.pool.QueryRow(ctx, `SELECT claimed_by FROM chunk WHERE id=$1`, id).Scan(&claimed); err != nil {
+	if err := q.pool.QueryRow(ctx, `SELECT claimed_by FROM chunk WHERE id=$1`, id).Scan(&claimed); err != nil {
 		t.Fatal(err)
 	}
 	if claimed != nil {
@@ -546,10 +546,7 @@ func TestAbandonedChunkStopsBeingRetried(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
 
 	// Claim, then abandon by expiring the lease, MaxAttempts times over.
 	for i := 1; i <= MaxAttempts; i++ {
@@ -578,15 +575,22 @@ func TestAbandonedChunkStopsBeingRetried(t *testing.T) {
 		}
 	}
 
-	got, _, err := q.Get(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
+	got := getChunk(t, q, id)
 	if got.Status != StatusError {
 		t.Fatalf("status = %q, want %q — the chunk is still being retried", got.Status, StatusError)
 	}
 	if got.Error == "" {
 		t.Error("no error recorded; the chunk failed with nothing said about why")
+	}
+	// And the job with it. finish() never ran for this chunk — its worker died
+	// each time — so a submission left at "running" would wait for ever on work
+	// that has given up.
+	job, _, err := q.GetJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if job.Status != StatusError {
+		t.Fatalf("the job is %q while its only chunk has given up", job.Status)
 	}
 	// And it must not be claimable again.
 	if _, _, ok, err := q.claimNext(ctx); err != nil {
@@ -601,10 +605,7 @@ func TestOneAbandonmentStillRequeues(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
 	if _, _, ok, cErr := q.claimNext(ctx); cErr != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", cErr, ok)
 	}
@@ -616,12 +617,17 @@ func TestOneAbandonmentStillRequeues(t *testing.T) {
 	} else if n != 1 {
 		t.Fatalf("reclaimed %d, want 1", n)
 	}
-	got, _, err := q.Get(ctx, id)
+	// The chunk goes back on the queue. Its job stays running: the submission
+	// has not finished and has not failed, it lost a worker.
+	if got := getChunk(t, q, id); got.Status != StatusQueued {
+		t.Fatalf("chunk status = %q, want %q", got.Status, StatusQueued)
+	}
+	job, _, err := q.GetJob(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != StatusQueued {
-		t.Fatalf("status = %q, want %q", got.Status, StatusQueued)
+	if job.Terminal() {
+		t.Fatalf("job status = %q; one lost attempt is not an outcome", job.Status)
 	}
 }
 
@@ -636,10 +642,7 @@ func TestLogSurvivesAWorkerThatNeverReturns(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
 
 	w := NewLogWriter(ctx, q, id)
 	w.Note("starting on worker abc")
@@ -648,7 +651,7 @@ func TestLogSurvivesAWorkerThatNeverReturns(t *testing.T) {
 	// No Close: the process died here.
 	w.flush(ctx)
 
-	out, found, err := q.Log(ctx, id)
+	out, found, err := q.Log(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -668,10 +671,7 @@ func TestAbandonmentIsRecordedInTheChunkLog(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
 	if _, _, ok, cErr := q.claimNext(ctx); cErr != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", cErr, ok)
 	}
@@ -682,7 +682,7 @@ func TestAbandonmentIsRecordedInTheChunkLog(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	out, found, err := q.Log(ctx, id)
+	out, found, err := q.Log(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -696,17 +696,14 @@ func TestAbandonmentIsRecordedInTheChunkLog(t *testing.T) {
 func TestAppendLogDoesNotClobber(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{Kind: KindLocus, Snapshot: "s", ClientIP: "1.2.3.4", Body: []byte("x")})
 	if err := q.AppendLog(ctx, id, "first\n"); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.AppendLog(ctx, id, "second\n"); err != nil {
 		t.Fatal(err)
 	}
-	out, _, err := q.Log(ctx, id)
+	out, _, err := q.Log(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}

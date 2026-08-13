@@ -656,7 +656,12 @@ func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
 		pw.CloseWithError(mErr)
 	}()
 
-	uri := queue.ObjectURI(jobStorage, chunk.ID, queue.ResultName)
+	// Under the job's prefix, not the chunk's. Storage is laid out by job and
+	// the sweep decides what to keep from the set of job ids; an object written
+	// under a chunk id belongs to no job it can see, so it would be collected
+	// as scrap on the next pass — a result that vanishes hours after the job
+	// reported done.
+	uri := queue.ObjectURI(jobStorage, chunk.JobID, queue.ResultName)
 	if err := blob.PutReader(ctx, uri, pr); err != nil {
 		pr.CloseWithError(err)
 		return "", err
@@ -665,7 +670,7 @@ func buildResultVCF(ctx context.Context, jobStorage string, chunk queue.Chunk,
 	return uri, nil
 }
 
-// sweepStorage removes chunk-storage files that no chunk owns, on demand.
+// sweepStorage removes job-storage files that no job owns, on demand.
 //
 // The worker does this on a timer already. It is a subcommand as well because
 // the timer is invisible: an operator looking at a storage bill wants to see
@@ -984,7 +989,7 @@ commands:
   seed      populate an empty catalog with a starter snapshot, then exit
 
   sweep-storage [--dry-run] [--grace 1h]
-            remove chunk-storage files that no chunk owns. The worker does this
+            remove job-storage files that no job owns. The worker does this
             daily; this is for looking now, and for deployments that would
             rather schedule it themselves.
 
@@ -1145,11 +1150,12 @@ func storeChunkVCF(ctx context.Context, prefix string, chunk queue.Chunk, inputP
 	return uri, nil
 }
 
-// runSplitChunk cuts a submitted VCF into chunks and queues a chunk for each.
+// runSplitChunk cuts a submitted VCF into pieces and queues a chunk for each.
 //
-// The chunk the submitter was given and polls. It produces no variants of its
-// own: what it produces is the job, and the answer arrives when the collect
-// chunk that follows the last chunk finishes.
+// The first chunk of a VCF job, and the only one that exists when the caller is
+// handed their job id. It produces no variants of its own: what it produces is
+// the rest of the job, and the answer arrives when the collect chunk that
+// follows the last piece finishes.
 func runSplitChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 	jobStorage string, chunkSize int) (queue.Outcome, error) {
 
@@ -1171,7 +1177,7 @@ func runSplitChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 		return queue.Outcome{}, fmt.Errorf("stage input: %w", err)
 	}
 
-	_, n, err := fanout.RunSplit(ctx, q, chunk, local, jobStorage,
+	n, err := fanout.RunSplit(ctx, q, chunk, local, jobStorage,
 		fanout.DefaultCgkitBin, chunkSize, alw.Note)
 	if err != nil {
 		return queue.Outcome{}, err
@@ -1203,17 +1209,11 @@ func runCollectChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 	}
 	alw.Note("··· joined file stored at " + uri)
 
-	// Filed against the chunk the submitter was given, not this one. They
-	// polled the split chunk and have never heard of the collect chunk —
-	// leaving the answer here would mean a job that finishes with its file in
-	// storage and no id that reaches it.
-	if b, ok, gErr := q.GetJob(ctx, chunk.JobID); gErr == nil && ok {
-		if sErr := q.SetResultVCF(ctx, b.ChunkID, uri); sErr != nil {
-			return queue.Outcome{}, fmt.Errorf("record the answer against chunk %s: %w",
-				b.ChunkID, sErr)
-		}
-		alw.Note("··· available from chunk " + b.ChunkID)
-	}
+	// Returned rather than filed anywhere by hand. This chunk completes its job
+	// (see queue.Chunk.CompletesJob), so recording its outcome is what points
+	// the job at this file — which is how a caller holding only the job id
+	// reaches an answer produced by a chunk they never saw.
+	alw.Note("··· available from job " + chunk.JobID)
 	return queue.Outcome{VCFURI: uri}, nil
 }
 
@@ -1263,7 +1263,9 @@ func finishChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk, jobStor
 		Label:    "joining " + fmt.Sprint(b.Chunks) + " chunk(s)",
 		Origin:   chunk.Origin,
 		JobID:    chunk.JobID,
-		Body:     []byte{},
+		// The chunk that produces the answer, so finishing it finishes the job.
+		CompletesJob: true,
+		Body:         []byte{},
 	}); err != nil {
 		log.Printf("worker: chunk %s: queue the collect step: %v", chunk.ID, err)
 		return

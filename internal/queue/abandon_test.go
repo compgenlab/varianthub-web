@@ -24,12 +24,9 @@ func TestAnAbandonedChunkRecordsWhichWorkerLostIt(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	jobID, id := submitJob(t, q, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
@@ -39,7 +36,7 @@ func TestAnAbandonedChunkRecordsWhichWorkerLostIt(t *testing.T) {
 		t.Fatalf("reclaim: %v", err)
 	}
 
-	logText, _, err := q.Log(ctx, id)
+	logText, _, err := q.Log(ctx, jobID)
 	if err != nil {
 		t.Fatalf("log: %v", err)
 	}
@@ -61,12 +58,9 @@ func TestStatsCountAbandonmentApartFromFailure(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	_, id := submitJob(t, q, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if _, _, ok, _ := q.claimNext(ctx); !ok {
 		t.Fatal("claim")
 	}

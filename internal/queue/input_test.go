@@ -13,7 +13,7 @@ func TestASmallInputIsCarriedInline(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
 	if err != nil {
@@ -43,7 +43,7 @@ func TestAStoredInputIsAReferenceNotBytes(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/abc/input.vcf.gz"
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	})
 	if err != nil {
@@ -79,7 +79,7 @@ func TestAClaimCarriesTheInputLocation(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/def/input.vcf"
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	}); err != nil {
 		t.Fatal(err)
@@ -107,15 +107,12 @@ func TestAChunkInputMustHaveExactlyOneSource(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	_, id := submitJob(t, q, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	// Both: rejected.
-	_, err = q.pool.Exec(ctx,
+	_, err := q.pool.Exec(ctx,
 		`UPDATE chunk_input SET uri = 's3://b/k' WHERE chunk_id = $1`, id)
 	if err == nil {
 		t.Error("a row with both a body and a URI was accepted")
@@ -141,7 +138,7 @@ func TestAURIWinsWhenACallerSetsBoth(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/ghi/input.vcf"
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u",
 		Body: []byte("stale"), InputURI: uri,
 	})
@@ -164,7 +161,7 @@ func TestAnEmptyBodyIsStillABody(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", UserID: "u"})
+	id, err := q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", UserID: "u"})
 	if err != nil {
 		t.Fatalf("enqueue with no body: %v", err)
 	}
@@ -188,13 +185,12 @@ func TestDroppingAnInputReportsTheObjectToDelete(t *testing.T) {
 	ctx := context.Background()
 	const uri = "s3://varhub-dev/jobs/jkl/input.vcf"
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	jobID, id := submitJob(t, q, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
+	// Dropped by chunk: the input belongs to the chunk that reads it, and a
+	// split job has many. The job is what names it for a caller.
 	got, err := q.DropInput(ctx, id)
 	if err != nil {
 		t.Fatal(err)
@@ -202,17 +198,14 @@ func TestDroppingAnInputReportsTheObjectToDelete(t *testing.T) {
 	if got != uri {
 		t.Errorf("DropInput = %q, want %q — the object would be orphaned", got, uri)
 	}
-	if _, stored, _ := q.InputRef(ctx, id); stored {
+	if _, stored, _ := q.InputRef(ctx, jobID); stored {
 		t.Error("the input row survived the drop")
 	}
 
 	// Dropping an inline input is fine and reports no object.
-	id2, err := q.Enqueue(ctx, NewChunk{
+	_, id2 := submitJob(t, q, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if got, err := q.DropInput(ctx, id2); err != nil || got != "" {
 		t.Errorf("DropInput on an inline chunk = %q (err %v), want no object", got, err)
 	}

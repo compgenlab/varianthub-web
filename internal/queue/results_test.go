@@ -6,13 +6,24 @@ import (
 	"testing"
 )
 
-// seedResults inserts a finished chunk with n annotated variants.
-func seedResults(t *testing.T, q *Queue, chunkID string, body, columns string) {
+// seedResults inserts a finished job with one chunk holding the annotated
+// variants, which is the shape every result query reads: rows belong to a
+// chunk, and a job's results are its chunks'.
+func seedResults(t *testing.T, q *Queue, jobID string, body, columns string) {
 	t.Helper()
 	ctx := context.Background()
+	chunkID := jobID + "-c0"
 	if _, err := q.pool.Exec(ctx, `
-		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
-		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2)`, chunkID, columns); err != nil {
+		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
+		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2)`, jobID, columns); err != nil {
+		t.Fatal(err)
+	}
+	zero := 0
+	if _, err := q.pool.Exec(ctx, `
+		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,
+		                   columns,job_id,chunk_index,completes_job)
+		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2,$3,$4,TRUE)`,
+		chunkID, columns, jobID, zero); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := q.pool.Begin(ctx)

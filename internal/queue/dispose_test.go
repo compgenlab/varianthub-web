@@ -21,7 +21,7 @@ func TestSweepingAChunkOffersItsStoredInputForRemoval(t *testing.T) {
 		disposed = append(disposed, uris...)
 	})
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u", InputURI: uri,
 	})
 	if err != nil {
@@ -31,7 +31,7 @@ func TestSweepingAChunkOffersItsStoredInputForRemoval(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
@@ -61,7 +61,7 @@ func TestSweepingLeavesARunningChunksInputAlone(t *testing.T) {
 		disposed = append(disposed, uris...)
 	})
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u",
 		InputURI: "s3://varhub-dev/jobs/bbb/input.vcf",
 	}); err != nil {
@@ -88,7 +88,7 @@ func TestSweepingAnInlineChunkOffersNothing(t *testing.T) {
 	called := false
 	q.SetObjectDisposer(func(_ context.Context, uris []string) { called = true })
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
 	}); err != nil {
 		t.Fatal(err)
@@ -97,7 +97,7 @@ func TestSweepingAnInlineChunkOffersNothing(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
@@ -113,7 +113,7 @@ func TestSweepingWorksWithNoDisposer(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindVCF, Snapshot: "s", UserID: "u",
 		InputURI: "s3://varhub-dev/jobs/ccc/input.vcf",
 	}); err != nil {
@@ -123,7 +123,7 @@ func TestSweepingWorksWithNoDisposer(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	n, err := q.DeleteOlderThan(ctx, 1<<62)
 	if err != nil {

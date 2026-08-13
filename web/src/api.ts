@@ -410,7 +410,31 @@ export interface Job {
   created_at: number;
   started_at?: number;
   finished_at?: number;
+  /** How many chunks the submission became. A job that was not split has one.
+   *  0 means a split is still deciding — not "nothing to do". Believe status. */
+  chunks: number;
+  chunks_done: number;
+  chunks_failed: number;
   results?: Variant[];
+}
+
+/** One unit of work under a job. A submission that was not split has one; a
+ *  large VCF has a split, a piece per hundred thousand variants, and a collect
+ *  that joins them. This is where a split job says which piece failed. */
+export interface Chunk {
+  chunk_id: string;
+  job_id: string;
+  kind: string;
+  /** Its place in the split. Absent for the split and collect, which are not
+   *  pieces of the file. */
+  index?: number;
+  status: "queued" | "running" | "done" | "error" | "cancelled";
+  n_variants: number;
+  error?: string;
+  label?: string;
+  created_at: number;
+  started_at?: number;
+  finished_at?: number;
 }
 
 export interface Column {
@@ -1032,6 +1056,25 @@ export const api = {
   jobLog: (id: string) =>
     req<{ job_id: string; output: string; recorded: boolean }>(
       `/jobs/${encodeURIComponent(id)}/log`,
+    ),
+
+  /** The chunks a job was cut into, oldest first, pieces in split order. */
+  jobChunks: (id: string) =>
+    req<{ job_id: string; chunks: Chunk[] }>(
+      `/jobs/${encodeURIComponent(id)}/chunks`,
+    ),
+
+  jobChunk: (id: string, chunkId: string) =>
+    req<Chunk>(
+      `/jobs/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}`,
+    ),
+
+  /** One chunk's own output. The job's log is its first chunk's — the run a
+   *  caller submitted, or the split that cut it up — so this is how the rest
+   *  are read. */
+  chunkLog: (id: string, chunkId: string) =>
+    req<{ job_id: string; chunk_id: string; output: string; recorded: boolean }>(
+      `/jobs/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}/log`,
     ),
 
   sourceSettings: (id: string) =>

@@ -22,7 +22,7 @@ func claimIDs(t *testing.T, q *Queue, n int) []string {
 			break
 		}
 		who = append(who, chunk.UserID)
-		q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+		q.finish(ctx, chunk, StatusDone, "", Outcome{})
 	}
 	return who
 }
@@ -44,7 +44,7 @@ func enqueueFor(t *testing.T, q *Queue, user string, n int) {
 	t.Helper()
 	ctx := context.Background()
 	for i := 0; i < n; i++ {
-		if _, err := q.Enqueue(ctx, NewChunk{
+		if _, err := q.Submit(ctx, NewJob{
 			Kind: KindLocus, Snapshot: "s", UserID: user, Body: []byte("chr1:1:A:T"),
 		}); err != nil {
 			t.Fatalf("enqueue for %s: %v", user, err)
@@ -157,7 +157,7 @@ func TestFinishingChargesTheCallerTheOrderingReads(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	id, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "u1", ClientIP: "10.0.0.1",
 		Body: []byte("chr1:1:A:T"),
 	})
@@ -168,7 +168,7 @@ func TestFinishingChargesTheCallerTheOrderingReads(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	var who string
 	var at int64
@@ -193,7 +193,7 @@ func TestAnAnonymousCallerIsChargedByAddress(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0.2", Body: []byte("chr1:1:A:T"),
 	}); err != nil {
 		t.Fatal(err)
@@ -202,7 +202,7 @@ func TestAnAnonymousCallerIsChargedByAddress(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	var who string
 	if err := q.pool.QueryRow(ctx, `SELECT who FROM queue_caller`).Scan(&who); err != nil {
@@ -220,13 +220,13 @@ func TestSweepingChunksAlsoPrunesTheFairShareRows(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	if _, err := q.Enqueue(ctx, NewChunk{
+	if _, err := q.Submit(ctx, NewJob{
 		Kind: KindLocus, Snapshot: "s", UserID: "old", Body: []byte("chr1:1:A:T"),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	chunk, _, _, _ := q.claimNext(ctx)
-	q.finish(ctx, chunk.ID, StatusDone, "", Outcome{})
+	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
 	var n int
 	if err := q.pool.QueryRow(ctx, `SELECT COUNT(*) FROM queue_caller`).Scan(&n); err != nil {

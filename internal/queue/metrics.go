@@ -106,43 +106,56 @@ func (q *Queue) ActiveDownloads(ctx context.Context) (map[string]string, error) 
 func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 	now := q.nowFn()
 	var s Stats
+	// Jobs, not chunks. A page that says "12 running" while three of them are
+	// pieces of one submission is answering a question nobody asked; what an
+	// operator watches is how many submissions are in flight.
 	err := q.pool.QueryRow(ctx, `
 		SELECT count(*),
 		       count(*) FILTER (WHERE status = $1),
 		       count(*) FILTER (WHERE status = $2),
-		       count(*) FILTER (WHERE status = $7),
+		       count(*) FILTER (WHERE status = $6),
 		       count(*) FILTER (WHERE status = $3),
 		       count(*) FILTER (WHERE status = $4),
 		       coalesce(min(created_at) FILTER (WHERE status = $3), 0),
 		       coalesce(sum(n_variants) FILTER (WHERE status = $1), 0),
 		       count(*) FILTER (WHERE finished_at >= $5),
-		       count(*) FILTER (WHERE finished_at >= $6),
-		       count(*) FILTER (WHERE status = $3 AND lost),
-		       count(*) FILTER (WHERE status = $2 AND last_lost)
-		  FROM (
-		    SELECT j.status, j.created_at, j.finished_at, j.n_variants,
-		           -- Any attempt was abandoned: this chunk has been retried after
-		           -- losing a worker.
-		           EXISTS (SELECT 1 FROM chunk_attempt a
-		                    WHERE a.chunk_id = j.id AND a.outcome = $8) AS lost,
-		           -- The *last* attempt was abandoned: the chunk ended because it
-		           -- ran out of attempts, not because it failed on its own.
-		           (SELECT a.outcome = $8 FROM chunk_attempt a
-		              WHERE a.chunk_id = j.id
-		              ORDER BY a.attempt DESC LIMIT 1) AS last_lost
-		      FROM chunk j
-		  ) t`,
+		       count(*) FILTER (WHERE finished_at >= $7)
+		  FROM job`,
 		StatusDone, StatusError, StatusQueued, StatusRunning,
-		now-24*3600, now-7*24*3600, StatusCancelled, OutcomeAbandoned).
+		now-24*3600, StatusCancelled, now-7*24*3600).
 		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Cancelled, &s.Queued, &s.Running,
-			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d,
-			&s.AbandonedRetrying, &s.AbandonedExhausted)
+			&s.OldestQueuedAt, &s.Variants, &s.Last24h, &s.Last7d)
 	if err != nil {
 		return s, err
 	}
-	// Separate query because it counts a different thing: attempts, not
-	// chunks, so it cannot share the FROM above without either double-counting
-	// the chunk columns or duplicating rows across the join.
+	// Abandonment is a chunk's property and stays one: a lease is held over a
+	// chunk, and a submission that lost a worker lost it on one piece. Counting
+	// these per job would hide a deployment losing every twenty-sixth piece of
+	// everything behind a handful of jobs that eventually succeeded.
+	err = q.pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE status = $1 AND lost),
+		       count(*) FILTER (WHERE status = $2 AND last_lost)
+		  FROM (
+		    SELECT c.status,
+		           -- Any attempt was abandoned: this chunk has been retried
+		           -- after losing a worker.
+		           EXISTS (SELECT 1 FROM chunk_attempt a
+		                    WHERE a.chunk_id = c.id AND a.outcome = $3) AS lost,
+		           -- The *last* attempt was abandoned: the chunk ended because
+		           -- it ran out of attempts, not because it failed on its own.
+		           (SELECT a.outcome = $3 FROM chunk_attempt a
+		              WHERE a.chunk_id = c.id
+		              ORDER BY a.attempt DESC LIMIT 1) AS last_lost
+		      FROM chunk c
+		  ) t`,
+		StatusQueued, StatusError, OutcomeAbandoned).
+		Scan(&s.AbandonedRetrying, &s.AbandonedExhausted)
+	if err != nil {
+		return s, err
+	}
+	// Separate again because it counts a different thing: attempts, not chunks,
+	// so it cannot share the FROM above without duplicating rows across the
+	// join.
 	err = q.pool.QueryRow(ctx,
 		`SELECT count(*) FROM chunk_attempt WHERE outcome = $1 AND ended_at >= $2`,
 		OutcomeAbandoned, now-24*3600).Scan(&s.AbandonedAttempts24h)

@@ -27,16 +27,10 @@ type fakeQueue struct {
 	order []string
 }
 
-func (f *fakeQueue) CreateJob(_ context.Context, chunkID, prefix string) (string, error) {
-	f.jobID, f.prefix = "job-1", prefix
-	f.job = queue.Job{ID: f.jobID, ChunkID: chunkID, Prefix: prefix}
-	f.order = append(f.order, "create")
-	return f.jobID, nil
-}
-
-func (f *fakeQueue) SetChunkCount(_ context.Context, _ string, n int) error {
+func (f *fakeQueue) SetChunkCount(_ context.Context, jobID, prefix string, n int) error {
+	f.jobID, f.prefix = jobID, prefix
 	f.count, f.countSet = n, true
-	f.job.Chunks = n
+	f.job = queue.Job{ID: jobID, Prefix: prefix, Chunks: n}
 	f.order = append(f.order, "count")
 	return nil
 }
@@ -47,7 +41,7 @@ func (f *fakeQueue) Enqueue(_ context.Context, j queue.NewChunk) (string, error)
 	return "chunk-" + j.Label, nil
 }
 
-func (f *fakeQueue) JobChunks(context.Context, string) ([]queue.Chunk, error) {
+func (f *fakeQueue) SplitChunks(context.Context, string) ([]queue.Chunk, error) {
 	return f.chunks, nil
 }
 
@@ -68,14 +62,15 @@ func TestSplitQueuesAChunkPerPiece(t *testing.T) {
 	}
 
 	q := &fakeQueue{}
-	submitted := queue.Chunk{ID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
-	jobID, n, err := RunSplit(context.Background(), q, submitted, in, store, bin, 4, nil)
+	submitted := queue.Chunk{ID: "chunk-1", JobID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
+	n, err := RunSplit(context.Background(), q, submitted, in, store, bin, 4, nil)
 	if err != nil {
 		t.Fatalf("RunSplit: %v", err)
 	}
-	if n != 3 || jobID == "" {
-		t.Fatalf("split into %d chunks, job %q", n, jobID)
+	if n != 3 {
+		t.Fatalf("split into %d chunks, want 3", n)
 	}
+	const jobID = "abc123"
 	if len(q.enqueued) != 3 {
 		t.Fatalf("queued %d chunks, want 3", len(q.enqueued))
 	}
@@ -124,8 +119,8 @@ func TestSplitAndCollectAgreeOnWhereChunksLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	q := &fakeQueue{}
-	submitted := queue.Chunk{ID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
-	if _, _, err := RunSplit(ctx, q, submitted, in, store, bin, 3, nil); err != nil {
+	submitted := queue.Chunk{ID: "chunk-1", JobID: "abc123", Snapshot: "s", Label: "cohort.vcf"}
+	if _, err := RunSplit(ctx, q, submitted, in, store, bin, 3, nil); err != nil {
 		t.Fatal(err)
 	}
 

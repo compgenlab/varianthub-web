@@ -39,7 +39,7 @@ const DefaultGrace = time.Hour
 
 // Store is what a sweep needs from the queue.
 type Store interface {
-	KnownChunkIDs(ctx context.Context) (map[string]bool, error)
+	KnownJobIDs(ctx context.Context) (map[string]bool, error)
 	TryLock(ctx context.Context, name string) (bool, func(), error)
 }
 
@@ -78,7 +78,7 @@ func Sweep(ctx context.Context, st Store, jobStorage string, grace time.Duration
 	// and would be collected. Reading first inverts the race into the harmless
 	// direction: a job created after this snapshot is simply not in it, its
 	// files are new, and the grace period covers them.
-	known, err := st.KnownChunkIDs(ctx)
+	known, err := st.KnownJobIDs(ctx)
 	if err != nil {
 		return res, err
 	}

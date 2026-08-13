@@ -26,7 +26,7 @@ func TestStats(t *testing.T) {
 			fin = finished
 		}
 		if _, err := q.pool.Exec(ctx, `
-			INSERT INTO chunk (id,kind,snapshot,selection,status,n_variants,created_at,finished_at)
+			INSERT INTO job (id,kind,snapshot,selection,status,n_variants,created_at,finished_at)
 			VALUES ($1,'locus','snap','',$2,$3,$4,$5)`,
 			id, status, variants, created, fin); err != nil {
 			t.Fatal(err)
@@ -36,7 +36,7 @@ func TestStats(t *testing.T) {
 	insert("d1", StatusDone, 10, now-3600, now-3000)           // within 24h
 	insert("d2", StatusDone, 32, now-3*24*3600, now-3*24*3600) // within 7d, not 24h
 	insert("d3", StatusDone, 5, now-30*24*3600, now-30*24*3600)
-	// A failed chunk's n_variants is what was submitted, not what was
+	// A failed job's n_variants is what was submitted, not what was
 	// annotated.
 	insert("e1", StatusError, 999, now-7200, now-7000)
 	insert("q1", StatusQueued, 3, now-600, 0)
@@ -89,13 +89,12 @@ func TestChunkLog(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, id := submitJob(t, q, NewJob{
+		Kind: KindDownload, Snapshot: "s", Body: []byte("{}"),
+	})
 
 	// Nothing recorded yet is distinguishable from a run that printed nothing.
-	out, found, err := q.Log(ctx, id)
+	out, found, err := q.Log(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +105,7 @@ func TestChunkLog(t *testing.T) {
 	if err := q.SetLog(ctx, id, "varhub: fetching\nvarhub: done\n"); err != nil {
 		t.Fatal(err)
 	}
-	out, found, err = q.Log(ctx, id)
+	out, found, err = q.Log(ctx, jobID)
 	if err != nil || !found {
 		t.Fatalf("Log = %q, %v, %v", out, found, err)
 	}
@@ -120,7 +119,7 @@ func TestChunkLog(t *testing.T) {
 	if err := q.SetLog(ctx, id, "second run\n"); err != nil {
 		t.Fatal(err)
 	}
-	out, _, _ = q.Log(ctx, id)
+	out, _, _ = q.Log(ctx, jobID)
 	if strings.Contains(out, "fetching") || !strings.Contains(out, "second run") {
 		t.Errorf("after a second run: %q", out)
 	}
@@ -132,24 +131,25 @@ func TestChunkLog(t *testing.T) {
 	}
 }
 
-// Cancelling a queued chunk settles it without a worker ever seeing it.
-func TestCancelQueuedChunk(t *testing.T) {
+// Cancelling a queued job settles it, and its chunk, without a worker ever
+// seeing either.
+func TestCancelQueuedJob(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	id, err := q.Submit(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
 	if err != nil {
 		t.Fatal(err)
 	}
-	chunk, err := q.Cancel(ctx, id)
+	job, err := q.CancelJob(ctx, id)
 	if err != nil {
-		t.Fatalf("Cancel: %v", err)
+		t.Fatalf("CancelJob: %v", err)
 	}
-	if chunk.Status != StatusCancelled {
-		t.Errorf("status = %q, want %q", chunk.Status, StatusCancelled)
+	if job.Status != StatusCancelled {
+		t.Errorf("status = %q, want %q", job.Status, StatusCancelled)
 	}
-	if !chunk.Terminal() {
-		t.Error("a cancelled chunk does not report as terminal")
+	if !job.Terminal() {
+		t.Error("a cancelled job does not report as terminal")
 	}
 	// It must not then be claimable: a cancelled chunk that a worker picks up
 	// anyway is worse than one that never cancelled.
@@ -158,9 +158,9 @@ func TestCancelQueuedChunk(t *testing.T) {
 	}
 }
 
-// The case that matters: a chunk already executing stops, and is recorded as
+// The case that matters: a job already executing stops, and is recorded as
 // cancelled rather than as a failure.
-func TestCancelRunningChunk(t *testing.T) {
+func TestCancelRunningJob(t *testing.T) {
 	q := testQueue(t)
 	ctx, stop := context.WithCancel(context.Background())
 	defer stop()
@@ -174,7 +174,7 @@ func TestCancelRunningChunk(t *testing.T) {
 		return Outcome{}, runCtx.Err()
 	})
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
+	id, err := q.Submit(ctx, NewJob{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,48 +184,44 @@ func TestCancelRunningChunk(t *testing.T) {
 		t.Fatal("the chunk never started")
 	}
 
-	if _, err := q.Cancel(ctx, id); err != nil {
+	if _, err := q.CancelJob(ctx, id); err != nil {
 		t.Fatalf("Cancel: %v", err)
 	}
 
 	deadline := time.Now().Add(10 * time.Second)
-	var chunk Chunk
+	var job Job
 	for time.Now().Before(deadline) {
-		chunk, _, _ = q.Get(ctx, id)
-		if chunk.Terminal() {
+		job, _, _ = q.GetJob(ctx, id)
+		if job.Terminal() {
 			break
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if chunk.Status != StatusCancelled {
-		t.Fatalf("status = %q, want %q (error=%q)", chunk.Status, StatusCancelled, chunk.Error)
+	if job.Status != StatusCancelled {
+		t.Fatalf("status = %q, want %q (error=%q)", job.Status, StatusCancelled, job.Error)
 	}
 	// The run reported a context error on its way down, but the reason it went
 	// down is known — recording it as a failure would misattribute a decision.
-	if chunk.Error != "cancelled" {
-		t.Errorf("error = %q, want %q", chunk.Error, "cancelled")
+	if job.Error != "cancelled" {
+		t.Errorf("error = %q, want %q", job.Error, "cancelled")
 	}
 }
 
 // Cancelling something already finished is not an error: the caller wanted it
 // stopped, and it is stopped.
-func TestCancelFinishedChunk(t *testing.T) {
+func TestCancelFinishedJob(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
 
-	id, err := q.Enqueue(ctx, NewChunk{Kind: KindDownload, Snapshot: "s", Body: []byte("{}")})
-	if err != nil {
-		t.Fatal(err)
+	jobID, chunkID := submitJob(t, q, NewJob{
+		Kind: KindDownload, Snapshot: "s", Body: []byte("{}"),
+	})
+	finishByID(t, q, chunkID, StatusDone, "", Outcome{})
+	if _, err := q.CancelJob(ctx, jobID); !errors.Is(err, ErrNotCancellable) {
+		t.Errorf("CancelJob on a finished job = %v, want ErrNotCancellable", err)
 	}
-	if _, err := q.pool.Exec(ctx,
-		`UPDATE chunk SET status=$1, finished_at=$2 WHERE id=$3`, StatusDone, 1, id); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := q.Cancel(ctx, id); !errors.Is(err, ErrNotCancellable) {
-		t.Errorf("Cancel on a finished chunk = %v, want ErrNotCancellable", err)
-	}
-	if _, err := q.Cancel(ctx, "no-such-id"); !errors.Is(err, ErrNoSuchChunk) {
-		t.Errorf("Cancel on an unknown id = %v, want ErrNoSuchChunk", err)
+	if _, err := q.CancelJob(ctx, "no-such-id"); !errors.Is(err, ErrNoSuchJob) {
+		t.Errorf("Cancel on an unknown id = %v, want ErrNoSuchJob", err)
 	}
 }
 
@@ -239,21 +235,17 @@ func TestChunkWeightLimitsConcurrency(t *testing.T) {
 
 	heavy := func() string {
 		t.Helper()
-		id, err := q.Enqueue(ctx, NewChunk{
+		_, chunkID := submitJob(t, q, NewJob{
 			Kind: KindDownload, Snapshot: "s", Weight: 2, Body: []byte("{}"),
 		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return id
+		return chunkID
 	}
 	light := func() string {
 		t.Helper()
-		id, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")})
-		if err != nil {
-			t.Fatal(err)
-		}
-		return id
+		_, chunkID := submitJob(t, q, NewJob{
+			Kind: KindLocus, Snapshot: "s", Body: []byte("{}"),
+		})
+		return chunkID
 	}
 
 	first, second := heavy(), heavy()
@@ -288,7 +280,7 @@ func TestChunkWeightLimitsConcurrency(t *testing.T) {
 	// waiting chunks goes first is not asserted: they were created in the same
 	// second, and the ordering then falls to a random id — a real property of
 	// the queue, not something this test should pin.
-	q.finish(ctx, running, StatusDone, "", Outcome{})
+	finishByID(t, q, running, StatusDone, "", Outcome{})
 	got, _, ok, err = q.claimNext(ctx)
 	if err != nil || !ok {
 		t.Fatalf("claim after the first finished: ok=%v err=%v", ok, err)
@@ -313,7 +305,7 @@ func TestLightChunksStillShareThePool(t *testing.T) {
 	q.SetSlots(2)
 
 	for i := 0; i < 2; i++ {
-		if _, err := q.Enqueue(ctx, NewChunk{
+		if _, err := q.Submit(ctx, NewJob{
 			Kind: KindLocus, Snapshot: "s", ClientIP: "10.0.0." + string(rune('1'+i)),
 			Body: []byte("{}"),
 		}); err != nil {
@@ -326,7 +318,7 @@ func TestLightChunksStillShareThePool(t *testing.T) {
 		}
 	}
 	// ...and the third waits, because the budget is spent.
-	if _, err := q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
+	if _, err := q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, _ := q.claimNext(ctx); ok {
@@ -349,12 +341,9 @@ func TestAChunkHeavierThanThePoolStillRuns(t *testing.T) {
 	ctx := context.Background()
 	q.SetSlots(1) // one worker; a download weighs 2
 
-	id, err := q.Enqueue(ctx, NewChunk{
+	_, id := submitJob(t, q, NewJob{
 		Kind: KindDownload, Snapshot: "s", Weight: 2, Body: []byte("{}"),
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	got, _, ok, err := q.claimNext(ctx)
 	if err != nil {
@@ -368,7 +357,7 @@ func TestAChunkHeavierThanThePoolStillRuns(t *testing.T) {
 	}
 
 	// It still holds the pool exclusively: nothing else may join it.
-	if _, err = q.Enqueue(ctx, NewChunk{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
+	if _, err = q.Submit(ctx, NewJob{Kind: KindLocus, Snapshot: "s", Body: []byte("{}")}); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, ok, err = q.claimNext(ctx); err != nil {
