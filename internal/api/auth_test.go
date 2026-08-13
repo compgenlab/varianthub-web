@@ -4,108 +4,51 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
+	"github.com/compgenlab/varianthub-web/internal/pgtest"
 	"github.com/compgenlab/varianthub-web/internal/queue"
 )
 
 // The authorization rules are the point of this file, and they are enforced
 // against real rows — a stubbed store would test the stub.
-// allMigrations are every migration, discovered rather than listed.
-//
-// The list used to be written out by hand — and had drifted out of numeric
-// order, and gone stale twice. A missing entry surfaces as `column "x" does not
-// exist` in whichever test happens to touch it, rather than as anything about
-// the list. Globbing means a new migration is exercised by the existing tests
-// the moment it lands.
-//
-// Sorted, because migrations are ordered by their numeric prefix and a later one
-// alters what an earlier one created.
-func allMigrations(t *testing.T) []string {
-	t.Helper()
-	files, err := filepath.Glob("../../migrations/*.sql")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(files) == 0 {
-		t.Fatal("no migrations found; the glob or the layout has moved")
-	}
-	sort.Strings(files)
-	return files
-}
-
 type harness struct {
 	server *Server
 	http   http.Handler
 	ids    *identity.Store
 	cat    *catalog.Store
-	dsn    string // schema-scoped, for tests that need a real queue
+	dsn    string // this test's own database, for anything opening its own pool
 }
 
 func newHarness(t *testing.T) *harness {
 	t.Helper()
-	dsn := os.Getenv("VHW_TEST_DATABASE_URL")
-	if dsn == "" {
-		t.Skip("VHW_TEST_DATABASE_URL not set; skipping auth integration tests")
-	}
-	ctx := context.Background()
+	// One implementation of "a migrated database for this test", shared with
+	// every other package. This used to be a second copy here, which meant the
+	// api tests kept replaying every migration into a fresh schema long after
+	// pgtest had stopped doing that — the copy that drifts being exactly what
+	// pgtest's doc comment warns about.
+	dsn := pgtest.DSN(t)
 
-	var ddl strings.Builder
-	for _, f := range allMigrations(t) {
-		b, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		ddl.Write(b)
-		ddl.WriteString("\n")
-	}
-	schema := fmt.Sprintf("a_%d", time.Now().UnixNano())
-	setup, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("connect: %v", err)
-	}
-	if _, err := setup.Exec(ctx, `CREATE SCHEMA `+schema); err != nil {
-		setup.Close()
-		t.Fatalf("create schema: %v", err)
-	}
-	if _, err := setup.Exec(ctx, `SET search_path TO `+schema+`; `+ddl.String()); err != nil {
-		setup.Close()
-		t.Fatalf("migrate: %v", err)
-	}
-	setup.Close()
-
-	pool, err := pgxpool.New(ctx, dsn+"&search_path="+schema)
+	pool, err := pgxpool.New(context.Background(), dsn)
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	t.Cleanup(func() {
-		if drop, err := pgxpool.New(context.Background(), dsn); err == nil {
-			_, _ = drop.Exec(context.Background(), `DROP SCHEMA `+schema+` CASCADE`)
-			drop.Close()
-		}
-		pool.Close()
-	})
+	t.Cleanup(pool.Close)
 
 	cat := catalog.New(pool)
 	ids := identity.NewStore(pool)
 	srv := New(&config.Config{
 		Version: "test", RatePerMin: 1000, RateBurst: 1000,
 	}, nil, cat, ids, nil)
-	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat,
-		dsn: dsn + "&search_path=" + schema}
+	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat, dsn: dsn}
 }
 
 // withQueue gives the harness a real queue. Most tests do not need one — the
