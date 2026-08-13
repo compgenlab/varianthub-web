@@ -18,7 +18,10 @@ func TestStats(t *testing.T) {
 	q.nowFn = func() int64 { return now }
 
 	// created_at/finished_at are written directly: the point is the aggregate,
-	// and driving it through the scheduler would fix the timestamps to real time.
+	// and driving it through the scheduler would fix the timestamps to real
+	// time. A job and its one chunk, because a job's state is read from its
+	// chunks — writing a status on the job would not be seen, there being no
+	// column to write it to.
 	insert := func(id, status string, variants int64, created, finished int64) {
 		t.Helper()
 		var fin any
@@ -26,9 +29,19 @@ func TestStats(t *testing.T) {
 			fin = finished
 		}
 		if _, err := q.pool.Exec(ctx, `
-			INSERT INTO job (id,kind,snapshot,selection,status,n_variants,created_at,finished_at)
-			VALUES ($1,'locus','snap','',$2,$3,$4,$5)`,
-			id, status, variants, created, fin); err != nil {
+			INSERT INTO job (id,kind,snapshot,selection,created_at,input_chunk_id)
+			VALUES ($1,'locus','snap','',$2,$3)`, id, created, id+"-c0"); err != nil {
+			t.Fatal(err)
+		}
+		started := any(nil)
+		if status != StatusQueued {
+			started = created
+		}
+		if _, err := q.pool.Exec(ctx, `
+			INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,n_variants,
+			                   created_at,started_at,finished_at,job_id,completes_job)
+			VALUES ($1,'locus','snap','',$2,'10.0.0.1',$3,$4,$5,$6,$7,TRUE)`,
+			id+"-c0", status, variants, created, started, fin, id); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -202,8 +215,10 @@ func TestCancelRunningJob(t *testing.T) {
 	}
 	// The run reported a context error on its way down, but the reason it went
 	// down is known — recording it as a failure would misattribute a decision.
-	if job.Error != "cancelled" {
-		t.Errorf("error = %q, want %q", job.Error, "cancelled")
+	// No error text. A cancel is a decision, not a fault: it has its own
+	// status, and the error field is for what went wrong.
+	if job.Error != "" {
+		t.Errorf("a cancelled job reports the error %q", job.Error)
 	}
 }
 

@@ -27,17 +27,17 @@ type fakeQueue struct {
 	order []string
 }
 
-func (f *fakeQueue) SetChunkCount(_ context.Context, jobID, prefix string, n int) error {
+func (f *fakeQueue) SetPrefix(_ context.Context, jobID, prefix string) error {
 	f.jobID, f.prefix = jobID, prefix
-	f.count, f.countSet = n, true
-	f.job = queue.Job{ID: jobID, Prefix: prefix, Chunks: n}
-	f.order = append(f.order, "count")
+	f.job = queue.Job{ID: jobID, Prefix: prefix}
+	f.order = append(f.order, "prefix")
 	return nil
 }
 
 func (f *fakeQueue) Enqueue(_ context.Context, j queue.NewChunk) (string, error) {
 	f.enqueued = append(f.enqueued, j)
 	f.order = append(f.order, "enqueue")
+	f.count++
 	return "chunk-" + j.Label, nil
 }
 
@@ -71,11 +71,11 @@ func TestSplitQueuesAChunkPerPiece(t *testing.T) {
 		t.Fatalf("split into %d chunks, want 3", n)
 	}
 	const jobID = "abc123"
-	if len(q.enqueued) != 3 {
-		t.Fatalf("queued %d chunks, want 3", len(q.enqueued))
+	if len(q.enqueued) != 4 {
+		t.Fatalf("queued %d chunks, want three pieces and the join", len(q.enqueued))
 	}
 
-	for i, j := range q.enqueued {
+	for i, j := range q.enqueued[:3] {
 		if j.ChunkIndex == nil || *j.ChunkIndex != i {
 			t.Errorf("chunk %d has index %v, want %d", i, j.ChunkIndex, i)
 		}
@@ -95,14 +95,23 @@ func TestSplitQueuesAChunkPerPiece(t *testing.T) {
 		}
 	}
 
-	// The count is written last. Written first, the earliest chunk to finish
-	// could complete a job whose remaining chunks had not been queued yet,
-	// and collect would join a file that was still being built.
-	if !q.countSet || q.count != 3 {
-		t.Fatalf("chunk count = %d set=%v", q.count, q.countSet)
+	// The join is queued here, with the pieces, rather than by whichever of
+	// them finishes last — so the work the job still owes is a row from the
+	// moment there is any. It waits for them, and it holds the answer.
+	join := q.enqueued[3]
+	if join.Kind != queue.KindCollect {
+		t.Fatalf("the last chunk queued is %q, want the join", join.Kind)
 	}
-	if last := q.order[len(q.order)-1]; last != "count" {
-		t.Errorf("the chunk count was written at %q, not last: %v", last, q.order)
+	if !join.AwaitsPieces {
+		t.Error("the join does not wait for its pieces; a worker would claim it " +
+			"and join files that are still being written")
+	}
+	if !join.CompletesJob {
+		t.Error("the join does not hold the job's answer; nothing would point at it")
+	}
+	// Queued last, so it never waits on a set of pieces still being written.
+	if last := q.order[len(q.order)-1]; last != "enqueue" {
+		t.Errorf("the join was queued at %q, not last: %v", last, q.order)
 	}
 }
 
@@ -124,8 +133,9 @@ func TestSplitAndCollectAgreeOnWhereChunksLive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Each chunk annotated and stored, as the chunk runs would do.
-	for i := range q.enqueued {
+	// Each piece annotated and stored, as the chunk runs would do. The join is
+	// the last thing queued and produces no piece of its own.
+	for i := range q.enqueued[:len(q.enqueued)-1] {
 		body := chunk(100+i*3, 3)
 		if _, err := StoreChunkResult(ctx, q.prefix, i, strings.NewReader(body), nil); err != nil {
 			t.Fatalf("store chunk %d: %v", i, err)

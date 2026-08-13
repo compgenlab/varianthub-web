@@ -42,9 +42,14 @@ func TestPublishedResponseKeys(t *testing.T) {
 		// that was not split is a job of one chunk, so there is no shape where
 		// they are absent and a client has to handle both.
 		{"job status", JobStatusResponse{}, []string{
-			"chunks", "chunks_done", "chunks_failed", "created_at", "job_id",
-			"kind", "n_variants", "selection", "snapshot", "status"}},
-		{"chunks", ChunksResponse{}, []string{"chunks", "job_id"}},
+			"chunks_done", "chunks_failed", "chunks_total", "created_at",
+			"job_id", "kind", "n_variants", "selection", "snapshot", "status"}},
+		// The single-job read is the status with the chunks inlined. The
+		// embedded struct's fields are the same keys, at the top level.
+		{"job", JobResponse{}, []string{
+			"chunks", "chunks_done", "chunks_failed", "chunks_total",
+			"created_at", "job_id", "kind", "n_variants", "selection",
+			"snapshot", "status"}},
 		{"chunk", ChunkResponse{}, []string{
 			"chunk_id", "created_at", "job_id", "kind", "n_variants", "status"}},
 	}

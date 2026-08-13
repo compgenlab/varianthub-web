@@ -2,32 +2,52 @@ package queue
 
 import (
 	"context"
-	"sync"
 	"testing"
 )
 
-// newSplitJob submits a VCF job — whose first chunk is the split — and, when
-// chunks > 0, records the count the split would have produced.
-func newSplitJob(t *testing.T, q *Queue, chunks int) (jobID string) {
+// splitJob submits a VCF job and returns the job id and its split chunk's id.
+func splitJob(t *testing.T, q *Queue) (jobID, splitID string) {
 	t.Helper()
-	ctx := context.Background()
-	id, err := q.Submit(ctx, NewJob{
+	return submitJob(t, q, NewJob{
 		Kind: KindSplit, Snapshot: "s", UserID: "u", Label: "cohort.vcf",
 		InputURI: "s3://b/jobs/x/input.vcf.gz",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	// The job is a VCF submission; only its first chunk is a split.
-	if j, _, _ := q.GetJob(ctx, id); j.Kind != KindVCF {
-		t.Fatalf("a submitted VCF is job kind %q, want %q", j.Kind, KindVCF)
-	}
-	if chunks > 0 {
-		if err := q.SetChunkCount(ctx, id, "/tmp/jobs/"+id, chunks); err != nil {
+}
+
+// addPieces queues n pieces and the join that waits for them, the way a split
+// does.
+func addPieces(t *testing.T, q *Queue, jobID string, n int) []string {
+	t.Helper()
+	ctx := context.Background()
+	var ids []string
+	for i := 0; i < n; i++ {
+		idx := i
+		id, err := q.Enqueue(ctx, NewChunk{
+			Kind: KindVCF, Snapshot: "s", UserID: "u",
+			InputURI: "s3://b/jobs/x/chunk.vcf.gz",
+			JobID:    jobID, ChunkIndex: &idx,
+		})
+		if err != nil {
 			t.Fatal(err)
 		}
+		ids = append(ids, id)
 	}
-	return id
+	if _, err := q.Enqueue(ctx, NewChunk{
+		Kind: KindCollect, Snapshot: "s", UserID: "u", JobID: jobID,
+		AwaitsPieces: true, CompletesJob: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return ids
+}
+
+func statusOfJob(t *testing.T, q *Queue, jobID string) Job {
+	t.Helper()
+	j, ok, err := q.GetJob(context.Background(), jobID)
+	if err != nil || !ok {
+		t.Fatalf("GetJob: %v ok=%v", err, ok)
+	}
+	return j
 }
 
 // Every submission is a job with at least one chunk.
@@ -39,10 +59,7 @@ func TestASubmissionIsAJobWithAChunk(t *testing.T) {
 	ctx := context.Background()
 
 	jobID := submitOne(t, q, "u")
-	j, ok, err := q.GetJob(ctx, jobID)
-	if err != nil || !ok {
-		t.Fatalf("GetJob: %v ok=%v", err, ok)
-	}
+	j := statusOfJob(t, q, jobID)
 	if j.Status != StatusQueued {
 		t.Errorf("a fresh job is %q, want %q", j.Status, StatusQueued)
 	}
@@ -61,201 +78,325 @@ func TestASubmissionIsAJobWithAChunk(t *testing.T) {
 	if c.JobID != jobID {
 		t.Errorf("the chunk belongs to %q, want %q", c.JobID, jobID)
 	}
-	if !c.CompletesJob {
-		t.Error("the only chunk of a job does not complete it; the job could " +
-			"never reach done")
-	}
 	if j.InputChunkID != c.ID {
 		t.Errorf("the job's input is filed under %q, not its chunk %q",
 			j.InputChunkID, c.ID)
 	}
+	if j.Chunks != 1 || j.Done != 0 {
+		t.Errorf("counts are %d done of %d, want 0 of 1", j.Done, j.Chunks)
+	}
 }
 
-// A job whose split has not finished is pending, not complete.
+// A job of one chunk follows that chunk, with no partial states in between.
 //
-// Zero of zero chunks reads as "all done" to any comparison that does not know
-// better, and a caller shown that would reasonably think their submission had
-// finished with no results.
-func TestAJobWithNoChunkCountYetIsPending(t *testing.T) {
+// "partial" is a property of a thing made of parts. A submission that was not
+// split has none, so it goes queued → running → done exactly as its chunk does.
+func TestAJobOfOneChunkFollowsIt(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newSplitJob(t, q, 0)
 
-	b, ok, err := q.GetJob(ctx, id)
-	if err != nil || !ok {
-		t.Fatalf("GetJob: %v ok=%v", err, ok)
+	jobID, chunkID := submitJob(t, q, NewJob{
+		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
+	})
+	if got := statusOfJob(t, q, jobID).Status; got != StatusQueued {
+		t.Fatalf("before the claim the job is %q, want queued", got)
 	}
-	if !b.Pending() {
-		t.Error("a job that has not been counted should be pending")
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
-	if b.Complete() {
-		t.Error("0 of 0 chunks reported as complete")
+	if got := statusOfJob(t, q, jobID).Status; got != StatusRunning {
+		t.Fatalf("with its chunk claimed the job is %q, want running", got)
+	}
+	finishByID(t, q, chunkID, StatusDone, "", Outcome{Result: []byte("[]"), N: 4})
+
+	j := statusOfJob(t, q, jobID)
+	if j.Status != StatusDone {
+		t.Fatalf("the job is %q after its only chunk finished", j.Status)
+	}
+	if j.NVariants != 4 {
+		t.Errorf("n_variants = %d, want the chunk's 4", j.NVariants)
+	}
+	if j.ResultChunkID != chunkID {
+		t.Errorf("the answer is filed under %q, want the chunk %q", j.ResultChunkID, chunkID)
+	}
+	if j.FinishedAt == 0 || j.StartedAt == 0 {
+		t.Errorf("a finished job has no times: started=%d finished=%d", j.StartedAt, j.FinishedAt)
 	}
 }
 
-// Exactly one caller is told it was the last, however many finish at once.
+// A fan-out reports partial states, because that is what it is.
 //
-// This is the whole reason the count is a counter. Asked as a query over
-// sibling chunks — "is every chunk terminal yet" — two finishing at the same
-// instant each see the other's row already updated and both answer yes, and
-// the collect step runs twice: two readers of the same chunks, two uploads to
-// the same key, and whichever lands second wins.
-func TestExactlyOneChunkIsToldItWasTheLast(t *testing.T) {
+// Nine of twenty-six pieces annotated is neither "running" nor "queued" in any
+// useful sense, and reporting it as either is how a caller ends up counting
+// chunks themselves.
+func TestAFanOutReportsPartialStates(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	const chunks = 16
-	id := newSplitJob(t, q, chunks)
 
-	var (
-		mu    sync.Mutex
-		lasts int
-		wg    sync.WaitGroup
-	)
-	for i := 0; i < chunks; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			last, err := q.ChunkFinished(ctx, id, true)
-			if err != nil {
-				t.Errorf("ChunkFinished: %v", err)
-				return
-			}
-			if last {
-				mu.Lock()
-				lasts++
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	pieces := addPieces(t, q, jobID, 2)
 
-	if lasts != 1 {
-		t.Errorf("%d chunks were told they were the last; collect would run that many times", lasts)
+	// One of four chunks done, nothing running.
+	if got := statusOfJob(t, q, jobID).Status; got != StatusPartialQueued {
+		t.Fatalf("after the split the job is %q, want %q", got, StatusPartialQueued)
 	}
-	b, _, err := q.GetJob(ctx, id)
-	if err != nil {
-		t.Fatal(err)
+
+	// Something finished, something running.
+	if _, _, ok, err := q.claimNext(ctx); err != nil || !ok {
+		t.Fatalf("claim a piece: %v ok=%v", err, ok)
 	}
-	if b.Done != chunks {
-		t.Errorf("done = %d, want %d", b.Done, chunks)
+	if got := statusOfJob(t, q, jobID).Status; got != StatusPartialRunning {
+		t.Fatalf("with a piece running the job is %q, want %q", got, StatusPartialRunning)
+	}
+
+	for _, id := range pieces {
+		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 3})
+	}
+
+	// Every piece done, the join still to run. This is the moment a status
+	// aggregated over "is every chunk terminal" would call done, and there is
+	// no answer to fetch.
+	j := statusOfJob(t, q, jobID)
+	if j.Status != StatusPartialQueued {
+		t.Fatalf("with the join still queued the job is %q, want %q", j.Status, StatusPartialQueued)
+	}
+	if j.Terminal() {
+		t.Error("a job whose answer has not been assembled reports as terminal")
 	}
 }
 
-// A failed chunk still counts toward completion, or a job with one bad chunk
-// waits for a collect step that can never start.
-func TestAFailedChunkStillCompletesTheJob(t *testing.T) {
+// The join does not run until every piece is done.
+//
+// It is queued with the pieces, so it is a row a worker can see from the start
+// — and the claim has to be what keeps it back, or a worker joins a set of
+// files that is still being written.
+func TestTheJoinWaitsForItsPieces(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newSplitJob(t, q, 2)
 
-	if last, err := q.ChunkFinished(ctx, id, false); err != nil || last {
-		t.Fatalf("first of two: last=%v err=%v", last, err)
-	}
-	last, err := q.ChunkFinished(ctx, id, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !last {
-		t.Fatal("the job never completed; collect would never run")
-	}
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	pieces := addPieces(t, q, jobID, 2)
 
-	b, _, err := q.GetJob(ctx, id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b.Failed != 1 || b.Done != 1 {
-		t.Errorf("done=%d failed=%d, want 1 and 1", b.Done, b.Failed)
-	}
-	// Recorded separately so collect can refuse: a joined file missing a chunk
-	// is a VCF with a hole in it, and nothing downstream would notice.
-	if !b.Complete() {
-		t.Error("Complete() is false with every chunk reported")
-	}
-}
-
-// A chunk that finishes before the split has counted them does not complete
-// the job. The split cannot have produced the last chunk if it has not
-// finished.
-func TestAChunkFinishingBeforeTheCountDoesNotComplete(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	id := newSplitJob(t, q, 0)
-
-	last, err := q.ChunkFinished(ctx, id, true)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if last {
-		t.Error("a job with no chunk count reported completion")
-	}
-}
-
-// Pieces come back in split order, because joining them any other way produces
-// a VCF whose records go backwards.
-func TestChunksAreListedInSplitOrder(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	id := newSplitJob(t, q, 3)
-
-	// Enqueued out of order on purpose.
-	for _, i := range []int{2, 0, 1} {
-		idx := i
-		if _, err := q.Enqueue(ctx, NewChunk{
-			Kind: KindVCF, Snapshot: "s", UserID: "u",
-			InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-			JobID:    id, ChunkIndex: &idx,
-		}); err != nil {
+	// Two pieces claimable, and nothing else, however many times we ask.
+	claimed := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		c, _, ok, err := q.claimNext(ctx)
+		if err != nil {
 			t.Fatal(err)
 		}
+		if !ok {
+			break
+		}
+		if c.Kind == KindCollect {
+			t.Fatal("the join was claimed with pieces still unfinished")
+		}
+		claimed[c.ID] = true
+	}
+	if len(claimed) != 2 {
+		t.Fatalf("claimed %d chunks, want the two pieces", len(claimed))
 	}
 
-	chunks, err := q.SplitChunks(ctx, id)
-	if err != nil {
+	// One piece done is not enough.
+	finishByID(t, q, pieces[0], StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
+	if c, _, ok, err := q.claimNext(ctx); err != nil {
 		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("claimed %s (%s) with a piece still running", c.ID, c.Kind)
 	}
-	if len(chunks) != 3 {
-		t.Fatalf("got %d chunks, want 3", len(chunks))
+
+	// Both done, and now it is.
+	finishByID(t, q, pieces[1], StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
+	c, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("the join never became claimable: ok=%v err=%v", ok, err)
 	}
-	for i, c := range chunks {
-		if c.ChunkIndex == nil || *c.ChunkIndex != i {
-			t.Fatalf("position %d holds chunk %v; the join would reorder the file", i, c.ChunkIndex)
-		}
+	if c.Kind != KindCollect {
+		t.Fatalf("claimed a %s, want the join", c.Kind)
 	}
 }
 
-// Listing a job's chunks shows the split and the collect too, not only the
-// pieces.
+// Only one worker ever gets the join.
 //
-// A split job that failed says so at the job; which of its chunks failed, and
-// whether it was the split, a piece or the join, is only visible here. Hiding
-// the brackets would leave a caller able to see that something went wrong and
-// nothing about where.
-func TestListingAJobsChunksIncludesTheSplitAndCollect(t *testing.T) {
+// It is queued once and claimed like anything else, so exactly-once comes from
+// the claim rather than from a counter deciding who is allowed to queue it.
+// Asking twice must find nothing the second time.
+func TestTheJoinIsClaimedOnce(t *testing.T) {
 	q := testQueue(t)
 	ctx := context.Background()
-	id := newSplitJob(t, q, 1)
 
-	idx := 0
-	if _, err := q.Enqueue(ctx, NewChunk{
-		Kind: KindVCF, Snapshot: "s", UserID: "u",
-		InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-		JobID:    id, ChunkIndex: &idx,
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := q.Enqueue(ctx, NewChunk{
-		Kind: KindCollect, Snapshot: "s", UserID: "u",
-		JobID: id, CompletesJob: true,
-	}); err != nil {
-		t.Fatal(err)
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	for _, id := range addPieces(t, q, jobID, 2) {
+		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
 	}
 
-	all, err := q.JobChunks(ctx, id)
+	first, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok || first.Kind != KindCollect {
+		t.Fatalf("first claim: %s ok=%v err=%v", first.Kind, ok, err)
+	}
+	if c, _, ok, err := q.claimNext(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("a second worker also claimed %s (%s); the join would run twice",
+			c.ID, c.Kind)
+	}
+}
+
+// The answer is reachable from the job, whichever chunk produced it, and the
+// count is the pieces' rather than the join's.
+func TestTheJoinedAnswerIsReachableFromTheJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	for _, id := range addPieces(t, q, jobID, 2) {
+		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 5})
+	}
+	collect, _, ok, err := q.claimNext(ctx)
+	if err != nil || !ok {
+		t.Fatalf("claim the join: ok=%v err=%v", ok, err)
+	}
+
+	const joined = "s3://varhub-dev/jobs/x/result.vcf.gz"
+	finishByID(t, q, collect.ID, StatusDone, "", Outcome{
+		Result: []byte("[]"), VCFURI: joined,
+	})
+
+	got, found, err := q.ResultVCF(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("the job has no answer; the file is unreachable")
+	}
+	if got != joined {
+		t.Errorf("ResultVCF = %q, want %q", got, joined)
+	}
+
+	j := statusOfJob(t, q, jobID)
+	if j.Status != StatusDone {
+		t.Errorf("the job is %q after its join finished, want done", j.Status)
+	}
+	// The join annotated nothing; the pieces did.
+	if j.NVariants != 10 {
+		t.Errorf("n_variants = %d, want the 10 its pieces annotated", j.NVariants)
+	}
+}
+
+// A piece that fails fails the job, and the first failure is the one reported.
+//
+// There is no answer to assemble once a piece is missing — the join refuses to
+// produce a file with a gap — so a job left running is a caller waiting for a
+// result nobody will produce.
+func TestAFailedPieceFailsTheJob(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	pieces := addPieces(t, q, jobID, 2)
+	finishByID(t, q, pieces[0], StatusError, "reference FASTA missing", Outcome{})
+	finishByID(t, q, pieces[1], StatusError, "a later, different failure", Outcome{})
+
+	j := statusOfJob(t, q, jobID)
+	if j.Status != StatusError {
+		t.Fatalf("the job is %q after a piece failed, want error", j.Status)
+	}
+	if j.Error != "reference FASTA missing" {
+		t.Errorf("the job reports %q; the first failure is the one that explains it", j.Error)
+	}
+	if j.FinishedAt == 0 {
+		t.Error("a failed job has no finish time")
+	}
+	// And the join never runs: it waits for every piece to be *done*, and two
+	// of them never will be.
+	if c, _, ok, err := q.claimNext(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("claimed %s (%s) for a job that cannot be joined", c.ID, c.Kind)
+	}
+}
+
+// Cancelling a job stops every chunk of it, and says so at once.
+//
+// A caller who cancels and then polls must not be told the work is still
+// running: a running chunk is only signalled, and its worker records the
+// outcome whenever it gets the message.
+func TestCancellingAJobSettlesItAndItsChunks(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	addPieces(t, q, jobID, 2)
+
+	j, err := q.CancelJob(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Status != StatusCancelled {
+		t.Errorf("the job is %q after a cancel", j.Status)
+	}
+
+	chunks, err := q.JobChunks(ctx, jobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range chunks {
+		if c.Status == StatusQueued {
+			t.Errorf("chunk %s (%s) is still queued; it would be claimed", c.ID, c.Kind)
+		}
+	}
+	if c, _, ok, err := q.claimNext(ctx); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("claimed %s (%s) from a cancelled job", c.ID, c.Kind)
+	}
+}
+
+// A chunk reporting in after a cancel does not undo it.
+//
+// The worker holding a running chunk learns about the cancel over NOTIFY and
+// records whatever it saw; that write must not move a job the caller already
+// stopped back to done.
+func TestAChunkFinishingAfterACancelDoesNotUndoIt(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	jobID, chunkID := submitJob(t, q, NewJob{
+		Kind: KindLocus, Snapshot: "s", UserID: "u", Body: []byte("chr1:1:A:T"),
+	})
+	if _, err := q.CancelJob(ctx, jobID); err != nil {
+		t.Fatal(err)
+	}
+	finishByID(t, q, chunkID, StatusDone, "", Outcome{Result: []byte("[]"), N: 3})
+
+	if got := statusOfJob(t, q, jobID).Status; got != StatusCancelled {
+		t.Errorf("the job is %q; a cancel was undone by the run it stopped", got)
+	}
+}
+
+// Listing a job's chunks shows the split and the join too, not only the pieces.
+//
+// A split job that failed says so at the job; which of its chunks failed, and
+// whether it was the split, a piece or the join, is only visible here.
+func TestListingAJobsChunksIncludesTheSplitAndJoin(t *testing.T) {
+	q := testQueue(t)
+	ctx := context.Background()
+
+	jobID, splitID := splitJob(t, q)
+	finishByID(t, q, splitID, StatusDone, "", Outcome{})
+	addPieces(t, q, jobID, 1)
+
+	all, err := q.JobChunks(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(all) != 3 {
-		t.Fatalf("the job lists %d chunks, want the split, its piece and the collect", len(all))
+		t.Fatalf("the job lists %d chunks, want the split, its piece and the join", len(all))
 	}
 	kinds := map[string]bool{}
 	for _, c := range all {
@@ -266,7 +407,7 @@ func TestListingAJobsChunksIncludesTheSplitAndCollect(t *testing.T) {
 			t.Errorf("no %s chunk in the listing", want)
 		}
 	}
-	pieces, err := q.SplitChunks(ctx, id)
+	pieces, err := q.SplitChunks(ctx, jobID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,21 +446,12 @@ func TestAChunkIsNotFoundUnderAnotherJob(t *testing.T) {
 // confusing the two would produce a joined file with no header at all.
 func TestChunkZeroIsDistinctFromNotAChunk(t *testing.T) {
 	q := testQueue(t)
-	ctx := context.Background()
-	id := newSplitJob(t, q, 1)
 
-	zero := 0
-	chunkID, err := q.Enqueue(ctx, NewChunk{
-		Kind: KindVCF, Snapshot: "s", UserID: "u",
-		InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-		JobID:    id, ChunkIndex: &zero,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	jobID, _ := splitJob(t, q)
+	pieces := addPieces(t, q, jobID, 1)
 	plainID := enqueueOne(t, q, "u")
 
-	chunk := getChunk(t, q, chunkID)
+	chunk := getChunk(t, q, pieces[0])
 	if chunk.ChunkIndex == nil {
 		t.Fatal("chunk 0 came back as not-a-chunk")
 	}
@@ -328,189 +460,5 @@ func TestChunkZeroIsDistinctFromNotAChunk(t *testing.T) {
 	}
 	if plain := getChunk(t, q, plainID); plain.ChunkIndex != nil {
 		t.Errorf("an ordinary chunk has chunk index %d", *plain.ChunkIndex)
-	}
-}
-
-// The answer is reachable from the job, whichever chunk produced it.
-//
-// A caller holding a job id has never heard of the collect chunk that built the
-// file. Filing the answer anywhere they cannot reach means a job that finishes
-// with its result in storage and no id that gets to it — a download returning
-// nothing for a job reporting done.
-func TestTheJoinedAnswerIsReachableFromTheJob(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	jobID := newSplitJob(t, q, 1)
-
-	collectID, err := q.Enqueue(ctx, NewChunk{
-		Kind: KindCollect, Snapshot: "s", UserID: "u",
-		JobID: jobID, CompletesJob: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	const joined = "s3://varhub-dev/jobs/x/result.vcf.gz"
-	finishByID(t, q, collectID, StatusDone, "", Outcome{
-		Result: []byte("[]"), VCFURI: joined,
-	})
-
-	got, found, err := q.ResultVCF(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !found {
-		t.Fatal("the job has no answer; the file is unreachable")
-	}
-	if got != joined {
-		t.Errorf("ResultVCF = %q, want %q", got, joined)
-	}
-
-	j, _, err := q.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j.Status != StatusDone {
-		t.Errorf("the job is %q after its collect finished, want done", j.Status)
-	}
-}
-
-// A piece finishing does not finish the job.
-//
-// The window this closes: between the last piece reporting done and the collect
-// being queued, every chunk that exists is terminal. A job whose status was
-// aggregated over its chunks would read as done there, and a caller polling
-// would fetch a result that has not been assembled.
-func TestAPieceFinishingLeavesTheJobRunning(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	jobID := newSplitJob(t, q, 1)
-
-	idx := 0
-	pieceID, err := q.Enqueue(ctx, NewChunk{
-		Kind: KindVCF, Snapshot: "s", UserID: "u",
-		InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-		JobID:    jobID, ChunkIndex: &idx,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	finishByID(t, q, pieceID, StatusDone, "", Outcome{Result: []byte("[]"), N: 7})
-
-	j, _, err := q.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j.Terminal() {
-		t.Errorf("the job is %q with its collect still to come", j.Status)
-	}
-}
-
-// A piece that fails fails the job, and the first failure is the one reported.
-//
-// There is no answer to assemble once a piece is missing — collect refuses to
-// join a file with a gap — so a job left running is a caller waiting for a
-// result nobody will produce.
-func TestAFailedPieceFailsTheJob(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	jobID := newSplitJob(t, q, 2)
-
-	for i, outcome := range []struct {
-		status, msg string
-	}{{StatusError, "reference FASTA missing"}, {StatusError, "a later, different failure"}} {
-		idx := i
-		id, err := q.Enqueue(ctx, NewChunk{
-			Kind: KindVCF, Snapshot: "s", UserID: "u",
-			InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-			JobID:    jobID, ChunkIndex: &idx,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		finishByID(t, q, id, outcome.status, outcome.msg, Outcome{})
-	}
-
-	j, _, err := q.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j.Status != StatusError {
-		t.Fatalf("the job is %q after a piece failed, want error", j.Status)
-	}
-	if j.Error != "reference FASTA missing" {
-		t.Errorf("the job reports %q; the first failure is the one that explains it", j.Error)
-	}
-	if j.FinishedAt == 0 {
-		t.Error("a failed job has no finish time")
-	}
-}
-
-// Cancelling a job stops every chunk of it, and says so at once.
-//
-// A caller who cancels and then polls must not be told the work is still
-// running: a running chunk is only signalled, and its worker records the
-// outcome whenever it gets the message.
-func TestCancellingAJobSettlesItAndItsChunks(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-	jobID := newSplitJob(t, q, 2)
-
-	for i := 0; i < 2; i++ {
-		idx := i
-		if _, err := q.Enqueue(ctx, NewChunk{
-			Kind: KindVCF, Snapshot: "s", UserID: "u",
-			InputURI: "s3://b/jobs/x/chunk.vcf.gz",
-			JobID:    jobID, ChunkIndex: &idx,
-		}); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	j, err := q.CancelJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j.Status != StatusCancelled {
-		t.Errorf("the job is %q after a cancel", j.Status)
-	}
-
-	chunks, err := q.JobChunks(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, c := range chunks {
-		if c.Status != StatusCancelled {
-			t.Errorf("chunk %s (%s) is %q; a queued chunk of a cancelled job "+
-				"would still be claimed", c.ID, c.Kind, c.Status)
-		}
-	}
-}
-
-// A chunk reporting in after a cancel does not undo it.
-//
-// The worker holding a running chunk learns about the cancel over NOTIFY and
-// records whatever it saw; that write must not move a job the caller already
-// stopped back to done.
-func TestAChunkFinishingAfterACancelDoesNotUndoIt(t *testing.T) {
-	q := testQueue(t)
-	ctx := context.Background()
-
-	jobID := submitOne(t, q, "u")
-	chunks, err := q.JobChunks(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := q.CancelJob(ctx, jobID); err != nil {
-		t.Fatal(err)
-	}
-	finishByID(t, q, chunks[0].ID, StatusDone, "", Outcome{Result: []byte("[]"), N: 3})
-
-	j, _, err := q.GetJob(ctx, jobID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if j.Status != StatusCancelled {
-		t.Errorf("the job is %q; a cancel was undone by the run it stopped", j.Status)
 	}
 }

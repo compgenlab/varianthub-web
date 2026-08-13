@@ -839,7 +839,15 @@ func (s *Server) handleGetJob(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, jobStatus(job))
+	// The chunks come back with it. See JobResponse: which piece of a split
+	// submission failed is part of the job's status, not a separate thing to go
+	// and ask about.
+	chunks, err := s.queue.JobChunks(r.Context(), job.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, jobDetail(job, chunks))
 }
 
 // handleCancelJob stops a job.
@@ -920,30 +928,12 @@ func (s *Server) handleJobLog(w http.ResponseWriter, r *http.Request) {
 
 // --- chunks ---
 
-// handleJobChunks lists the chunks of one job.
+// jobChunk loads one chunk of a job the caller may read.
 //
 // Underneath the job, never beside it: a chunk id means nothing on its own, and
 // a route that took one directly would need its own entitlement check over a
-// row that carries no owner of its own. Reaching it through the job means the
-// job's rule is the only rule.
-func (s *Server) handleJobChunks(w http.ResponseWriter, r *http.Request) {
-	job, ok := s.job(w, r)
-	if !ok {
-		return
-	}
-	chunks, err := s.queue.JobChunks(r.Context(), job.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	out := make([]ChunkResponse, 0, len(chunks))
-	for _, c := range chunks {
-		out = append(out, chunkStatus(c))
-	}
-	writeJSON(w, http.StatusOK, ChunksResponse{JobID: job.ID, Chunks: out})
-}
-
-// jobChunk loads one chunk of a job the caller may read.
+// row that carries no owner. Reaching it through the job means the job's rule
+// is the only rule.
 func (s *Server) jobChunk(w http.ResponseWriter, r *http.Request) (queue.Chunk, bool) {
 	job, ok := s.job(w, r)
 	if !ok {
@@ -964,20 +954,13 @@ func (s *Server) jobChunk(w http.ResponseWriter, r *http.Request) (queue.Chunk, 
 	return c, true
 }
 
-func (s *Server) handleJobChunk(w http.ResponseWriter, r *http.Request) {
-	c, ok := s.jobChunk(w, r)
-	if !ok {
-		return
-	}
-	writeJSON(w, http.StatusOK, chunkStatus(c))
-}
-
 // handleChunkLog serves what one chunk printed.
 //
-// The job's own log is the first chunk's — the run a caller submitted, or the
-// split that cut it up. This is how the other twenty-five are read, one at a
-// time, which is what a job log that concatenated them would make impossible to
-// avoid.
+// The only thing a chunk has that GET /jobs/{id} does not already return, which
+// is why it is the only route under a chunk id. The job's own log is its first
+// chunk's — the run a caller submitted, or the split that cut it up — and this
+// is how the other twenty-five are read, one at a time, which a job log that
+// concatenated them would make impossible to avoid.
 func (s *Server) handleChunkLog(w http.ResponseWriter, r *http.Request) {
 	c, ok := s.jobChunk(w, r)
 	if !ok {

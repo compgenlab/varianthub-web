@@ -218,16 +218,13 @@ func TestQueueListAndGC(t *testing.T) {
 		`INSERT INTO chunk_result (chunk_id,json) VALUES ($1,'[]')`, oldChunk); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := q.pool.Exec(ctx,
-		`UPDATE job SET result_chunk_id=$1 WHERE id=$2`, oldChunk, oldID); err != nil {
-		t.Fatal(err)
-	}
 	for _, tc := range []struct {
 		id  string
 		fin int64
 	}{{oldID, 10}, {newID, 100}} {
+		// The chunk finishes; the job's finish time is read from it.
 		if _, err := q.pool.Exec(ctx,
-			`UPDATE job SET status=$1, finished_at=$2 WHERE id=$3`, StatusDone, tc.fin, tc.id); err != nil {
+			`UPDATE chunk SET status=$1, finished_at=$2 WHERE job_id=$3`, StatusDone, tc.fin, tc.id); err != nil {
 			t.Fatal(err)
 		}
 	}

@@ -7,10 +7,19 @@ import { api, type Job } from "../api";
 const STATUS: Record<Job["status"], { label: string; color: string }> = {
   done: { label: "Complete", color: "var(--benign-dot)" },
   running: { label: "Running", color: "var(--vus-dot)" },
+  // A submission part-way through its chunks. The count beside it says how far,
+  // which is the whole reason these are separate states.
+  partial_running: { label: "Running", color: "var(--vus-dot)" },
+  partial_queued: { label: "Waiting", color: "var(--text-4)" },
   queued: { label: "Queued", color: "var(--text-4)" },
   error: { label: "Failed", color: "var(--path-dot)" },
   cancelled: { label: "Cancelled", color: "var(--text-3)" },
 };
+
+/** Whether a job is still going. Four of the seven statuses are. */
+function inFlight(s: Job["status"]): boolean {
+  return s !== "done" && s !== "error" && s !== "cancelled";
+}
 
 function when(sec: number) {
   if (!sec) return "";
@@ -126,10 +135,17 @@ export default function JobsList({
               <span className="num">{j.n_variants || "—"}</span>
               <span className="row gap-8">
                 <i
-                  className={`status-dot ${j.status === "running" ? "blink" : ""}`}
+                  className={`status-dot ${inFlight(j.status) ? "blink" : ""}`}
                   style={{ background: st.color }}
                 />
-                <span style={{ fontSize: 12.5, color: st.color }}>{st.label}</span>
+                <span style={{ fontSize: 12.5, color: st.color }}>
+                  {st.label}
+                  {/* Only where it says something a label cannot: a job of one
+                      chunk is fully described by its status. */}
+                  {j.chunks_total > 1 && inFlight(j.status)
+                    ? ` ${j.chunks_done}/${j.chunks_total}`
+                    : ""}
+                </span>
               </span>
               <ChevronRight size={15} color="var(--text-3)" />
             </button>

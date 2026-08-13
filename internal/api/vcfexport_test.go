@@ -22,20 +22,20 @@ func seedJob(t *testing.T, h *harness, id, kind, columns string, rows [][4]any, 
 	defer pool.Close()
 
 	// A job and the one chunk that produced its answer, which is the shape
-	// every read goes through: results belong to chunks, and the job names the
-	// chunk holding its input and the chunk holding its result.
+	// every read goes through: the job carries what was submitted, the chunk
+	// carries how it went, and the status comes back through the job_state
+	// view. Writing "done" on the job would write nothing — there is no column
+	// for it, deliberately.
 	chunk := chunkOf(id)
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,
-		                 finished_at,columns,input_chunk_id,result_chunk_id,chunks,done)
-		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3,$4,$4,1,1)`,
-		id, kind, columns, chunk); err != nil {
+		INSERT INTO job (id,kind,snapshot,selection,client_ip,created_at,input_chunk_id)
+		VALUES ($1,$2,'s','','1.1.1.1',1,$3)`, id, kind, chunk); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,
-		                   finished_at,columns,job_id,chunk_index,completes_job)
-		VALUES ($1,$2,'s','','done','1.1.1.1',1,2,$3,$4,0,TRUE)`,
+		                   started_at,finished_at,columns,job_id,chunk_index,completes_job)
+		VALUES ($1,$2,'s','','done','1.1.1.1',1,1,2,$3,$4,0,TRUE)`,
 		chunk, kind, columns, id); err != nil {
 		t.Fatal(err)
 	}

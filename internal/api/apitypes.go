@@ -134,12 +134,30 @@ type JobStatusResponse struct {
 	// How the submission was cut up. One chunk of one for anything that was
 	// not split, which is what makes these safe to read without asking first.
 	//
-	// Chunks is 0 while a split is still running: not "nothing to do" but "not
+	// Total is 0 while a split is still running: not "nothing to do" but "not
 	// counted yet", and a caller shown 0/0 would reasonably read it as
 	// finished. Status is the field to believe.
-	Chunks int `json:"chunks" doc:"How many chunks the submission became. 0 while a split is still deciding."`
+	Total  int `json:"chunks_total" doc:"How many chunks the submission became. 0 while a split is still deciding how many there will be."`
 	Done   int `json:"chunks_done" doc:"How many have finished successfully."`
 	Failed int `json:"chunks_failed" doc:"How many have failed."`
+}
+
+// JobResponse is GET /jobs/{id}: the status, plus the chunks behind it.
+//
+// The chunks are here rather than at an endpoint of their own. They are part of
+// what a job is, not a separate resource to go and fetch: a caller watching a
+// split submission wants the progress and the piece that failed in the same
+// answer, and a second round trip to learn which of twenty-six went wrong is a
+// round trip for something the first call already knew.
+//
+// Always populated — every job has at least one chunk — so there is no shape
+// where a client has to check before reading it. The list at GET /jobs returns
+// the status alone: a page of a hundred jobs carrying every chunk of each is
+// the one case where separating them is right, and there the counts are what a
+// table shows anyway.
+type JobResponse struct {
+	JobStatusResponse
+	Chunks []ChunkResponse `json:"chunks" doc:"Every chunk of the job, oldest first, with the pieces in split order. A submission that was not split has one."`
 }
 
 // jobStatus projects a queue row onto the published shape.
@@ -148,8 +166,18 @@ func jobStatus(j queue.Job) JobStatusResponse {
 		JobID: j.ID, Kind: j.Kind, Snapshot: j.Snapshot, Selection: j.Selection,
 		Status: j.Status, NVariants: j.NVariants, CreatedAt: j.CreatedAt,
 		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Label: j.Label,
-		Error: j.Error, Chunks: j.Chunks, Done: j.Done, Failed: j.Failed,
+		Error: j.Error, Total: j.Chunks, Done: j.Done, Failed: j.Failed,
 	}
+}
+
+// jobDetail is jobStatus plus the job's chunks.
+func jobDetail(j queue.Job, chunks []queue.Chunk) JobResponse {
+	out := JobResponse{JobStatusResponse: jobStatus(j),
+		Chunks: make([]ChunkResponse, 0, len(chunks))}
+	for _, c := range chunks {
+		out.Chunks = append(out.Chunks, chunkStatus(c))
+	}
+	return out
 }
 
 // ChunkResponse is one chunk of a job: a piece of work a worker claimed.
@@ -173,12 +201,6 @@ type ChunkResponse struct {
 	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
 	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
-}
-
-// ChunksResponse is GET /jobs/{id}/chunks.
-type ChunksResponse struct {
-	JobID  string          `json:"job_id" doc:"The submission these chunks belong to."`
-	Chunks []ChunkResponse `json:"chunks" doc:"Every chunk of the job, oldest first, with the pieces in split order."`
 }
 
 // chunkStatus projects a queue row onto the published shape.

@@ -97,13 +97,13 @@ type Column struct {
 // Columns returns a job's stored column model. Nil when the job predates the
 // column model or produced no rows.
 //
-// Read from the job, which takes them from whichever chunk completed it. Every
-// chunk of a split job describes the same columns — they annotated one file
-// against one snapshot — so there is nothing to reconcile, only somewhere to
-// put the one answer.
+// Read through the job, which takes them from whichever of its chunks has
+// them. Every chunk of a split job describes the same columns — they annotated
+// one file against one snapshot — so any will do and there is nothing to
+// reconcile.
 func (q *Queue) Columns(ctx context.Context, jobID string) ([]Column, error) {
 	var raw []byte
-	err := q.pool.QueryRow(ctx, `SELECT columns FROM job WHERE id=$1`, jobID).Scan(&raw)
+	err := q.pool.QueryRow(ctx, `SELECT columns FROM job_state WHERE id=$1`, jobID).Scan(&raw)
 	if errors.Is(err, pgx.ErrNoRows) || len(raw) == 0 {
 		return nil, nil
 	}

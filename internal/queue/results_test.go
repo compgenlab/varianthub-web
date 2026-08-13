@@ -13,17 +13,18 @@ func seedResults(t *testing.T, q *Queue, jobID string, body, columns string) {
 	t.Helper()
 	ctx := context.Background()
 	chunkID := jobID + "-c0"
+	// The job carries what was submitted; how it went is the chunk's, and is
+	// read back through the job_state view.
 	if _, err := q.pool.Exec(ctx, `
-		INSERT INTO job (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,columns)
-		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2)`, jobID, columns); err != nil {
+		INSERT INTO job (id,kind,snapshot,selection,client_ip,created_at,input_chunk_id)
+		VALUES ($1,'locus','s','','1.1.1.1',1,$2)`, jobID, chunkID); err != nil {
 		t.Fatal(err)
 	}
-	zero := 0
 	if _, err := q.pool.Exec(ctx, `
 		INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,created_at,finished_at,
 		                   columns,job_id,chunk_index,completes_job)
-		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2,$3,$4,TRUE)`,
-		chunkID, columns, jobID, zero); err != nil {
+		VALUES ($1,'locus','s','','done','1.1.1.1',1,2,$2,$3,0,TRUE)`,
+		chunkID, columns, jobID); err != nil {
 		t.Fatal(err)
 	}
 	tx, err := q.pool.Begin(ctx)

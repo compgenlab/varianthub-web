@@ -398,23 +398,43 @@ export interface SourceFile {
   modified_at: number;
 }
 
+/** A job's status: the chunk's five, plus two for a submission made of parts.
+ *
+ *  "partial" is a property of a thing made of parts, so a chunk never has one.
+ *  Nine of twenty-six pieces annotated is neither running nor queued in any
+ *  useful sense — partial_running means something finished and something is
+ *  running, partial_queued that something finished and nothing is running yet. */
+export type JobStatus =
+  | "queued"
+  | "running"
+  | "partial_running"
+  | "partial_queued"
+  | "done"
+  | "error"
+  | "cancelled";
+
 export interface Job {
   job_id: string;
   kind: string;
   snapshot: string;
   selection?: string;
-  status: "queued" | "running" | "done" | "error" | "cancelled";
+  status: JobStatus;
   error?: string;
   n_variants: number;
   label?: string;
   created_at: number;
   started_at?: number;
   finished_at?: number;
-  /** How many chunks the submission became. A job that was not split has one.
-   *  0 means a split is still deciding — not "nothing to do". Believe status. */
-  chunks: number;
+  /** How many chunks the job has, and how many have finished each way. A
+   *  submission that was not split has one; a split's pieces appear as they
+   *  are queued. */
+  chunks_total: number;
   chunks_done: number;
   chunks_failed: number;
+  /** Every chunk of the job. Present on a single-job read, absent from the
+   *  listing — a page of a hundred jobs carrying every chunk of each grows
+   *  with the wrong thing. */
+  chunks?: Chunk[];
   results?: Variant[];
 }
 
@@ -1058,20 +1078,10 @@ export const api = {
       `/jobs/${encodeURIComponent(id)}/log`,
     ),
 
-  /** The chunks a job was cut into, oldest first, pieces in split order. */
-  jobChunks: (id: string) =>
-    req<{ job_id: string; chunks: Chunk[] }>(
-      `/jobs/${encodeURIComponent(id)}/chunks`,
-    ),
-
-  jobChunk: (id: string, chunkId: string) =>
-    req<Chunk>(
-      `/jobs/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}`,
-    ),
-
-  /** One chunk's own output. The job's log is its first chunk's — the run a
-   *  caller submitted, or the split that cut it up — so this is how the rest
-   *  are read. */
+  /** One chunk's own output. A job comes back with its chunks, so this is the
+   *  only thing a chunk has that reading the job does not already tell you.
+   *  The job's log is its first chunk's — the run a caller submitted, or the
+   *  split that cut it up — so this is how the rest are read. */
   chunkLog: (id: string, chunkId: string) =>
     req<{ job_id: string; chunk_id: string; output: string; recorded: boolean }>(
       `/jobs/${encodeURIComponent(id)}/chunks/${encodeURIComponent(chunkId)}/log`,

@@ -83,7 +83,13 @@ export default function Running() {
               className="between mono"
               style={{ fontSize: 11, color: "var(--text-2)", marginTop: 8 }}
             >
-              <span>{job?.status === "running" ? "Annotating…" : "Queued…"}</span>
+              <span>
+                {job && job.chunks_total > 1
+                  ? `Annotating… ${job.chunks_done}/${job.chunks_total}`
+                  : job?.status === "running"
+                    ? "Annotating…"
+                    : "Queued…"}
+              </span>
               <span>—</span>
             </div>
           </>

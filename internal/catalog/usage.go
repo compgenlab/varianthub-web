@@ -120,7 +120,7 @@ func (s *Store) windowUsage(ctx context.Context, since int64) (WindowUsage, erro
 	var w WindowUsage
 	rows, err := s.pool.Query(ctx, `
 		SELECT COALESCE(origin,''), count(*), COALESCE(sum(n_variants),0)
-		  FROM job
+		  FROM job_state
 		 WHERE created_at >= $1 AND kind IN ('locus','vcf')
 		 GROUP BY COALESCE(origin,'')`, since)
 	if err != nil {
@@ -148,7 +148,7 @@ func (s *Store) windowUsage(ctx context.Context, since int64) (WindowUsage, erro
 		SELECT count(DISTINCT user_id) FILTER (WHERE COALESCE(user_id,'') <> ''),
 		       count(DISTINCT session_id) FILTER (WHERE COALESCE(user_id,'') = ''
 		                                            AND COALESCE(session_id,'') <> '')
-		  FROM job
+		  FROM job_state
 		 WHERE created_at >= $1 AND kind IN ('locus','vcf')`,
 		since).Scan(&w.Accounts, &w.Anonymous); err != nil {
 		return WindowUsage{}, fmt.Errorf("usage: submitters: %w", err)
@@ -166,7 +166,7 @@ func (s *Store) userUsage(ctx context.Context, since int64) ([]UserUsage, error)
 		SELECT u.id, u.email, u.tier, COALESCE(j.origin,''),
 		       count(j.id), COALESCE(sum(j.n_variants),0), COALESCE(max(j.created_at),0)
 		  FROM app_user u
-		  LEFT JOIN job j
+		  LEFT JOIN job_state j
 		    ON j.user_id = u.id AND j.created_at >= $1 AND j.kind IN ('locus','vcf')
 		 GROUP BY u.id, u.email, u.tier, COALESCE(j.origin,'')
 		 ORDER BY lower(u.email)`, since)

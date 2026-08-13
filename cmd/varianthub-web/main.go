@@ -543,12 +543,18 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 		// annotation succeeded. Without a stored VCF the export falls back to
 		// rendering from rows, which is the same answer more slowly and with
 		// less of the submitter's file in it.
-		if chunk.Kind == queue.KindVCF && chunk.JobID != "" && chunk.ChunkIndex != nil {
-			// A chunk's output is a piece of a larger file: gzipped, and
+		if chunk.ChunkIndex != nil {
+			// A piece's output is part of a larger file: gzipped, and
 			// headerless unless it is the first. Stored under the job's
-			// prefix, which is the split chunk's, so collect knows where to
-			// look without asking about each chunk chunk.
-			finishChunk(ctx, q, chunk, cfgJobStorage, inputPath, res, alw)
+			// prefix so the join can find every piece without asking about
+			// each one.
+			//
+			// Failing to store it fails the chunk, which is what makes the
+			// join refuse rather than produce a file missing a range of the
+			// genome — the one wrong answer here that looks like a right one.
+			if err := storePieceOutput(ctx, q, chunk, cfgJobStorage, inputPath, res, alw); err != nil {
+				return queue.Outcome{}, err
+			}
 			return out, nil
 		}
 		if chunk.Kind == queue.KindVCF && inputPath != "" {
@@ -1217,60 +1223,29 @@ func runCollectChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 	return queue.Outcome{VCFURI: uri}, nil
 }
 
-// finishChunk stores a chunk's annotated output and tells its job.
+// storePieceOutput stores one piece's annotated output under its job's prefix,
+// where the collect will look for it.
 //
-// Whoever finishes last queues the collect chunk, and exactly one caller is
-// told it was last — the count is bumped and read in one statement precisely
-// so two chunks finishing together cannot both start a collect.
-func finishChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk, jobStorage, inputPath string,
-	res runner.Result, alw *queue.LogWriter) {
+// It does not have to tell anyone. The join is already queued and waiting on
+// these — see fanout.RunSplit — so finishing here is the whole of this piece's
+// obligation, and a worker will pick the join up once the last of them is done.
+//
+// A failure to store is reported by failing the chunk. The alternative is a
+// joined file missing a range of the genome, which reads exactly like one where
+// those variants had nothing to say.
+func storePieceOutput(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
+	jobStorage, inputPath string, res runner.Result, alw *queue.LogWriter) error {
 
 	bg := context.WithoutCancel(ctx)
-	prefix := queue.JobPrefix(jobStorage, "")
-	if b, ok, err := q.GetJob(bg, chunk.JobID); err == nil && ok {
+	prefix := queue.JobPrefix(jobStorage, chunk.JobID)
+	if b, ok, err := q.GetJob(bg, chunk.JobID); err == nil && ok && b.Prefix != "" {
 		prefix = b.Prefix
 	}
-
-	ok := true
 	if _, err := storeChunkVCF(bg, prefix, chunk, inputPath, res, alw); err != nil {
-		// The chunk annotated but its output could not be stored, so the joined
-		// file would have a hole. Reported as a failed chunk, which is what
-		// makes collect refuse rather than produce a file missing a range.
-		log.Printf("worker: chunk %s: store chunk result: %v", chunk.ID, err)
 		alw.Note("··· could not store this chunk's output; the job cannot be joined")
-		ok = false
+		return fmt.Errorf("store chunk result: %w", err)
 	}
-
-	last, err := q.ChunkFinished(bg, chunk.JobID, ok)
-	if err != nil {
-		log.Printf("worker: chunk %s: report this chunk to its job: %v", chunk.ID, err)
-		return
-	}
-	if !last {
-		return
-	}
-	b, found, err := q.GetJob(bg, chunk.JobID)
-	if err != nil || !found {
-		log.Printf("worker: chunk %s: read the job after its last chunk: %v", chunk.ID, err)
-		return
-	}
-	if _, err := q.Enqueue(bg, queue.NewChunk{
-		Kind:     queue.KindCollect,
-		Snapshot: chunk.Snapshot,
-		ClientIP: chunk.ClientIP,
-		Session:  chunk.Session,
-		UserID:   chunk.UserID,
-		Label:    "joining " + fmt.Sprint(b.Chunks) + " chunk(s)",
-		Origin:   chunk.Origin,
-		JobID:    chunk.JobID,
-		// The chunk that produces the answer, so finishing it finishes the job.
-		CompletesJob: true,
-		Body:         []byte{},
-	}); err != nil {
-		log.Printf("worker: chunk %s: queue the collect step: %v", chunk.ID, err)
-		return
-	}
-	alw.Note("··· last chunk; the joining step is queued")
+	return nil
 }
 
 // chunkSizeFor resolves the split chunk size at the moment a split runs.

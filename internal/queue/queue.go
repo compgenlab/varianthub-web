@@ -82,16 +82,20 @@ const (
 	// because it moves the same volume of data a download does, and because
 	// only the worker can reach both ends.
 	KindMove = "move"
-	// KindSplit cuts a submitted VCF into chunks and queues one chunk for
-	// each.
+	// KindSplit cuts a submitted VCF into pieces, and queues a chunk for each
+	// piece plus the join that will put them back together.
 	//
 	// A chunk rather than work done in the request handler: cutting a
 	// chromosome means reading hundreds of megabytes and writing them back,
-	// which is a worker's business. It is also the chunk the submitter was
-	// given, so it is what they poll while the split is running.
+	// which is a worker's business. It is also the first chunk of the job, so
+	// it is what runs while a caller is polling and seeing nothing yet.
 	KindSplit = "split"
-	// KindCollect joins a job's annotated chunks into the final file. Queued
-	// by whichever chunk finishes last.
+	// KindCollect joins a job's annotated pieces into the final file.
+	//
+	// Queued by the split, at the same time as the pieces, and held back until
+	// they are done — see Chunk.AwaitsPieces. Queued by whichever piece
+	// finished last, the work a job still owed was an intention held by a
+	// worker rather than a row anything could see.
 	KindCollect = "collect"
 )
 
@@ -150,12 +154,20 @@ type Chunk struct {
 	JobID      string `json:"-"`
 	ChunkIndex *int   `json:"-"`
 
-	// CompletesJob says that finishing this chunk finishes its job.
+	// AwaitsPieces holds this chunk back until every piece of its job is done.
 	//
-	// True for the single chunk of an unsplit submission and for the collect
-	// that joins a split one; false for a split, and for each piece it
-	// produced. Recorded when the chunk is created rather than worked out at
-	// finish time, because the only code that knows is the code that queued it.
+	// The collect that joins a split submission, and nothing else. It is queued
+	// with the pieces rather than by whichever of them finishes last, so what a
+	// job still owes is visible as rows — see migration 0035, and the claim
+	// query's predicate.
+	AwaitsPieces bool `json:"-"`
+
+	// CompletesJob marks the chunk whose stored output is the job's answer:
+	// the only chunk of an unsplit submission, or the collect of a split one.
+	//
+	// Which chunk to serve, not when the job is done — that is every chunk
+	// being done. Recorded when the chunk is created because the only code that
+	// knows is the code that queued it.
 	CompletesJob bool `json:"-"`
 
 	// InputURI is where this chunk's input is stored, set only on the Chunk a
@@ -214,8 +226,9 @@ type NewChunk struct {
 	// and "not a chunk" has to be distinguishable from "the first chunk".
 	JobID      string
 	ChunkIndex *int
-	// CompletesJob says that finishing this chunk finishes its job. See
-	// Chunk.CompletesJob.
+	// AwaitsPieces and CompletesJob place this chunk in a fan-out. See the
+	// fields of the same name on Chunk.
+	AwaitsPieces bool
 	CompletesJob bool
 
 	// Body is the input itself, for submissions small enough to be worth
@@ -256,14 +269,16 @@ func weightOf(w int) int {
 const chunkCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` +
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
 	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(job_id,''), chunk_index, ` +
-	`completes_job, created_at, COALESCE(started_at,0), COALESCE(finished_at,0)`
+	`awaits_pieces, completes_job, created_at, COALESCE(started_at,0), ` +
+	`COALESCE(finished_at,0)`
 
 // chunkColsJ is chunkCols qualified with the "j" alias, for the claim query's
 // join.
 const chunkColsJ = `j.id, j.kind, j.snapshot, j.selection, j.status, COALESCE(j.error,''), ` +
 	`COALESCE(j.n_variants,0), j.client_ip, j.session_id, COALESCE(j.user_id,''), j.label, j.weight, ` +
 	`COALESCE(j.origin,''), COALESCE(j.max_variants,0), COALESCE(j.job_id,''), j.chunk_index, ` +
-	`j.completes_job, j.created_at, COALESCE(j.started_at,0), COALESCE(j.finished_at,0)`
+	`j.awaits_pieces, j.completes_job, j.created_at, COALESCE(j.started_at,0), ` +
+	`COALESCE(j.finished_at,0)`
 
 // ErrNotCancellable is returned when a chunk has already finished.
 var ErrNotCancellable = errors.New("chunk is not running")
@@ -569,25 +584,6 @@ func (q *Queue) ReclaimExpired(ctx context.Context) (int, error) {
 		MaxAttempts); err != nil {
 		return 0, fmt.Errorf("fail exhausted chunks: %w", err)
 	}
-	// And their jobs. finish() is what usually carries a chunk's outcome up to
-	// its job, and it never ran for these — the process that would have called
-	// it is gone. Without this a submission whose worker was killed three times
-	// sits at "running" for ever while the chunk under it has given up.
-	//
-	// Written as "any job with a failed chunk has failed" rather than as a list
-	// of the ids just failed, so it also reconciles anything an earlier crash
-	// left half-recorded. The direction is safe: a failed chunk means there is
-	// no answer to assemble, and the guard leaves an already-terminal job
-	// alone, so a cancel or an earlier failure keeps its own explanation.
-	if _, err := q.pool.Exec(ctx, `
-		UPDATE job j
-		   SET status=$1, error=c.error, finished_at=$2
-		  FROM chunk c
-		 WHERE c.job_id = j.id AND c.status = $1
-		   AND j.status NOT IN ($1,$3,$4)`,
-		StatusError, q.nowFn(), StatusDone, StatusCancelled); err != nil {
-		return 0, fmt.Errorf("fail the jobs of exhausted chunks: %w", err)
-	}
 	// Which chunks are about to be reclaimed, so each can be told in its own
 	// log that this happened. Without it an abandoned chunk carries no record
 	// of the abandonment: the worker died without writing anything, and
@@ -812,12 +808,12 @@ func insertChunk(ctx context.Context, tx pgx.Tx, now int64, j NewChunk) error {
 	if _, err := tx.Exec(ctx,
 		`INSERT INTO chunk (id,kind,snapshot,selection,status,client_ip,session_id,user_id,label,
 		                  weight,max_concurrent,origin,max_variants,job_id,chunk_index,
-		                  completes_job,created_at)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`,
+		                  awaits_pieces,completes_job,created_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)`,
 		j.ID, j.Kind, j.Snapshot, j.Selection, StatusQueued,
 		j.ClientIP, j.Session, j.UserID, j.Label, weightOf(j.Weight),
 		j.MaxConcurrent, j.Origin, j.MaxVariants,
-		j.JobID, j.ChunkIndex, j.CompletesJob, now); err != nil {
+		j.JobID, j.ChunkIndex, j.AwaitsPieces, j.CompletesJob, now); err != nil {
 		return err
 	}
 	// One of the two, never both — matching the CHECK rather than trusting it.
@@ -980,7 +976,7 @@ func (q *Queue) ResultVCF(ctx context.Context, jobID string) (string, bool, erro
 	var uri *string
 	err := q.pool.QueryRow(ctx, `
 		SELECT vcf_uri FROM chunk_result
-		 WHERE chunk_id = (SELECT result_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&uri)
+		 WHERE chunk_id = (SELECT result_chunk_id FROM job_state WHERE id=$1)`, jobID).Scan(&uri)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return "", false, nil
@@ -1040,7 +1036,7 @@ func (q *Queue) Result(ctx context.Context, jobID string) ([]byte, bool, error) 
 	var js string
 	err := q.pool.QueryRow(ctx, `
 		SELECT json FROM chunk_result
-		 WHERE chunk_id = (SELECT result_chunk_id FROM job WHERE id=$1)`, jobID).Scan(&js)
+		 WHERE chunk_id = (SELECT result_chunk_id FROM job_state WHERE id=$1)`, jobID).Scan(&js)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, false, nil
 	}
@@ -1056,8 +1052,8 @@ func scanChunk(row rowScanner) (Chunk, error) {
 	var j Chunk
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
-		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex, &j.CompletesJob,
-		&j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
+		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex, &j.AwaitsPieces,
+		&j.CompletesJob, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
 		return Chunk{}, err
 	}
 	return j, nil
@@ -1151,13 +1147,13 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 	if rows, err := q.pool.Query(ctx, `
 		SELECT i.uri FROM chunk_input i
 		  JOIN chunk c ON c.id = i.chunk_id
-		  JOIN job j ON j.id = c.job_id
+		  JOIN job_state j ON j.id = c.job_id
 		 WHERE i.uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1
 		UNION ALL
 		SELECT r.vcf_uri FROM chunk_result r
 		  JOIN chunk c ON c.id = r.chunk_id
-		  JOIN job j ON j.id = c.job_id
+		  JOIN job_state j ON j.id = c.job_id
 		 WHERE r.vcf_uri IS NOT NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
 		for rows.Next() {
@@ -1174,8 +1170,12 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		log.Printf("queue: could not list the objects of expiring jobs: %v", err)
 	}
 
-	tag, err := q.pool.Exec(ctx,
-		`DELETE FROM job WHERE finished_at IS NOT NULL AND finished_at < $1`, cutoff)
+	// Through the view: a job's finish time is its chunks' — see job_state — so
+	// there is no column here to compare against.
+	tag, err := q.pool.Exec(ctx, `
+		DELETE FROM job WHERE id IN (
+		  SELECT id FROM job_state
+		   WHERE finished_at IS NOT NULL AND finished_at < $1)`, cutoff)
 	if err != nil {
 		return 0, err
 	}
@@ -1362,6 +1362,15 @@ WHERE id = (
   WHERE j.status = $3
     AND COALESCE(r.c, 0) < (CASE WHEN j.max_concurrent > 0 THEN j.max_concurrent ELSE $4 END)
     AND (p.used = 0 OR p.used + j.weight <= $5)
+    -- A collect waits for the pieces it joins. It is queued with them rather
+    -- than by whichever finishes last, so the work a job still owes is visible
+    -- as rows; this is what keeps it out of a worker's hands until there is
+    -- something to join. Exactly one worker claims it for the same reason
+    -- exactly one worker claims anything, so no counter decides who starts it.
+    AND (NOT j.awaits_pieces OR NOT EXISTS (
+          SELECT 1 FROM chunk s
+           WHERE s.job_id = j.job_id AND s.chunk_index IS NOT NULL
+             AND s.status <> $8))
   ORDER BY COALESCE(r.c, 0) ASC,
            GREATEST(j.created_at, COALESCE(f.last_finished_at, 0)) ASC,
            j.created_at ASC, j.id ASC
@@ -1401,7 +1410,7 @@ func (q *Queue) claimNext(ctx context.Context) (Chunk, []byte, bool, error) {
 	}
 
 	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots,
-		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()))
+		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()), StatusDone)
 	chunk, err := scanChunk(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Chunk{}, nil, false, nil
@@ -1440,15 +1449,6 @@ func (q *Queue) claimNext(ctx context.Context) (Chunk, []byte, bool, error) {
 	}
 	if uri != nil {
 		chunk.InputURI = *uri
-	}
-	// The job starts when its first chunk does. Guarded on "still queued" so a
-	// later chunk cannot restart the clock, and so a job cancelled while its
-	// chunks were still being claimed does not come back to life.
-	if _, err := tx.Exec(ctx, `
-		UPDATE job SET status=$2, started_at=COALESCE(started_at,$3)
-		 WHERE id=$1 AND status=$4`,
-		chunk.JobID, StatusRunning, q.nowFn(), StatusQueued); err != nil {
-		return Chunk{}, nil, false, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Chunk{}, nil, false, err
@@ -1583,81 +1583,10 @@ func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, 
 		log.Printf("queue: charge caller for chunk %s: %v", id, err)
 		return
 	}
-	if err := rollUp(wctx, tx, chunk, status, errArg, colArg, out.N, q.nowFn()); err != nil {
-		log.Printf("queue: roll chunk %s up to job %s: %v", id, chunk.JobID, err)
-		return
-	}
 	if err := tx.Commit(wctx); err != nil {
 		log.Printf("queue: commit chunk %s: %v", id, err)
 		return
 	}
-}
-
-// rollUp carries a chunk's outcome up to its job, in the transaction that
-// recorded it.
-//
-// Two rules, and between them they cover every shape of submission:
-//
-//   - Anything other than success ends the job. A chunk that failed, or was
-//     cancelled, means there is no answer to assemble — a split that failed
-//     produced no pieces, and a piece that failed leaves a gap that collect
-//     refuses to join. Reporting the job as still running while a caller waits
-//     for a result nobody will produce is the worse of the two mistakes.
-//   - Success ends the job only if the chunk said it would. See
-//     Chunk.CompletesJob: the split does not, its pieces do not, the collect
-//     does — which is what keeps a job out of "done" in the window between its
-//     last piece finishing and the collect being queued.
-//
-// Both writes are guarded on the job not already being terminal, so the first
-// failure is the one recorded and a later chunk reporting in cannot overwrite
-// it — nor can a chunk finishing after a cancel undo the cancel.
-//
-// A completed job's variant count is the sum over its pieces, falling back to
-// the finishing chunk's own count for a job that was never split. SUM over no
-// rows is NULL, which is what makes one expression serve both.
-func rollUp(ctx context.Context, tx pgx.Tx, chunk Chunk, status string,
-	errArg, colArg any, n int, now int64) error {
-
-	if chunk.JobID == "" {
-		return nil
-	}
-	// A chunk that is not part of a fan-out is its job's only one, so its
-	// outcome is also the job's tally. The pieces of a split job are counted by
-	// ChunkFinished instead, and the split and collect that bracket them are
-	// not counted at all — they are how the job is done, not part of what it
-	// was asked to do.
-	sole := chunk.ChunkIndex == nil && chunk.Kind != KindSplit && chunk.Kind != KindCollect
-	if status != StatusDone {
-		failed := "failed"
-		if sole {
-			failed = "1"
-		}
-		_, err := tx.Exec(ctx, fmt.Sprintf(`
-			UPDATE job SET status=$2, error=$3, finished_at=$4, failed=%s
-			 WHERE id=$1 AND status NOT IN ($5,$6,$7)`, failed),
-			chunk.JobID, status, errArg, now,
-			StatusDone, StatusError, StatusCancelled)
-		return err
-	}
-	if !chunk.CompletesJob {
-		return nil
-	}
-	done := "done"
-	if sole {
-		done = "1"
-	}
-	_, err := tx.Exec(ctx, fmt.Sprintf(`
-		UPDATE job
-		   SET status=$2,
-		       n_variants = COALESCE(
-		           (SELECT SUM(n_variants) FROM chunk
-		             WHERE job_id=$1 AND chunk_index IS NOT NULL), $3),
-		       finished_at=$4, result_chunk_id=$5, columns=COALESCE($6, columns),
-		       done=%s
-		 WHERE id=$1 AND status NOT IN ($7,$8,$9)`, done),
-		chunk.JobID, StatusDone, n, now, chunk.ID, colArg,
-		StatusDone, StatusError, StatusCancelled)
-	return err
 }
 
 // nullable renders an empty string as SQL NULL.

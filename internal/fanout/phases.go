@@ -19,7 +19,7 @@ import (
 // part of this that decides how a submission becomes many chunks, and that is
 // worth being able to check directly.
 type Queue interface {
-	SetChunkCount(ctx context.Context, jobID, prefix string, n int) error
+	SetPrefix(ctx context.Context, jobID, prefix string) error
 	Enqueue(ctx context.Context, j queue.NewChunk) (string, error)
 	SplitChunks(ctx context.Context, jobID string) ([]queue.Chunk, error)
 	GetJob(ctx context.Context, id string) (queue.Job, bool, error)
@@ -58,11 +58,10 @@ func RunSplit(ctx context.Context, q Queue, chunk queue.Chunk, inputPath, jobSto
 
 	jobID := chunk.JobID
 	prefix := queue.JobPrefix(jobStorage, jobID)
+	if err := q.SetPrefix(ctx, jobID, prefix); err != nil {
+		return 0, err
+	}
 
-	// Every chunk is stored and queued before the count is written. The count
-	// is what lets a chunk's completion complete the job, so writing it early
-	// would let the first chunk to finish decide the job was done while the
-	// rest were still being queued.
 	for i, p := range paths {
 		uri := prefix + "/" + ChunkName(i+1)
 		f, oErr := os.Open(p)
@@ -94,8 +93,30 @@ func RunSplit(ctx context.Context, q Queue, chunk queue.Chunk, inputPath, jobSto
 		}
 	}
 
-	if err := q.SetChunkCount(ctx, jobID, prefix, len(paths)); err != nil {
-		return 0, err
+	// The join, queued here rather than by whichever piece finishes last.
+	//
+	// It waits for them — see queue.Chunk.AwaitsPieces — so a worker cannot
+	// start it early, and exactly one worker starts it in the end because
+	// exactly one worker claims anything. Queued last so it never waits on a
+	// set of pieces that is still being written.
+	//
+	// Doing it here is what makes a job's state readable from its chunks: the
+	// work still owed is a row from the moment there is any, instead of an
+	// intention held by whichever worker gets there.
+	if _, err := q.Enqueue(ctx, queue.NewChunk{
+		Kind:         queue.KindCollect,
+		Snapshot:     chunk.Snapshot,
+		Selection:    chunk.Selection,
+		ClientIP:     chunk.ClientIP,
+		Session:      chunk.Session,
+		UserID:       chunk.UserID,
+		Label:        fmt.Sprintf("%s (joining %d chunks)", chunk.Label, len(paths)),
+		Origin:       chunk.Origin,
+		JobID:        jobID,
+		AwaitsPieces: true,
+		CompletesJob: true,
+	}); err != nil {
+		return 0, fmt.Errorf("queue the join: %w", err)
 	}
 	return len(paths), nil
 }
@@ -125,8 +146,8 @@ func RunCollect(ctx context.Context, q Queue, jobID, jobStorage string,
 	if err != nil {
 		return "", err
 	}
-	if len(chunks) != b.Chunks {
-		return "", fmt.Errorf("the job says %d chunks, found %d", b.Chunks, len(chunks))
+	if len(chunks) == 0 {
+		return "", fmt.Errorf("job %s has no pieces to join", jobID)
 	}
 
 	uris := make([]string, 0, len(chunks))

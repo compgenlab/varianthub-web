@@ -120,7 +120,7 @@ func (q *Queue) Stats(ctx context.Context) (Stats, error) {
 		       coalesce(sum(n_variants) FILTER (WHERE status = $1), 0),
 		       count(*) FILTER (WHERE finished_at >= $5),
 		       count(*) FILTER (WHERE finished_at >= $7)
-		  FROM job`,
+		  FROM job_state`,
 		StatusDone, StatusError, StatusQueued, StatusRunning,
 		now-24*3600, StatusCancelled, now-7*24*3600).
 		Scan(&s.Total, &s.Succeeded, &s.Failed, &s.Cancelled, &s.Queued, &s.Running,
