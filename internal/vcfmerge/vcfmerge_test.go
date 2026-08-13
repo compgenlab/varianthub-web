@@ -1,4 +1,4 @@
-package api
+package vcfmerge
 
 import (
 	"strings"
@@ -23,26 +23,26 @@ func TestVCFInfoIDIsAlwaysLegal(t *testing.T) {
 		"":              "_",
 	}
 	for in, want := range cases {
-		if got := vcfInfoID(in); got != want {
-			t.Errorf("vcfInfoID(%q) = %q, want %q", in, got, want)
+		if got := InfoID(in); got != want {
+			t.Errorf("InfoID(%q) = %q, want %q", in, got, want)
 		}
 	}
 	// Whatever the input, the result must be a legal ID.
 	for in := range cases {
-		got := vcfInfoID(in)
+		got := InfoID(in)
 		if got == "" {
-			t.Fatalf("vcfInfoID(%q) is empty", in)
+			t.Fatalf("InfoID(%q) is empty", in)
 		}
 		c := got[0]
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c == '_') {
-			t.Errorf("vcfInfoID(%q) = %q starts with an illegal character", in, got)
+			t.Errorf("InfoID(%q) = %q starts with an illegal character", in, got)
 		}
 		for i := 0; i < len(got); i++ {
 			b := got[i]
 			ok := b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' ||
 				b >= '0' && b <= '9' || b == '_' || b == '.'
 			if !ok {
-				t.Errorf("vcfInfoID(%q) = %q contains %q", in, got, string(b))
+				t.Errorf("InfoID(%q) = %q contains %q", in, got, string(b))
 			}
 		}
 	}
@@ -52,7 +52,7 @@ func TestVCFInfoIDIsAlwaysLegal(t *testing.T) {
 // written literally — so the record parses, into the wrong values. That is worse
 // than failing, because nothing reports it.
 func TestVCFEscapeClosesTheFieldSeparators(t *testing.T) {
-	got := vcfEscape("a;b=c,d e:f%g")
+	got := Escape("a;b=c,d e:f%g")
 	for _, bad := range []string{";", "=", ",", " ", ":"} {
 		if strings.Contains(got, bad) {
 			t.Errorf("escaped value still contains %q: %s", bad, got)
@@ -63,8 +63,8 @@ func TestVCFEscapeClosesTheFieldSeparators(t *testing.T) {
 	}
 	// The escape character itself must be escaped first, or decoding is
 	// ambiguous: a literal "%3B" would decode to a semicolon.
-	if !strings.HasPrefix(vcfEscape("%3B"), "%253B") {
-		t.Errorf("a literal %%3B was not escaped: %s", vcfEscape("%3B"))
+	if !strings.HasPrefix(Escape("%3B"), "%253B") {
+		t.Errorf("a literal %%3B was not escaped: %s", Escape("%3B"))
 	}
 }
 
@@ -87,9 +87,9 @@ func TestVCFInfoValueRendering(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := vcfInfoValue(tc.in)
+			got, ok := InfoValue(tc.in)
 			if ok != tc.ok || got != tc.want {
-				t.Errorf("vcfInfoValue(%#v) = %q,%v; want %q,%v", tc.in, got, ok, tc.want, tc.ok)
+				t.Errorf("InfoValue(%#v) = %q,%v; want %q,%v", tc.in, got, ok, tc.want, tc.ok)
 			}
 		})
 	}
@@ -102,7 +102,7 @@ func TestVCFCollidingKeysGetDistinctIDs(t *testing.T) {
 	seen := map[string]bool{}
 	used := map[string]int{}
 	for _, c := range cols {
-		id := vcfInfoID(c.Key)
+		id := InfoID(c.Key)
 		if n, clash := used[id]; clash {
 			used[id] = n + 1
 			id = id + "_" + string(rune('0'+n+1))
@@ -128,15 +128,15 @@ func TestVCFTypeMapping(t *testing.T) {
 		"bool": "Flag", "flag": "Flag",
 		"string": "String", "": "String", "anything else": "String",
 	} {
-		if got := vcfType(in); got != want {
-			t.Errorf("vcfType(%q) = %q, want %q", in, got, want)
+		if got := InfoType(in); got != want {
+			t.Errorf("InfoType(%q) = %q, want %q", in, got, want)
 		}
 	}
 }
 
 // A quote or a newline inside a Description breaks the header line it sits in.
 func TestVCFHeaderDescriptionIsQuoteSafe(t *testing.T) {
-	got := vcfHeaderDescription(queue.Column{
+	got := HeaderDescription(queue.Column{
 		Key: "k", Description: "says \"hi\"\nand more", SourceRef: "clinvar:1",
 	})
 	if strings.Contains(got, "\n") {
