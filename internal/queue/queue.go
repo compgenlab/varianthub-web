@@ -109,6 +109,16 @@ type Job struct {
 	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
 	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
+
+	// InputURI is where this job's input is stored, set only on the Job a claim
+	// returns — Get and List do not fill it, because nothing reading a job's
+	// status needs it.
+	//
+	// Never serialized. It names a bucket and key inside the deployment, which
+	// is an operator's business and not something a job status response should
+	// hand to whoever asks. The rest of this struct is the published API; this
+	// is not part of it.
+	InputURI string `json:"-"`
 }
 
 // Terminal reports whether the job has reached a final status.
@@ -138,7 +148,19 @@ type NewJob struct {
 	// Origin is how the job arrived: OriginWeb, OriginAPI, or empty when
 	// unrecorded. Reporting only — it decides nothing.
 	Origin string
-	Body   []byte
+
+	// Body is the input itself, for submissions small enough to be worth
+	// carrying: a locus list is a few hundred bytes and a round trip through
+	// storage would cost more than it saves.
+	//
+	// Exactly one of Body and InputURI is set. The database enforces it, because
+	// neither is a job that can be claimed and then cannot run, and both is two
+	// inputs with no rule about which wins.
+	Body []byte
+	// InputURI locates the input in job storage, for submissions that should not
+	// pass through this process whole — an uploaded VCF above all. See
+	// migration 0032.
+	InputURI string
 }
 
 // How a job was submitted. Empty is a third state, not a default: rows written
@@ -610,8 +632,23 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 		j.MaxConcurrent, j.Origin, q.nowFn()); err != nil {
 		return "", err
 	}
+	// One of the two, never both — matching the CHECK rather than trusting it.
+	// A URI wins when set, so a caller that filled in both by mistake gets the
+	// one it went to the trouble of uploading rather than a stale body.
+	var body, uri any
+	if j.InputURI != "" {
+		uri = j.InputURI
+	} else {
+		body = j.Body
+		if j.Body == nil {
+			// An empty body is still a body: NULL would trip the constraint and
+			// fail the insert with a message about neither column being set,
+			// which says nothing about the empty submission that caused it.
+			body = []byte{}
+		}
+	}
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO job_input (job_id,body) VALUES ($1,$2)`, id, j.Body); err != nil {
+		`INSERT INTO job_input (job_id,body,uri) VALUES ($1,$2,$3)`, id, body, uri); err != nil {
 		return "", err
 	}
 	// NOTIFY fires on commit, so a listener never sees a job it cannot yet claim.
@@ -621,8 +658,12 @@ func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
 	if err := tx.Commit(ctx); err != nil {
 		return "", err
 	}
-	log.Printf("queue: job %s queued (kind=%s, ip=%s, session=%s, selection=%q, %d bytes)",
-		id, j.Kind, j.ClientIP, j.Session, j.Selection, len(j.Body))
+	where := fmt.Sprintf("%d bytes", len(j.Body))
+	if j.InputURI != "" {
+		where = "input at " + j.InputURI
+	}
+	log.Printf("queue: job %s queued (kind=%s, ip=%s, session=%s, selection=%q, %s)",
+		id, j.Kind, j.ClientIP, j.Session, j.Selection, where)
 	q.poke()
 	return id, nil
 }
@@ -650,14 +691,20 @@ func (q *Queue) Get(ctx context.Context, id string) (Job, bool, error) {
 
 // Result returns a done job's result JSON (ok=false when the id is unknown or the
 // job has no stored result yet).
-// Input returns the body a job was submitted with.
+// Input returns the body a job was submitted with, for the jobs that carry one.
 //
 // Retained rather than discarded once the job runs, which is what lets a VCF
 // submission be answered with its own file annotated instead of a synthesised
 // one carrying only the columns this server knows about.
+//
+// ok is false for a job whose input is in storage. That is not an error and
+// callers must not treat it as one: it is the ordinary case for anything large,
+// and the point of storing it there is that this process never holds it. Use
+// InputRef and stream it.
 func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 	var body []byte
-	err := q.pool.QueryRow(ctx, `SELECT body FROM job_input WHERE job_id=$1`, id).Scan(&body)
+	err := q.pool.QueryRow(ctx,
+		`SELECT body FROM job_input WHERE job_id=$1 AND body IS NOT NULL`, id).Scan(&body)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, false, nil
@@ -665,6 +712,46 @@ func (q *Queue) Input(ctx context.Context, id string) ([]byte, bool, error) {
 		return nil, false, err
 	}
 	return body, true, nil
+}
+
+// InputRef returns where a job's input is stored, and whether it is stored at
+// all rather than carried inline.
+func (q *Queue) InputRef(ctx context.Context, id string) (string, bool, error) {
+	var uri *string
+	err := q.pool.QueryRow(ctx, `SELECT uri FROM job_input WHERE job_id=$1`, id).Scan(&uri)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	if uri == nil || *uri == "" {
+		return "", false, nil
+	}
+	return *uri, true, nil
+}
+
+// DropInput deletes a job's input row, and reports the storage URI it referred
+// to so the caller can delete the object too.
+//
+// Two steps rather than one, and deliberately not transactional: an object left
+// behind after the row is gone is scrap that the storage sweep collects, while a
+// row pointing at an object that has been deleted is a job that looks runnable
+// and is not. Losing the pointer last is the safe order.
+func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
+	var uri *string
+	err := q.pool.QueryRow(ctx,
+		`DELETE FROM job_input WHERE job_id=$1 RETURNING uri`, id).Scan(&uri)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if uri == nil {
+		return "", nil
+	}
+	return *uri, nil
 }
 
 func (q *Queue) Result(ctx context.Context, id string) ([]byte, bool, error) {
@@ -998,13 +1085,21 @@ func (q *Queue) claimNext(ctx context.Context) (Job, []byte, bool, error) {
 		job.ID, q.workerID, q.nowFn()); err != nil {
 		return Job{}, nil, false, err
 	}
-	// Read the body inside the same transaction, so a claim and its input are
-	// one atomic step: committing the claim and then failing to read the body
-	// would leave a job marked running that no worker is running.
+	// Read the input inside the same transaction, so a claim and its input are
+	// one atomic step: committing the claim and then failing to read it would
+	// leave a job marked running that no worker is running.
+	//
+	// A stored input yields a URI and no bytes. The claim only needs to know it
+	// exists — staging it is the runner's job, and doing it here would hold the
+	// claim transaction open for the length of a download.
 	var body []byte
+	var uri *string
 	if err := tx.QueryRow(ctx,
-		`SELECT body FROM job_input WHERE job_id=$1`, job.ID).Scan(&body); err != nil {
+		`SELECT body, uri FROM job_input WHERE job_id=$1`, job.ID).Scan(&body, &uri); err != nil {
 		return Job{}, nil, false, err
+	}
+	if uri != nil {
+		job.InputURI = *uri
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return Job{}, nil, false, err
