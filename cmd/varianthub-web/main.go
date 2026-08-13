@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -445,12 +446,41 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgDataDir, cfgV
 		defer alw.Close(context.WithoutCancel(ctx))
 		alw.Note("starting on worker " + q.WorkerID())
 
+		// A stored input is fetched to a local file, because that is what the
+		// engine takes. It is never read into this process: a chromosome's VCF
+		// is hundreds of megabytes, and holding it here only to write it
+		// straight back out is the copy this whole path exists to remove.
+		var inputPath string
+		if job.InputURI != "" {
+			dir, mkErr := os.MkdirTemp("", "vhw-input-")
+			if mkErr != nil {
+				return queue.Outcome{}, fmt.Errorf("staging directory: %w", mkErr)
+			}
+			// Removed however this returns, including the error paths below.
+			// Otherwise a worker that fails a few large jobs fills its disk and
+			// then fails every job after them, for a reason that looks nothing
+			// like the first failure.
+			defer os.RemoveAll(dir)
+
+			// Named as it is stored, ".gz" and all. What the file is called is
+			// how a later reader knows whether it is compressed, rather than
+			// each one deciding for itself from the bytes.
+			inputPath = filepath.Join(dir, path.Base(job.InputURI))
+			alw.Note("staging input from " + job.InputURI)
+			n, dlErr := blob.Download(ctx, job.InputURI, inputPath)
+			if dlErr != nil {
+				return queue.Outcome{}, fmt.Errorf("stage input: %w", dlErr)
+			}
+			alw.Note(fmt.Sprintf("staged %d bytes to %s", n, inputPath))
+		}
+
 		res, err := r.Annotate(ctx, runner.Request{
 			Sink:      alw.Line,
 			Kind:      job.Kind,
 			Snapshot:  job.Snapshot,
 			Selection: job.Selection,
 			Body:      input,
+			InputPath: inputPath,
 		})
 		if err != nil {
 			// The full diagnostic goes to the log and to the job, so it can be

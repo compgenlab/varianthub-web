@@ -14,6 +14,7 @@ package api
 // anyway — so export ships now and results waits for the schema work.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,6 +24,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/limit"
 	"github.com/compgenlab/varianthub-web/internal/queue"
@@ -495,18 +497,10 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	}
 	defer file.Close()
 
-	// MaxBytesReader above already bounds this; ParseMultipartForm has spilled
-	// anything over the in-memory threshold to a temp file that RemoveAll clears.
-	body, err := io.ReadAll(file)
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
-		return
-	}
-	if len(body) == 0 {
-		writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
-		return
-	}
-
+	// Everything that can refuse this request happens before a byte is stored.
+	// The upload has already cost a spill to local disk, which is bounded; what
+	// must not be spent on a request that will be rejected is the transfer to
+	// job storage, which for a chromosome is hundreds of megabytes.
 	sel, err := selection(anyOf(r.FormValue("annotations")))
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -526,15 +520,62 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	s.submit(w, r, queue.NewJob{
+
+	// Classify the compression once, here, and record it in the object's name.
+	//
+	// This is the only place that looks at the bytes to decide. Every later
+	// reader is told by the filename instead of working it out again — the
+	// process that received the file is the one that knows, and four consumers
+	// each sniffing for themselves is four chances to disagree about what was
+	// uploaded.
+	var magic [2]byte
+	n, err := io.ReadFull(file, magic[:])
+	if n == 0 {
+		writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
+		return
+	}
+	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
+		writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
+		return
+	}
+	compressed := n == 2 && magic[0] == 0x1f && magic[1] == 0x8b
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		writeError(w, http.StatusInternalServerError, "could not rewind the upload")
+		return
+	}
+
+	// The id comes first because the object is stored under it, which is what
+	// makes a bucket listing say which job every object belongs to.
+	id, err := queue.NewID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	uri := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(compressed))
+	if err := blob.PutReader(r.Context(), uri, file); err != nil {
+		log.Printf("api: store upload for job %s at %s: %v", id, uri, err)
+		writeError(w, http.StatusInternalServerError, "could not store the uploaded VCF")
+		return
+	}
+
+	// From here the object exists and the job may not. submit() writes the row;
+	// if that fails the object is scrap, and nothing else knows where it is
+	// because the row that would have named it was never written.
+	if !s.submit(w, r, queue.NewJob{
+		ID:        id,
 		Kind:      queue.KindVCF,
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
 		UserID:    callerOf(r).UserID(),
 		Label:     hdr.Filename,
-		Body:      body,
-	})
+		InputURI:  uri,
+	}) {
+		if rmErr := blob.Remove(context.WithoutCancel(r.Context()), uri); rmErr != nil {
+			log.Printf("api: job %s was not queued and its upload at %s could not be "+
+				"removed: %v", id, uri, rmErr)
+		}
+	}
 }
 
 // anyOf lifts an empty form value to nil so selection() reads it as "unset"
@@ -554,7 +595,13 @@ func anyOf(s string) any {
 // client had to handle both regardless, because the window was never a
 // guarantee — so the shape that was always required is now the only one, and
 // each of status, results and cancellation is its own call.
-func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) {
+// submit records the job and writes the response, reporting whether it was
+// accepted.
+//
+// The boolean exists for the upload path: when the row cannot be written, the
+// object already in storage has to be removed, and the caller is the only one
+// that still knows where it is.
+func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob) bool {
 	nj.ClientIP = limit.ClientIP(r, s.trusted)
 
 	// Stamped at submit, not read at dispatch. The limit a job runs under is the
@@ -571,9 +618,10 @@ func (s *Server) submit(w http.ResponseWriter, r *http.Request, nj queue.NewJob)
 	id, err := s.queue.Enqueue(r.Context(), nj)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+		return false
 	}
 	writeJSON(w, http.StatusAccepted, AcceptedResponse{JobID: id})
+	return true
 }
 
 // --- jobs ---

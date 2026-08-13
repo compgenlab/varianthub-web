@@ -13,11 +13,15 @@
 package cacherunner
 
 import (
+	"bufio"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -165,6 +169,12 @@ func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work 
 		sub := req
 		sub.Selection = strings.Join(g.ask, ",")
 		sub.Body = requestBody(req.Kind, g.loci)
+		// The whole point of a sub-run is that it asks about *fewer* variants
+		// than were submitted. A staged input is the full file, and the runner
+		// prefers a path over a body — so leaving it set would silently
+		// re-annotate everything on every group, turning the cache from a
+		// saving into a multiplier.
+		sub.InputPath = ""
 		res, err := r.Inner.Annotate(ctx, sub)
 		if err != nil {
 			return nil, runner.Result{}, err
@@ -644,10 +654,72 @@ func parseInput(req runner.Request) ([]anncache.Locus, bool) {
 	case runner.KindLocus:
 		return parseLoci(string(req.Body))
 	case runner.KindVCF:
+		if req.InputPath != "" {
+			return parseVCFFile(req.InputPath)
+		}
 		return parseVCF(req.Body)
 	}
 	return nil, false
 }
+
+// parseVCFFile is parseVCF over a staged file rather than a buffer.
+//
+// A VCF large enough to be staged is large enough that reading it into memory
+// to split it on newlines would cost several times the file — the bytes, the
+// string copy, and a slice header per line. This is the same parse, streamed.
+//
+// Compression is decided by the file's name, not by looking at its first bytes.
+// The name was assigned when the upload was accepted, by the one process that
+// saw it arrive; every reader after that is told rather than guessing, so four
+// consumers cannot come to four different conclusions about one file.
+func parseVCFFile(path string) ([]anncache.Locus, bool) {
+	f, err := os.Open(path)
+	if err != nil {
+		// Standing aside, not failing: the cache is an optimization, and a job
+		// whose input this cannot read is still a job the engine can run.
+		log.Printf("cacherunner: cannot read staged input %s, skipping the cache: %v", path, err)
+		return nil, false
+	}
+	defer f.Close()
+
+	var src io.Reader = f
+	if strings.HasSuffix(path, ".gz") {
+		gz, gzErr := gzip.NewReader(f)
+		if gzErr != nil {
+			log.Printf("cacherunner: %s is named .gz but is not gzip, skipping the cache: %v",
+				path, gzErr)
+			return nil, false
+		}
+		defer gz.Close()
+		src = gz
+	}
+
+	var out []anncache.Locus
+	sc := bufio.NewScanner(src)
+	// A VCF line carrying many samples is long past the 64 KB default, and the
+	// scanner reports that as a plain end of input — which would silently cache
+	// a prefix of the file as if it were all of it.
+	sc.Buffer(make([]byte, 0, 256*1024), maxVCFLine)
+	for sc.Scan() {
+		var ok bool
+		if out, ok = appendVCFLoci(out, strings.TrimSuffix(sc.Text(), "\r")); !ok {
+			return nil, false
+		}
+	}
+	if err := sc.Err(); err != nil {
+		log.Printf("cacherunner: reading %s, skipping the cache: %v", path, err)
+		return nil, false
+	}
+	if len(out) == 0 {
+		return nil, false
+	}
+	return out, true
+}
+
+// maxVCFLine bounds one record. A cohort VCF's line grows with its sample
+// count; 8 MB covers tens of thousands of samples and still refuses a file that
+// is not line-oriented at all.
+const maxVCFLine = 8 << 20
 
 // parseLoci reads a locus list, normalizing exactly as varhub does.
 //
@@ -696,29 +768,51 @@ func parseLoci(body string) ([]anncache.Locus, bool) {
 func parseVCF(body []byte) ([]anncache.Locus, bool) {
 	var out []anncache.Locus
 	for _, text := range strings.Split(string(body), "\n") {
-		text = strings.TrimSuffix(text, "\r")
-		if text == "" || strings.HasPrefix(text, "#") {
-			continue
-		}
-		fields := strings.Split(text, "\t")
-		if len(fields) < 5 {
-			return nil, false // the engine rejects this outright; let it say so
-		}
-		pos, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil {
+		var ok bool
+		if out, ok = appendVCFLoci(out, strings.TrimSuffix(text, "\r")); !ok {
 			return nil, false
-		}
-		ref := strings.ToUpper(fields[3])
-		for _, alt := range strings.Split(fields[4], ",") {
-			alt = strings.ToUpper(strings.TrimSpace(alt))
-			if alt == "" || alt == "." {
-				continue
-			}
-			out = append(out, anncache.Locus{Chrom: fields[0], Pos: pos, Ref: ref, Alt: alt})
 		}
 	}
 	if len(out) == 0 {
 		return nil, false
+	}
+	return out, true
+}
+
+// appendVCFLoci adds one data line's alleles to out, skipping headers and blanks.
+//
+// Shared by the buffered and the streamed parse so there is one definition of
+// how a VCF line becomes cache keys. Two copies would be free to drift, and the
+// drift would be silent in the worst way: a variant split differently than the
+// engine splits it is a value filed under a key the engine never asks for, so
+// the cache would simply stop hitting — which looks like a cold cache, not like
+// a bug.
+//
+// A line that does not parse fails the whole parse rather than being skipped,
+// and that is not fussiness. The caller pairs the engine's results with this
+// list *by position*. If the engine accepts a line this one dropped, every
+// annotation after it lands on the wrong variant — a wrong answer that looks
+// exactly like a right one. Standing aside costs a cache miss; guessing costs
+// correctness.
+func appendVCFLoci(out []anncache.Locus, text string) ([]anncache.Locus, bool) {
+	if text == "" || strings.HasPrefix(text, "#") {
+		return out, true
+	}
+	fields := strings.Split(text, "\t")
+	if len(fields) < 5 {
+		return out, false // the engine rejects this outright; let it say so
+	}
+	pos, err := strconv.ParseInt(fields[1], 10, 64)
+	if err != nil {
+		return out, false
+	}
+	ref := strings.ToUpper(fields[3])
+	for _, alt := range strings.Split(fields[4], ",") {
+		alt = strings.ToUpper(strings.TrimSpace(alt))
+		if alt == "" || alt == "." {
+			continue
+		}
+		out = append(out, anncache.Locus{Chrom: fields[0], Pos: pos, Ref: ref, Alt: alt})
 	}
 	return out, true
 }

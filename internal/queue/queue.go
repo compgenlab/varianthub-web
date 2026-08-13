@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -126,8 +127,15 @@ func (j Job) Terminal() bool {
 	return j.Status == StatusDone || j.Status == StatusError || j.Status == StatusCancelled
 }
 
-// NewJob is the metadata for enqueuing a job (plus its input body).
+// NewJob is the metadata for enqueuing a job (plus its input).
 type NewJob struct {
+	// ID is the job's identifier, minted by NewID. Empty means Enqueue mints
+	// one, which is what every caller that has no reason to care does.
+	//
+	// Supplied only by a caller that had to name the job before creating it —
+	// an upload writes its object to jobs/<id>/ so a bucket listing says which
+	// job each object belongs to. Never taken from a request: see NewID.
+	ID        string
 	Kind      string
 	Snapshot  string
 	Selection string
@@ -360,7 +368,7 @@ const MaxAttempts = 3
 //
 // The caller must have applied migrations/ first; nothing here creates schema.
 func New(pool *pgxpool.Pool) (*Queue, error) {
-	id, err := newID()
+	id, err := NewID()
 	if err != nil {
 		return nil, fmt.Errorf("worker id: %w", err)
 	}
@@ -602,8 +610,19 @@ func (q *Queue) SetMaxJobsPerIP(n int) { q.maxJobsPerIP = n }
 // gives itself more slots than a download weighs.
 func (q *Queue) SetSlots(n int) { q.slots = n }
 
-// newID returns a random 128-bit hex id.
-func newID() (string, error) {
+// NewID returns a random 128-bit hex id.
+//
+// Exported so a caller can mint one *before* enqueuing, which is what lets an
+// uploaded input be stored under the id of the job that will read it. Without
+// that the object would have to be written under some other name and the two
+// reconciled afterwards, and "which objects belong to jobs that no longer
+// exist" would need a join instead of a listing.
+//
+// This is for internal callers — the API handler that accepts an upload. It is
+// not a hook for letting a client choose its own job id: that would hand out
+// collisions with other people's jobs, an enumerable id space, and the ability
+// to claim an id before its owner does.
+func NewID() (string, error) {
 	var b [16]byte
 	if _, err := rand.Read(b[:]); err != nil {
 		return "", err
@@ -611,11 +630,25 @@ func newID() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-// Enqueue records a new queued job (metadata + input body) and wakes a worker.
+// idPattern is what NewID produces, and the only shape Enqueue accepts.
+//
+// Checked rather than trusted because a job id becomes a path segment in job
+// storage. An id containing a slash or a "…/../…" would place the object
+// somewhere other than the prefix it was meant for — silently, since writing to
+// a valid-looking key succeeds. Every other reason to validate is secondary to
+// that one.
+var idPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
+
+// Enqueue records a new queued job (metadata + its input) and wakes a worker.
 func (q *Queue) Enqueue(ctx context.Context, j NewJob) (string, error) {
-	id, err := newID()
-	if err != nil {
-		return "", err
+	id := j.ID
+	if id == "" {
+		var err error
+		if id, err = NewID(); err != nil {
+			return "", err
+		}
+	} else if !idPattern.MatchString(id) {
+		return "", fmt.Errorf("job id %q is not one NewID produced", id)
 	}
 	tx, err := q.pool.Begin(ctx)
 	if err != nil {

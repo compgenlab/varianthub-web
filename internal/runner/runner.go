@@ -53,6 +53,18 @@ type Request struct {
 	Snapshot  string // snapshot name; "" uses the config default
 	Selection string // "" (snapshot defaults) | "all" | "a,b,c"
 	Body      []byte // the locus string, or the VCF file's bytes
+
+	// InputPath is a VCF already on disk, used instead of Body when set.
+	//
+	// A large submission is staged from job storage by the caller, which is why
+	// this is a path and not a reader: the engine takes a filename, so anything
+	// else would only be copied to one. Staging is the caller's job because
+	// this package execs a binary and knows nothing about where inputs live —
+	// giving it a storage client to keep that true would be the wrong trade.
+	//
+	// The name is kept as stored, ".gz" and all, so a reader that wants to know
+	// whether it is compressed can be told rather than have to look.
+	InputPath string
 }
 
 // Result is a completed annotation.
@@ -234,9 +246,12 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 
 	switch req.Kind {
 	case KindVCF:
-		in := filepath.Join(work, "input.vcf")
-		if err := os.WriteFile(in, req.Body, 0o600); err != nil {
-			return Result{}, fmt.Errorf("stage VCF: %w", err)
+		in := req.InputPath
+		if in == "" {
+			in = filepath.Join(work, "input.vcf")
+			if err := os.WriteFile(in, req.Body, 0o600); err != nil {
+				return Result{}, fmt.Errorf("stage VCF: %w", err)
+			}
 		}
 		// "--" terminates flag parsing, so a path beginning with "-" is read as a
 		// path rather than as an unknown flag.

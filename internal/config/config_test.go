@@ -260,6 +260,10 @@ func TestExampleFileIsValid(t *testing.T) {
 		{"standard_per_hour", c.StandardPerHour, d.StandardPerHour},
 		{"elevated_concurrent", c.ElevatedConcurrent, d.ElevatedConcurrent},
 		{"elevated_per_hour", c.ElevatedPerHour, d.ElevatedPerHour},
+		{"anon_max_variants", c.AnonMaxVariants, d.AnonMaxVariants},
+		{"standard_max_variants", c.StandardMaxVariants, d.StandardMaxVariants},
+		{"elevated_max_variants", c.ElevatedMaxVariants, d.ElevatedMaxVariants},
+		{"vcf_chunk_size", c.VCFChunkSize, d.VCFChunkSize},
 	} {
 		if f.example != f.actual {
 			t.Errorf("%s: example says %d, Defaults() says %d", f.key, f.example, f.actual)
@@ -268,6 +272,24 @@ func TestExampleFileIsValid(t *testing.T) {
 	if c.CacheEnabled != d.CacheEnabled || c.CacheMaxEntries != d.CacheMaxEntries {
 		t.Errorf("cache: example %v/%d, defaults %v/%d",
 			c.CacheEnabled, c.CacheMaxEntries, d.CacheEnabled, d.CacheMaxEntries)
+	}
+	// The durations, which were not checked at all. job_ttl had drifted to
+	// documenting 24h against a default of a week — precisely the quietly-wrong
+	// advice this test exists to prevent, sitting inside the test that exists to
+	// prevent it.
+	for _, f := range []struct {
+		key             string
+		example, actual time.Duration
+	}{
+		{"download_timeout", c.DownloadTimeout, d.DownloadTimeout},
+		{"job_ttl", c.JobTTL, d.JobTTL},
+	} {
+		if f.example != f.actual {
+			t.Errorf("%s: example says %v, Defaults() says %v", f.key, f.example, f.actual)
+		}
+	}
+	if c.JobStorage != d.JobStorage {
+		t.Errorf("job_storage: example %q, defaults %q", c.JobStorage, d.JobStorage)
 	}
 }
 

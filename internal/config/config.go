@@ -183,11 +183,16 @@ type Config struct {
 	// arbitrary hour does not free capacity, it wastes the capacity already
 	// spent.
 	JobTimeout time.Duration
-	// DownloadTimeout bounds a provisioning job. It shares JobTimeout's default
-	// but is configured separately, because the two are sized by different
-	// things: a tool's one-time install fetches tens of gigabytes over one TCP
-	// stream, and being killed partway leaves a half-populated data directory
-	// the next attempt has to redo from the start.
+	// DownloadTimeout bounds a provisioning job.
+	//
+	// Longer than JobTimeout, and it has to stay longer: the two are sized by
+	// different things. An annotation is bounded by how much work one
+	// submission may carry; a tool's one-time install is bounded by how long it
+	// takes to fetch tens of gigabytes down a single TCP stream. A measured VEP
+	// install took about 17 hours, so the 12h this used to default to would have
+	// killed it five hours from done — and being killed partway is worse than
+	// being slow, because it leaves a half-populated data directory with no
+	// sentinel and the next attempt starts from nothing.
 	DownloadTimeout time.Duration
 	JobTTL          time.Duration // terminal jobs GC'd after this
 	// MaxUploadBytes caps a POST /annotate/vcf body.
@@ -236,7 +241,7 @@ func Defaults() *Config {
 		JobStorage:      "/var/lib/varianthub/jobs",
 		StoragePaths:    []string{"default=/var/lib/varianthub/sources"},
 		JobTimeout:      12 * time.Hour,
-		DownloadTimeout: 12 * time.Hour,
+		DownloadTimeout: 48 * time.Hour,
 		// Results are the thing a user comes back for, and a day is shorter
 		// than the gap between someone running an annotation and being asked
 		// about it. A week covers that without storing every result an
