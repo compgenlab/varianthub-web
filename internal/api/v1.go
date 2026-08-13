@@ -14,6 +14,7 @@ package api
 // anyway — so export ships now and results waits for the schema work.
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -471,96 +472,171 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// maxFormField bounds one non-file part of an upload. Snapshot names and
+// annotation lists are tens of bytes; anything approaching this is not one.
+const maxFormField = 1 << 20
+
+// maxFormFields bounds how many non-file parts one request may carry, so a
+// client cannot make the server accumulate an unbounded number of small
+// strings while claiming to be uploading a VCF.
+const maxFormFields = 32
+
 func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	max := s.cfg.MaxUploadBytes
 	if max <= 0 {
 		max = 64 << 20
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, max)
-	// ParseMultipartForm's argument is the in-memory threshold, not the total
-	// cap; MaxBytesReader above is what actually bounds the upload.
-	if err := r.ParseMultipartForm(8 << 20); err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf(
-			"could not read upload (limit %d bytes): %v", max, err))
+
+	// Read the parts as they arrive rather than through ParseMultipartForm.
+	//
+	// That one buffers the whole request before any of it can be looked at — a
+	// few megabytes in memory and the rest spilled to a temp file — so the API
+	// needed local scratch proportional to the upload cap, and the file was
+	// written to disk once on the way to being written to storage.
+	//
+	// Streaming removes both. The trade is that a part is available only when
+	// it arrives, so a request whose file comes before its metadata is stored
+	// before it can be validated. That is a smaller cost than it looks:
+	// buffering did not avoid *receiving* the bytes either, it only delayed
+	// them, and what is wasted here is the hop to job storage, which is
+	// internal and undone by a delete.
+	mr, err := r.MultipartReader()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "expected a multipart form upload")
 		return
 	}
-	defer func() {
-		if r.MultipartForm != nil {
-			_ = r.MultipartForm.RemoveAll()
-		}
-	}()
 
-	file, hdr, err := r.FormFile("vcf")
-	if err != nil {
+	var (
+		fields   = map[string]string{}
+		filename string
+		id       string
+		uri      string
+	)
+	// Whatever was stored before an error, so every failure path below can undo
+	// it. Without this an upload that arrives before a metadata field it turns
+	// out to conflict with would be left in storage with nothing pointing at it.
+	discard := func() {
+		if uri == "" {
+			return
+		}
+		if rmErr := blob.Remove(context.WithoutCancel(r.Context()), uri); rmErr != nil {
+			log.Printf("api: upload at %s was not turned into a job and could not be "+
+				"removed: %v", uri, rmErr)
+		}
+	}
+
+	for {
+		part, err := mr.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			discard()
+			writeError(w, http.StatusBadRequest, fmt.Sprintf(
+				"could not read the upload (limit %d bytes): %v", max, err))
+			return
+		}
+
+		if part.FormName() != "vcf" {
+			if len(fields) >= maxFormFields {
+				part.Close()
+				discard()
+				writeError(w, http.StatusBadRequest, "too many form fields")
+				return
+			}
+			v, err := io.ReadAll(io.LimitReader(part, maxFormField))
+			part.Close()
+			if err != nil {
+				discard()
+				writeError(w, http.StatusBadRequest, "could not read a form field")
+				return
+			}
+			fields[part.FormName()] = string(v)
+			continue
+		}
+
+		if uri != "" {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "only one `vcf` part is allowed")
+			return
+		}
+		filename = part.FileName()
+
+		// Classify the compression once, here, and record it in the object's
+		// name. This is the only place that looks at the bytes to decide; every
+		// later reader is told by the filename instead of working it out again.
+		// The process that received the file is the one that knows, and four
+		// consumers each sniffing for themselves is four chances to disagree
+		// about one file.
+		//
+		// Buffered rather than seeked, because a streamed part cannot rewind —
+		// the two bytes are read and then put back in front of the stream.
+		buf := bufio.NewReader(part)
+		magic, err := buf.Peek(2)
+		if len(magic) == 0 {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
+			return
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			part.Close()
+			discard()
+			writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
+			return
+		}
+		compressed := len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b
+
+		// The id is minted before the object because the object is stored under
+		// it, which is what makes a bucket listing say which job every object
+		// belongs to.
+		if id, err = queue.NewID(); err != nil {
+			part.Close()
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		dest := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(compressed))
+		if err := blob.PutReader(r.Context(), dest, buf); err != nil {
+			part.Close()
+			// dest is not assigned to uri until it exists, so discard() has
+			// nothing to undo — PutReader leaves no partial object behind.
+			log.Printf("api: store upload for job %s at %s: %v", id, dest, err)
+			writeError(w, http.StatusInternalServerError, "could not store the uploaded VCF")
+			return
+		}
+		part.Close()
+		uri = dest
+	}
+
+	if uri == "" {
 		writeError(w, http.StatusBadRequest, "a `vcf` file part is required")
 		return
 	}
-	defer file.Close()
 
-	// Everything that can refuse this request happens before a byte is stored.
-	// The upload has already cost a spill to local disk, which is bounded; what
-	// must not be spent on a request that will be rejected is the transfer to
-	// job storage, which for a chromosome is hundreds of megabytes.
-	sel, err := selection(anyOf(r.FormValue("annotations")))
+	sel, err := selection(anyOf(strings.TrimSpace(fields["annotations"])))
 	if err != nil {
+		discard()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var sources []string
-	if v := strings.TrimSpace(r.FormValue("sources")); v != "" {
-		for _, id := range strings.Split(v, ",") {
-			if id = strings.TrimSpace(id); id != "" {
-				sources = append(sources, id)
+	if v := strings.TrimSpace(fields["sources"]); v != "" {
+		for _, sid := range strings.Split(v, ",") {
+			if sid = strings.TrimSpace(sid); sid != "" {
+				sources = append(sources, sid)
 			}
 		}
 	}
-	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(r.FormValue("snapshot")),
-		sources, strings.TrimSpace(r.FormValue("build")), splitSelection(sel))
+	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(fields["snapshot"]),
+		sources, strings.TrimSpace(fields["build"]), splitSelection(sel))
 	if err != nil {
+		discard()
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
-	// Classify the compression once, here, and record it in the object's name.
-	//
-	// This is the only place that looks at the bytes to decide. Every later
-	// reader is told by the filename instead of working it out again — the
-	// process that received the file is the one that knows, and four consumers
-	// each sniffing for themselves is four chances to disagree about what was
-	// uploaded.
-	var magic [2]byte
-	n, err := io.ReadFull(file, magic[:])
-	if n == 0 {
-		writeError(w, http.StatusBadRequest, "the uploaded VCF is empty")
-		return
-	}
-	if err != nil && !errors.Is(err, io.ErrUnexpectedEOF) {
-		writeError(w, http.StatusBadRequest, "could not read the uploaded VCF")
-		return
-	}
-	compressed := n == 2 && magic[0] == 0x1f && magic[1] == 0x8b
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		writeError(w, http.StatusInternalServerError, "could not rewind the upload")
-		return
-	}
-
-	// The id comes first because the object is stored under it, which is what
-	// makes a bucket listing say which job every object belongs to.
-	id, err := queue.NewID()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	uri := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(compressed))
-	if err := blob.PutReader(r.Context(), uri, file); err != nil {
-		log.Printf("api: store upload for job %s at %s: %v", id, uri, err)
-		writeError(w, http.StatusInternalServerError, "could not store the uploaded VCF")
-		return
-	}
-
-	// From here the object exists and the job may not. submit() writes the row;
-	// if that fails the object is scrap, and nothing else knows where it is
-	// because the row that would have named it was never written.
 	if !s.submit(w, r, queue.NewJob{
 		ID:        id,
 		Kind:      queue.KindVCF,
@@ -568,13 +644,10 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 		Selection: sel,
 		Session:   sessionOf(r),
 		UserID:    callerOf(r).UserID(),
-		Label:     hdr.Filename,
+		Label:     filename,
 		InputURI:  uri,
 	}) {
-		if rmErr := blob.Remove(context.WithoutCancel(r.Context()), uri); rmErr != nil {
-			log.Printf("api: job %s was not queued and its upload at %s could not be "+
-				"removed: %v", id, uri, rmErr)
-		}
+		discard()
 	}
 }
 
