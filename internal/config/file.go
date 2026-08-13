@@ -344,7 +344,23 @@ type S3Site struct {
 	URI string `toml:"uri"`
 	// Endpoint is an S3-compatible gateway. Empty means AWS itself.
 	Endpoint string `toml:"endpoint"`
-	Region   string `toml:"region"`
+	// PublicEndpoint is that same gateway as something outside the deployment
+	// reaches it. Set it only when the two differ, which is the container case:
+	// this service talks to http://s3:7070 and a laptop cannot.
+	//
+	// It is what a result download is signed against. Left empty, no presigned
+	// link is minted and downloads stream through this service as before — a
+	// missing setting costs bandwidth, while a link signed against a host the
+	// caller cannot reach fails as a DNS error that says nothing about why.
+	//
+	// Setting this also needs CORS on the bucket, allowing GET from the web
+	// origin. A command-line caller following the redirect does not care, but
+	// the browser fetches the download with a header on it and will not read a
+	// cross-origin response without it — so without CORS the API works and the
+	// web UI's download button stops, which is a confusing pair of symptoms to
+	// be handed at once.
+	PublicEndpoint string `toml:"public_endpoint"`
+	Region         string `toml:"region"`
 	// AccessKey and SecretKey are presented when both are set.
 	AccessKey string `toml:"access_key"`
 	SecretKey string `toml:"secret_key"`

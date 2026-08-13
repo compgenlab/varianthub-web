@@ -84,7 +84,7 @@ func TestExportVCFEndToEnd(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	out := w.Body.String()
+	out := vcfBody(t, w)
 	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
 
 	if lines[0] != "##fileformat=VCFv4.2" {
@@ -186,9 +186,9 @@ func TestVCFJobDefaultsToVCFOutput(t *testing.T) {
 		[][4]any{{"chr1", int64(100), "A", "G"}},
 		[]string{`{"GENE":"TP53"}`})
 
-	if w := h.do("GET", "/api/v1/jobs/vcfjob/export", tok, nil); !strings.HasPrefix(
-		w.Body.String(), "##fileformat=VCFv4.2") {
-		t.Errorf("a VCF job did not default to VCF: %.60s", w.Body.String())
+	if out := vcfBody(t, h.do("GET", "/api/v1/jobs/vcfjob/export", tok, nil)); !strings.HasPrefix(
+		out, "##fileformat=VCFv4.2") {
+		t.Errorf("a VCF job did not default to VCF: %.60s", out)
 	}
 	// And a locus job still defaults to JSON, which is what a script expects.
 	if w := h.do("GET", "/api/v1/jobs/locusjob/export", tok, nil); !strings.HasPrefix(

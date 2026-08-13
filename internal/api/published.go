@@ -149,10 +149,12 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		{
 			Method: "GET", Path: "/api/v1/jobs/{id}/export", OpID: "exportResults",
 			Public:  true,
-			Summary: "Download a finished job's results, whole, in a chosen format.",
+			Summary: "Download a finished job's results, whole, in a chosen format. " +
+				"format=vcf may answer 302 with a short-lived link straight to " +
+				"object storage, so follow redirects.",
 			Handler: s.handleExport,
 			// Streamed in four formats, so the body is not one JSON schema.
-			Produces: "application/json, text/tab-separated-values, text/csv, text/plain",
+			Produces: "application/json, text/tab-separated-values, text/csv, application/gzip",
 			Params: []param{
 				{
 					Name: "id", In: "path", Required: true, Type: "string",
@@ -163,7 +165,14 @@ func (s *Server) publishedRoutes() []publishedRoute {
 					Enum: []string{"json", "tsv", "csv", "vcf"},
 					Doc: "Defaults to json, or to vcf for a job submitted as a VCF. " +
 						"vcf is available for any job: a locus list yields a VCF with " +
-						"ID, QUAL and FILTER missing and the annotations as INFO.",
+						"ID, QUAL and FILTER missing and the annotations as INFO. " +
+						"vcf comes back gzipped, as variants-<id>.vcf.gz — it is the " +
+						"stored object served as it is. Where object storage is " +
+						"reachable by the caller this answers 302 with a presigned " +
+						"URL good for 15 minutes, so the transfer never passes " +
+						"through the API; otherwise the same bytes are relayed. The " +
+						"other three formats are converted from that same file and " +
+						"always stream from here.",
 				},
 				{
 					Name: "q", In: "query", Type: "string",

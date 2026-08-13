@@ -395,12 +395,16 @@ func registerS3Sites(cfg *config.Config) {
 	if len(cfg.S3Sites) == 0 {
 		return
 	}
+	// A conversion, not a field-by-field copy. The two structs are the same
+	// declaration twice — one with toml tags, one without, because config owns
+	// reading files and blob owns talking to the store — so this compiles only
+	// while they still match. Listing the fields by hand meant a field added to
+	// one and forgotten here was silently zero, which for a credential reads as
+	// a permission problem and for public_endpoint reads as presigning being
+	// unsupported.
 	sites := make([]blob.Site, 0, len(cfg.S3Sites))
 	for _, s := range cfg.S3Sites {
-		sites = append(sites, blob.Site{
-			Name: s.Name, URI: s.URI, Endpoint: s.Endpoint, Region: s.Region,
-			AccessKey: s.AccessKey, SecretKey: s.SecretKey, Default: s.Default,
-		})
+		sites = append(sites, blob.Site(s))
 	}
 	blob.RegisterSites(sites)
 	log.Printf("config: %d S3 site(s) declared with their own credentials", len(sites))

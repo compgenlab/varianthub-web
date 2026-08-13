@@ -26,10 +26,15 @@ import (
 type Site struct {
 	Name      string
 	URI       string
-	Endpoint  string
-	Region    string
-	AccessKey string
-	SecretKey string
+	Endpoint string
+	// PublicEndpoint is the same store as Endpoint reaches, named as something
+	// outside the deployment can reach it. Set only when the two differ — an
+	// in-cluster gateway address is no use in a URL handed to a browser. Empty
+	// means no presigned link is minted for this site; see presignClientFor.
+	PublicEndpoint string
+	Region         string
+	AccessKey      string
+	SecretKey      string
 	// Default marks the site an annotation job's credentials come from when
 	// several are declared.
 	Default bool
@@ -42,11 +47,23 @@ var (
 )
 
 // RegisterSites replaces the known sites. Called once, at startup.
+//
+// Both client caches are dropped, not just the reading one. They are keyed by
+// site name, so a re-registration that changed a site's endpoint or keys would
+// otherwise keep handing out a client built from the old ones — and for the
+// presigning cache that means signing links against a host the deployment has
+// stopped using.
 func RegisterSites(s []Site) {
 	sitesMu.Lock()
-	defer sitesMu.Unlock()
 	sites = append([]Site(nil), s...)
 	clients = map[string]*s3.Client{}
+	sitesMu.Unlock()
+
+	// Its own lock, taken after the other is released: two locks held at once in
+	// two orders is how this deadlocks later, and nothing needs them together.
+	presignMu.Lock()
+	presignClients = map[string]*s3.Client{}
+	presignMu.Unlock()
 }
 
 // siteFor returns the declared site a URI belongs to.

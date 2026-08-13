@@ -109,7 +109,7 @@ func TestAStoredInputStillExportsTheSubmittersFile(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 			}
-			out := w.Body.String()
+			out := vcfBody(t, w)
 
 			// What the fallback path drops. Each of these is the submitter's own
 			// data, and getting a file back without them is the failure.
@@ -176,7 +176,7 @@ func TestAMisnamedStoredInputFallsBackRatherThanServingGarbage(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	out := w.Body.String()
+	out := vcfBody(t, w)
 	// The fallback: a valid VCF built from rows, carrying our annotation but not
 	// the submitter's extras.
 	if !strings.Contains(out, "##fileformat=VCF") {

@@ -27,16 +27,26 @@ import (
 // indexed, so it answers those. This is not a fallback in the apologetic sense —
 // it is the query engine doing the query.
 
-// openStoredResult opens a job's stored answer, decompressed.
+// resultURI is where a job's stored answer lives.
 //
 // False is an ordinary answer, not a failure: a job whose storage was swept, or
-// one whose worker could not build the file. The caller reads rows instead.
-func (s *Server) openStoredResult(r *http.Request, job queue.Job) (io.ReadCloser, bool) {
+// one whose worker could not build the file.
+func (s *Server) resultURI(r *http.Request, job queue.Job) (string, bool) {
 	uri, ok, err := s.queue.ResultVCF(r.Context(), job.ID)
 	if err != nil {
 		log.Printf("api: job %s: locate result vcf: %v", job.ID, err)
-		return nil, false
+		return "", false
 	}
+	return uri, ok
+}
+
+// openStoredResult opens a job's stored answer, decompressed.
+//
+// This is the reading path — what the tab, csv and json conversions consume.
+// Serving the VCF itself does not come through here: it hands the object over
+// as it is, or a link to it. See exportVCFResult.
+func (s *Server) openStoredResult(r *http.Request, job queue.Job) (io.ReadCloser, bool) {
+	uri, ok := s.resultURI(r, job)
 	if !ok {
 		return nil, false
 	}

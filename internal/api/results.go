@@ -4,7 +4,6 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -118,28 +117,20 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 	qy.Limit, qy.Offset = 0, 0 // export is the whole matching set
 
 	filename := "variants-" + job.ID[:min(8, len(job.ID))] + "." + format
+	if format == "vcf" {
+		// The stored object is gzipped and that is what every path serves, so
+		// the name says so. A file called .vcf that is gzip is the bug this
+		// replaces — a split job's download was exactly that.
+		filename += ".gz"
+	}
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filename+`"`)
 
-	// A VCF download is the stored object itself, decompressed on the way out.
-	// No parse, no render, no column model — the bytes the worker wrote are the
-	// answer, and for a submitted file they are that file with the annotations
-	// added, samples and all.
+	// The VCF is the stored answer, so it is handed over rather than built:
+	// a signed link to the object when the store is reachable from outside,
+	// the object relayed when it is not, and only failing both is it rebuilt.
 	if format == "vcf" {
-		if rc, ok := s.openStoredResult(r, job); ok {
-			defer rc.Close()
-			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-			w.WriteHeader(http.StatusOK)
-			if _, err := io.Copy(w, rc); err != nil {
-				logExportFailure(job.ID, err)
-			}
-			return
-		}
-		// Nothing stored, so this will be rendered from rows below. Coordinate
-		// order, whatever was asked for: a VCF sorted by CADD is not a VCF
-		// anything can index, and it would look perfectly fine until someone ran
-		// tabix on it. The search filter is still honoured — that changes which
-		// records appear, not their order.
-		qy.Sort, qy.Desc = "locus", false
+		s.exportVCFResult(w, r, job, cols, qy, filename)
+		return
 	}
 
 	rows, release := s.rowSource(r, job, qy)
@@ -155,15 +146,6 @@ func (s *Server) handleExport(w http.ResponseWriter, r *http.Request) {
 		s.exportDelimited(w, job, cols, rows, '\t')
 	case "csv":
 		s.exportDelimited(w, job, cols, rows, ',')
-	case "vcf":
-		// Nothing stored to serve. A submitted VCF is still answered with its
-		// own file annotated, which keeps the ID, QUAL, FILTER, existing INFO,
-		// FORMAT and sample columns the caller sent; anything else is rendered
-		// from rows. So a download degrades rather than fails.
-		if job.Kind == queue.KindVCF && s.exportMergedVCF(w, r, job, cols, qy) {
-			return
-		}
-		s.exportVCF(w, job, cols, rows)
 	}
 }
 

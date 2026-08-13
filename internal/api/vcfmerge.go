@@ -77,19 +77,23 @@ func (s *Server) openJobInput(r *http.Request, job queue.Job) (io.Reader, func()
 	return gz, func() { gz.Close(); rc.Close() }, true
 }
 
-// exportMergedVCF writes the submitted VCF back with the annotations added.
+// writeMergedVCF writes the submitted VCF back with the annotations added.
 //
 // Only reached when the worker's stored result is gone or unreadable — the
-// ordinary answer is that object, copied straight out. Merging again is slower
+// ordinary answer is that object, linked to or relayed. Merging again is slower
 // but still correct, so this exists rather than failing a download over a
-// missing shortcut. It reports false when there is no stored input to merge
-// onto either, and the caller renders from rows.
-func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job queue.Job,
-	cols []queue.Column, qy queue.ResultQuery) bool {
+// missing shortcut.
+//
+// done is false when there is no stored input to merge onto either, and the
+// caller renders from rows. It is separate from the error so that "I could not
+// do this" and "I did it and it went wrong" are not the same answer — the first
+// has a fallback and the second does not.
+func (s *Server) writeMergedVCF(w io.Writer, r *http.Request, job queue.Job,
+	cols []queue.Column, qy queue.ResultQuery) (done bool, err error) {
 
 	src, closeSrc, ok := s.openJobInput(r, job)
 	if !ok {
-		return false
+		return false, nil
 	}
 	defer closeSrc()
 
@@ -98,30 +102,21 @@ func (s *Server) exportMergedVCF(w http.ResponseWriter, r *http.Request, job que
 	// round trip per line of the file.
 	qy.Limit, qy.Offset = 0, 0
 	byAllele := vcfmerge.Annotations{}
-	if err := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
+	if sErr := s.queue.StreamResults(r.Context(), job.ID, qy, func(v queue.Variant) error {
 		byAllele[vcfmerge.VariantKey(v.Chrom, v.Pos, v.Ref, v.Alt)] = v.Annotations
 		return nil
-	}); err != nil {
-		return false
+	}); sErr != nil {
+		return false, nil
 	}
 
 	rd, err := vcf.NewVcfReader(src)
 	if err != nil {
-		return false
+		return false, nil
 	}
 	hdr, err := rd.Header()
 	if err != nil {
-		return false
+		return false, nil
 	}
-
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-
-	// Headers are already sent, so a failure here cannot become an error
-	// response — it can only truncate. Logged and abandoned, which is what the
-	// streaming export next door does for the same reason.
-	if _, err := vcfmerge.Merge(rd, w, hdr, cols, byAllele); err != nil {
-		log.Printf("api: merged vcf %s: %v", job.ID, err)
-	}
-	return true
+	_, err = vcfmerge.Merge(rd, w, hdr, cols, byAllele)
+	return true, err
 }

@@ -74,8 +74,9 @@ func TestAPrebuiltResultIsServedWithoutMergingAgain(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), marker) {
-		t.Errorf("the stored file was not served; the export merged again:\n%s", w.Body.String())
+	out := vcfBody(t, w)
+	if !strings.Contains(out, marker) {
+		t.Errorf("the stored file was not served; the export merged again:\n%s", out)
 	}
 }
 
@@ -103,7 +104,7 @@ func TestAMissingPrebuiltResultFallsBackToMerging(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	out := w.Body.String()
+	out := vcfBody(t, w)
 	// Merged from the input: the submitter's own fields are back.
 	if !strings.Contains(out, "GENE=theirs") || !strings.Contains(out, "rs121913529") {
 		t.Errorf("the fallback did not merge the submitted file:\n%s", out)
@@ -128,7 +129,7 @@ func TestAJobWithNoPrebuiltResultStillExports(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	if !strings.Contains(w.Body.String(), "GENE=theirs") {
-		t.Errorf("no merge happened:\n%s", w.Body.String())
+	if out := vcfBody(t, w); !strings.Contains(out, "GENE=theirs") {
+		t.Errorf("no merge happened:\n%s", out)
 	}
 }

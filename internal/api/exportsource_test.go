@@ -1,11 +1,45 @@
 package api
 
 import (
+	"compress/gzip"
+	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/compgenlab/varianthub-web/internal/blob"
+	"github.com/compgenlab/varianthub-web/internal/queue"
 )
+
+// vcfBody is a format=vcf response as text.
+//
+// The VCF is served gzipped by every path — it is the stored object handed over
+// as it is, and where storage is publicly reachable the caller is redirected to
+// that object instead, which can only ever deliver what is stored. A test that
+// read the body as text would be asserting against a shape the server no longer
+// produces.
+func vcfBody(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	if got := w.Header().Get("Content-Type"); got != gzipContentType {
+		t.Errorf("Content-Type = %q, want %q", got, gzipContentType)
+	}
+	zr, err := gzip.NewReader(w.Body)
+	if err != nil {
+		t.Fatalf("the vcf download is not gzip: %v", err)
+	}
+	defer zr.Close()
+	body, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatalf("reading the vcf download: %v", err)
+	}
+	return string(body)
+}
 
 // A file whose values differ from the rows in Postgres, so an export says which
 // of the two it read. Checking that the annotations are present would pass
@@ -18,6 +52,23 @@ const storedFileVCF = `##fileformat=VCFv4.2
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
 chr1	100	.	A	G	.	.	GENE=FROMFILE;gnomAD_AF=0.5
 `
+
+// pointResultAt records where a job's answer is stored, without writing one.
+func pointResultAt(t *testing.T, h *harness, id, uri string) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, h.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO chunk_result (chunk_id, vcf_uri) VALUES ($1, $2)
+		ON CONFLICT (chunk_id) DO UPDATE SET vcf_uri = excluded.vcf_uri`,
+		chunkOf(id), uri); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // seedDivergent stores a result file that disagrees with the rows, and returns
 // the job id.
@@ -125,12 +176,83 @@ func TestASearchIsAnsweredFromTheRows(t *testing.T) {
 	}
 }
 
-// A VCF download is the stored object, decompressed.
+// The VCF download redirects to object storage when the caller can reach it.
 //
-// It is stored gzipped, and it used to be copied to the client verbatim under a
-// filename ending .vcf with Content-Type text/plain — so a split job's download
-// was compressed bytes and nothing said so.
-func TestAVCFDownloadIsNotServedCompressed(t *testing.T) {
+// This is the whole point of storing the answer as a file: the transfer goes
+// from the store to the caller without passing through this service. Relaying a
+// chromosome's annotated VCF means reading it out of the store, through this
+// process and out again — paid twice, and held open for as long as the client is
+// slow.
+func TestAVCFDownloadRedirectsToStorageWhenItIsReachable(t *testing.T) {
+	root := t.TempDir()
+	h := newHarness(t)
+	h.withQueue(t)
+	h.server.cfg.JobStorage = root
+	h.http = h.server.Routes()
+	_, tok := h.admin(t)
+
+	seedJob(t, h, "signed", "vcf", vcfCols,
+		[][4]any{{"chr1", int64(100), "A", "G"}},
+		[]string{`{"GENE":"TP53"}`})
+	// The result lives in a bucket, and the deployment has said how the outside
+	// world reaches that bucket.
+	pointResultAt(t, h, "signed", "s3://results/jobs/signed/"+queue.ResultName)
+	blob.RegisterSites([]blob.Site{{
+		Name: "results", URI: "s3://results",
+		Endpoint: "http://s3:7070", PublicEndpoint: "https://files.example.org",
+		Region: "us-east-1", AccessKey: "k", SecretKey: "s",
+	}})
+	t.Cleanup(func() { blob.RegisterSites(nil) })
+
+	w := h.do("GET", "/api/v1/jobs/signed/export?format=vcf", tok, nil)
+	if w.Code != http.StatusFound {
+		t.Fatalf("export = %d, want 302 to the object: %s", w.Code, w.Body.String())
+	}
+	loc, err := url.Parse(w.Header().Get("Location"))
+	if err != nil {
+		t.Fatalf("Location does not parse: %v", err)
+	}
+	if loc.Host != "files.example.org" {
+		t.Errorf("redirected to %q, not the public endpoint", loc.Host)
+	}
+	if loc.Query().Get("X-Amz-Signature") == "" {
+		t.Error("the redirect target is unsigned; it is not a capability, just a " +
+			"request to a private object")
+	}
+}
+
+// And relays instead when the store is only reachable from inside.
+//
+// The same request, the same job, one setting different — so a caller behind a
+// deployment with a private gateway sees the file rather than an error, and sees
+// the same file the redirect would have delivered.
+func TestAVCFDownloadRelaysWhenStorageIsPrivate(t *testing.T) {
+	root := t.TempDir()
+	h := newHarness(t)
+	h.withQueue(t)
+	h.server.cfg.JobStorage = root
+	h.http = h.server.Routes()
+	_, tok := h.admin(t)
+	seedDivergent(t, h, root, "private")
+
+	// A filesystem-backed result: nothing to sign, so it must be served.
+	w := h.do("GET", "/api/v1/jobs/private/export?format=vcf", tok, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("export = %d, want the bytes: %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(vcfBody(t, w), "FROMFILE") {
+		t.Error("the relayed download did not come from the stored file")
+	}
+}
+
+// A VCF download is the stored object, and it says so.
+//
+// It used to be copied to the client verbatim under a filename ending .vcf with
+// Content-Type text/plain, so a split job's download was compressed bytes and
+// nothing said so. Now the compression is the same on every path and the name
+// carries it — which is what lets the redirect to object storage return the same
+// file as the relay does.
+func TestAVCFDownloadIsTheStoredObjectAndIsNamedAsOne(t *testing.T) {
 	root := t.TempDir()
 	h := newHarness(t)
 	h.withQueue(t)
@@ -143,15 +265,15 @@ func TestAVCFDownloadIsNotServedCompressed(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("export = %d: %s", w.Code, w.Body.String())
 	}
-	body := w.Body.Bytes()
-	if len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b {
-		t.Fatal("the download starts with the gzip magic number; the stored " +
-			"object was served without being decompressed")
+	if cd := w.Header().Get("Content-Disposition"); !strings.Contains(cd, ".vcf.gz") {
+		t.Errorf("Content-Disposition = %q; a gzipped body under a .vcf name is "+
+			"the bug this replaced", cd)
 	}
-	if !strings.HasPrefix(string(body), "##fileformat=VCFv4.2") {
-		t.Errorf("the download is not a VCF:\n%.200s", body)
+	out := vcfBody(t, w)
+	if !strings.HasPrefix(out, "##fileformat=VCFv4.2") {
+		t.Errorf("the download is not a VCF:\n%.200s", out)
 	}
-	if !strings.Contains(string(body), "FROMFILE") {
-		t.Errorf("the download was re-rendered rather than served:\n%s", body)
+	if !strings.Contains(out, "FROMFILE") {
+		t.Errorf("the download was re-rendered rather than served:\n%s", out)
 	}
 }
