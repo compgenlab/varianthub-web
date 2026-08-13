@@ -221,19 +221,19 @@ type Config struct {
 // without anything noticing.
 func Defaults() *Config {
 	return &Config{
-		Addr:            ":8080",
-		Workers:         2,
-		JobSlots:        0, // 0 = follow Workers
-		DownloadWeight:  2,
-		VarhubBin:       "varhub",
-		DataDir:         "/var/lib/varianthub/data",
-		CacheDir:        "/var/lib/varianthub/cache",
+		Addr:           ":8080",
+		Workers:        2,
+		JobSlots:       0, // 0 = follow Workers
+		DownloadWeight: 2,
+		VarhubBin:      "varhub",
+		DataDir:        "/var/lib/varianthub/data",
+		CacheDir:       "/var/lib/varianthub/cache",
 		// A filesystem default, not a bucket: a single-node installation should
 		// come up without object storage configured. It sits beside the other
 		// var directories rather than inside DataDir, because that one holds
 		// source data an administrator keeps and this holds job scratch that is
 		// deleted on a timer — the two should not be one `rm -rf` apart.
-		JobStorage: "/var/lib/varianthub/jobs",
+		JobStorage:      "/var/lib/varianthub/jobs",
 		StoragePaths:    []string{"default=/var/lib/varianthub/sources"},
 		JobTimeout:      12 * time.Hour,
 		DownloadTimeout: 12 * time.Hour,
@@ -326,8 +326,51 @@ func Load() (*Config, error) {
 	if c.JobSlots <= 0 {
 		c.JobSlots = c.Workers
 	}
+	if err := c.checkJobStorage(configHint(path)); err != nil {
+		return nil, err
+	}
 	c.applyPublicURL()
 	return c, nil
+}
+
+// checkJobStorage refuses a job storage location that cannot be shared.
+//
+// The API writes a job's input and the worker reads it, so they must see the
+// same bytes — a bucket, or a directory both processes have mounted. Whether it
+// is object storage or a filesystem does not matter; whether it is *shared*
+// does, and only one of the two ways to get that wrong is visible from in here.
+//
+// A relative path is the visible one, and it is always wrong: it resolves
+// against each process's working directory, so the API and the worker would
+// each get their own. That fails at the first upload with "no such file",
+// pointing at the worker rather than at the configuration.
+//
+// The other way — an absolute path that is pod-local rather than a shared mount
+// — cannot be detected from a single process, since it looks identical to a
+// correct shared mount. The deployment files are where that is settled, and the
+// error below says so rather than implying this check is complete.
+func (c *Config) checkJobStorage(hint string) error {
+	s := strings.TrimSpace(c.JobStorage)
+	if s == "" {
+		return fmt.Errorf("no job storage configured: set worker.job_storage in %s, "+
+			"or VHW_JOB_STORAGE. It holds job inputs and results, and the API and "+
+			"the worker must both reach it — an s3:// bucket, or a directory mounted "+
+			"into both", hint)
+	}
+	if strings.HasPrefix(s, "s3://") {
+		if strings.TrimPrefix(s, "s3://") == "" {
+			return fmt.Errorf("worker.job_storage %q names no bucket", s)
+		}
+		c.JobStorage = strings.TrimRight(s, "/")
+		return nil
+	}
+	if !filepath.IsAbs(s) {
+		return fmt.Errorf("worker.job_storage %q must be absolute or an s3:// URI: a "+
+			"relative path resolves against each process's working directory, so the "+
+			"API and the worker would not share one", s)
+	}
+	c.JobStorage = filepath.Clean(s)
+	return nil
 }
 
 // applyPublicURL fills in what the site's address implies.

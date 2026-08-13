@@ -101,6 +101,7 @@ services:
       # above, and a container that advertises a path it cannot reach is the
       # asymmetry that made the API fail to write assets.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+      - varhub-jobs:/mnt/jobs
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -144,6 +145,7 @@ services:
       # there. It is the same volume either way — the two must not disagree
       # about what is stored.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+      - varhub-jobs:/mnt/jobs
     ports:
       # Not 8080: like postgres above, a dev machine usually already has one.
       #
@@ -219,6 +221,7 @@ services:
       # bare name as a named volume, so one variable covers both. Reference data
       # runs to hundreds of gigabytes, so a dedicated disk is the norm.
       - ${VHW_HOST_STORAGE:-varhub-sources}:/mnt/storage
+      - varhub-jobs:/mnt/jobs
     # Tool sources (VEP, ANNOVAR) run inside apptainer, which mounts a SIF and
     # overlays it — operations a container is normally not allowed.
     #
@@ -282,9 +285,19 @@ services:
     ports:
       - "${S3_PORT:-17070}:7070"
     volumes:
-      # Host-backed so the bucket survives `make dev-reset` and can be inspected
-      # with ordinary tools — it is just a directory tree.
-      - ${S3_HOST_DIR:-/mnt/data1/working/varhub-web-versitygw}:/data
+      # A named volume by default, the same shape as VHW_HOST_STORAGE above: it
+      # survives `make dev-reset` without depending on any particular host
+      # having any particular directory.
+      #
+      # It used to default to a path on one developer's machine, which on
+      # anyone else's would be created empty and root-owned by the daemon —
+      # working, in the sense that nothing errors, while writing the bucket
+      # somewhere nobody meant.
+      #
+      # Set S3_HOST_DIR to bind-mount a directory instead, which is worth doing
+      # when you want to inspect the bucket with ordinary tools: the posix
+      # backend is just a directory tree.
+      - ${S3_HOST_DIR:-varhub-s3}:/data
     healthcheck:
       # An unauthenticated request gets a signed-request error, which is proof
       # the S3 endpoint is answering. Only a connection failure means not-ready.
@@ -349,3 +362,15 @@ volumes:
   caddy-config:
   varhub-data:
   varhub-sources:
+  # Job inputs and results. Mounted into both the API and the worker because
+  # they are the two halves of one exchange: the API writes an upload here and
+  # the worker reads it back. A volume only one of them has is a job that is
+  # accepted and then cannot run.
+  #
+  # A shared volume works because compose puts both on one host. Production is
+  # k8s, where it is a bucket instead — set VHW_JOB_STORAGE to an s3:// URI and
+  # nothing else changes, which is the point of the config taking either.
+  varhub-jobs:
+  # The versitygw bucket, under the s3 profile. Named so a fresh checkout needs
+  # nothing from its host; S3_HOST_DIR overrides it with a bind mount.
+  varhub-s3:
