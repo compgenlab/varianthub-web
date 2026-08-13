@@ -260,12 +260,14 @@ func TestANumericAnnotationIsDeclaredFloat(t *testing.T) {
 		t.Fatalf("annotate --format vcf: %v", err)
 	}
 	got := string(out)
-	if !strings.Contains(got, "ID=gnomad_af,Number=1,Type=Float") {
+	// Number=A, not 1: an exact match writes one value per ALT, so that is what
+	// the header has to say. See TestAMultiAllelicRecordKeepsItsAllelesStraight.
+	if !strings.Contains(got, "ID=gnomad_af,Number=A,Type=Float") {
 		t.Errorf("a numeric annotation was not declared Float:\n%s", got)
 	}
 	// And a categorical one is still a String, so the type is being read from
 	// the manifest rather than applied to everything.
-	if !strings.Contains(got, "ID=sig,Number=1,Type=String") {
+	if !strings.Contains(got, "ID=sig,Number=A,Type=String") {
 		t.Errorf("a categorical annotation was not declared String:\n%s", got)
 	}
 }
