@@ -114,6 +114,8 @@ type fileConfig struct {
 		// Variants per chunk of a split VCF. Sized by per-chunk fixed cost, not
 		// by fairness — see catalog.Site.VCFChunkSize.
 		VCFChunkSize   *int   `toml:"vcf_chunk_size"`
+		// Rows kept for the results table; the whole answer is the stored VCF.
+		MaxTableRows   *int   `toml:"max_table_rows"`
 		MaxUploadBytes *int64 `toml:"max_upload_bytes"`
 	} `toml:"limits"`
 }
@@ -229,6 +231,7 @@ func applyFile(c *Config, path string) (hasSecret bool, err error) {
 	setInt(&c.StandardMaxVariants, f.Limits.StandardMaxVariants)
 	setInt(&c.ElevatedMaxVariants, f.Limits.ElevatedMaxVariants)
 	setInt(&c.VCFChunkSize, f.Limits.VCFChunkSize)
+	setInt(&c.MaxTableRows, f.Limits.MaxTableRows)
 	if f.Limits.MaxUploadBytes != nil {
 		c.MaxUploadBytes = *f.Limits.MaxUploadBytes
 	}

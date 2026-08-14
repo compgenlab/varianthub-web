@@ -272,7 +272,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, chunkSizeFor(ctx, cfg, cat)))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, siteFor(ctx, cfg, cat)))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -455,11 +455,11 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // bridges — and it is written outside the Outcome because an Outcome is the
 // chunk's result, while a log exists for the runs that produced no result at
 // all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, cfgVersion string, chunkSize func() int) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, cfgVersion string, site func() catalog.Site) queue.Runner {
 	return func(ctx context.Context, chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 		switch chunk.Kind {
 		case queue.KindSplit:
-			return runSplitChunk(ctx, q, chunk, cfgJobStorage, chunkSize())
+			return runSplitChunk(ctx, q, chunk, cfgJobStorage, site().ChunkSize())
 		case queue.KindCollect:
 			return runCollectChunk(ctx, q, chunk, cfgJobStorage)
 		case queue.KindDownload:
@@ -537,7 +537,12 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, c
 				log.Printf("worker: chunk %s: encode columns: %v", chunk.ID, mErr)
 			}
 		}
-		out := queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}
+		out := queue.Outcome{
+			Result: res.Variants, N: res.N, Columns: cols, Variants: true,
+			// How much of this may be kept for the browsable table. The queue
+			// decides *which* chunk contributes; this is *how many*.
+			MaxRows: site().TableRows(),
+		}
 
 		// Assemble the answer-as-a-VCF here, while the submitted file is still
 		// staged. It used to be built on every download — the whole file parsed
@@ -1298,22 +1303,28 @@ func storePieceOutput(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 	return nil
 }
 
-// chunkSizeFor resolves the split chunk size at the moment a split runs.
+// siteFor resolves the deployment's effective settings at the moment a chunk
+// runs.
 //
-// Read per chunk rather than captured at boot, matching how the cache setting
-// is resolved: an administrator changing it should reach a running worker
-// rather than wait for a redeploy. A database that cannot be read falls back
-// to the configured default instead of guessing, so a blip cannot silently
-// change how a submission is cut.
-func chunkSizeFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() int {
-	return func() int {
+// Read per chunk rather than captured at boot, matching how the cache setting is
+// resolved: an administrator changing a limit should reach a running worker
+// rather than wait for a redeploy. A database that cannot be read falls back to
+// the configured values instead of guessing, so a blip cannot silently change
+// how a submission is cut or how much of it is kept.
+//
+// The whole Site rather than one number, because the worker needs several of
+// them — the split size and the table-row cap so far — and a resolver per
+// setting is a list to forget to add to.
+func siteFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() catalog.Site {
+	return func() catalog.Site {
+		base := catalog.SiteFromConfig(cfg)
 		if cat == nil {
-			return catalog.SiteFromConfig(cfg).ChunkSize()
+			return base
 		}
-		site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+		site, err := cat.EffectiveSite(ctx, base)
 		if err != nil {
-			return catalog.SiteFromConfig(cfg).ChunkSize()
+			return base
 		}
-		return site.ChunkSize()
+		return site
 	}
 }

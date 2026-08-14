@@ -381,6 +381,13 @@ type Outcome struct {
 	// Variants says whether Result is an annotated-variant array that should
 	// be projected into chunk_variant. A download's result is a file manifest.
 	Variants bool
+	// MaxRows bounds how many variants are kept as rows; 0 keeps every one.
+	//
+	// Carried on the outcome because the number is a deployment setting the
+	// worker resolves per chunk, while which chunk may contribute rows is a fact
+	// about the job's shape that the queue knows. Each decides the half it can
+	// see.
+	MaxRows int
 	// VCFURI is where the chunk's answer was stored as a VCF. Every annotation
 	// chunk produces one — a submitted file with the annotations set on its
 	// records, or a sites-only render for a locus list — and it is what every
@@ -1033,6 +1040,15 @@ func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 	return *uri, nil
 }
 
+// firstChunk reports whether this chunk is where a job's results table starts.
+//
+// The sole chunk of an ordinary submission, or piece 0 of a split one. A split's
+// own chunk and its collect are neither: the first produces no variants and the
+// second's output is the join, which is every piece over again.
+func firstChunk(c Chunk) bool {
+	return c.ChunkIndex == nil || *c.ChunkIndex == 0
+}
+
 type rowScanner interface{ Scan(dest ...any) error }
 
 func scanChunk(row rowScanner) (Chunk, error) {
@@ -1528,8 +1544,14 @@ func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, 
 	// Skipped for a download: its result is a file manifest, not variants, and
 	// forcing it through the variant projection would fail on a shape that was
 	// never meant to fit.
-	if out.Variants && out.Result != nil {
-		if err := insertVariants(wctx, tx, id, out.Result); err != nil {
+	//
+	// Taken only from a job's first chunk. These rows are a window onto the
+	// start of the result, so later pieces have nothing to add to it — and
+	// reading only the first is what lets the cap be applied by one worker
+	// looking at its own chunk, with no counter shared between the twenty-six
+	// that may be finishing at the same moment.
+	if out.Variants && out.Result != nil && firstChunk(chunk) {
+		if err := insertVariants(wctx, tx, id, out.Result, out.MaxRows); err != nil {
 			log.Printf("queue: store chunk %s variants: %v", id, err)
 			return
 		}

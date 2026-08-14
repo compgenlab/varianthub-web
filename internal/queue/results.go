@@ -22,13 +22,23 @@ type Variant struct {
 
 // insertVariants explodes the CLI's result JSON into chunk_variant rows.
 //
-// It runs inside the same transaction as the result blob and the status
-// change, so a chunk is never observably done with results that are not yet
-// queryable.
-func insertVariants(ctx context.Context, tx pgx.Tx, chunkID string, result []byte) error {
+// It runs inside the same transaction as the status change, so a chunk is never
+// observably done with results that are not yet queryable.
+//
+// max bounds how many rows are kept; 0 or less keeps them all. These rows exist
+// so a person can page, search and sort through a result in a browser — the
+// answer itself is the stored VCF, and every download is served from that. A
+// whole genome's worth of JSONB buys a table nobody can use at the size that
+// makes it expensive, so it is not written. See catalog.Site.TableRows.
+func insertVariants(ctx context.Context, tx pgx.Tx, chunkID string, result []byte, max int) error {
 	var variants []Variant
 	if err := json.Unmarshal(result, &variants); err != nil {
 		return fmt.Errorf("parse result for indexing: %w", err)
+	}
+	if max > 0 && len(variants) > max {
+		// The first max, not a sample: the table is read in order, so the rows
+		// somebody sees have to be the ones the file starts with.
+		variants = variants[:max]
 	}
 	if len(variants) == 0 {
 		return nil

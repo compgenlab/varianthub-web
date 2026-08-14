@@ -37,6 +37,25 @@ import (
 // WGS cohort is 2.6M variants: 260 chunks at 10,000, 26 at this.
 const DefaultVCFChunkSize = 100_000
 
+// DefaultMaxTableRows bounds how many of a job's variants are kept as rows for
+// the results table to page, search and sort.
+//
+// The answer is not "all of them". A job's whole answer is the VCF in storage
+// and every download is served from it; these rows exist only so a person can
+// look through the result in a browser. Nobody scrolls to page 26,000, so
+// keeping 2.6M rows of JSONB — a gigabyte or two per chromosome — buys a table
+// that is unusable at exactly the sizes that make it expensive.
+//
+// The effective cap is the smaller of this and the chunk size, and only a job's
+// first chunk contributes: see catalog.Site.TableRows. That is what makes the
+// bound something one chunk can apply by itself, with no running total shared
+// between twenty-six workers finishing at once.
+//
+// What it costs is that a search or a sort over a very large job covers the rows
+// that exist rather than the whole file. That trade is the point; the full
+// answer is a download away.
+const DefaultMaxTableRows = 10_000
+
 // Config is the resolved service configuration.
 type Config struct {
 	Addr string // listen address, e.g. ":8080" or "10.0.0.5:8080"
@@ -169,6 +188,10 @@ type Config struct {
 	// VCFChunkSize is variants per chunk of a split VCF. A different question
 	// from the caps above and sized differently — see catalog.Site.VCFChunkSize.
 	VCFChunkSize int
+	// MaxTableRows bounds the rows kept for the results table — see
+	// DefaultMaxTableRows. The whole answer is the stored VCF; these are for
+	// browsing it.
+	MaxTableRows int
 
 	// JobTimeout bounds a single annotation job's wall clock.
 	//
@@ -289,6 +312,7 @@ func Defaults() *Config {
 		StandardMaxVariants: 10_000,
 		ElevatedMaxVariants: 0,
 		VCFChunkSize:        DefaultVCFChunkSize,
+		MaxTableRows:        DefaultMaxTableRows,
 
 		References: map[string]string{},
 		TrustedProxy: []string{
@@ -470,6 +494,7 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_STANDARD_MAX_VARIANTS", &c.StandardMaxVariants)
 	envIntInto("VHW_ELEVATED_MAX_VARIANTS", &c.ElevatedMaxVariants)
 	envIntInto("VHW_VCF_CHUNK_SIZE", &c.VCFChunkSize)
+	envIntInto("VHW_MAX_TABLE_ROWS", &c.MaxTableRows)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n
