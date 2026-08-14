@@ -21,12 +21,14 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
+	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 )
 
@@ -101,23 +103,156 @@ func (r *Runner) Columns(ctx context.Context, snapshot string, present map[strin
 	return l.Columns(ctx, snapshot, present)
 }
 
-// Annotate passes the request to the engine, uncached.
+// Annotate answers from the cache what it can and asks the engine for the rest.
 //
-// TEMPORARY. The engine's answer is a VCF now rather than a JSON array, and this
-// decorator cannot yet produce one: it answers part of a request from stored
-// values and has to merge those into whatever the engine returns for the rest,
-// which means writing a VCF, not just reading one. That is the next commit.
+// Three files: the submitted VCF, one reduced copy of it per engine run holding
+// only the records still owed an answer, and the output. The reduced copies are
+// the input with records removed, so what comes back is in the input's order and
+// the answer can be assembled by walking the submitted file once, setting values
+// on each record as it goes. Nothing is sorted and nothing has to be.
 //
-// Standing aside rather than half-working is the only safe shape in between.
-// Every uncertainty in this package already resolves this way — see plan — for
-// the reason that applies here too: a correct slow answer beats a fast wrong
-// one, and a cache that merged into the wrong records would produce a file that
-// is well-formed and misattributed, which nothing downstream can detect.
-//
-// The cost is that every job recomputes until the next commit lands. The
-// planning below is kept, unused, because it is what the rewrite builds on.
+// Nothing here can fail a job. Every error falls back to running the request
+// unchanged, because a correct slow answer beats a fast wrong one — and a merge
+// that went astray would produce a well-formed VCF with values on the wrong
+// records, which no reader downstream can detect.
 func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Result, error) {
-	return r.Inner.Annotate(ctx, req)
+	p, ok := r.plan(ctx, req)
+	if !ok {
+		return r.Inner.Annotate(ctx, req)
+	}
+
+	hits, err := r.Cache.Lookup(ctx, p.assembly, p.loci, p.sourceRefs())
+	if err != nil {
+		log.Printf("cacherunner: lookup failed, running uncached: %v", err)
+		return r.Inner.Annotate(ctx, req)
+	}
+
+	work := p.remaining(hits, r.MaxRuns)
+	if work.bail {
+		return r.Inner.Annotate(ctx, req)
+	}
+	note(req, fmt.Sprintf("··· cache: %d/%d variant(s) served whole, %d source(s) skipped, %d varhub run(s) for %d",
+		len(p.loci)-len(work.loci), len(p.loci), len(work.skipped), len(work.groups), len(work.loci)))
+
+	fresh, res, err := r.compute(ctx, req, p, work)
+	if err != nil {
+		return runner.Result{}, err
+	}
+	res.Columns = r.columnsFor(ctx, req, p, res.Columns)
+
+	if err := writeAnswer(req.InputPath, req.OutputPath, queueColumns(res.Columns),
+		p.merge(hits, fresh)); err != nil {
+		// The engine's own answer for the reduced set is on disk but it is not
+		// the whole request, so there is nothing here to salvage. Run the lot.
+		log.Printf("cacherunner: assembling the answer failed, running uncached: %v", err)
+		return r.Inner.Annotate(ctx, req)
+	}
+	res.VCFPath, res.N = req.OutputPath, len(p.loci)
+
+	// After the answer is written, so a cache that cannot be updated still
+	// returns the right result — the cost is only that the next job recomputes.
+	//
+	// The sweep follows the write and only the write: a job answered entirely
+	// from cache added nothing to enforce a budget against, and the fastest path
+	// in the system should not spend a round trip discovering that.
+	if r.store(ctx, p, work, hits, fresh) {
+		r.sweep(ctx)
+	}
+	return res, nil
+}
+
+// compute runs the engine over whatever the cache could not answer, and returns
+// the fresh values by locus key alongside the Result to build on.
+//
+// A run with nothing left to ask is the point of all of this: no process, no
+// home, no source reads. It still owes the caller a column model, which the
+// inner runner can supply without annotating.
+func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work remainder) (map[string]map[string]any, runner.Result, error) {
+	if len(work.groups) == 0 {
+		note(req, "··· cache: answered entirely from cache; varhub not invoked")
+		return nil, runner.Result{
+			Log: "every variant answered from the shared annotation cache",
+		}, nil
+	}
+
+	// The reduced inputs and the engine's answers to them. Scratch, all of it:
+	// what survives is the assembled output at req.OutputPath.
+	dir, err := os.MkdirTemp("", "vhw-cache-")
+	if err != nil {
+		return nil, runner.Result{}, err
+	}
+	defer os.RemoveAll(dir)
+
+	fresh := map[string]map[string]any{}
+	var out runner.Result
+	for i, g := range work.groups {
+		note(req, fmt.Sprintf("··· cache: run %d/%d — %d variant(s), %d annotation(s)",
+			i+1, len(work.groups), len(g.loci), len(g.ask)))
+
+		want := make(map[string]bool, len(g.loci))
+		for _, l := range g.loci {
+			want[l.Key()] = true
+		}
+		subIn := filepath.Join(dir, fmt.Sprintf("ask.%d.vcf", i))
+		n, sErr := writeSubset(req.InputPath, subIn, want)
+		if sErr != nil {
+			return nil, runner.Result{}, fmt.Errorf("reduce the input: %w", sErr)
+		}
+		if n == 0 {
+			continue // nothing of this group survived; the cache had it all
+		}
+
+		sub := req
+		sub.Selection = strings.Join(g.ask, ",")
+		// The reduced file, not the submitted one. Leaving InputPath alone was
+		// the whole failure this guards: the runner prefers a path over a body,
+		// so the engine would re-annotate every variant on every group and the
+		// cache would become a multiplier rather than a saving.
+		sub.InputPath = subIn
+		sub.Body = nil
+		sub.OutputPath = filepath.Join(dir, fmt.Sprintf("got.%d.vcf.gz", i))
+
+		res, aErr := r.Inner.Annotate(ctx, sub)
+		if aErr != nil {
+			return nil, runner.Result{}, aErr
+		}
+		values, vErr := valuesFrom(res.VCFPath)
+		if vErr != nil {
+			return nil, runner.Result{}, vErr
+		}
+		// No group asks about a name another group asked about — each source
+		// belongs to exactly one — so merging cannot overwrite a real value with
+		// another run's null.
+		for key, ann := range values {
+			if have, ok := fresh[key]; ok {
+				for name, v := range ann {
+					have[name] = v
+				}
+				continue
+			}
+			fresh[key] = ann
+		}
+		if i == 0 {
+			out = res
+			continue
+		}
+		out.Columns = append(out.Columns, res.Columns...)
+		out.Log += "\n" + res.Log
+	}
+	return fresh, out, nil
+}
+
+// queueColumns converts the runner's column model to the queue's.
+//
+// The same struct declared twice — the runner describes what the engine
+// reported, the queue describes what was stored — so this converts rather than
+// translates, and stops compiling if they ever diverge.
+func queueColumns(cols []runner.Column) []queue.Column {
+	out := make([]queue.Column, len(cols))
+	for i, c := range cols {
+		out[i] = queue.Column(c)
+	}
+	return out
 }
 
 // store writes back what the engine just computed, for the sources that may be
@@ -320,7 +455,28 @@ func (p *plan) classify(fields []catalog.Field) bool {
 			continue
 		}
 		f := found[0]
-		if f.Builtin != "" && !variantOnlyBuiltin(f.Builtin) {
+		if f.Builtin != "" {
+			// Every builtin, not only the sample-dependent ones.
+			//
+			// A builtin does not come back under the name the manifest gave it:
+			// cghts writes fixed names of its own — CG_TSTV for tstv — and
+			// auto_id sets the record ID rather than an INFO field. The values
+			// this decorator reads out of an engine run are therefore filed
+			// under CG_TSTV while everything here is keyed on tstv, so a freshly
+			// computed builtin would be dropped on the way through and a cached
+			// one would never be written. Silently: the annotation would simply
+			// be absent from a cached job's answer and present in an uncached
+			// one.
+			//
+			// Passthrough rather than refusing the whole request, because it
+			// costs almost nothing. A builtin is computed from the variant
+			// itself with no source to open, and passthrough only forces the
+			// engine to see every locus — the expensive sources are still
+			// skipped for the ones already cached, which is the saving that
+			// matters.
+			//
+			// This restriction lifts the moment builtins emit the names they
+			// were given. See TestExecRunnerLocus for where that is pinned.
 			p.passthrough = append(p.passthrough, name)
 			banned[f.SourceRef] = true
 			continue
@@ -533,31 +689,6 @@ func (p *plan) allCached(hits anncache.Hits, key string) bool {
 }
 
 // --- helpers ---
-
-// variantOnlyBuiltin reports whether a builtin computes from chrom, pos, ref and
-// alt alone, and may therefore be cached.
-//
-// varhub's annotate.VariantOnlyBuiltin is the authority. The rest read a
-// sample's FORMAT columns — dosage, vaf, minor_strand, fisher_sb, copy_logratio
-// — or the neighbouring variants in the stream, as vardist does. None of those
-// is the same answer for two callers asking about the same locus, so a cached
-// one hands one sample's number to another: wrong, entirely plausible, and
-// invisible in the result.
-//
-// The list is copied rather than imported because varhub is a separate program
-// this service execs, and taking a dependency on its packages for one function
-// pulls in the filesystem- and container-bound closure the process boundary
-// exists to keep out. What makes the copy safe is its direction: a builtin this
-// has not heard of is not cached. A new sample-dependent builtin is then correct
-// without anyone remembering this file, and a new variant-only one is merely
-// uncached until someone does.
-func variantOnlyBuiltin(name string) bool {
-	switch name {
-	case "auto_id", "indel", "tstv", "tags":
-		return true
-	}
-	return false
-}
 
 // parseInput reads a job's variants, in the order the engine will report them.
 //
