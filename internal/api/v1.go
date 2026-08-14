@@ -452,15 +452,52 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	if len(loci) > 1 {
 		label = fmt.Sprintf("%s +%d more", loci[0], len(loci)-1)
 	}
-	s.submit(w, r, queue.NewJob{
+
+	// The list becomes a VCF here, so a job's stored input is always one
+	// whatever it was submitted as. Everything downstream — the worker, the
+	// cache, the engine — then has a file rather than two shapes to tell apart.
+	//
+	// The id is minted before the object because the object is stored under it,
+	// which is what makes a bucket listing say which job every object belongs
+	// to. Same order as the upload path, for the same reason.
+	id, err := queue.NewID()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	uri := queue.ObjectURI(s.cfg.JobStorage, id, queue.InputName(true))
+	pr, pw := io.Pipe()
+	go func() {
+		_, wErr := writeLocusVCF(pw, loci)
+		pw.CloseWithError(wErr)
+	}()
+	if err := blob.PutReader(r.Context(), uri, pr); err != nil {
+		pr.CloseWithError(err)
+		log.Printf("api: store loci for job %s at %s: %v", id, uri, err)
+		writeError(w, http.StatusInternalServerError, "could not store the submitted variants")
+		return
+	}
+
+	if !s.submit(w, r, queue.NewJob{
+		ID:        id,
 		Kind:      queue.KindLocus,
 		Snapshot:  snapshot,
 		Selection: sel,
 		Session:   sessionOf(r),
 		UserID:    callerOf(r).UserID(),
 		Label:     label,
-		Body:      []byte(strings.Join(loci, "\n")),
-	})
+		InputURI:  uri,
+		// Kept alongside the stored file until the worker reads the file
+		// instead. Two copies of a locus list is a few hundred bytes; two code
+		// paths, briefly, is the thing being removed.
+		Body: []byte(strings.Join(loci, "\n")),
+	}) {
+		// The row was refused, so nothing will ever read the object. Removed
+		// here because this is the last place that knows where it went.
+		if rmErr := blob.Remove(context.WithoutCancel(r.Context()), uri); rmErr != nil {
+			log.Printf("api: remove orphaned loci object %s: %v", uri, rmErr)
+		}
+	}
 }
 
 // maxFormField bounds one non-file part of an upload. Snapshot names and

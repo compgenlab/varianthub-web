@@ -45,8 +45,14 @@ func newHarness(t *testing.T) *harness {
 
 	cat := catalog.New(pool)
 	ids := identity.NewStore(pool)
+	// Job storage, because every submission writes its input there now — a
+	// pasted locus list becomes a stored VCF exactly as an upload does. Left
+	// unset it resolves to /jobs/<id>/…, an absolute path at the filesystem
+	// root, and every submit fails on permissions rather than on anything the
+	// test is about.
 	srv := New(&config.Config{
 		Version: "test", RatePerMin: 1000, RateBurst: 1000,
+		JobStorage: t.TempDir(),
 	}, nil, cat, ids, nil)
 	return &harness{server: srv, http: srv.Routes(), ids: ids, cat: cat, dsn: dsn}
 }
