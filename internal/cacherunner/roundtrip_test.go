@@ -126,30 +126,45 @@ func read(t *testing.T, path string) string {
 
 var _ = io.Discard
 
-// A builtin is never cached, whatever it computes from.
+// A builtin is cached only when its value can be stored and read back.
 //
-// It does not come back under the name the manifest gave it — cghts writes
-// CG_TSTV for tstv, and auto_id sets the record ID rather than an INFO field —
-// so a freshly computed builtin would be dropped on the way through this
-// decorator and a cached one would never be written. The annotation would simply
-// be missing from a cached job's answer and present in an uncached one, which is
-// the kind of difference nobody goes looking for.
-func TestABuiltinIsNeverCacheable(t *testing.T) {
+// tstv can: it is a function of the variant, it writes one INFO field, and since
+// varianthub-cli honoured the manifest it writes it under the declared name.
+// auto_id cannot — it sets the record ID, so there is no INFO field to read back
+// — and indel cannot, because it writes five fields and the cache is keyed on
+// the one name the manifest gave. A builtin that fails any of those would be
+// missing from a cached job's answer and present in an uncached one.
+func TestOnlyAReadableBuiltinIsCacheable(t *testing.T) {
 	fields := []catalog.Field{
-		{Name: "tstv", SourceRef: "builtins:1", Builtin: "tstv", Manifest: "tstv"},
-		{Name: "auto_id", SourceRef: "builtins:1", Builtin: "auto_id", Manifest: "auto_id"},
+		{Name: "tstv", SourceRef: "tstvsrc:1", Builtin: "tstv", Manifest: "tstv"},
+		{Name: "auto_id", SourceRef: "idsrc:1", Builtin: "auto_id", Manifest: "auto_id"},
+		{Name: "indel", SourceRef: "indelsrc:1", Builtin: "indel", Manifest: "indel"},
 		{Name: "clinvar_sig", SourceRef: "clinvar:2026-01", Manifest: "CLNSIG"},
 	}
-	p := &plan{selected: []string{"tstv", "auto_id", "clinvar_sig"}}
+	p := &plan{selected: []string{"tstv", "auto_id", "indel", "clinvar_sig"}}
 	if !p.classify(fields) {
 		t.Fatal("classify refused a workable plan")
 	}
 
 	for _, ref := range p.sourceRefs() {
-		if ref == "builtins:1" {
-			t.Error("a builtin source was treated as cacheable; its values would be " +
-				"filed under a name this decorator never looks up")
+		if ref == "idsrc:1" {
+			t.Error("auto_id was treated as cacheable; it writes no INFO field, so " +
+				"nothing could be read back out of an engine run")
 		}
+		if ref == "indelsrc:1" {
+			t.Error("indel was treated as cacheable; it writes five fields and the " +
+				"cache is keyed on the one name the manifest gave")
+		}
+	}
+	var cachesTsTv bool
+	for _, ref := range p.sourceRefs() {
+		if ref == "tstvsrc:1" {
+			cachesTsTv = true
+		}
+	}
+	if !cachesTsTv {
+		t.Error("tstv is a function of the variant and writes one named INFO field; " +
+			"it should be cacheable")
 	}
 	// The real source is still cached — that is the saving worth keeping.
 	var cachesClinvar bool
@@ -161,8 +176,8 @@ func TestABuiltinIsNeverCacheable(t *testing.T) {
 	if !cachesClinvar {
 		t.Error("excluding builtins also excluded the source that costs something")
 	}
-	// And the builtins are asked of the engine rather than dropped.
-	for _, want := range []string{"tstv", "auto_id"} {
+	// And the uncacheable builtins are asked of the engine rather than dropped.
+	for _, want := range []string{"auto_id", "indel"} {
 		var asked bool
 		for _, n := range p.passthrough {
 			if n == want {

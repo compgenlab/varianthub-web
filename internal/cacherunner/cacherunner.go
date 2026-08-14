@@ -455,28 +455,7 @@ func (p *plan) classify(fields []catalog.Field) bool {
 			continue
 		}
 		f := found[0]
-		if f.Builtin != "" {
-			// Every builtin, not only the sample-dependent ones.
-			//
-			// A builtin does not come back under the name the manifest gave it:
-			// cghts writes fixed names of its own — CG_TSTV for tstv — and
-			// auto_id sets the record ID rather than an INFO field. The values
-			// this decorator reads out of an engine run are therefore filed
-			// under CG_TSTV while everything here is keyed on tstv, so a freshly
-			// computed builtin would be dropped on the way through and a cached
-			// one would never be written. Silently: the annotation would simply
-			// be absent from a cached job's answer and present in an uncached
-			// one.
-			//
-			// Passthrough rather than refusing the whole request, because it
-			// costs almost nothing. A builtin is computed from the variant
-			// itself with no source to open, and passthrough only forces the
-			// engine to see every locus — the expensive sources are still
-			// skipped for the ones already cached, which is the saving that
-			// matters.
-			//
-			// This restriction lifts the moment builtins emit the names they
-			// were given. See TestExecRunnerLocus for where that is pinned.
+		if f.Builtin != "" && !cacheableBuiltin(f.Builtin) {
 			p.passthrough = append(p.passthrough, name)
 			banned[f.SourceRef] = true
 			continue
@@ -689,6 +668,35 @@ func (p *plan) allCached(hits anncache.Hits, key string) bool {
 }
 
 // --- helpers ---
+
+// cacheableBuiltin reports whether a builtin's value can be stored and served
+// from the cache.
+//
+// Three things have to hold, and only two builtins manage all three.
+//
+// It must be a function of the variant alone. dosage, vaf, minor_strand and
+// fisher_sb read a sample's FORMAT columns, so a stored value would be one
+// sample's number served to another; vardist reads the neighbouring variants, so
+// its answer depends on what else was submitted.
+//
+// It must write an INFO field. auto_id sets the record's ID column — the right
+// place for a variant identifier — so there is nothing for this to read back out
+// of an engine run.
+//
+// And it must write exactly one, under the manifest's name. indel writes five
+// fields describing the change; the cache is keyed on the annotation's name, and
+// no one of those five is it.
+//
+// The list is spelled out rather than derived because it is a statement about
+// what each builtin means, and a new one added upstream should be uncached until
+// somebody has thought about which of these it satisfies.
+func cacheableBuiltin(name string) bool {
+	switch name {
+	case "tstv", "tags":
+		return true
+	}
+	return false
+}
 
 // parseInput reads a job's variants, in the order the engine will report them.
 //

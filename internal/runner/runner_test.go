@@ -115,28 +115,25 @@ func TestExecRunnerLocus(t *testing.T) {
 	if !strings.HasPrefix(data[0], "chr1\t115256529\t") {
 		t.Errorf("unexpected record: %q", data[0])
 	}
-	// Builtins do not come back under the names the manifest gave them, and
-	// that is worth pinning rather than glossing.
+	// Builtins come back under the names the manifest gave them.
 	//
-	// The manifest declares "auto_id" and "tstv"; the engine's json path reports
-	// exactly those. Its VCF path does not: cghts's builtin annotators write
-	// fixed names of their own — CG_TSTV here — and auto_id sets the record's ID
-	// column rather than an INFO field at all. So the column model this service
-	// gets from `annotation list` says tstv while the file says CG_TSTV, and
-	// nothing joins the two.
-	//
-	// Asserted as it is, so the discrepancy is visible in the suite rather than
-	// discovered by a user whose table has an empty column. Fixing it belongs in
-	// cghts, which would have to let a builtin be told its name.
+	// They did not until varianthub-cli honoured a.Name: the annotator wrote
+	// CG_TSTV whatever the manifest said, so the column model said tstv while
+	// the file said CG_TSTV and nothing joined them. Pinned here because this is
+	// where the consequence lands — a column key that does not match the file is
+	// an empty column in somebody's results table.
 	f := strings.Split(data[0], "\t")
+	if !strings.Contains(data[0], "tstv=TS") {
+		t.Errorf("tstv did not come back under its manifest name: %q", data[0])
+	}
+	if strings.Contains(data[0], "CG_TSTV") {
+		t.Errorf("the annotator's own fixed name leaked into the output: %q", data[0])
+	}
+	// auto_id is the exception, and deliberately so: a variant identifier belongs
+	// in the ID column, which is where it goes. It is not an INFO field and has
+	// no name to take.
 	if f[2] != "1-115256529-T-C" {
-		t.Errorf("auto_id should be the record ID on this path, got %q", f[2])
-	}
-	if !strings.Contains(data[0], "CG_TSTV=TS") {
-		t.Errorf("tstv missing: %q", data[0])
-	}
-	if strings.Contains(data[0], "tstv=TS") {
-		t.Log("builtins now emit their manifest names; the note above is stale")
+		t.Errorf("auto_id should be the record ID, got %q", f[2])
 	}
 }
 

@@ -70,20 +70,19 @@ func TestCatalogDrivenAnnotation(t *testing.T) {
 	// The seeded snapshot's defaults are auto_id, tstv, indel. Getting all three
 	// proves default_annotations survived the round trip through Postgres.
 	//
-	// Under the names cghts's builtins actually write, which are not the names
-	// the manifest gave them: CG_TSTV rather than tstv, and auto_id as the
-	// record's ID column rather than an INFO field. See TestExecRunnerLocus.
+	// Under the names the manifest gave them. auto_id is the exception by
+	// design: an identifier belongs in the ID column.
 	f := strings.Split(data[0], "\t")
 	if f[2] != "1-115256529-T-C" {
 		t.Errorf("auto_id should be the record ID, got %q", f[2])
 	}
-	if !strings.Contains(data[0], "CG_TSTV=TS") {
-		t.Errorf("missing default annotation CG_TSTV; got %q", data[0])
+	if !strings.Contains(data[0], "tstv=TS") {
+		t.Errorf("missing default annotation tstv; got %q", data[0])
 	}
 	// indel is a flag and this variant is a SNV, so its absence is the answer
 	// rather than a missing annotation. The json path reported the key with an
 	// empty value; a VCF says the same thing by not writing the field.
-	if strings.Contains(data[0], "CG_INDEL") {
+	if strings.Contains(data[0], "indel_INSERT") || strings.Contains(data[0], "indel_DELETE") {
 		t.Errorf("a SNV was flagged as an indel: %q", data[0])
 	}
 }
