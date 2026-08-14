@@ -60,8 +60,8 @@ func TestOnlyTheFirstChunkContributesRows(t *testing.T) {
 		{"piece 0 of a split", Chunk{ChunkIndex: &zero}, true},
 		{"piece 1 of a split", Chunk{ChunkIndex: &one}, false},
 	} {
-		if got := firstChunk(tc.chunk); got != tc.want {
-			t.Errorf("%s: firstChunk = %v, want %v", tc.name, got, tc.want)
+		if got := FirstChunk(tc.chunk); got != tc.want {
+			t.Errorf("%s: FirstChunk = %v, want %v", tc.name, got, tc.want)
 		}
 	}
 }

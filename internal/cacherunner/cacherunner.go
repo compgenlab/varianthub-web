@@ -16,7 +16,6 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -102,107 +101,23 @@ func (r *Runner) Columns(ctx context.Context, snapshot string, present map[strin
 	return l.Columns(ctx, snapshot, present)
 }
 
-// Annotate answers from the cache what it can and passes the rest to the engine.
-func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Result, error) {
-	p, ok := r.plan(ctx, req)
-	if !ok {
-		return r.Inner.Annotate(ctx, req)
-	}
-
-	hits, err := r.Cache.Lookup(ctx, p.assembly, p.loci, p.sourceRefs())
-	if err != nil {
-		log.Printf("cacherunner: lookup failed, running uncached: %v", err)
-		return r.Inner.Annotate(ctx, req)
-	}
-
-	work := p.remaining(hits, r.MaxRuns)
-	if work.bail {
-		return r.Inner.Annotate(ctx, req)
-	}
-	note(req, fmt.Sprintf("··· cache: %d/%d variant(s) served whole, %d source(s) skipped, %d varhub run(s) for %d",
-		len(p.loci)-len(work.loci), len(p.loci), len(work.skipped), len(work.groups), len(work.loci)))
-
-	fresh, res, err := r.compute(ctx, req, p, work)
-	if err != nil {
-		return runner.Result{}, err
-	}
-
-	out, err := p.merge(hits, fresh)
-	if err != nil {
-		log.Printf("cacherunner: merge failed, running uncached: %v", err)
-		return r.Inner.Annotate(ctx, req)
-	}
-	res.Variants, res.N = out, len(p.loci)
-	res.Columns = r.columnsFor(ctx, req, p, res.Columns)
-
-	// After the answer is assembled, so a cache that cannot be written still
-	// returns the right result — the cost is only that the next job recomputes.
-	//
-	// The sweep follows the write and only the write: a job answered entirely
-	// from cache added nothing to enforce a budget against, and the fastest path
-	// in the system should not spend a round trip discovering that.
-	if r.store(ctx, p, work, hits, fresh) {
-		r.sweep(ctx)
-	}
-	return res, nil
-}
-
-// compute runs the engine over whatever the cache could not answer, and returns
-// the fresh values by locus key alongside the Result to build on.
+// Annotate passes the request to the engine, uncached.
 //
-// A run with nothing left to ask is the point of all of this: no process, no
-// home, no source reads. It still owes the caller a column model, which the
-// inner runner can supply without annotating.
-func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work remainder) (map[string]map[string]any, runner.Result, error) {
-	if len(work.groups) == 0 {
-		note(req, "··· cache: answered entirely from cache; varhub not invoked")
-		return nil, runner.Result{
-			Log: "every variant answered from the shared annotation cache",
-		}, nil
-	}
-
-	fresh := map[string]map[string]any{}
-	var out runner.Result
-	for i, g := range work.groups {
-		note(req, fmt.Sprintf("··· cache: run %d/%d — %d variant(s), %d annotation(s)",
-			i+1, len(work.groups), len(g.loci), len(g.ask)))
-		sub := req
-		sub.Selection = strings.Join(g.ask, ",")
-		sub.Body = requestBody(req.Kind, g.loci)
-		// The whole point of a sub-run is that it asks about *fewer* variants
-		// than were submitted. A staged input is the full file, and the runner
-		// prefers a path over a body — so leaving it set would silently
-		// re-annotate everything on every group, turning the cache from a
-		// saving into a multiplier.
-		sub.InputPath = ""
-		res, err := r.Inner.Annotate(ctx, sub)
-		if err != nil {
-			return nil, runner.Result{}, err
-		}
-		values, err := decodeVariants(res.Variants)
-		if err != nil {
-			return nil, runner.Result{}, err
-		}
-		// No group asks about a name another group asked about — each source
-		// belongs to exactly one — so merging cannot overwrite a real value with
-		// another run's null.
-		for key, ann := range values {
-			if have, ok := fresh[key]; ok {
-				for name, v := range ann {
-					have[name] = v
-				}
-				continue
-			}
-			fresh[key] = ann
-		}
-		if i == 0 {
-			out = res
-			continue
-		}
-		out.Columns = append(out.Columns, res.Columns...)
-		out.Log += "\n" + res.Log
-	}
-	return fresh, out, nil
+// TEMPORARY. The engine's answer is a VCF now rather than a JSON array, and this
+// decorator cannot yet produce one: it answers part of a request from stored
+// values and has to merge those into whatever the engine returns for the rest,
+// which means writing a VCF, not just reading one. That is the next commit.
+//
+// Standing aside rather than half-working is the only safe shape in between.
+// Every uncertainty in this package already resolves this way — see plan — for
+// the reason that applies here too: a correct slow answer beats a fast wrong
+// one, and a cache that merged into the wrong records would produce a file that
+// is well-formed and misattributed, which nothing downstream can detect.
+//
+// The cost is that every job recomputes until the next commit lands. The
+// planning below is kept, unused, because it is what the rewrite builds on.
+func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Result, error) {
+	return r.Inner.Annotate(ctx, req)
 }
 
 // store writes back what the engine just computed, for the sources that may be
@@ -890,21 +805,3 @@ func note(req runner.Request, line string) {
 	}
 }
 
-func decodeVariants(b []byte) (map[string]map[string]any, error) {
-	var rows []struct {
-		Chrom       string         `json:"chrom"`
-		Pos         int64          `json:"pos"`
-		Ref         string         `json:"ref"`
-		Alt         string         `json:"alt"`
-		Annotations map[string]any `json:"annotations"`
-	}
-	if err := json.Unmarshal(b, &rows); err != nil {
-		return nil, fmt.Errorf("parse engine output: %w", err)
-	}
-	out := make(map[string]map[string]any, len(rows))
-	for _, r := range rows {
-		l := anncache.Locus{Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt}
-		out[l.Key()] = r.Annotations
-	}
-	return out, nil
-}

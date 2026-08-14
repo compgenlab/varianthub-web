@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -37,7 +38,11 @@ func seedResultsCapped(t *testing.T, q *Queue, jobID string, body, columns strin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := insertVariants(ctx, tx, chunkID, []byte(body), max); err != nil {
+	var rows []Variant
+	if err := json.Unmarshal([]byte(body), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertVariants(ctx, tx, chunkID, rows, max); err != nil {
 		tx.Rollback(ctx) // or the open transaction blocks every test after this
 		t.Fatal(err)
 	}

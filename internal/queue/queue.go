@@ -367,20 +367,19 @@ func (q *Queue) Log(ctx context.Context, jobID string) (string, bool, error) {
 
 // Outcome is what a Runner produces for a completed chunk.
 type Outcome struct {
-	// Result is the annotation JSON the CLI emitted. It is projected into
-	// chunk_variant and written out as the stored VCF, and is not itself
-	// stored: for 2.6M variants it is gigabytes of JSON in one column, and
-	// nothing has read it since chunk_variant existed to be paged instead.
-	Result []byte
+	// Rows are the variants to keep for the results table, already bounded by
+	// MaxRows. Empty for a chunk that contributes none.
+	//
+	// Read from the answer rather than being it: the answer is the VCF at
+	// VCFURI, and these are the front of it, parsed out so a person can page,
+	// search and sort through them.
+	Rows []Variant
 	// N is the number of variants.
 	N int
 	// Columns is the JSON column model for these results (may be nil). Stored
 	// on the chunk so its results stay renderable even if the snapshot is
 	// re-pinned.
 	Columns []byte
-	// Variants says whether Result is an annotated-variant array that should
-	// be projected into chunk_variant. A download's result is a file manifest.
-	Variants bool
 	// MaxRows bounds how many variants are kept as rows; 0 keeps every one.
 	//
 	// Carried on the outcome because the number is a deployment setting the
@@ -1040,12 +1039,12 @@ func (q *Queue) DropInput(ctx context.Context, id string) (string, error) {
 	return *uri, nil
 }
 
-// firstChunk reports whether this chunk is where a job's results table starts.
+// FirstChunk reports whether this chunk is where a job's results table starts.
 //
 // The sole chunk of an ordinary submission, or piece 0 of a split one. A split's
 // own chunk and its collect are neither: the first produces no variants and the
 // second's output is the join, which is every piece over again.
-func firstChunk(c Chunk) bool {
+func FirstChunk(c Chunk) bool {
 	return c.ChunkIndex == nil || *c.ChunkIndex == 0
 }
 
@@ -1541,17 +1540,15 @@ func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, 
 	// Rows for querying. Same transaction as the status change, so a chunk is
 	// never observably "done" with results that are not yet queryable.
 	//
-	// Skipped for a download: its result is a file manifest, not variants, and
-	// forcing it through the variant projection would fail on a shape that was
-	// never meant to fit.
+	// A download contributes none: its outcome is a set of files, not variants.
 	//
 	// Taken only from a job's first chunk. These rows are a window onto the
 	// start of the result, so later pieces have nothing to add to it — and
 	// reading only the first is what lets the cap be applied by one worker
 	// looking at its own chunk, with no counter shared between the twenty-six
 	// that may be finishing at the same moment.
-	if out.Variants && out.Result != nil && firstChunk(chunk) {
-		if err := insertVariants(wctx, tx, id, out.Result, out.MaxRows); err != nil {
+	if len(out.Rows) > 0 && FirstChunk(chunk) {
+		if err := insertVariants(wctx, tx, id, out.Rows, out.MaxRows); err != nil {
 			log.Printf("queue: store chunk %s variants: %v", id, err)
 			return
 		}

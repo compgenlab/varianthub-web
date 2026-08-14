@@ -1,9 +1,12 @@
 package catalog
 
 import (
+	"compress/gzip"
 	"context"
-	"encoding/json"
+	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -40,8 +43,9 @@ func TestCatalogDrivenAnnotation(t *testing.T) {
 		Snapshot: "dev",
 		// Empty selection: exercises the snapshot's default_annotations, which is
 		// the manifest key most easily got wrong.
-		Selection: "",
-		Body:      []byte("chr1:115256529:T:C"),
+		Selection:  "",
+		Body:       []byte("chr1:115256529:T:C"),
+		OutputPath: filepath.Join(t.TempDir(), "result.vcf.gz"),
 	})
 	if err != nil {
 		t.Fatalf("annotate from catalog: %v", err)
@@ -50,31 +54,58 @@ func TestCatalogDrivenAnnotation(t *testing.T) {
 		t.Fatalf("N = %d, want 1", res.N)
 	}
 
-	var got []struct {
-		Chrom       string         `json:"chrom"`
-		Pos         int64          `json:"pos"`
-		Annotations map[string]any `json:"annotations"`
+	body := readAnnotatedVCF(t, res.VCFPath)
+	var data []string
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		if !strings.HasPrefix(line, "#") {
+			data = append(data, line)
+		}
 	}
-	if err := json.Unmarshal(res.Variants, &got); err != nil {
-		t.Fatalf("bad result JSON: %v\n%s", err, res.Variants)
+	if len(data) != 1 {
+		t.Fatalf("got %d records:\n%s", len(data), body)
 	}
-	if len(got) != 1 || got[0].Chrom != "chr1" || got[0].Pos != 115256529 {
-		t.Fatalf("unexpected variant: %+v", got)
+	if !strings.HasPrefix(data[0], "chr1\t115256529\t") {
+		t.Fatalf("unexpected variant: %q", data[0])
 	}
 	// The seeded snapshot's defaults are auto_id, tstv, indel. Getting all three
 	// proves default_annotations survived the round trip through Postgres.
-	for _, key := range []string{"auto_id", "tstv", "indel"} {
-		if _, ok := got[0].Annotations[key]; !ok {
-			t.Errorf("missing default annotation %q; got %v", key, got[0].Annotations)
-		}
+	//
+	// Under the names cghts's builtins actually write, which are not the names
+	// the manifest gave them: CG_TSTV rather than tstv, and auto_id as the
+	// record's ID column rather than an INFO field. See TestExecRunnerLocus.
+	f := strings.Split(data[0], "\t")
+	if f[2] != "1-115256529-T-C" {
+		t.Errorf("auto_id should be the record ID, got %q", f[2])
 	}
-	// The portable form; see cghts VariantID.
-	if got[0].Annotations["auto_id"] != "1-115256529-T-C" {
-		t.Errorf("auto_id = %v", got[0].Annotations["auto_id"])
+	if !strings.Contains(data[0], "CG_TSTV=TS") {
+		t.Errorf("missing default annotation CG_TSTV; got %q", data[0])
 	}
-	if got[0].Annotations["tstv"] != "TS" {
-		t.Errorf("tstv = %v", got[0].Annotations["tstv"])
+	// indel is a flag and this variant is a SNV, so its absence is the answer
+	// rather than a missing annotation. The json path reported the key with an
+	// empty value; a VCF says the same thing by not writing the field.
+	if strings.Contains(data[0], "CG_INDEL") {
+		t.Errorf("a SNV was flagged as an indel: %q", data[0])
 	}
+}
+
+// readAnnotatedVCF returns an annotated VCF as text, decompressing it.
+func readAnnotatedVCF(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("the engine wrote no output: %v", err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("the output is not gzip: %v", err)
+	}
+	defer zr.Close()
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 // Each job gets a fresh home, and the shared data/cache dirs are reused rather
