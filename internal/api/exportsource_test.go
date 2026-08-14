@@ -70,6 +70,22 @@ func pointResultAt(t *testing.T, h *harness, id, uri string) {
 	}
 }
 
+// setChunkVariants records how many variants a seeded job's chunk annotated,
+// which for a capped job is more than the rows it left behind.
+func setChunkVariants(t *testing.T, h *harness, id string, n int) {
+	t.Helper()
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, h.dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	if _, err := pool.Exec(ctx,
+		`UPDATE chunk SET n_variants=$2 WHERE id=$1`, chunkOf(id), n); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // seedDivergent stores a result file that disagrees with the rows, and returns
 // the job id.
 func seedDivergent(t *testing.T, h *harness, root, id string) string {

@@ -81,9 +81,19 @@ type ResultQuery struct {
 type ResultPage struct {
 	Columns []Column  `json:"columns"`
 	Rows    []Variant `json:"rows"`
-	Total   int       `json:"total"`
-	Limit   int       `json:"limit"`
-	Offset  int       `json:"offset"`
+	// Total is how many rows this table holds, which for a large job is fewer
+	// than the job annotated — see NVariants.
+	Total  int       `json:"total"`
+	Limit  int       `json:"limit"`
+	Offset int       `json:"offset"`
+	// NVariants is how many variants the job actually annotated.
+	//
+	// Sent alongside Total so a caller can tell a complete table from a window
+	// onto the front of a large one. They differ whenever a job ran past the
+	// row cap (catalog.Site.TableRows), and without this the difference is
+	// invisible: a table of 10,000 rows looks like a job of 10,000 variants,
+	// and somebody concludes their submission lost 2.6 million of them.
+	NVariants int `json:"n_variants"`
 }
 
 // Column mirrors the stored column model.
@@ -252,8 +262,17 @@ func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (Resu
 	}
 	defer rows.Close()
 
+	// What the job annotated, as against what this table holds. Read from the
+	// job rather than counted here: the rows are capped and the count is not.
+	var annotated int
+	if err := q.pool.QueryRow(ctx,
+		`SELECT n_variants FROM job_state WHERE id=$1`, jobID).Scan(&annotated); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return ResultPage{}, err
+	}
+
 	page := ResultPage{Columns: cols, Rows: []Variant{}, Total: total,
-		Limit: qy.Limit, Offset: qy.Offset}
+		Limit: qy.Limit, Offset: qy.Offset, NVariants: annotated}
 	for rows.Next() {
 		var v Variant
 		var ann []byte
