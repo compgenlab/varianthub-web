@@ -2,6 +2,7 @@ package queue
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -10,6 +11,12 @@ import (
 // variants, which is the shape every result query reads: rows belong to a
 // chunk, and a job's results are its chunks'.
 func seedResults(t *testing.T, q *Queue, jobID string, body, columns string) {
+	seedResultsCapped(t, q, jobID, body, columns, 0)
+}
+
+// seedResultsCapped is seedResults with a bound on the rows kept, so a test can
+// exercise the cap through the same seeding every other result test uses.
+func seedResultsCapped(t *testing.T, q *Queue, jobID string, body, columns string, max int) {
 	t.Helper()
 	ctx := context.Background()
 	chunkID := jobID + "-c0"
@@ -31,7 +38,12 @@ func seedResults(t *testing.T, q *Queue, jobID string, body, columns string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := insertVariants(ctx, tx, chunkID, []byte(body)); err != nil {
+	var rows []Variant
+	if err := json.Unmarshal([]byte(body), &rows); err != nil {
+		t.Fatal(err)
+	}
+	if err := insertVariants(ctx, tx, chunkID, rows, max); err != nil {
+		tx.Rollback(ctx) // or the open transaction blocks every test after this
 		t.Fatal(err)
 	}
 	if err := tx.Commit(ctx); err != nil {

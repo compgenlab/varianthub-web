@@ -1,8 +1,11 @@
 package vcfmerge
 
 import (
+	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 
@@ -155,19 +158,32 @@ func decode(hdr *vcf.VcfHeader, id, text string) any {
 // answer: an id is sanitised from its key and may be suffixed to avoid a
 // collision with the submitter's own fields, so it cannot be reversed.
 //
-// A file with no such lines yields no annotations rather than a guess. That is
-// the safe direction — an export with an empty column is visibly wrong, while
-// one built by matching ids to keys by resemblance is confidently wrong, and
-// attributing one source's values to another is the failure this whole mapping
-// exists to prevent.
+// A file without those lines falls back to using each INFO id as its own key.
+//
+// That is not a guess, it is the other writer's contract: varhub emits an
+// annotation under the name the manifest gave it, so for a file it wrote the id
+// *is* the key. The mapping lines exist for the case where that cannot hold —
+// this service merging onto a submitted VCF, where an id may have been sanitised
+// or suffixed to avoid colliding with a field the submitter already had.
+//
+// The distinction matters because there is one exception: cghts's builtins write
+// fixed names of their own (CG_TSTV and the like) whatever the manifest calls
+// them, and auto_id sets the record ID rather than an INFO field. Those come
+// back under the name the file uses, which is at least the truth about the file.
 func readColumnMap(hdr *vcf.VcfHeader) (keys map[string]string, flags map[string]bool) {
 	keys, flags = map[string]string{}, map[string]bool{}
 	for _, line := range hdr.OtherLines() {
-		id, key, ok := ParseColumnLine(line)
-		if !ok {
-			continue
+		if id, key, ok := ParseColumnLine(line); ok {
+			keys[id] = key
 		}
-		keys[id] = key
+	}
+	if len(keys) == 0 {
+		// No mapping: every declared INFO field is its own key.
+		for _, id := range hdr.InfoIDs() {
+			keys[id] = id
+		}
+	}
+	for id := range keys {
 		if def, found := hdr.InfoDef(id); found && def.Type == "Flag" {
 			flags[id] = true
 		}
@@ -186,3 +202,47 @@ func ColumnKeys(hdr *vcf.VcfHeader) []string {
 	}
 	return out
 }
+
+// RowsFrom reads at most max variants out of a stored VCF file.
+//
+// Bounded because the caller wants the front of the result, not all of it: these
+// rows are what a results table pages through, and the file they come from may
+// hold a chromosome. Reading stops as soon as enough have been collected, so the
+// cost is the cap rather than the file.
+//
+// max of 0 or less reads the lot, which is what an unbounded setting means.
+func RowsFrom(path string, max int) ([]queue.Variant, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	var src io.Reader = f
+	if strings.HasSuffix(path, ".gz") {
+		gz, gzErr := gzip.NewReader(f)
+		if gzErr != nil {
+			return nil, fmt.Errorf("%s is named .gz but is not gzip: %w", path, gzErr)
+		}
+		defer gz.Close()
+		src = gz
+	}
+
+	var out []queue.Variant
+	err = Rows(src, func(v queue.Variant) error {
+		out = append(out, v)
+		if max > 0 && len(out) >= max {
+			return errEnough
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errEnough) {
+		return nil, err
+	}
+	return out, nil
+}
+
+// errEnough stops the walk once the cap is reached. A sentinel rather than a
+// flag checked per record, so the reader stops rather than skipping the rest of
+// a file it has no use for.
+var errEnough = errors.New("enough rows")

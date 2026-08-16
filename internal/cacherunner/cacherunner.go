@@ -16,18 +16,19 @@ import (
 	"bufio"
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
+	"github.com/compgenlab/varianthub-web/internal/queue"
 	"github.com/compgenlab/varianthub-web/internal/runner"
 )
 
@@ -102,7 +103,18 @@ func (r *Runner) Columns(ctx context.Context, snapshot string, present map[strin
 	return l.Columns(ctx, snapshot, present)
 }
 
-// Annotate answers from the cache what it can and passes the rest to the engine.
+// Annotate answers from the cache what it can and asks the engine for the rest.
+//
+// Three files: the submitted VCF, one reduced copy of it per engine run holding
+// only the records still owed an answer, and the output. The reduced copies are
+// the input with records removed, so what comes back is in the input's order and
+// the answer can be assembled by walking the submitted file once, setting values
+// on each record as it goes. Nothing is sorted and nothing has to be.
+//
+// Nothing here can fail a job. Every error falls back to running the request
+// unchanged, because a correct slow answer beats a fast wrong one — and a merge
+// that went astray would produce a well-formed VCF with values on the wrong
+// records, which no reader downstream can detect.
 func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Result, error) {
 	p, ok := r.plan(ctx, req)
 	if !ok {
@@ -126,16 +138,18 @@ func (r *Runner) Annotate(ctx context.Context, req runner.Request) (runner.Resul
 	if err != nil {
 		return runner.Result{}, err
 	}
-
-	out, err := p.merge(hits, fresh)
-	if err != nil {
-		log.Printf("cacherunner: merge failed, running uncached: %v", err)
-		return r.Inner.Annotate(ctx, req)
-	}
-	res.Variants, res.N = out, len(p.loci)
 	res.Columns = r.columnsFor(ctx, req, p, res.Columns)
 
-	// After the answer is assembled, so a cache that cannot be written still
+	if err := writeAnswer(req.InputPath, req.OutputPath, queueColumns(res.Columns),
+		p.merge(hits, fresh)); err != nil {
+		// The engine's own answer for the reduced set is on disk but it is not
+		// the whole request, so there is nothing here to salvage. Run the lot.
+		log.Printf("cacherunner: assembling the answer failed, running uncached: %v", err)
+		return r.Inner.Annotate(ctx, req)
+	}
+	res.VCFPath, res.N = req.OutputPath, len(p.loci)
+
+	// After the answer is written, so a cache that cannot be updated still
 	// returns the right result — the cost is only that the next job recomputes.
 	//
 	// The sweep follows the write and only the write: a job answered entirely
@@ -161,27 +175,50 @@ func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work 
 		}, nil
 	}
 
+	// The reduced inputs and the engine's answers to them. Scratch, all of it:
+	// what survives is the assembled output at req.OutputPath.
+	dir, err := os.MkdirTemp("", "vhw-cache-")
+	if err != nil {
+		return nil, runner.Result{}, err
+	}
+	defer os.RemoveAll(dir)
+
 	fresh := map[string]map[string]any{}
 	var out runner.Result
 	for i, g := range work.groups {
 		note(req, fmt.Sprintf("··· cache: run %d/%d — %d variant(s), %d annotation(s)",
 			i+1, len(work.groups), len(g.loci), len(g.ask)))
+
+		want := make(map[string]bool, len(g.loci))
+		for _, l := range g.loci {
+			want[l.Key()] = true
+		}
+		subIn := filepath.Join(dir, fmt.Sprintf("ask.%d.vcf", i))
+		n, sErr := writeSubset(req.InputPath, subIn, want)
+		if sErr != nil {
+			return nil, runner.Result{}, fmt.Errorf("reduce the input: %w", sErr)
+		}
+		if n == 0 {
+			continue // nothing of this group survived; the cache had it all
+		}
+
 		sub := req
 		sub.Selection = strings.Join(g.ask, ",")
-		sub.Body = requestBody(req.Kind, g.loci)
-		// The whole point of a sub-run is that it asks about *fewer* variants
-		// than were submitted. A staged input is the full file, and the runner
-		// prefers a path over a body — so leaving it set would silently
-		// re-annotate everything on every group, turning the cache from a
-		// saving into a multiplier.
-		sub.InputPath = ""
-		res, err := r.Inner.Annotate(ctx, sub)
-		if err != nil {
-			return nil, runner.Result{}, err
+		// The reduced file, not the submitted one. Leaving InputPath alone was
+		// the whole failure this guards: the runner prefers a path over a body,
+		// so the engine would re-annotate every variant on every group and the
+		// cache would become a multiplier rather than a saving.
+		sub.InputPath = subIn
+		sub.Body = nil
+		sub.OutputPath = filepath.Join(dir, fmt.Sprintf("got.%d.vcf.gz", i))
+
+		res, aErr := r.Inner.Annotate(ctx, sub)
+		if aErr != nil {
+			return nil, runner.Result{}, aErr
 		}
-		values, err := decodeVariants(res.Variants)
-		if err != nil {
-			return nil, runner.Result{}, err
+		values, vErr := valuesFrom(res.VCFPath)
+		if vErr != nil {
+			return nil, runner.Result{}, vErr
 		}
 		// No group asks about a name another group asked about — each source
 		// belongs to exactly one — so merging cannot overwrite a real value with
@@ -203,6 +240,19 @@ func (r *Runner) compute(ctx context.Context, req runner.Request, p *plan, work 
 		out.Log += "\n" + res.Log
 	}
 	return fresh, out, nil
+}
+
+// queueColumns converts the runner's column model to the queue's.
+//
+// The same struct declared twice — the runner describes what the engine
+// reported, the queue describes what was stored — so this converts rather than
+// translates, and stops compiling if they ever diverge.
+func queueColumns(cols []runner.Column) []queue.Column {
+	out := make([]queue.Column, len(cols))
+	for i, c := range cols {
+		out[i] = queue.Column(c)
+	}
+	return out
 }
 
 // store writes back what the engine just computed, for the sources that may be
@@ -405,7 +455,7 @@ func (p *plan) classify(fields []catalog.Field) bool {
 			continue
 		}
 		f := found[0]
-		if f.Builtin != "" && !variantOnlyBuiltin(f.Builtin) {
+		if f.Builtin != "" && !cacheableBuiltin(f.Builtin) {
 			p.passthrough = append(p.passthrough, name)
 			banned[f.SourceRef] = true
 			continue
@@ -619,26 +669,30 @@ func (p *plan) allCached(hits anncache.Hits, key string) bool {
 
 // --- helpers ---
 
-// variantOnlyBuiltin reports whether a builtin computes from chrom, pos, ref and
-// alt alone, and may therefore be cached.
+// cacheableBuiltin reports whether a builtin's value can be stored and served
+// from the cache.
 //
-// varhub's annotate.VariantOnlyBuiltin is the authority. The rest read a
-// sample's FORMAT columns — dosage, vaf, minor_strand, fisher_sb, copy_logratio
-// — or the neighbouring variants in the stream, as vardist does. None of those
-// is the same answer for two callers asking about the same locus, so a cached
-// one hands one sample's number to another: wrong, entirely plausible, and
-// invisible in the result.
+// Three things have to hold, and only two builtins manage all three.
 //
-// The list is copied rather than imported because varhub is a separate program
-// this service execs, and taking a dependency on its packages for one function
-// pulls in the filesystem- and container-bound closure the process boundary
-// exists to keep out. What makes the copy safe is its direction: a builtin this
-// has not heard of is not cached. A new sample-dependent builtin is then correct
-// without anyone remembering this file, and a new variant-only one is merely
-// uncached until someone does.
-func variantOnlyBuiltin(name string) bool {
+// It must be a function of the variant alone. dosage, vaf, minor_strand and
+// fisher_sb read a sample's FORMAT columns, so a stored value would be one
+// sample's number served to another; vardist reads the neighbouring variants, so
+// its answer depends on what else was submitted.
+//
+// It must write an INFO field. auto_id sets the record's ID column — the right
+// place for a variant identifier — so there is nothing for this to read back out
+// of an engine run.
+//
+// And it must write exactly one, under the manifest's name. indel writes five
+// fields describing the change; the cache is keyed on the annotation's name, and
+// no one of those five is it.
+//
+// The list is spelled out rather than derived because it is a statement about
+// what each builtin means, and a new one added upstream should be uncached until
+// somebody has thought about which of these it satisfies.
+func cacheableBuiltin(name string) bool {
 	switch name {
-	case "auto_id", "indel", "tstv", "tags":
+	case "tstv", "tags":
 		return true
 	}
 	return false
@@ -888,23 +942,4 @@ func note(req runner.Request, line string) {
 	if req.Sink != nil {
 		req.Sink(line)
 	}
-}
-
-func decodeVariants(b []byte) (map[string]map[string]any, error) {
-	var rows []struct {
-		Chrom       string         `json:"chrom"`
-		Pos         int64          `json:"pos"`
-		Ref         string         `json:"ref"`
-		Alt         string         `json:"alt"`
-		Annotations map[string]any `json:"annotations"`
-	}
-	if err := json.Unmarshal(b, &rows); err != nil {
-		return nil, fmt.Errorf("parse engine output: %w", err)
-	}
-	out := make(map[string]map[string]any, len(rows))
-	for _, r := range rows {
-		l := anncache.Locus{Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt}
-		out[l.Key()] = r.Annotations
-	}
-	return out, nil
 }

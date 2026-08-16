@@ -100,15 +100,14 @@ func TestEnqueueProcessDone(t *testing.T) {
 	gotInput := make(chan string, 1)
 	q.StartWorkers(ctx, 2, func(_ context.Context, _ Chunk, input []byte) (Outcome, error) {
 		gotInput <- string(input)
-		// A real result shape, so the chunk_variant projection is exercised
-		// too.
-		body := `[{"chrom":"chr1","pos":100,"ref":"A","alt":"G","annotations":{"echo":"` +
-			string(input) + `"}}]`
+		// Real rows, so the chunk_variant projection is exercised too.
 		return Outcome{
-			Result:   []byte(body),
-			N:        1,
-			Columns:  []byte(`[{"key":"echo","label":"echo"}]`),
-			Variants: true,
+			Rows: []Variant{{
+				Chrom: "chr1", Pos: 100, Ref: "A", Alt: "G",
+				Annotations: map[string]any{"echo": string(input)},
+			}},
+			N:       1,
+			Columns: []byte(`[{"key":"echo","label":"echo"}]`),
 		}, nil
 	})
 

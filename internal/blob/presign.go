@@ -152,6 +152,13 @@ func presignClientFor(ctx context.Context, uri string) (*s3.Client, bool, error)
 	if endpoint != "" && !public {
 		return nil, false, nil // a gateway nobody has said is reachable
 	}
+	// Declared reachable, but its bucket was found at startup not to let the
+	// app's origin read a download. A link would work from curl and fail in the
+	// browser, so this relays instead — the same answer, by the same route, as
+	// an endpoint nobody vouched for. See VerifyPublicSites.
+	if _, no := presignBlocked(site.Name); no {
+		return nil, false, nil
+	}
 
 	cacheKey := site.Name + "\x00" + endpoint
 	presignMu.Lock()

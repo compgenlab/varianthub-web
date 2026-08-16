@@ -10,7 +10,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -34,9 +33,6 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/store"
 	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
-
-	"github.com/compgenlab/cghts/htsio/bgzf"
-	"github.com/compgenlab/cghts/vcf"
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…".
@@ -93,6 +89,8 @@ func run(args []string) error {
 		return worker(ctx, cfg)
 	case "sweep-storage":
 		return sweepStorage(ctx, cfg, args[1:])
+	case "s3":
+		return cmdS3(ctx, cfg, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -120,6 +118,8 @@ func serve(ctx context.Context, cfg *config.Config) error {
 			log.Printf("serve: storage config: %v", err)
 		}
 	}
+
+	verifyDownloadCORS(ctx, cfg)
 
 	// Accounts share the catalog's pool, so they are available exactly when it
 	// is. Without them the server still runs: it just has no way to identify
@@ -272,7 +272,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
 	q.SetSlots(cfg.JobSlots)
-	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, chunkSizeFor(ctx, cfg, cat)))
+	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, siteFor(ctx, cfg, cat)))
 
 	<-ctx.Done()
 	log.Printf("worker: shutting down")
@@ -411,6 +411,33 @@ func registerS3Sites(cfg *config.Config) {
 	log.Printf("config: %d S3 site(s) declared with their own credentials", len(sites))
 }
 
+// verifyDownloadCORS checks that a browser will be able to follow the download
+// links this server is about to hand out.
+//
+// Only serve does this. A download link is minted by the API and by nothing
+// else, so the worker has no reason to ask, and a bucket owner has no reason to
+// see the question twice.
+//
+// Nothing here is fatal. A site whose bucket is found to block the web origin
+// stops being redirected to and starts being relayed — slower, correct, and
+// reported — and a site that cannot be asked is left exactly as configured.
+//
+// Its own deadline, short. This runs before the listener opens, and a store that
+// has gone away must not turn into a server that never starts; the consequence
+// of giving up is a log line and the status quo.
+func verifyDownloadCORS(ctx context.Context, cfg *config.Config) {
+	origins := cfg.DownloadOrigins()
+	if len(cfg.S3Sites) == 0 || len(origins) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	for _, note := range blob.VerifyPublicSites(ctx, origins) {
+		log.Printf("serve: %s", note)
+	}
+}
+
 // syncStorage reconciles the deployment's declared locations into the catalog,
 // so the config file stays authoritative for them and a target the deployment
 // no longer provides stops being offered.
@@ -455,11 +482,11 @@ func seed(ctx context.Context, cfg *config.Config) error {
 // bridges — and it is written outside the Outcome because an Outcome is the
 // chunk's result, while a log exists for the runs that produced no result at
 // all.
-func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, cfgVersion string, chunkSize func() int) queue.Runner {
+func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, cfgVersion string, site func() catalog.Site) queue.Runner {
 	return func(ctx context.Context, chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 		switch chunk.Kind {
 		case queue.KindSplit:
-			return runSplitChunk(ctx, q, chunk, cfgJobStorage, chunkSize())
+			return runSplitChunk(ctx, q, chunk, cfgJobStorage, site().ChunkSize())
 		case queue.KindCollect:
 			return runCollectChunk(ctx, q, chunk, cfgJobStorage)
 		case queue.KindDownload:
@@ -504,13 +531,29 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, c
 			alw.Note(fmt.Sprintf("staged %d bytes to %s", n, inputPath))
 		}
 
+		// Where the engine writes its answer. Its own directory, removed on
+		// every return: this is the largest thing a chunk produces and a worker
+		// that leaks one per failed chunk fills its disk, then fails every chunk
+		// after that for a reason resembling nothing.
+		//
+		// Named .vcf.gz because that is how cghts's writer is told to emit BGZF,
+		// which is what storage wants — so the unsplit path uploads these bytes
+		// verbatim, with no compression step anywhere in this process.
+		outDir, err := os.MkdirTemp("", "vhw-out-")
+		if err != nil {
+			return queue.Outcome{}, fmt.Errorf("output directory: %w", err)
+		}
+		defer os.RemoveAll(outDir)
+		outPath := filepath.Join(outDir, queue.ResultName)
+
 		res, err := r.Annotate(ctx, runner.Request{
-			Sink:      alw.Line,
-			Kind:      chunk.Kind,
-			Snapshot:  chunk.Snapshot,
-			Selection: chunk.Selection,
-			Body:      input,
-			InputPath: inputPath,
+			Sink:       alw.Line,
+			Kind:       chunk.Kind,
+			Snapshot:   chunk.Snapshot,
+			Selection:  chunk.Selection,
+			Body:       input,
+			InputPath:  inputPath,
+			OutputPath: outPath,
 		})
 		if err != nil {
 			// The full diagnostic goes to the log and to the chunk, so it can
@@ -537,7 +580,28 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, c
 				log.Printf("worker: chunk %s: encode columns: %v", chunk.ID, mErr)
 			}
 		}
-		out := queue.Outcome{Result: res.Variants, N: res.N, Columns: cols, Variants: true}
+		out := queue.Outcome{
+			N: res.N, Columns: cols,
+			// How much of this may be kept for the browsable table. The queue
+			// decides *which* chunk contributes; this is *how many*.
+			MaxRows: site().TableRows(),
+		}
+
+		// The front of the answer, for the table to page through. Read only
+		// where it will be kept, and only as far as the cap — the file itself
+		// may be a chromosome.
+		//
+		// Never fatal: the answer is the file, and a table that could not be
+		// filled is a job whose results are still correct and still downloadable.
+		if queue.FirstChunk(chunk) {
+			rows, rErr := vcfmerge.RowsFrom(outPath, out.MaxRows)
+			if rErr != nil {
+				log.Printf("worker: chunk %s: read rows for the table: %v", chunk.ID, rErr)
+				alw.Note("··· could not build the browsable table; the download is unaffected")
+			} else {
+				out.Rows = rows
+			}
+		}
 
 		// Assemble the answer-as-a-VCF here, while the submitted file is still
 		// staged. It used to be built on every download — the whole file parsed
@@ -557,7 +621,7 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, c
 			// Failing to store it fails the chunk, which is what makes the
 			// join refuse rather than produce a file missing a range of the
 			// genome — the one wrong answer here that looks like a right one.
-			if err := storePieceOutput(ctx, q, chunk, cfgJobStorage, inputPath, res, alw); err != nil {
+			if err := storePieceOutput(ctx, q, chunk, cfgJobStorage, outPath, alw); err != nil {
 				return queue.Outcome{}, err
 			}
 			return out, nil
@@ -568,13 +632,15 @@ func adapt(q *queue.Queue, r runner.Runner, cat *catalog.Store, cfgJobStorage, c
 		// step. That is what lets every export be a conversion of one stored
 		// file rather than a second rendering from a copy of the same data in
 		// Postgres.
-		uri, mErr := buildResultVCF(ctx, cfgJobStorage, cfgVersion, chunk, inputPath, res, alw)
-		if mErr != nil {
-			log.Printf("worker: chunk %s: build result VCF: %v", chunk.ID, mErr)
-			alw.Note("··· could not pre-build the annotated VCF; downloads will " +
-				"render from the result rows instead")
-			return out, nil
+		uri := queue.ObjectURI(cfgJobStorage, chunk.JobID, queue.ResultName)
+		if sErr := storeFile(ctx, outPath, uri); sErr != nil {
+			// Fatal, unlike the table above. This file is the answer: a chunk
+			// that finished without storing one has produced nothing a caller
+			// can be given, and reporting it done would be reporting a result
+			// that does not exist.
+			return queue.Outcome{}, fmt.Errorf("store the annotated VCF: %w", sErr)
 		}
+		alw.Note("··· annotated VCF stored at " + uri)
 		out.VCFURI = uri
 		if inputPath != "" {
 			// The input existed to be annotated and to be merged onto. Both are
@@ -615,115 +681,6 @@ func dropInput(ctx context.Context, q *queue.Queue, id string, alw *queue.LogWri
 		return
 	}
 	alw.Note("··· submitted file removed; the annotated VCF stands in for it")
-}
-
-// buildResultVCF stores a chunk's answer as a VCF, and reports where it went.
-//
-// Two sources, one object. A submitted file is read back and the annotations set
-// on its records, which is what keeps the submitter's ID, QUAL, FILTER, INFO,
-// FORMAT and sample columns; a locus list, which never had a file, is rendered
-// sites-only. Either way the job ends up with one object under one name, so
-// nothing downstream has to ask which kind of job produced it.
-//
-// Streamed from the staged input straight into the upload, so the file is never
-// held in memory or written to disk a second time — a chromosome's worth of VCF
-// would be hundreds of megabytes of both.
-func buildResultVCF(ctx context.Context, jobStorage, version string, chunk queue.Chunk,
-	inputPath string, res runner.Result, alw *queue.LogWriter) (string, error) {
-
-	// runner.Column and queue.Column are the same struct declared twice — the
-	// runner describes what the engine reported, the queue describes what was
-	// stored — so this converts rather than translates. If they ever stop
-	// matching, this stops compiling, which is the right place to find out.
-	cols := make([]queue.Column, len(res.Columns))
-	for i, c := range res.Columns {
-		cols[i] = queue.Column(c)
-	}
-	meta := vcfmerge.Meta{Version: version, JobID: chunk.JobID, Snapshot: chunk.Snapshot}
-
-	// A pipe rather than a buffer: the write happens as the upload reads, so
-	// neither side has to hold the file.
-	pr, pw := io.Pipe()
-	go func() {
-		pw.CloseWithError(writeResultVCF(pw, meta, cols, inputPath, res))
-	}()
-
-	// Under the job's prefix, not the chunk's. Storage is laid out by job and
-	// the sweep decides what to keep from the set of job ids; an object written
-	// under a chunk id belongs to no job it can see, so it would be collected
-	// as scrap on the next pass — a result that vanishes hours after the job
-	// reported done.
-	uri := queue.ObjectURI(jobStorage, chunk.JobID, queue.ResultName)
-	if err := blob.PutReader(ctx, uri, pr); err != nil {
-		pr.CloseWithError(err)
-		return "", err
-	}
-	alw.Note("··· annotated VCF stored at " + uri)
-	return uri, nil
-}
-
-// writeResultVCF gzips the job's answer into w.
-//
-// Compressed because this object is kept for the job's whole life and an
-// annotated chromosome is hundreds of megabytes. The name says so — see
-// queue.ResultName — so every reader is told rather than sniffing.
-func writeResultVCF(w io.Writer, meta vcfmerge.Meta, cols []queue.Column,
-	inputPath string, res runner.Result) error {
-
-	zw := bgzf.NewWriter(w)
-	if err := writeAnnotated(zw, meta, cols, inputPath, res); err != nil {
-		return err
-	}
-	// Closing is what flushes the final block and writes the BGZF EOF marker.
-	// Skipped, the object uploads cleanly and is truncated garbage on the way
-	// back — and without the marker htslib reports the file as unterminated.
-	return zw.Close()
-}
-
-func writeAnnotated(w io.Writer, meta vcfmerge.Meta, cols []queue.Column,
-	inputPath string, res runner.Result) error {
-
-	if inputPath == "" {
-		// No submitted file: the answer is the engine's rows, written out as a
-		// sites-only VCF.
-		variants, err := vcfmerge.Variants(res.Variants)
-		if err != nil {
-			return err
-		}
-		return vcfmerge.Render(w, meta, cols, vcfmerge.SliceStream(variants))
-	}
-
-	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
-	if err != nil {
-		return err
-	}
-	in, err := os.Open(inputPath)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-
-	// The staged file keeps the name it was stored under, so whether it is
-	// compressed is something this is told rather than something it works out.
-	var src io.Reader = in
-	if strings.HasSuffix(inputPath, ".gz") {
-		gz, gzErr := gzip.NewReader(in)
-		if gzErr != nil {
-			return fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
-		}
-		defer gz.Close()
-		src = gz
-	}
-	rd, err := vcf.NewVcfReader(src)
-	if err != nil {
-		return err
-	}
-	hdr, err := rd.Header()
-	if err != nil {
-		return err
-	}
-	_, err = vcfmerge.Merge(rd, w, hdr, cols, ann)
-	return err
 }
 
 // sweepStorage removes job-storage files that no job owns, on demand.
@@ -924,13 +881,10 @@ func runDownload(ctx context.Context, q *queue.Queue, r runner.Runner, cat *cata
 		cacheGTFGenes(ctx, r, cat, chunk.ID, src, lw.Note)
 	}
 
-	// The chunk's "result" is the manifest of what landed, so the UI can show
-	// it without a second call.
-	body, err := json.Marshal(res.Files)
-	if err != nil {
-		return queue.Outcome{}, err
-	}
-	return queue.Outcome{Result: body, N: len(res.Files)}, nil
+	// The count, not a manifest. What landed is recorded in source_file by
+	// ReplaceSourceFiles above, which is the durable answer; the manifest this
+	// used to return alongside was a second copy that nothing ever read.
+	return queue.Outcome{N: len(res.Files)}, nil
 }
 
 // cacheGTFGenes records which genes a freshly provisioned GTF source knows, so a
@@ -1005,13 +959,9 @@ func runCleanup(chunk queue.Chunk, input []byte) (queue.Outcome, error) {
 	}
 	log.Printf("worker: cleanup chunk %s: reclaimed %d bytes from %s/%s",
 		chunk.ID, freed, req.Name, req.Version)
-	body, err := json.Marshal(map[string]any{
-		"freed_bytes": freed, "name": req.Name, "version": req.Version,
-	})
-	if err != nil {
-		return queue.Outcome{}, err
-	}
-	return queue.Outcome{Result: body}, nil
+	// What it freed is in the log line above; there is nowhere left to file a
+	// structured copy of it and nothing that read one.
+	return queue.Outcome{}, nil
 }
 
 // sweepInterval scales GC frequency to the TTL, clamped to a sane band: often
@@ -1057,6 +1007,11 @@ catalog administration:
   snapshot list                      list snapshots
   assets list                        show helper files still held in Postgres
   assets backfill                    move them into the configured storage
+
+storage:
+  s3 cors [--apply]                  check (or set) the bucket CORS rule that
+                                     lets a browser follow a download link. Only
+                                     needed where a site sets public_endpoint.
   version   print the version
 
 Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or
@@ -1131,11 +1086,7 @@ func runMove(ctx context.Context, cat *catalog.Store, chunk queue.Chunk, input [
 
 	log.Printf("worker: move %s: %d file(s), %d bytes now in %s",
 		req.SourceID, len(moved), bytes, req.ToID)
-	body, _ := json.Marshal(map[string]any{
-		"source_id": req.SourceID, "files": len(moved), "size_bytes": bytes,
-		"storage_id": req.ToID,
-	})
-	return queue.Outcome{Result: body, N: len(moved)}, nil
+	return queue.Outcome{N: len(moved)}, nil
 }
 
 // joinLoc appends a source-relative path to a storage root, for either a
@@ -1146,64 +1097,6 @@ func joinLoc(root, rel string) string {
 		return root + "/" + rel
 	}
 	return filepath.Join(root, rel)
-}
-
-// storeChunkVCF merges a chunk's annotations onto the chunk itself and stores
-// the result.
-//
-// The same merge an unsplit chunk does, written to the job's prefix instead of
-// the chunk's, and headerless unless this is the first chunk. What must not be
-// stored here is the engine's JSON: it is individually well-formed, so a join
-// concatenates it without complaint into a file no VCF reader accepts.
-func storeChunkVCF(ctx context.Context, prefix string, chunk queue.Chunk, inputPath string,
-	res runner.Result, alw *queue.LogWriter) (string, error) {
-
-	if inputPath == "" {
-		return "", errors.New("a chunk needs its staged input to merge onto")
-	}
-	ann, err := vcfmerge.DecodeAnnotations(res.Variants)
-	if err != nil {
-		return "", err
-	}
-	cols := make([]queue.Column, len(res.Columns))
-	for i, c := range res.Columns {
-		cols[i] = queue.Column(c)
-	}
-
-	in, err := os.Open(inputPath)
-	if err != nil {
-		return "", err
-	}
-	defer in.Close()
-	var src io.Reader = in
-	if strings.HasSuffix(inputPath, ".gz") {
-		gz, gzErr := gzip.NewReader(in)
-		if gzErr != nil {
-			return "", fmt.Errorf("%s is named .gz but is not gzip: %w", inputPath, gzErr)
-		}
-		defer gz.Close()
-		src = gz
-	}
-	rd, err := vcf.NewVcfReader(src)
-	if err != nil {
-		return "", err
-	}
-	hdr, err := rd.Header()
-	if err != nil {
-		return "", err
-	}
-
-	pr, pw := io.Pipe()
-	go func() {
-		_, mErr := vcfmerge.Merge(rd, pw, hdr, cols, ann)
-		pw.CloseWithError(mErr)
-	}()
-	uri, err := fanout.StoreChunkResult(ctx, prefix, *chunk.ChunkIndex, pr, alw.Note)
-	if err != nil {
-		pr.CloseWithError(err)
-		return "", err
-	}
-	return uri, nil
 }
 
 // runSplitChunk cuts a submitted VCF into pieces and queues a chunk for each.
@@ -1284,36 +1177,74 @@ func runCollectChunk(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
 // joined file missing a range of the genome, which reads exactly like one where
 // those variants had nothing to say.
 func storePieceOutput(ctx context.Context, q *queue.Queue, chunk queue.Chunk,
-	jobStorage, inputPath string, res runner.Result, alw *queue.LogWriter) error {
+	jobStorage, vcfPath string, alw *queue.LogWriter) error {
 
 	bg := context.WithoutCancel(ctx)
 	prefix := queue.JobPrefix(jobStorage, chunk.JobID)
 	if b, ok, err := q.GetJob(bg, chunk.JobID); err == nil && ok && b.Prefix != "" {
 		prefix = b.Prefix
 	}
-	if _, err := storeChunkVCF(bg, prefix, chunk, inputPath, res, alw); err != nil {
+
+	f, err := os.Open(vcfPath)
+	if err != nil {
+		alw.Note("··· could not read this chunk's output; the job cannot be joined")
+		return fmt.Errorf("open chunk result: %w", err)
+	}
+	defer f.Close()
+
+	// Decompressed on the way in, because the join strips the header from every
+	// piece but the first and so has to read the records. It recompresses as
+	// BGZF on the way out — see fanout.StoreChunkResult.
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		alw.Note("··· this chunk's output is not readable; the job cannot be joined")
+		return fmt.Errorf("read chunk result: %w", err)
+	}
+	defer gz.Close()
+
+	if _, err := fanout.StoreChunkResult(bg, prefix, *chunk.ChunkIndex, gz, alw.Note); err != nil {
 		alw.Note("··· could not store this chunk's output; the job cannot be joined")
 		return fmt.Errorf("store chunk result: %w", err)
 	}
 	return nil
 }
 
-// chunkSizeFor resolves the split chunk size at the moment a split runs.
+// storeFile uploads a local file to job storage, streaming.
 //
-// Read per chunk rather than captured at boot, matching how the cache setting
-// is resolved: an administrator changing it should reach a running worker
-// rather than wait for a redeploy. A database that cannot be read falls back
-// to the configured default instead of guessing, so a blip cannot silently
-// change how a submission is cut.
-func chunkSizeFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() int {
-	return func() int {
+// Byte for byte: the engine already wrote BGZF, so there is nothing to convert
+// and nothing to hold. A chromosome's answer moves from disk to storage without
+// this process seeing more than a buffer of it.
+func storeFile(ctx context.Context, path, uri string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	return blob.PutReader(ctx, uri, f)
+}
+
+// siteFor resolves the deployment's effective settings at the moment a chunk
+// runs.
+//
+// Read per chunk rather than captured at boot, matching how the cache setting is
+// resolved: an administrator changing a limit should reach a running worker
+// rather than wait for a redeploy. A database that cannot be read falls back to
+// the configured values instead of guessing, so a blip cannot silently change
+// how a submission is cut or how much of it is kept.
+//
+// The whole Site rather than one number, because the worker needs several of
+// them — the split size and the table-row cap so far — and a resolver per
+// setting is a list to forget to add to.
+func siteFor(ctx context.Context, cfg *config.Config, cat *catalog.Store) func() catalog.Site {
+	return func() catalog.Site {
+		base := catalog.SiteFromConfig(cfg)
 		if cat == nil {
-			return catalog.SiteFromConfig(cfg).ChunkSize()
+			return base
 		}
-		site, err := cat.EffectiveSite(ctx, catalog.SiteFromConfig(cfg))
+		site, err := cat.EffectiveSite(ctx, base)
 		if err != nil {
-			return catalog.SiteFromConfig(cfg).ChunkSize()
+			return base
 		}
-		return site.ChunkSize()
+		return site
 	}
 }

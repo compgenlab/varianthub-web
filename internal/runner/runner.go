@@ -14,6 +14,7 @@ package runner
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -65,13 +66,29 @@ type Request struct {
 	// The name is kept as stored, ".gz" and all, so a reader that wants to know
 	// whether it is compressed can be told rather than have to look.
 	InputPath string
+
+	// OutputPath is where the annotated VCF is written.
+	//
+	// The caller's to choose, and therefore the caller's to clean up. This
+	// package works in a scratch directory it removes on return, so a result
+	// written there would be deleted before anyone could read it — and a result
+	// is not scratch: it is the answer, and it outlives the run that produced
+	// it.
+	OutputPath string
 }
 
 // Result is a completed annotation.
 type Result struct {
-	Variants []byte   // the raw JSON array, stored and served verbatim
-	N        int      // number of variants
-	Columns  []Column // the column model for these results, in snapshot order
+	// VCFPath is the annotated VCF the engine wrote, at Request.OutputPath.
+	//
+	// A path rather than bytes. The engine's answer for a chromosome is
+	// hundreds of megabytes, and every consumer of it — the upload to storage,
+	// the rows for the table, the join across a split — reads it in one pass and
+	// throws it away. Holding it in memory to hand it over would be the only
+	// place that ever needed it whole.
+	VCFPath string
+	N       int      // number of variants
+	Columns []Column // the column model for these results, in snapshot order
 
 	// Log is what the run printed — the tail of varhub's progress output.
 	//
@@ -231,7 +248,12 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 	if req.Snapshot != "" {
 		args = append(args, "-snapshot", req.Snapshot)
 	}
-	args = append(args, "annotate", "--format", "json", "-v")
+	if req.OutputPath == "" {
+		return Result{}, errors.New("no output path for the annotated VCF")
+	}
+	// --format vcf: the answer is a VCF, written to a file rather than to
+	// stdout, because stdout was a pipe this process had to buffer whole.
+	args = append(args, "annotate", "--format", "vcf", "-o", req.OutputPath, "-v")
 	if r.NoCache {
 		args = append(args, "--no-cache")
 	}
@@ -244,19 +266,30 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		args = append(args, "-a", req.Selection)
 	}
 
-	switch req.Kind {
-	case KindVCF:
-		in := req.InputPath
-		if in == "" {
-			in = filepath.Join(work, "input.vcf")
-			if err := os.WriteFile(in, req.Body, 0o600); err != nil {
-				return Result{}, fmt.Errorf("stage VCF: %w", err)
-			}
+	switch {
+	case req.Kind != KindVCF && req.Kind != KindLocus:
+		return Result{}, fmt.Errorf("unknown job kind %q", req.Kind)
+
+	case req.InputPath != "":
+		// One path for both kinds. A submission is stored as a VCF whatever it
+		// was typed as — see the API's locus conversion — so there is no longer
+		// a locus shape for this to know about.
+		//
+		// "--" terminates flag parsing, so a path beginning with "-" is read as
+		// a path rather than as an unknown flag.
+		args = append(args, "--", req.InputPath)
+
+	case req.Kind == KindVCF:
+		in := filepath.Join(work, "input.vcf")
+		if err := os.WriteFile(in, req.Body, 0o600); err != nil {
+			return Result{}, fmt.Errorf("stage VCF: %w", err)
 		}
-		// "--" terminates flag parsing, so a path beginning with "-" is read as a
-		// path rather than as an unknown flag.
 		args = append(args, "--", in)
-	case KindLocus:
+
+	default:
+		// A locus list with no stored file. Kept for a caller that has only the
+		// text — the cache decorator asks about a subset of a job's variants,
+		// and that subset is not a file anybody stored.
 		loci := strings.Fields(string(req.Body))
 		if len(loci) == 0 {
 			return Result{}, errors.New("empty locus input")
@@ -277,8 +310,6 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 			return Result{}, fmt.Errorf("stage loci: %w", err)
 		}
 		args = append(args, "--loci-file", in)
-	default:
-		return Result{}, fmt.Errorf("unknown job kind %q", req.Kind)
 	}
 
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -360,25 +391,11 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		return Result{}, &ExitError{Err: runErr, Stderr: tail, Home: home}
 	}
 
-	out := bytes.TrimSpace(stdout.Bytes())
-	if len(out) == 0 {
-		return Result{}, &ExitError{Err: errors.New("no output"), Stderr: tail, Home: home}
-	}
-	// Decode just enough to count rows and learn which annotation keys the engine
-	// actually emitted. The blob itself is stored verbatim.
-	var probe []struct {
-		Annotations map[string]json.RawMessage `json:"annotations"`
-	}
-	if err := json.Unmarshal(out, &probe); err != nil {
-		return Result{}, &ExitError{Err: fmt.Errorf("parse annotation output: %w", err), Stderr: tail, Home: home}
+	n, present, err := surveyVCF(req.OutputPath)
+	if err != nil {
+		return Result{}, &ExitError{Err: err, Stderr: tail, Home: home}
 	}
 
-	present := map[string]bool{}
-	for _, v := range probe {
-		for k := range v.Annotations {
-			present[k] = true
-		}
-	}
 	cols, err := r.columns(ctx, bin, home, req.Snapshot, present)
 	if err != nil {
 		// Columns are presentation metadata; a job that annotated successfully
@@ -386,8 +403,75 @@ func (r *ExecRunner) Annotate(ctx context.Context, req Request) (Result, error) 
 		log.Printf("runner: column metadata unavailable (%v); falling back to keys", err)
 		cols = fallbackColumns(present)
 	}
-	return Result{Variants: out, N: len(probe), Columns: cols, Log: tail}, nil
+	return Result{VCFPath: req.OutputPath, N: n, Columns: cols, Log: tail}, nil
 }
+
+// surveyVCF counts an annotated VCF's alleles and reports which annotation keys
+// it actually carries.
+//
+// Streamed, because this file is the answer and the answer can be hundreds of
+// megabytes; nothing here holds more than a line and a set of key names.
+//
+// "Actually carries" rather than "was asked for": the header declares every
+// selected annotation whether or not anything matched, and a column model built
+// from that would show a column for a source that answered nothing. Counting
+// what is present keeps the table describing the result rather than the request.
+//
+// Alleles, not records. A multi-allelic record is several variants, and the
+// count is what a caller is told their job produced — the same unit the rows and
+// the caps use.
+func surveyVCF(path string) (int, map[string]bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, nil, fmt.Errorf("the engine wrote no output: %w", err)
+	}
+	defer f.Close()
+
+	var src io.Reader = f
+	if gz, gzErr := gzip.NewReader(f); gzErr == nil {
+		defer gz.Close()
+		src = gz
+	} else if _, sErr := f.Seek(0, io.SeekStart); sErr != nil {
+		return 0, nil, sErr
+	}
+
+	present := map[string]bool{}
+	n := 0
+	sc := bufio.NewScanner(src)
+	// A cohort record grows with its sample count; the 64 KB default would
+	// report a long one as end of input and undercount the whole file.
+	sc.Buffer(make([]byte, 0, 256*1024), maxVCFLine)
+	for sc.Scan() {
+		line := sc.Text()
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		f := strings.Split(line, "\t")
+		if len(f) < 8 {
+			continue
+		}
+		n += len(strings.Split(f[4], ","))
+		if f[7] == "." {
+			continue
+		}
+		for _, kv := range strings.Split(f[7], ";") {
+			if k, _, _ := strings.Cut(kv, "="); k != "" {
+				present[k] = true
+			}
+		}
+	}
+	if err := sc.Err(); err != nil {
+		return 0, nil, fmt.Errorf("read the annotated VCF: %w", err)
+	}
+	if n == 0 {
+		return 0, nil, errors.New("no output")
+	}
+	return n, present, nil
+}
+
+// maxVCFLine bounds one record. A cohort VCF's line grows with its sample
+// count; 8 MB covers tens of thousands of samples.
+const maxVCFLine = 8 << 20
 
 // ColumnLister describes a result set's columns without annotating anything.
 //

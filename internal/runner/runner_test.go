@@ -1,9 +1,10 @@
 package runner
 
 import (
+	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -68,15 +69,24 @@ default_annotations = ["auto_id", "tstv"]
 	return bin, home
 }
 
+// outPath is where a test's annotated VCF goes. Named .vcf.gz because that is
+// how cghts's writer is told to emit BGZF, which is what the runner surveys and
+// what storage keeps.
+func outPath(t *testing.T) string {
+	t.Helper()
+	return filepath.Join(t.TempDir(), "result.vcf.gz")
+}
+
 func TestExecRunnerLocus(t *testing.T) {
 	bin, home := testHome(t)
 	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
 
 	res, err := r.Annotate(context.Background(), Request{
-		Kind:      KindLocus,
-		Snapshot:  "test",
-		Selection: "all",
-		Body:      []byte("chr1:115256529:T:C"),
+		Kind:       KindLocus,
+		Snapshot:   "test",
+		Selection:  "all",
+		Body:       []byte("chr1:115256529:T:C"),
+		OutputPath: outPath(t),
 	})
 	if err != nil {
 		t.Fatalf("Annotate: %v", err)
@@ -85,29 +95,66 @@ func TestExecRunnerLocus(t *testing.T) {
 		t.Errorf("N = %d, want 1", res.N)
 	}
 
-	// The stored blob must be exactly what the CLI emitted, and must match the
-	// []Variant schema the front-end consumes.
-	var got []struct {
-		Chrom       string         `json:"chrom"`
-		Pos         int64          `json:"pos"`
-		Ref         string         `json:"ref"`
-		Alt         string         `json:"alt"`
-		Annotations map[string]any `json:"annotations"`
+	// The engine wrote a VCF, and it is at the path the caller chose.
+	if res.VCFPath == "" {
+		t.Fatal("no output path came back")
 	}
-	if err := json.Unmarshal(res.Variants, &got); err != nil {
-		t.Fatalf("result is not a []Variant array: %v\n%s", err, res.Variants)
+	body := readAnnotated(t, res.VCFPath)
+	if !strings.HasPrefix(body, "##fileformat=VCF") {
+		t.Fatalf("the output is not a VCF:\n%s", body)
 	}
-	if len(got) != 1 || got[0].Chrom != "chr1" || got[0].Pos != 115256529 {
-		t.Fatalf("unexpected variant: %+v", got)
+	var data []string
+	for _, line := range strings.Split(strings.TrimSpace(body), "\n") {
+		if !strings.HasPrefix(line, "#") {
+			data = append(data, line)
+		}
 	}
-	// The portable form: chromosome without its "chr", hyphen-joined, as gnomAD
-	// and the variant portals write it. See cghts VariantID.
-	if got[0].Annotations["auto_id"] != "1-115256529-T-C" {
-		t.Errorf("auto_id = %v", got[0].Annotations["auto_id"])
+	if len(data) != 1 {
+		t.Fatalf("got %d records:\n%s", len(data), body)
 	}
-	if got[0].Annotations["tstv"] != "TS" {
-		t.Errorf("tstv = %v", got[0].Annotations["tstv"])
+	if !strings.HasPrefix(data[0], "chr1\t115256529\t") {
+		t.Errorf("unexpected record: %q", data[0])
 	}
+	// Builtins come back under the names the manifest gave them.
+	//
+	// They did not until varianthub-cli honoured a.Name: the annotator wrote
+	// CG_TSTV whatever the manifest said, so the column model said tstv while
+	// the file said CG_TSTV and nothing joined them. Pinned here because this is
+	// where the consequence lands — a column key that does not match the file is
+	// an empty column in somebody's results table.
+	f := strings.Split(data[0], "\t")
+	if !strings.Contains(data[0], "tstv=TS") {
+		t.Errorf("tstv did not come back under its manifest name: %q", data[0])
+	}
+	if strings.Contains(data[0], "CG_TSTV") {
+		t.Errorf("the annotator's own fixed name leaked into the output: %q", data[0])
+	}
+	// auto_id is the exception, and deliberately so: a variant identifier belongs
+	// in the ID column, which is where it goes. It is not an INFO field and has
+	// no name to take.
+	if f[2] != "1-115256529-T-C" {
+		t.Errorf("auto_id should be the record ID, got %q", f[2])
+	}
+}
+
+// readAnnotated returns an annotated VCF as text, decompressing it.
+func readAnnotated(t *testing.T, path string) string {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("the engine wrote no output: %v", err)
+	}
+	defer f.Close()
+	zr, err := gzip.NewReader(f)
+	if err != nil {
+		t.Fatalf("the output is not gzip: %v", err)
+	}
+	defer zr.Close()
+	b, err := io.ReadAll(zr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
 }
 
 func TestExecRunnerVCF(t *testing.T) {
@@ -124,6 +171,7 @@ func TestExecRunnerVCF(t *testing.T) {
 
 	res, err := r.Annotate(context.Background(), Request{
 		Kind: KindVCF, Snapshot: "test", Selection: "all", Body: []byte(vcf),
+		OutputPath: outPath(t),
 	})
 	if err != nil {
 		t.Fatalf("Annotate: %v", err)
@@ -171,6 +219,7 @@ func TestLeadingDashLocusIsNotAFlag(t *testing.T) {
 
 	_, err := r.Annotate(context.Background(), Request{
 		Kind: KindLocus, Snapshot: "test", Selection: "all", Body: []byte("-oops"),
+		OutputPath: outPath(t),
 	})
 	if err == nil {
 		t.Fatal("expected an error for a malformed locus")
@@ -198,6 +247,7 @@ func TestControlCharactersRejected(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := r.Annotate(context.Background(), Request{
 				Kind: KindLocus, Snapshot: "test", Selection: "all", Body: []byte(tc.body),
+				OutputPath: outPath(t),
 			})
 			if err == nil {
 				t.Fatal("expected rejection")
@@ -606,10 +656,11 @@ func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
 	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
 
 	res, err := r.Annotate(context.Background(), Request{
-		Kind:      KindLocus,
-		Snapshot:  "test",
-		Selection: "all",
-		Body:      []byte("chr1:115256529:T:C"),
+		Kind:       KindLocus,
+		Snapshot:   "test",
+		Selection:  "all",
+		Body:       []byte("chr1:115256529:T:C"),
+		OutputPath: outPath(t),
 	})
 	if err != nil {
 		t.Fatalf("Annotate: %v", err)
@@ -690,7 +741,15 @@ func TestNoCacheReachesTheCLI(t *testing.T) {
 			// the caller parses a result rather than failing on empty output.
 			bin := filepath.Join(dir, "varhub")
 			script := "#!/bin/sh\nprintf '%s\\n' \"$@\" >> " + argv + "\n" +
-				`echo '[{"chrom":"chr1","pos":1,"ref":"A","alt":"T","annotations":{}}]'` + "\n"
+				"out=''\n" +
+				"prev=''\n" +
+				"for a in \"$@\"; do\n" +
+				"  if [ \"$prev\" = '-o' ]; then out=\"$a\"; fi\n" +
+				"  prev=\"$a\"\n" +
+				"done\n" +
+				"{ printf '##fileformat=VCFv4.2\\n'; " +
+				"printf '#CHROM\\tPOS\\tID\\tREF\\tALT\\tQUAL\\tFILTER\\tINFO\\n'; " +
+				"printf 'chr1\\t1\\t.\\tA\\tT\\t.\\t.\\t.\\n'; } | gzip > \"$out\"\n"
 			if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 				t.Fatal(err)
 			}
@@ -707,7 +766,8 @@ func TestNoCacheReachesTheCLI(t *testing.T) {
 			}
 			if _, err := r.Annotate(context.Background(), Request{
 				Kind: KindLocus, Snapshot: "s", Selection: "all",
-				Body: []byte("chr1:1:A:T"),
+				Body:       []byte("chr1:1:A:T"),
+				OutputPath: outPath(t),
 			}); err != nil {
 				t.Fatalf("Annotate: %v", err)
 			}

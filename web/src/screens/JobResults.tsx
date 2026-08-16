@@ -79,6 +79,11 @@ export default function JobResults() {
 
   const cols = data?.columns ?? [];
   const total = data?.total ?? 0;
+  // What the job annotated, as against what this table holds. They differ once a
+  // job runs past the row cap: the table is a window onto the front of the
+  // result, and the whole of it is the download.
+  const annotated = data?.n_variants ?? 0;
+  const capped = annotated > total && !query;
   const pages = Math.max(1, Math.ceil(total / PER_PAGE));
   const from = total === 0 ? 0 : (page - 1) * PER_PAGE + 1;
   const to = Math.min(page * PER_PAGE, total);
@@ -169,7 +174,7 @@ export default function JobResults() {
                   className="thead"
                   style={{ padding: "9px 13px", fontSize: 10 }}
                 >
-                  Export {total} variants
+                  Export {(annotated || total).toLocaleString()} variants
                 </div>
                 {(["json", "tsv", "csv", "vcf"] as const).map((f) => (
                   <button key={f} onClick={() => download(f)}>
@@ -195,6 +200,13 @@ export default function JobResults() {
             <strong style={{ color: "var(--text)" }}>{total}</strong>
           </span>
           {query && <span>· filtered</span>}
+          {capped && (
+            <span>
+              · first {total.toLocaleString()} of{" "}
+              <strong style={{ color: "var(--text)" }}>{annotated.toLocaleString()}</strong>{" "}
+              annotated — download for all of them
+            </span>
+          )}
         </div>
         {err && <p className="err" style={{ fontSize: 13, marginTop: 10 }}>{err}</p>}
       </div>

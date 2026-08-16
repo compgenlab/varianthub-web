@@ -2,30 +2,20 @@ package cacherunner
 
 import (
 	"context"
-	"encoding/json"
-	"fmt"
 	"log"
 
 	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/runner"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 )
 
-// variant is the engine's per-locus output shape, which this has to reproduce
-// exactly: the caller stores it verbatim and the UI reads it directly.
-type variant struct {
-	Chrom       string         `json:"chrom"`
-	Pos         int64          `json:"pos"`
-	Ref         string         `json:"ref"`
-	Alt         string         `json:"alt"`
-	Annotations map[string]any `json:"annotations"`
-}
-
 // merge assembles the answer: cached values, then whatever the engine computed
-// over the top, for every locus in the order it was asked about.
+// over the top, keyed by allele.
 //
-// Input order matters and is not recoverable afterwards — the caller pairs
-// results with the rows it submitted by position. The engine preserves it for
-// the loci it was given; this preserves it across the ones it never saw.
+// Order is not this function's problem any more, and that is worth saying. The
+// answer is written by setting these values onto the submitted file record by
+// record, so the order is the file's — which is the caller's, whatever it was.
+// Nothing here has to reproduce it.
 //
 // Every selected name is a key on every variant, null where there is no value.
 // That is the engine's own contract, and a caller that has to distinguish "no
@@ -34,8 +24,8 @@ type variant struct {
 // Fresh values win over cached ones. In practice they cannot disagree — a source
 // the engine was asked about was, by construction, one the cache had nothing for
 // — but if they ever did, the one just computed is the one to trust.
-func (p *plan) merge(hits anncache.Hits, fresh map[string]map[string]any) ([]byte, error) {
-	out := make([]variant, 0, len(p.loci))
+func (p *plan) merge(hits anncache.Hits, fresh map[string]map[string]any) vcfmerge.Annotations {
+	out := make(vcfmerge.Annotations, len(p.loci))
 	for _, l := range p.loci {
 		key := l.Key()
 		ann := make(map[string]any, len(p.selected))
@@ -63,16 +53,9 @@ func (p *plan) merge(hits anncache.Hits, fresh map[string]map[string]any) ([]byt
 				ann[name] = v
 			}
 		}
-
-		out = append(out, variant{
-			Chrom: l.Chrom, Pos: l.Pos, Ref: l.Ref, Alt: l.Alt, Annotations: ann,
-		})
+		out[key] = ann
 	}
-	b, err := json.Marshal(out)
-	if err != nil {
-		return nil, fmt.Errorf("encode merged results: %w", err)
-	}
-	return b, nil
+	return out
 }
 
 // columnsFor describes the selection, filling in what the engine could not.

@@ -37,6 +37,25 @@ import (
 // WGS cohort is 2.6M variants: 260 chunks at 10,000, 26 at this.
 const DefaultVCFChunkSize = 100_000
 
+// DefaultMaxTableRows bounds how many of a job's variants are kept as rows for
+// the results table to page, search and sort.
+//
+// The answer is not "all of them". A job's whole answer is the VCF in storage
+// and every download is served from it; these rows exist only so a person can
+// look through the result in a browser. Nobody scrolls to page 26,000, so
+// keeping 2.6M rows of JSONB — a gigabyte or two per chromosome — buys a table
+// that is unusable at exactly the sizes that make it expensive.
+//
+// The effective cap is the smaller of this and the chunk size, and only a job's
+// first chunk contributes: see catalog.Site.TableRows. That is what makes the
+// bound something one chunk can apply by itself, with no running total shared
+// between twenty-six workers finishing at once.
+//
+// What it costs is that a search or a sort over a very large job covers the rows
+// that exist rather than the whole file. That trade is the point; the full
+// answer is a download away.
+const DefaultMaxTableRows = 10_000
+
 // Config is the resolved service configuration.
 type Config struct {
 	Addr string // listen address, e.g. ":8080" or "10.0.0.5:8080"
@@ -169,6 +188,10 @@ type Config struct {
 	// VCFChunkSize is variants per chunk of a split VCF. A different question
 	// from the caps above and sized differently — see catalog.Site.VCFChunkSize.
 	VCFChunkSize int
+	// MaxTableRows bounds the rows kept for the results table — see
+	// DefaultMaxTableRows. The whole answer is the stored VCF; these are for
+	// browsing it.
+	MaxTableRows int
 
 	// JobTimeout bounds a single annotation job's wall clock.
 	//
@@ -289,6 +312,7 @@ func Defaults() *Config {
 		StandardMaxVariants: 10_000,
 		ElevatedMaxVariants: 0,
 		VCFChunkSize:        DefaultVCFChunkSize,
+		MaxTableRows:        DefaultMaxTableRows,
 
 		References: map[string]string{},
 		TrustedProxy: []string{
@@ -401,6 +425,41 @@ func (c *Config) applyPublicURL() {
 	}
 }
 
+// DownloadOrigins are the browser origins a stored result must be readable from.
+//
+// Deliberately not CORSOrigins, and the difference is the whole point. That
+// list is about calls to *this* API, and it is empty in the ordinary deployment
+// — the web app is served from the same origin as the API, so there is no
+// cross-origin call to allow and advertising one would only widen the surface.
+//
+// The object store is a different host in every deployment. A browser at
+// https://variants.example.org fetching a download link from
+// https://s3.example.org is making a cross-origin request whatever the API's
+// arrangement, so the bucket needs the web origin named even when this service
+// needs nothing. Deriving the bucket rule from CORSOrigins produced an empty
+// list for exactly the installation that most needed the rule.
+//
+// So: where the app is served from, plus anything else declared able to call the
+// API — a separate front end, or a developer's vite server, both of which
+// download through the same code path.
+func (c *Config) DownloadOrigins() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(o string) {
+		o = strings.TrimRight(strings.TrimSpace(o), "/")
+		if o == "" || o == "*" || seen[o] {
+			return
+		}
+		seen[o] = true
+		out = append(out, o)
+	}
+	add(c.PublicURL)
+	for _, o := range c.CORSOrigins {
+		add(o)
+	}
+	return out
+}
+
 // configHint names the file in an error, or suggests where one would go.
 func configHint(path string) string {
 	if path != "" {
@@ -470,6 +529,7 @@ func applyEnv(c *Config) {
 	envIntInto("VHW_STANDARD_MAX_VARIANTS", &c.StandardMaxVariants)
 	envIntInto("VHW_ELEVATED_MAX_VARIANTS", &c.ElevatedMaxVariants)
 	envIntInto("VHW_VCF_CHUNK_SIZE", &c.VCFChunkSize)
+	envIntInto("VHW_MAX_TABLE_ROWS", &c.MaxTableRows)
 	if v, ok := lookup("VHW_MAX_UPLOAD_BYTES"); ok {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			c.MaxUploadBytes = n

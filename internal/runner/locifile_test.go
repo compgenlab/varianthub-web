@@ -33,7 +33,18 @@ func stubVarhub(t *testing.T) (bin, argvPath, lociPath string) {
 		"  if [ \"$prev\" = '--loci-file' ]; then cat \"$a\" > " + lociPath + "; fi\n" +
 		"  prev=\"$a\"\n" +
 		"done\n" +
-		`echo '[{"chrom":"chr1","pos":1,"ref":"A","alt":"T","annotations":{}}]'` + "\n"
+		// The answer is a VCF at the -o path now, not JSON on stdout. gzip
+		// rather than bgzip because the survey only needs to read it, and a
+		// shell stub has no bgzip.
+		"out=''\n" +
+		"prev=''\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$prev\" = '-o' ]; then out=\"$a\"; fi\n" +
+		"  prev=\"$a\"\n" +
+		"done\n" +
+		"{ printf '##fileformat=VCFv4.2\\n'; " +
+		"printf '#CHROM\\tPOS\\tID\\tREF\\tALT\\tQUAL\\tFILTER\\tINFO\\n'; " +
+		"printf 'chr1\\t1\\t.\\tA\\tT\\t.\\t.\\t.\\n'; } | gzip > \"$out\"\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -63,6 +74,7 @@ func TestLociTravelInAFileAndNotInArgv(t *testing.T) {
 	body := "chr1:100:A:T chr2:200:C:G\nchr3:300:G:A"
 	if _, err := r.Annotate(context.Background(), Request{
 		Kind: KindLocus, Snapshot: "s", Selection: "all", Body: []byte(body),
+		OutputPath: outPath(t),
 	}); err != nil {
 		t.Fatalf("Annotate: %v", err)
 	}
@@ -111,6 +123,7 @@ func TestALociBatchTooLargeForArgvSucceeds(t *testing.T) {
 
 	if _, err := r.Annotate(context.Background(), Request{
 		Kind: KindLocus, Snapshot: "s", Selection: "all", Body: []byte(b.String()),
+		OutputPath: outPath(t),
 	}); err != nil {
 		t.Fatalf("a %d-locus batch failed: %v", n, err)
 	}
@@ -136,7 +149,8 @@ func TestALocusThatLooksLikeACommentIsRefused(t *testing.T) {
 
 	_, err := r.Annotate(context.Background(), Request{
 		Kind: KindLocus, Snapshot: "s", Selection: "all",
-		Body: []byte("chr1:100:A:T #chr2:200:C:G"),
+		Body:       []byte("chr1:100:A:T #chr2:200:C:G"),
+		OutputPath: outPath(t),
 	})
 	if err == nil {
 		t.Fatal("a #-leading locus was accepted; it would have been silently dropped")

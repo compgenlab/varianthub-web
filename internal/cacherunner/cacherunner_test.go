@@ -1,19 +1,25 @@
 package cacherunner
 
 import (
+	"compress/gzip"
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 
+	"github.com/compgenlab/cghts/vcf"
+
 	"github.com/compgenlab/varianthub-web/internal/anncache"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/pgtest"
 	"github.com/compgenlab/varianthub-web/internal/runner"
+	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 )
 
 // --- a stand-in engine ---
@@ -25,38 +31,118 @@ import (
 // every field would pass whether or not the selection was narrowed at all.
 type fakeEngine struct {
 	mu     sync.Mutex
-	calls  []runner.Request
+	calls  []call
 	values map[string]map[string]any // locus key -> name -> value
 	err    error
 }
 
+// call is one request and the loci it actually carried.
+//
+// The loci are recorded here, at the moment of the call, because a reduced
+// request travels as a file in a directory the decorator removes when it
+// returns. A test that read InputPath afterwards would find nothing and report
+// the narrowing as a failure to narrow.
+type call struct {
+	runner.Request
+	loci []string
+}
+
 func (f *fakeEngine) Annotate(_ context.Context, req runner.Request) (runner.Result, error) {
+	names := strings.Split(req.Selection, ",")
+	// The staged file when there is one, exactly as the real runner does — it
+	// prefers InputPath over a body, and a reduced request carries only the
+	// file. A fake reading the body instead annotates nothing and every value
+	// comes back null, which reads like a broken cache rather than a broken
+	// stand-in.
+	//
+	// Through the same reader the decorator uses, which is how this stands in
+	// for an engine that splits multi-allelic records the same way.
+	var loci []anncache.Locus
+	if req.InputPath != "" {
+		loci, _ = parseVCFFile(req.InputPath)
+	} else {
+		loci, _ = parseInput(req)
+	}
+
+	keys := make([]string, 0, len(loci))
+	for _, l := range loci {
+		keys = append(keys, l.Key())
+	}
 	f.mu.Lock()
-	f.calls = append(f.calls, req)
+	f.calls = append(f.calls, call{Request: req, loci: keys})
 	f.mu.Unlock()
+
 	if f.err != nil {
 		return runner.Result{}, f.err
 	}
-
-	names := strings.Split(req.Selection, ",")
-	var out []variant
-	// Through the same reader the decorator uses, which is how the fake stands in
-	// for an engine that splits multi-allelic records the same way.
-	loci, _ := parseInput(req)
-	for _, l := range loci {
-		ann := map[string]any{}
-		for _, n := range names {
-			ann[n] = f.values[l.Key()][n]
-		}
-		out = append(out, variant{
-			Chrom: l.Chrom, Pos: l.Pos, Ref: l.Ref, Alt: l.Alt, Annotations: ann,
-		})
+	if req.OutputPath == "" {
+		return runner.Result{}, errors.New("no output path")
 	}
-	b, err := json.Marshal(out)
+
+	// A VCF, because that is what the engine emits and what this decorator has
+	// to read back. A fake returning values would let the tests pass against an
+	// interface the real thing does not have.
+	var b strings.Builder
+	b.WriteString("##fileformat=VCFv4.2\n")
+	for _, n := range names {
+		if n == "" {
+			continue
+		}
+		// Typed the way the real engine types them, because a value read back
+		// out of a VCF is typed by its header: declare a score String and 0.25
+		// comes back as the text "0.25", which compares unequal to the number a
+		// caller put in and looks like a cache that lost precision.
+		fmt.Fprintf(&b, "##INFO=<ID=%s,Number=A,Type=%s,Description=\"d\">\n", n, f.typeOf(n))
+	}
+	b.WriteString("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+	for _, l := range loci {
+		var info []string
+		for _, n := range names {
+			v, ok := f.values[l.Key()][n]
+			if !ok || v == nil {
+				continue
+			}
+			info = append(info, fmt.Sprintf("%s=%v", n, v))
+		}
+		field := strings.Join(info, ";")
+		if field == "" {
+			field = "."
+		}
+		fmt.Fprintf(&b, "%s\t%d\t.\t%s\t%s\t.\t.\t%s\n", l.Chrom, l.Pos, l.Ref, l.Alt, field)
+	}
+	// Compressed, because the name says .gz and every reader here is told by
+	// the name rather than sniffing. The real engine writes BGZF; plain gzip is
+	// enough for a fake, since BGZF is gzip.
+	out, err := os.Create(req.OutputPath)
 	if err != nil {
 		return runner.Result{}, err
 	}
-	return runner.Result{Variants: b, N: len(out), Columns: describe(names), Log: "ran"}, nil
+	defer out.Close()
+	zw := gzip.NewWriter(out)
+	if _, err := zw.Write([]byte(b.String())); err != nil {
+		zw.Close()
+		return runner.Result{}, err
+	}
+	if err := zw.Close(); err != nil {
+		return runner.Result{}, err
+	}
+	return runner.Result{VCFPath: req.OutputPath, N: len(loci), Columns: f.describe(names), Log: "ran"}, nil
+}
+
+// typeOf declares a field the way the values it holds imply.
+func (f *fakeEngine) typeOf(name string) string {
+	for _, ann := range f.values {
+		if v, ok := ann[name]; ok && v != nil {
+			switch v.(type) {
+			case float64, int, int64:
+				return "Float"
+			case bool:
+				return "Flag"
+			}
+			return "String"
+		}
+	}
+	return "String"
 }
 
 func (f *fakeEngine) Columns(_ context.Context, _ string, present map[string]bool) ([]runner.Column, error) {
@@ -65,21 +151,36 @@ func (f *fakeEngine) Columns(_ context.Context, _ string, present map[string]boo
 		names = append(names, n)
 	}
 	sort.Strings(names)
-	return describe(names), nil
+	return f.describe(names), nil
 }
 
-func describe(names []string) []runner.Column {
+// describe builds a column model like the one varhub reports, types included.
+//
+// The types matter and are easy to leave out: the answer's header is written
+// from this model, so a column with no type is declared String and its value
+// reads back as text. A test comparing 0.25 against the string "0.25" fails
+// looking exactly like a cache that lost the number.
+func (f *fakeEngine) describe(names []string) []runner.Column {
 	cols := make([]runner.Column, 0, len(names))
 	for _, n := range names {
-		cols = append(cols, runner.Column{Key: n, Label: n, Description: "described " + n})
+		if n == "" {
+			continue
+		}
+		typ := "text"
+		if f.typeOf(n) == "Float" {
+			typ = "numeric"
+		}
+		cols = append(cols, runner.Column{
+			Key: n, Label: n, Type: typ, Description: "described " + n,
+		})
 	}
 	return cols
 }
 
-func (f *fakeEngine) took() []runner.Request {
+func (f *fakeEngine) took() []call {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return append([]runner.Request{}, f.calls...)
+	return append([]call{}, f.calls...)
 }
 
 func (f *fakeEngine) reset() {
@@ -163,6 +264,7 @@ type harness struct {
 	cache  *anncache.Store
 	cat    *catalog.Store
 	r      *Runner
+	answer string // the last file run wrote, for tests that read its header
 }
 
 // newHarness builds a catalog, a cache and a decorator over the fake engine.
@@ -215,29 +317,131 @@ func newHarness(t *testing.T, values map[string]map[string]any, sources ...strin
 	}
 }
 
-// run annotates and returns the decoded result, keyed by locus.
+// variant is one annotated allele, read back out of the answer.
+//
+// A test convenience now rather than a wire format: the decorator's answer is a
+// VCF, and this is what one record of it means once parsed.
+type variant struct {
+	Chrom       string
+	Pos         int64
+	Ref, Alt    string
+	Annotations map[string]any
+}
+
+// run annotates and returns the answer, parsed back out of the VCF it wrote.
+//
+// The request carries both a body and a stored input file, which is what a job
+// looks like now: the body is what the planning reads to key the cache, and the
+// file is what the engine annotates and what the answer is assembled onto. They
+// describe the same variants — a submission writes the file from the same list.
 func (h *harness) run(selection string, loci ...string) []variant {
 	h.t.Helper()
+	dir := h.t.TempDir()
+	in := filepath.Join(dir, "in.vcf")
+	writeLociVCF(h.t, in, loci)
+	out := filepath.Join(dir, "out.vcf.gz")
+
 	res, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind:      runner.KindLocus,
-		Snapshot:  "snap",
-		Selection: selection,
-		Body:      []byte(strings.Join(loci, " ")),
+		Kind:       runner.KindLocus,
+		Snapshot:   "snap",
+		Selection:  selection,
+		Body:       []byte(strings.Join(loci, " ")),
+		InputPath:  in,
+		OutputPath: out,
 	})
 	if err != nil {
 		h.t.Fatalf("Annotate(%q): %v", selection, err)
 	}
-	var out []variant
-	if err := json.Unmarshal(res.Variants, &out); err != nil {
-		h.t.Fatalf("bad result JSON: %v\n%s", err, res.Variants)
-	}
 	if res.N != len(loci) {
 		h.t.Errorf("N = %d, want %d", res.N, len(loci))
 	}
-	return out
+
+	h.answer = res.VCFPath
+	rows, err := vcfmerge.RowsFrom(res.VCFPath, 0)
+	if err != nil {
+		h.t.Fatalf("read the answer: %v", err)
+	}
+	got := make([]variant, 0, len(rows))
+	for _, r := range rows {
+		got = append(got, variant{
+			Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt, Annotations: r.Annotations,
+		})
+	}
+	return got
+}
+
+// writeLociVCF writes a locus list as the sites-only VCF a submission stores.
+func writeLociVCF(t *testing.T, path string, loci []string) {
+	t.Helper()
+	var b strings.Builder
+	b.WriteString("##fileformat=VCFv4.2\n#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
+	for _, l := range loci {
+		f := strings.Split(l, ":")
+		if len(f) != 4 {
+			t.Fatalf("not a locus: %q", l)
+		}
+		fmt.Fprintf(&b, "%s\t%s\t.\t%s\t%s\t.\t.\t.\n", f[0], f[1], f[2], f[3])
+	}
+	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func vals(m map[string]map[string]any) map[string]map[string]any { return m }
+
+// askedAbout returns the loci a request carried, read from the file it points at.
+//
+// The reduced request travels as a file, not a body: the decorator writes a
+// filtered copy of the input and hands over its path. Asserting on Body would
+// read the caller's whole submission and report every narrowing as a failure to
+// narrow.
+func askedAbout(t *testing.T, c call) []string {
+	t.Helper()
+	if c.InputPath == "" {
+		t.Fatalf("the request carries no input file; body was %q", c.Body)
+	}
+	return c.loci
+}
+
+// declaredColumns reads the keys the answer's header declares.
+//
+// Where a caller used to look for a null on the row, it looks here: a VCF says
+// what fields the file carries once, in the header, and omits them from any
+// record that has no value. See TestOutputKeepsInputOrderAndSchema.
+func (h *harness) declaredColumns() []string {
+	h.t.Helper()
+	src, err := openVCF(h.answer)
+	if err != nil {
+		h.t.Fatalf("open the answer: %v", err)
+	}
+	defer src.Close()
+	rd, err := vcf.NewVcfReader(src)
+	if err != nil {
+		h.t.Fatalf("read the answer: %v", err)
+	}
+	hdr, err := rd.Header()
+	if err != nil {
+		h.t.Fatalf("read the answer's header: %v", err)
+	}
+	return vcfmerge.ColumnKeys(hdr)
+}
+
+// locusRequest is what a submitted locus list looks like by the time it reaches
+// this decorator: a stored VCF, an output path, and the body the planner keys on.
+func locusRequest(t *testing.T, selection string, loci ...string) runner.Request {
+	t.Helper()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "in.vcf")
+	writeLociVCF(t, in, loci)
+	return runner.Request{
+		Kind:       runner.KindLocus,
+		Snapshot:   "snap",
+		Selection:  selection,
+		Body:       []byte(strings.Join(loci, " ")),
+		InputPath:  in,
+		OutputPath: filepath.Join(dir, "out.vcf.gz"),
+	}
+}
 
 // --- tests ---
 
@@ -245,16 +449,20 @@ func vals(m map[string]map[string]any) map[string]map[string]any { return m }
 // pays for a home, a source read or a container.
 func TestASecondIdenticalJobNeverStartsTheEngine(t *testing.T) {
 	h := newHarness(t, vals(map[string]map[string]any{
-		"chr1:100:A:T": {"auto_id": "chr1_100_A_T", "af": 0.25},
+		"chr1:100:A:T": {"tstv": "ts", "af": 0.25},
 	}), "vbuiltins", "gnomad")
 
-	first := h.run("auto_id,af", "chr1:100:A:T")
+	// tstv rather than auto_id, and the difference is the cache's rule rather
+	// than the test's convenience: auto_id writes the record's ID column, so an
+	// engine run leaves nothing in INFO for this to read back and store. See
+	// cacheableBuiltin.
+	first := h.run("tstv,af", "chr1:100:A:T")
 	if n := len(h.engine.took()); n != 1 {
 		t.Fatalf("first run made %d engine call(s), want 1", n)
 	}
 	h.engine.reset()
 
-	second := h.run("auto_id,af", "chr1:100:A:T")
+	second := h.run("tstv,af", "chr1:100:A:T")
 	if n := len(h.engine.took()); n != 0 {
 		t.Errorf("second run made %d engine call(s), want 0", n)
 	}
@@ -262,8 +470,8 @@ func TestASecondIdenticalJobNeverStartsTheEngine(t *testing.T) {
 		t.Errorf("af changed between runs: %v then %v",
 			first[0].Annotations["af"], second[0].Annotations["af"])
 	}
-	if second[0].Annotations["auto_id"] != "chr1_100_A_T" {
-		t.Errorf("auto_id = %v, want chr1_100_A_T", second[0].Annotations["auto_id"])
+	if second[0].Annotations["tstv"] != "ts" {
+		t.Errorf("tstv = %v, want ts", second[0].Annotations["tstv"])
 	}
 }
 
@@ -337,7 +545,7 @@ func TestOnlyTheNewVariantsReachTheEngine(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("made %d engine call(s), want 1", len(calls))
 	}
-	if got := strings.Fields(string(calls[0].Body)); len(got) != 1 || got[0] != "chr1:300:T:A" {
+	if got := askedAbout(t, calls[0]); len(got) != 1 || got[0] != "chr1:300:T:A" {
 		t.Errorf("engine was given %v, want only the new variant", got)
 	}
 }
@@ -346,13 +554,13 @@ func TestOnlyTheNewVariantsReachTheEngine(t *testing.T) {
 // number as another's — wrong, plausible, and invisible in the result.
 func TestASampleDependentBuiltinIsNeverCached(t *testing.T) {
 	h := newHarness(t, vals(map[string]map[string]any{
-		"chr1:100:A:T": {"auto_id": "chr1_100_A_T", "dosage": 1.0, "af": 0.25},
+		"chr1:100:A:T": {"tstv": "ts", "dosage": 1.0, "af": 0.25},
 	}), "vbuiltins", "sbuiltins", "gnomad")
 
-	h.run("auto_id,dosage,af", "chr1:100:A:T")
+	h.run("tstv,dosage,af", "chr1:100:A:T")
 	h.engine.reset()
 
-	got := h.run("auto_id,dosage,af", "chr1:100:A:T")
+	got := h.run("tstv,dosage,af", "chr1:100:A:T")
 	calls := h.engine.took()
 	if len(calls) != 1 {
 		t.Fatalf("made %d engine call(s), want 1 — dosage must always be recomputed", len(calls))
@@ -363,7 +571,7 @@ func TestASampleDependentBuiltinIsNeverCached(t *testing.T) {
 	}
 	// The variant-only fields around it are still cached, so one uncacheable
 	// field does not make the whole job uncacheable.
-	for _, cached := range []string{"auto_id", "af"} {
+	for _, cached := range []string{"tstv", "af"} {
 		if contains(asked, cached) {
 			t.Errorf("selection %q still asks for %q, which is cacheable and cached",
 				calls[0].Selection, cached)
@@ -435,15 +643,20 @@ func TestAMixedBuiltinSourceStillAsksForItsCacheableFields(t *testing.T) {
 		Site: func(context.Context) catalog.Site { return catalog.Site{CacheEnabled: true} }}
 
 	for i := 0; i < 2; i++ {
+		dir := t.TempDir()
+		in := filepath.Join(dir, "in.vcf")
+		writeLociVCF(t, in, []string{"chr1:100:A:T"})
 		res, err := r.Annotate(ctx, runner.Request{
 			Kind: runner.KindLocus, Snapshot: "snap", Selection: "auto_id,dosage,af",
-			Body: []byte("chr1:100:A:T"),
+			Body:       []byte("chr1:100:A:T"),
+			InputPath:  in,
+			OutputPath: filepath.Join(dir, "out.vcf.gz"),
 		})
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
 		}
-		var got []variant
-		if err := json.Unmarshal(res.Variants, &got); err != nil {
+		got, err := vcfmerge.RowsFrom(res.VCFPath, 0)
+		if err != nil {
 			t.Fatal(err)
 		}
 		if got[0].Annotations["auto_id"] != "chr1_100_A_T" {
@@ -507,10 +720,7 @@ func TestAnAmbiguousNameIsNotCached(t *testing.T) {
 		Site: func(context.Context) catalog.Site { return catalog.Site{CacheEnabled: true} }}
 
 	for i := 0; i < 2; i++ {
-		if _, err := r.Annotate(ctx, runner.Request{
-			Kind: runner.KindLocus, Snapshot: "snap", Selection: "af",
-			Body: []byte("chr1:100:A:T"),
-		}); err != nil {
+		if _, err := r.Annotate(ctx, locusRequest(t, "af", "chr1:100:A:T")); err != nil {
 			t.Fatalf("Annotate: %v", err)
 		}
 	}
@@ -548,18 +758,25 @@ func TestOutputKeepsInputOrderAndSchema(t *testing.T) {
 		if key != want[i] {
 			t.Errorf("row %d = %s, want %s", i, key, want[i])
 		}
-		// Every selected name is a key on every row, null where there is no
-		// value — a caller cannot tell "no match" from "not selected" otherwise.
-		for _, n := range []string{"af", "ac"} {
-			if _, ok := v.Annotations[n]; !ok {
-				t.Errorf("row %d is missing the key %q", i, n)
+		// Only the selected names, and nothing the job did not ask for.
+		for n := range v.Annotations {
+			if n != "af" && n != "ac" {
+				t.Errorf("row %d carries %q, which was not selected: %v", i, n, v.Annotations)
 			}
 		}
-		if len(v.Annotations) != 2 {
-			t.Errorf("row %d carries %v; only the selected names belong there", i, v.Annotations)
+	}
+	// The schema is the header's, not each row's. Under the JSON result every
+	// selected name appeared on every row and was null where there was no value,
+	// so that a caller could tell "no match" from "not selected". A VCF says it
+	// once — the field is declared in the header and omitted from the records
+	// that have no value for it — so that is where a caller reads the schema.
+	declared := h.declaredColumns()
+	for _, n := range []string{"af", "ac"} {
+		if !contains(declared, n) {
+			t.Errorf("the answer's header declares %v, missing the selected %q", declared, n)
 		}
 	}
-	if got[2].Annotations["af"] != nil {
+	if _, ok := got[2].Annotations["af"]; ok {
 		t.Errorf("a locus no source annotates came back with af = %v", got[2].Annotations["af"])
 	}
 }
@@ -587,16 +804,13 @@ func TestAFullyCachedJobStillDescribesItsColumns(t *testing.T) {
 		"chr1:100:A:T": {"af": 0.25},
 	}), "gnomad")
 
-	if _, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind: runner.KindLocus, Snapshot: "snap", Selection: "af", Body: []byte("chr1:100:A:T"),
-	}); err != nil {
+	if _, err := h.r.Annotate(context.Background(),
+		locusRequest(t, "af", "chr1:100:A:T")); err != nil {
 		t.Fatal(err)
 	}
 	h.engine.reset()
 
-	res, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind: runner.KindLocus, Snapshot: "snap", Selection: "af", Body: []byte("chr1:100:A:T"),
-	})
+	res, err := h.r.Annotate(context.Background(), locusRequest(t, "af", "chr1:100:A:T"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -634,15 +848,30 @@ const twoAllelic = "##fileformat=VCFv4.2\n" +
 
 func (h *harness) runVCF(selection, body string) []variant {
 	h.t.Helper()
+	dir := h.t.TempDir()
+	in := filepath.Join(dir, "in.vcf")
+	if err := os.WriteFile(in, []byte(body), 0o600); err != nil {
+		h.t.Fatal(err)
+	}
 	res, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind: runner.KindVCF, Snapshot: "snap", Selection: selection, Body: []byte(body),
+		Kind: runner.KindVCF, Snapshot: "snap", Selection: selection,
+		Body:       []byte(body),
+		InputPath:  in,
+		OutputPath: filepath.Join(dir, "out.vcf.gz"),
 	})
 	if err != nil {
 		h.t.Fatalf("Annotate: %v", err)
 	}
-	var out []variant
-	if err := json.Unmarshal(res.Variants, &out); err != nil {
-		h.t.Fatalf("bad result JSON: %v\n%s", err, res.Variants)
+	h.answer = res.VCFPath
+	rows, err := vcfmerge.RowsFrom(res.VCFPath, 0)
+	if err != nil {
+		h.t.Fatalf("read the answer: %v", err)
+	}
+	out := make([]variant, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, variant{
+			Chrom: r.Chrom, Pos: r.Pos, Ref: r.Ref, Alt: r.Alt, Annotations: r.Annotations,
+		})
 	}
 	return out
 }
@@ -702,11 +931,7 @@ func TestAReducedVCFRequestIsStillAVCF(t *testing.T) {
 	if calls[0].Kind != runner.KindVCF {
 		t.Errorf("Kind = %q, want the request to stay a VCF", calls[0].Kind)
 	}
-	sent, ok := parseVCF(calls[0].Body)
-	if !ok {
-		t.Fatalf("the reduced body is not a VCF the engine could read:\n%s", calls[0].Body)
-	}
-	if len(sent) != 1 || sent[0].Key() != "chr1:200:G:C" {
+	if sent := askedAbout(t, calls[0]); len(sent) != 1 || sent[0] != "chr1:200:G:C" {
 		t.Errorf("engine was sent %v, want only the uncached allele", sent)
 	}
 	// And the answer still covers everything the caller submitted.
@@ -751,9 +976,7 @@ func TestEngineFailureIsNotSwallowed(t *testing.T) {
 	boom := errors.New("varhub exploded")
 	h.engine.err = boom
 
-	_, err := h.r.Annotate(context.Background(), runner.Request{
-		Kind: runner.KindLocus, Snapshot: "snap", Selection: "af", Body: []byte("chr1:100:A:T"),
-	})
+	_, err := h.r.Annotate(context.Background(), locusRequest(t, "af", "chr1:100:A:T"))
 	if !errors.Is(err, boom) {
 		t.Errorf("err = %v, want the engine's own error", err)
 	}
@@ -782,22 +1005,22 @@ func TestParseLociNormalizesTheWayTheEngineDoes(t *testing.T) {
 // those.
 func TestAnExpensiveSourceIsNotAskedAboutWhatItAlreadyKnows(t *testing.T) {
 	h := newHarness(t, vals(map[string]map[string]any{
-		"chr1:100:A:T": {"auto_id": "id1", "tstv": "ts", "consequence": "missense", "af": 0.25, "ac": 4.0},
-		"chr1:200:G:C": {"auto_id": "id2", "tstv": "ts", "consequence": "synonymous", "af": 0.10, "ac": 2.0},
-		"chr1:300:T:A": {"auto_id": "id3", "tstv": "tv", "consequence": "stop_gained", "af": 0.05, "ac": 1.0},
+		"chr1:100:A:T": {"tstv": "ts", "consequence": "missense", "af": 0.25, "ac": 4.0},
+		"chr1:200:G:C": {"tstv": "ts", "consequence": "synonymous", "af": 0.10, "ac": 2.0},
+		"chr1:300:T:A": {"tstv": "tv", "consequence": "stop_gained", "af": 0.05, "ac": 1.0},
 	}), "vbuiltins", "gnomad", "vep")
 
 	// The tool has answered for the first two variants and nothing else has.
 	h.run("consequence", "chr1:100:A:T", "chr1:200:G:C")
 	h.engine.reset()
 
-	got := h.run("auto_id,consequence,af", "chr1:100:A:T", "chr1:200:G:C", "chr1:300:T:A")
+	got := h.run("tstv,consequence,af", "chr1:100:A:T", "chr1:200:G:C", "chr1:300:T:A")
 	calls := h.engine.took()
 	if len(calls) != 2 {
 		t.Fatalf("made %d engine call(s), want 2 — the tool was not given its own run", len(calls))
 	}
 
-	var toolRun, sharedRun *runner.Request
+	var toolRun, sharedRun *call
 	for i := range calls {
 		if contains(strings.Split(calls[i].Selection, ","), "consequence") {
 			toolRun = &calls[i]
@@ -809,17 +1032,17 @@ func TestAnExpensiveSourceIsNotAskedAboutWhatItAlreadyKnows(t *testing.T) {
 		t.Fatalf("expected one tool run and one shared run, got %q and %q",
 			calls[0].Selection, calls[1].Selection)
 	}
-	if body := strings.Fields(string(toolRun.Body)); len(body) != 1 || body[0] != "chr1:300:T:A" {
-		t.Errorf("the tool was asked about %v, want only the variant it had not answered", body)
+	if given := askedAbout(t, *toolRun); len(given) != 1 || given[0] != "chr1:300:T:A" {
+		t.Errorf("the tool was asked about %v, want only the variant it had not answered", given)
 	}
 	// The cheap sources are not split off; a second process costs more than
 	// reading a few extra loci from local disk.
-	if n := len(strings.Fields(string(sharedRun.Body))); n != 3 {
+	if n := len(askedAbout(t, *sharedRun)); n != 3 {
 		t.Errorf("the shared run covered %d variant(s), want 3", n)
 	}
 	// And the answer is whole.
 	for i, v := range got {
-		for _, name := range []string{"auto_id", "consequence", "af"} {
+		for _, name := range []string{"tstv", "consequence", "af"} {
 			if v.Annotations[name] == nil {
 				t.Errorf("row %d lost %s: %v", i, name, v.Annotations)
 			}

@@ -107,7 +107,7 @@ func TestAJobOfOneChunkFollowsIt(t *testing.T) {
 	if got := statusOfJob(t, q, jobID).Status; got != StatusRunning {
 		t.Fatalf("with its chunk claimed the job is %q, want running", got)
 	}
-	finishByID(t, q, chunkID, StatusDone, "", Outcome{Result: []byte("[]"), N: 4})
+	finishByID(t, q, chunkID, StatusDone, "", Outcome{N: 4})
 
 	j := statusOfJob(t, q, jobID)
 	if j.Status != StatusDone {
@@ -151,7 +151,7 @@ func TestAFanOutReportsPartialStates(t *testing.T) {
 	}
 
 	for _, id := range pieces {
-		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 3})
+		finishByID(t, q, id, StatusDone, "", Outcome{N: 3})
 	}
 
 	// Every piece done, the join still to run. This is the moment a status
@@ -199,7 +199,7 @@ func TestTheJoinWaitsForItsPieces(t *testing.T) {
 	}
 
 	// One piece done is not enough.
-	finishByID(t, q, pieces[0], StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
+	finishByID(t, q, pieces[0], StatusDone, "", Outcome{N: 1})
 	if c, _, ok, err := q.claimNext(ctx); err != nil {
 		t.Fatal(err)
 	} else if ok {
@@ -207,7 +207,7 @@ func TestTheJoinWaitsForItsPieces(t *testing.T) {
 	}
 
 	// Both done, and now it is.
-	finishByID(t, q, pieces[1], StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
+	finishByID(t, q, pieces[1], StatusDone, "", Outcome{N: 1})
 	c, _, ok, err := q.claimNext(ctx)
 	if err != nil || !ok {
 		t.Fatalf("the join never became claimable: ok=%v err=%v", ok, err)
@@ -229,7 +229,7 @@ func TestTheJoinIsClaimedOnce(t *testing.T) {
 	jobID, splitID := splitJob(t, q)
 	finishByID(t, q, splitID, StatusDone, "", Outcome{})
 	for _, id := range addPieces(t, q, jobID, 2) {
-		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 1})
+		finishByID(t, q, id, StatusDone, "", Outcome{N: 1})
 	}
 
 	first, _, ok, err := q.claimNext(ctx)
@@ -253,7 +253,7 @@ func TestTheJoinedAnswerIsReachableFromTheJob(t *testing.T) {
 	jobID, splitID := splitJob(t, q)
 	finishByID(t, q, splitID, StatusDone, "", Outcome{})
 	for _, id := range addPieces(t, q, jobID, 2) {
-		finishByID(t, q, id, StatusDone, "", Outcome{Result: []byte("[]"), N: 5})
+		finishByID(t, q, id, StatusDone, "", Outcome{N: 5})
 	}
 	collect, _, ok, err := q.claimNext(ctx)
 	if err != nil || !ok {
@@ -262,7 +262,7 @@ func TestTheJoinedAnswerIsReachableFromTheJob(t *testing.T) {
 
 	const joined = "s3://varhub-dev/jobs/x/result.vcf.gz"
 	finishByID(t, q, collect.ID, StatusDone, "", Outcome{
-		Result: []byte("[]"), VCFURI: joined,
+		VCFURI: joined,
 	})
 
 	got, found, err := q.ResultVCF(ctx, jobID)
@@ -372,7 +372,7 @@ func TestAChunkFinishingAfterACancelDoesNotUndoIt(t *testing.T) {
 	if _, err := q.CancelJob(ctx, jobID); err != nil {
 		t.Fatal(err)
 	}
-	finishByID(t, q, chunkID, StatusDone, "", Outcome{Result: []byte("[]"), N: 3})
+	finishByID(t, q, chunkID, StatusDone, "", Outcome{N: 3})
 
 	if got := statusOfJob(t, q, jobID).Status; got != StatusCancelled {
 		t.Errorf("the job is %q; a cancel was undone by the run it stopped", got)

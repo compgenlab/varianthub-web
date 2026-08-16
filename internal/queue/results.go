@@ -20,15 +20,21 @@ type Variant struct {
 	Annotations map[string]any `json:"annotations"`
 }
 
-// insertVariants explodes the CLI's result JSON into chunk_variant rows.
+// insertVariants writes a chunk's variants as chunk_variant rows.
 //
-// It runs inside the same transaction as the result blob and the status
-// change, so a chunk is never observably done with results that are not yet
-// queryable.
-func insertVariants(ctx context.Context, tx pgx.Tx, chunkID string, result []byte) error {
-	var variants []Variant
-	if err := json.Unmarshal(result, &variants); err != nil {
-		return fmt.Errorf("parse result for indexing: %w", err)
+// It runs inside the same transaction as the status change, so a chunk is never
+// observably done with results that are not yet queryable.
+//
+// max bounds how many rows are kept; 0 or less keeps them all. These rows exist
+// so a person can page, search and sort through a result in a browser — the
+// answer itself is the stored VCF, and every download is served from that. A
+// whole genome's worth of JSONB buys a table nobody can use at the size that
+// makes it expensive, so it is not written. See catalog.Site.TableRows.
+func insertVariants(ctx context.Context, tx pgx.Tx, chunkID string, variants []Variant, max int) error {
+	if max > 0 && len(variants) > max {
+		// The first max, not a sample: the table is read in order, so the rows
+		// somebody sees have to be the ones the file starts with.
+		variants = variants[:max]
 	}
 	if len(variants) == 0 {
 		return nil
@@ -71,9 +77,19 @@ type ResultQuery struct {
 type ResultPage struct {
 	Columns []Column  `json:"columns"`
 	Rows    []Variant `json:"rows"`
-	Total   int       `json:"total"`
-	Limit   int       `json:"limit"`
-	Offset  int       `json:"offset"`
+	// Total is how many rows this table holds, which for a large job is fewer
+	// than the job annotated — see NVariants.
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
+	// NVariants is how many variants the job actually annotated.
+	//
+	// Sent alongside Total so a caller can tell a complete table from a window
+	// onto the front of a large one. They differ whenever a job ran past the
+	// row cap (catalog.Site.TableRows), and without this the difference is
+	// invisible: a table of 10,000 rows looks like a job of 10,000 variants,
+	// and somebody concludes their submission lost 2.6 million of them.
+	NVariants int `json:"n_variants"`
 }
 
 // Column mirrors the stored column model.
@@ -242,8 +258,17 @@ func (q *Queue) Results(ctx context.Context, jobID string, qy ResultQuery) (Resu
 	}
 	defer rows.Close()
 
+	// What the job annotated, as against what this table holds. Read from the
+	// job rather than counted here: the rows are capped and the count is not.
+	var annotated int
+	if err := q.pool.QueryRow(ctx,
+		`SELECT n_variants FROM job_state WHERE id=$1`, jobID).Scan(&annotated); err != nil &&
+		!errors.Is(err, pgx.ErrNoRows) {
+		return ResultPage{}, err
+	}
+
 	page := ResultPage{Columns: cols, Rows: []Variant{}, Total: total,
-		Limit: qy.Limit, Offset: qy.Offset}
+		Limit: qy.Limit, Offset: qy.Offset, NVariants: annotated}
 	for rows.Next() {
 		var v Variant
 		var ann []byte

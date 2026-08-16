@@ -126,12 +126,14 @@ func TestASanitisedIDIsReadBackAsItsKey(t *testing.T) {
 	}
 }
 
-// A file with no mapping yields no annotations rather than guessed ones.
+// A file with no mapping uses each INFO id as its own key.
 //
-// Guessing would mean matching ids to keys by resemblance, and attributing one
-// source's values to another is exactly what the mapping exists to prevent. An
-// empty column is visibly wrong; a plausible wrong one is not.
-func TestAFileWithoutAMappingYieldsNoAnnotations(t *testing.T) {
+// That is varhub's contract rather than a guess: it emits an annotation under
+// the name the manifest gave it, so for a file it wrote the id is the key. The
+// mapping lines exist for the case where that cannot hold — this service merging
+// onto a submitted VCF, where an id may have been sanitised or suffixed to avoid
+// colliding with something the submitter already had.
+func TestAFileWithoutAMappingUsesItsInfoIDs(t *testing.T) {
 	const plain = `##fileformat=VCFv4.2
 ##INFO=<ID=GENE,Number=A,Type=String,Description="g">
 #CHROM	POS	ID	REF	ALT	QUAL	FILTER	INFO
@@ -141,9 +143,9 @@ chr1	100	.	A	G	.	.	GENE=TP53
 	if len(got) != 1 {
 		t.Fatalf("read %d rows, want 1", len(got))
 	}
-	if len(got[0].Annotations) != 0 {
-		t.Errorf("annotations = %v, want none: nothing in the file says which "+
-			"column GENE is", got[0].Annotations)
+	if got[0].Annotations["GENE"] != "TP53" {
+		t.Errorf("annotations = %v, want GENE read under its own id",
+			got[0].Annotations)
 	}
 }
 

@@ -9,7 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.34
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.22.41
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.0
-	github.com/compgenlab/cghts v0.10.6
+	github.com/compgenlab/cghts v0.10.17
 	github.com/jackc/pgx/v5 v5.10.0
 	golang.org/x/crypto v0.54.0
 	golang.org/x/oauth2 v0.35.0

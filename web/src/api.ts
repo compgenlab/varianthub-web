@@ -478,9 +478,18 @@ export interface Variant {
 export interface ResultPage {
   columns: Column[] | null;
   rows: Variant[];
+  /** How many rows this table holds — capped for a large job. */
   total: number;
   limit: number;
   offset: number;
+  /**
+   * How many variants the job actually annotated.
+   *
+   * Larger than `total` whenever the job ran past the table's row cap. Without
+   * the pair a window onto the front of a big result is indistinguishable from
+   * a small result, and somebody concludes their submission lost most of itself.
+   */
+  n_variants: number;
 }
 
 /** Thrown for any non-2xx response, carrying the server's message. */

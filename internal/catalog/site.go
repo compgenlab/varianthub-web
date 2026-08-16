@@ -68,6 +68,13 @@ type Site struct {
 	// somebody promised 10,000 variants gets a different number depending on
 	// which endpoint they used.
 	VCFChunkSize int `json:"vcf_chunk_size"`
+
+	// MaxTableRows bounds the variants kept as rows for the results table.
+	//
+	// Not a limit on the answer — the answer is the stored VCF and every
+	// download comes from it. This bounds only what is kept in Postgres so a
+	// person can page, search and sort through the result in a browser.
+	MaxTableRows int `json:"max_table_rows"`
 }
 
 // SiteFromConfig is the deployment as configured, before any stored override.
@@ -93,6 +100,7 @@ func SiteFromConfig(cfg *config.Config) Site {
 		StandardMaxVariants: cfg.StandardMaxVariants,
 		ElevatedMaxVariants: cfg.ElevatedMaxVariants,
 		VCFChunkSize:        cfg.VCFChunkSize,
+		MaxTableRows:        cfg.MaxTableRows,
 	}
 	// Through the same parser the overrides use, so "2160h" cannot mean one thing
 	// in the file and another in the form.
@@ -119,6 +127,7 @@ const (
 	KeyStandardMaxVariants = "standard_max_variants"
 	KeyElevatedMaxVariants = "elevated_max_variants"
 	KeyVCFChunkSize        = "vcf_chunk_size"
+	KeyMaxTableRows        = "max_table_rows"
 )
 
 // Service tiers: how much of the pool an account may occupy.
@@ -141,6 +150,10 @@ var Tiers = []string{TierStandard, TierElevated, TierUnlimited}
 // default" cannot come to mean two different numbers.
 const DefaultVCFChunkSize = config.DefaultVCFChunkSize
 
+// DefaultMaxTableRows is what an unset table-row cap resolves to. Aliased for
+// the same reason as the chunk size above.
+const DefaultMaxTableRows = config.DefaultMaxTableRows
+
 // ChunkSize is VCFChunkSize with the default filled in.
 //
 // Resolved here rather than when the setting is parsed, because ApplySetting
@@ -156,6 +169,28 @@ func (s Site) ChunkSize() int {
 		return DefaultVCFChunkSize
 	}
 	return s.VCFChunkSize
+}
+
+// TableRows is how many of a job's variants are kept for the results table.
+//
+// The smaller of the configured cap and one chunk, and only a job's first chunk
+// contributes any. Taking the minimum is what keeps the rule local: a chunk
+// applies it knowing only its own index and its own output, so twenty-six
+// workers finishing at once need no shared counter and cannot race each other
+// past the limit. Were the cap larger than a chunk, the first chunk could not
+// fill it alone and the number would be a promise the code does not keep.
+//
+// A person looking through a result in a browser sees the first N of it. The
+// whole answer is the VCF in storage, and that is what a download serves.
+func (s Site) TableRows() int {
+	cap := s.MaxTableRows
+	if cap <= 0 {
+		cap = DefaultMaxTableRows
+	}
+	if chunk := s.ChunkSize(); chunk < cap {
+		return chunk
+	}
+	return cap
 }
 
 // ValidTier reports whether a tier is one this server knows.
@@ -246,7 +281,7 @@ var SettingKeys = []string{
 	KeyStandardConcurrent, KeyStandardPerHour,
 	KeyElevatedConcurrent, KeyElevatedPerHour,
 	KeyAnonMaxVariants, KeyStandardMaxVariants, KeyElevatedMaxVariants,
-	KeyVCFChunkSize,
+	KeyVCFChunkSize, KeyMaxTableRows,
 }
 
 // Values renders a Site as the override map, the inverse of apply.
@@ -268,6 +303,7 @@ func (s Site) Values() map[string]string {
 		KeyStandardMaxVariants: strconv.Itoa(s.StandardMaxVariants),
 		KeyElevatedMaxVariants: strconv.Itoa(s.ElevatedMaxVariants),
 		KeyVCFChunkSize:        strconv.Itoa(s.VCFChunkSize),
+		KeyMaxTableRows:        strconv.Itoa(s.MaxTableRows),
 	}
 }
 
@@ -302,7 +338,7 @@ func (s *Site) ApplySetting(key, value string) error {
 		KeyStandardConcurrent, KeyStandardPerHour,
 		KeyElevatedConcurrent, KeyElevatedPerHour,
 		KeyAnonMaxVariants, KeyStandardMaxVariants, KeyElevatedMaxVariants,
-		KeyVCFChunkSize:
+		KeyVCFChunkSize, KeyMaxTableRows:
 		// 0 is unbounded rather than "refuse everything", so an operator cannot
 		// take the service down by clearing a field.
 		n, err := strconv.Atoi(value)
@@ -333,6 +369,8 @@ func (s *Site) ApplySetting(key, value string) error {
 			s.ElevatedMaxVariants = n
 		case KeyVCFChunkSize:
 			s.VCFChunkSize = n
+		case KeyMaxTableRows:
+			s.MaxTableRows = n
 		}
 	case KeyCacheMaxAge:
 		if value == "" {
