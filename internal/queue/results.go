@@ -79,9 +79,9 @@ type ResultPage struct {
 	Rows    []Variant `json:"rows"`
 	// Total is how many rows this table holds, which for a large job is fewer
 	// than the job annotated — see NVariants.
-	Total  int       `json:"total"`
-	Limit  int       `json:"limit"`
-	Offset int       `json:"offset"`
+	Total  int `json:"total"`
+	Limit  int `json:"limit"`
+	Offset int `json:"offset"`
 	// NVariants is how many variants the job actually annotated.
 	//
 	// Sent alongside Total so a caller can tell a complete table from a window

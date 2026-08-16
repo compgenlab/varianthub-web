@@ -62,9 +62,9 @@ type Annotation struct {
 // Record is one annotated position in a fixture source.
 type Record struct {
 	Chrom string
-	Pos    int64
-	Ref    string
-	Alt    string
+	Pos   int64
+	Ref   string
+	Alt   string
 	// Info maps a source INFO id to its value, as text.
 	Info map[string]string
 }

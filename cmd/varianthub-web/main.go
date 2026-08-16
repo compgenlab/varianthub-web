@@ -33,7 +33,6 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/store"
 	"github.com/compgenlab/varianthub-web/internal/vcfmerge"
 	webui "github.com/compgenlab/varianthub-web/web/embed"
-
 )
 
 // version is stamped at build time with -ldflags "-X main.version=…".

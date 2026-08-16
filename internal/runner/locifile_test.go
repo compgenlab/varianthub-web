@@ -149,7 +149,7 @@ func TestALocusThatLooksLikeACommentIsRefused(t *testing.T) {
 
 	_, err := r.Annotate(context.Background(), Request{
 		Kind: KindLocus, Snapshot: "s", Selection: "all",
-		Body: []byte("chr1:100:A:T #chr2:200:C:G"),
+		Body:       []byte("chr1:100:A:T #chr2:200:C:G"),
 		OutputPath: outPath(t),
 	})
 	if err == nil {

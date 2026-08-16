@@ -943,4 +943,3 @@ func note(req runner.Request, line string) {
 		req.Sink(line)
 	}
 }
-

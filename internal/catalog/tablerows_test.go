@@ -11,9 +11,9 @@ import "testing"
 // promise the code does not keep.
 func TestTableRowsIsTheSmallerOfTheCapAndAChunk(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		site  Site
-		want  int
+		name string
+		site Site
+		want int
 	}{
 		{"defaults", Site{}, DefaultMaxTableRows},
 		{"a chunk smaller than the cap bounds it",

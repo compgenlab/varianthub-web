@@ -80,11 +80,11 @@ func TestAStoredLocusListIsBGZF(t *testing.T) {
 // than what they pasted.
 func TestABadLocusIsRefusedNotSkipped(t *testing.T) {
 	for _, bad := range []string{
-		"chr1:100:A",       // too few fields
-		"chr1:abc:A:G",     // no position
-		"chr1:0:A:G",       // positions are 1-based
-		":100:A:G",         // no contig
-		"chr1:100::G",      // no ref
+		"chr1:100:A",   // too few fields
+		"chr1:abc:A:G", // no position
+		"chr1:0:A:G",   // positions are 1-based
+		":100:A:G",     // no contig
+		"chr1:100::G",  // no ref
 	} {
 		var buf bytes.Buffer
 		if _, err := writeLocusVCF(&buf, []string{"chr1:100:A:G", bad}); err == nil {

@@ -3,8 +3,8 @@ package runner
 import (
 	"compress/gzip"
 	"context"
-	"io"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -656,7 +656,7 @@ func TestSuccessfulRunKeepsItsOutput(t *testing.T) {
 	r := &ExecRunner{Bin: bin, Home: FixedHome(home), Timeout: 60 * time.Second}
 
 	res, err := r.Annotate(context.Background(), Request{
-		Kind:      KindLocus,
+		Kind:       KindLocus,
 		Snapshot:   "test",
 		Selection:  "all",
 		Body:       []byte("chr1:115256529:T:C"),

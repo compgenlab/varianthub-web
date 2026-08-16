@@ -13,8 +13,8 @@ package runner
 
 import (
 	"bufio"
-	"compress/gzip"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"

@@ -113,7 +113,7 @@ type fileConfig struct {
 		ElevatedMaxVariants *int `toml:"elevated_max_variants"`
 		// Variants per chunk of a split VCF. Sized by per-chunk fixed cost, not
 		// by fairness — see catalog.Site.VCFChunkSize.
-		VCFChunkSize   *int   `toml:"vcf_chunk_size"`
+		VCFChunkSize *int `toml:"vcf_chunk_size"`
 		// Rows kept for the results table; the whole answer is the stored VCF.
 		MaxTableRows   *int   `toml:"max_table_rows"`
 		MaxUploadBytes *int64 `toml:"max_upload_bytes"`
