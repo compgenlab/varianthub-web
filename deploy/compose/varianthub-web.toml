@@ -100,6 +100,43 @@
   paths = ["default=/mnt/storage"]                   # VHW_STORAGE_PATHS
   s3 = []                                            # VHW_STORAGE_S3
 
+# Object-storage targets that carry their own endpoint and credentials. The dev
+# stack keeps job storage on a volume, so nothing is declared here.
+#
+# public_endpoint says the endpoint above is reachable from outside the
+# deployment. With it, GET /jobs/{id}/export?format=vcf answers 302 and the
+# caller pulls the annotated VCF straight from storage instead of through this
+# server. Off by default: signing a link against an in-cluster address hands out
+# URLs that are correctly signed and useless.
+#
+# Turning it on needs a CORS rule on the bucket, allowing GET from the web
+# origin — the browser reads the download with a script and will not touch a
+# cross-origin response without one, so the API stays healthy, curl keeps
+# working, and the download button in the UI silently stops. The origin needed
+# is public_url, *not* cors_origins: the bucket is a different host even in a
+# same-origin deployment, which is why an empty cors_origins is not a sign that
+# no rule is wanted.
+#
+#   varianthub-web s3 cors           # report what each public bucket allows
+#   varianthub-web s3 cors --apply   # write the rule (replaces the bucket's
+#                                    # whole CORS configuration — S3 has no
+#                                    # per-rule edit, so a bucket shared with
+#                                    # another application needs its rules
+#                                    # written together, by hand)
+#
+# serve re-checks at startup and relays for any site whose bucket is found to
+# block the origin, so forgetting costs bandwidth rather than downloads.
+#
+# [[s3]]
+#   name = "results"
+#   uri = "s3://varianthub-results"
+#   endpoint = "https://s3.example.org"
+#   public_endpoint = true
+#   region = "us-east-1"
+#   access_key = ""                                 # omit to use the SDK chain
+#   secret_key = ""
+#   default = true
+
 # Reference FASTAs by assembly, for tool steps using {ref}. Empty until a tool
 # needs one; the file must be readable by the worker, so mount it in first.
 [references]

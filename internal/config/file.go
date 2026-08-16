@@ -367,6 +367,16 @@ type S3Site struct {
 	// cross-origin response without it — so without CORS the API works and the
 	// web UI's download button stops, which is a confusing pair of symptoms to
 	// be handed at once.
+	//
+	// Run `varianthub-web s3 cors --apply` after setting this. serve checks the
+	// rule at startup and falls back to relaying for any site whose bucket is
+	// found to block the web origin, so forgetting costs bandwidth rather than
+	// downloads — but only where the bucket can be asked. See
+	// blob.VerifyPublicSites.
+	//
+	// Note the origin the bucket must allow is the *web app's*, which is
+	// Config.DownloadOrigins() and not cors_origins: a same-origin deployment
+	// needs no API CORS at all and still needs this.
 	PublicEndpoint bool   `toml:"public_endpoint"`
 	Region         string `toml:"region"`
 	// AccessKey and SecretKey are presented when both are set.

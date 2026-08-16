@@ -89,6 +89,8 @@ func run(args []string) error {
 		return worker(ctx, cfg)
 	case "sweep-storage":
 		return sweepStorage(ctx, cfg, args[1:])
+	case "s3":
+		return cmdS3(ctx, cfg, args[1:])
 	default:
 		usage()
 		return fmt.Errorf("unknown command %q", cmd)
@@ -116,6 +118,8 @@ func serve(ctx context.Context, cfg *config.Config) error {
 			log.Printf("serve: storage config: %v", err)
 		}
 	}
+
+	verifyDownloadCORS(ctx, cfg)
 
 	// Accounts share the catalog's pool, so they are available exactly when it
 	// is. Without them the server still runs: it just has no way to identify
@@ -405,6 +409,33 @@ func registerS3Sites(cfg *config.Config) {
 	}
 	blob.RegisterSites(sites)
 	log.Printf("config: %d S3 site(s) declared with their own credentials", len(sites))
+}
+
+// verifyDownloadCORS checks that a browser will be able to follow the download
+// links this server is about to hand out.
+//
+// Only serve does this. A download link is minted by the API and by nothing
+// else, so the worker has no reason to ask, and a bucket owner has no reason to
+// see the question twice.
+//
+// Nothing here is fatal. A site whose bucket is found to block the web origin
+// stops being redirected to and starts being relayed — slower, correct, and
+// reported — and a site that cannot be asked is left exactly as configured.
+//
+// Its own deadline, short. This runs before the listener opens, and a store that
+// has gone away must not turn into a server that never starts; the consequence
+// of giving up is a log line and the status quo.
+func verifyDownloadCORS(ctx context.Context, cfg *config.Config) {
+	origins := cfg.DownloadOrigins()
+	if len(cfg.S3Sites) == 0 || len(origins) == 0 {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+
+	for _, note := range blob.VerifyPublicSites(ctx, origins) {
+		log.Printf("serve: %s", note)
+	}
 }
 
 // syncStorage reconciles the deployment's declared locations into the catalog,
@@ -976,6 +1007,11 @@ catalog administration:
   snapshot list                      list snapshots
   assets list                        show helper files still held in Postgres
   assets backfill                    move them into the configured storage
+
+storage:
+  s3 cors [--apply]                  check (or set) the bucket CORS rule that
+                                     lets a browser follow a download link. Only
+                                     needed where a site sets public_endpoint.
   version   print the version
 
 Configuration is read from varianthub-web.toml (or $VHW_CONFIG, or

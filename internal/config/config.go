@@ -425,6 +425,41 @@ func (c *Config) applyPublicURL() {
 	}
 }
 
+// DownloadOrigins are the browser origins a stored result must be readable from.
+//
+// Deliberately not CORSOrigins, and the difference is the whole point. That
+// list is about calls to *this* API, and it is empty in the ordinary deployment
+// — the web app is served from the same origin as the API, so there is no
+// cross-origin call to allow and advertising one would only widen the surface.
+//
+// The object store is a different host in every deployment. A browser at
+// https://variants.example.org fetching a download link from
+// https://s3.example.org is making a cross-origin request whatever the API's
+// arrangement, so the bucket needs the web origin named even when this service
+// needs nothing. Deriving the bucket rule from CORSOrigins produced an empty
+// list for exactly the installation that most needed the rule.
+//
+// So: where the app is served from, plus anything else declared able to call the
+// API — a separate front end, or a developer's vite server, both of which
+// download through the same code path.
+func (c *Config) DownloadOrigins() []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(o string) {
+		o = strings.TrimRight(strings.TrimSpace(o), "/")
+		if o == "" || o == "*" || seen[o] {
+			return
+		}
+		seen[o] = true
+		out = append(out, o)
+	}
+	add(c.PublicURL)
+	for _, o := range c.CORSOrigins {
+		add(o)
+	}
+	return out
+}
+
 // configHint names the file in an error, or suggests where one would go.
 func configHint(path string) string {
 	if path != "" {
