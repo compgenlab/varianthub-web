@@ -431,6 +431,12 @@ export interface Job {
   chunks_total: number;
   chunks_done: number;
   chunks_failed: number;
+  /** Set once this job's stored input and results have been destroyed, by age
+   *  or by request. The job itself is kept. Tells "results expired" apart from
+   *  "produced nothing", which otherwise look identical. */
+  purged_at?: number;
+  /** What executed the job — "local" for the installation's own worker pool. */
+  runner?: string;
   /** Every chunk of the job. Present on a single-job read, absent from the
    *  listing — a page of a hundred jobs carrying every chunk of each grows
    *  with the wrong thing. */
@@ -1089,6 +1095,27 @@ export const api = {
       `/jobs/${encodeURIComponent(id)}/cancel`,
       { method: "POST" },
     ),
+
+  /**
+   * Run a failed job's failed pieces again.
+   *
+   * Web only. A program still holds the request that produced the job and can
+   * submit it afresh; what it cannot do is judge that the cause was transient,
+   * and an endpoint mostly invites a client to loop on a job that fails the
+   * same way every time.
+   */
+  retryJob: (id: string) =>
+    req<Job>(`/jobs/${encodeURIComponent(id)}/retry`, { method: "POST" }),
+
+  /**
+   * Remove a job from your list and destroy its stored input and results.
+   *
+   * The record that the job ran is kept — this installation's account of what
+   * it has done is not a user-editable list. Needs an account; anonymous work
+   * is removed on the installation's own schedule.
+   */
+  deleteJob: (id: string) =>
+    req<void>(`/jobs/${encodeURIComponent(id)}`, { method: "DELETE" }),
 
   jobLog: (id: string) =>
     req<{ job_id: string; output: string; recorded: boolean }>(

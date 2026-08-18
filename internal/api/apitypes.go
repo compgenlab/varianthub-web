@@ -130,6 +130,11 @@ type JobStatusResponse struct {
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
 	Label      string `json:"label,omitempty" doc:"A short human label: the locus, or the submitted filename."`
 	Error      string `json:"error,omitempty" doc:"Why the job failed, when it did."`
+	// PurgedAt distinguishes "produced nothing" from "results have expired",
+	// which nothing else here can: after a purge the counts read zero and the
+	// result is empty, which is what a job that annotated nothing looks like.
+	PurgedAt int64  `json:"purged_at,omitempty" doc:"Unix seconds when this job's stored input and results were destroyed, by age or by request. The job itself is kept. Absent while they are still there."`
+	Runner   string `json:"runner,omitempty" doc:"What executed the job: local for the installation's own worker pool."`
 
 	// How the submission was cut up. One chunk of one for anything that was
 	// not split, which is what makes these safe to read without asking first.
@@ -167,6 +172,7 @@ func jobStatus(j queue.Job) JobStatusResponse {
 		Status: j.Status, NVariants: j.NVariants, CreatedAt: j.CreatedAt,
 		StartedAt: j.StartedAt, FinishedAt: j.FinishedAt, Label: j.Label,
 		Error: j.Error, Total: j.Chunks, Done: j.Done, Failed: j.Failed,
+		PurgedAt: j.PurgedAt, Runner: j.Runner,
 	}
 }
 

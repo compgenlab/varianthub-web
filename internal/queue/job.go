@@ -93,6 +93,10 @@ type Job struct {
 	// Runner is what executed the job — "local" for this deployment's own
 	// worker pool. Empty for jobs that ran before it was recorded.
 	Runner string `json:"runner,omitempty"`
+
+	// DeletedAt is when the caller finished with this job, or 0. A deleted job
+	// leaves their listing and keeps its place in the record.
+	DeletedAt int64 `json:"deleted_at,omitempty"`
 }
 
 // Purged reports whether the job's payload has aged out. A purged job still has
@@ -237,7 +241,8 @@ const jobCols = `id, kind, snapshot, selection, COALESCE(label,''), status, ` +
 	`COALESCE(session_id,''), COALESCE(user_id,''), COALESCE(origin,''), ` +
 	`created_at, COALESCE(started_at,0), COALESCE(finished_at,0), ` +
 	`chunks, done, failed, COALESCE(prefix,''), COALESCE(input_chunk_id,''), ` +
-	`COALESCE(result_chunk_id,''), COALESCE(purged_at,0), COALESCE(runner,'')`
+	`COALESCE(result_chunk_id,''), COALESCE(purged_at,0), COALESCE(runner,''), ` +
+	`COALESCE(deleted_at,0)`
 
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
@@ -245,7 +250,8 @@ func scanJob(row rowScanner) (Job, error) {
 		&j.Status, &j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID,
 		&j.Origin, &j.CreatedAt, &j.StartedAt, &j.FinishedAt,
 		&j.Chunks, &j.Done, &j.Failed, &j.Prefix,
-		&j.InputChunkID, &j.ResultChunkID, &j.PurgedAt, &j.Runner); err != nil {
+		&j.InputChunkID, &j.ResultChunkID, &j.PurgedAt, &j.Runner,
+		&j.DeletedAt); err != nil {
 		return Job{}, err
 	}
 	return j, nil
@@ -282,7 +288,11 @@ func (q *Queue) ListJobs(ctx context.Context, f JobFilter, limit, offset int) ([
 	if offset < 0 {
 		offset = 0
 	}
-	var where []string
+	// A job the caller has deleted is gone from their list and still in the
+	// record — see migration 0038. Unconditional rather than a filter field,
+	// because there is no listing that wants them: this is what a caller sees,
+	// and usage reporting counts from job_state directly.
+	where := []string{"deleted_at IS NULL"}
 	var args []any
 	add := func(clause string, v any) {
 		args = append(args, v)
@@ -453,4 +463,97 @@ func (q *Queue) JobChunk(ctx context.Context, jobID, chunkID string) (Chunk, boo
 func (q *Queue) SetPrefix(ctx context.Context, jobID, prefix string) error {
 	_, err := q.pool.Exec(ctx, `UPDATE job SET prefix=$2 WHERE id=$1`, jobID, prefix)
 	return err
+}
+
+// --- a caller finishing with a job, and asking for another go ---
+
+// ErrNotDeletable is returned when a job cannot be removed from a listing yet.
+var ErrNotDeletable = errors.New("a running job must be cancelled before it is deleted")
+
+// ErrNotRetryable is returned when a job cannot be run again.
+var ErrNotRetryable = errors.New("only a failed job with its input still stored can be retried")
+
+// DeleteJob removes a job from its owner's list and destroys its payload.
+//
+// Not the record. See migration 0038: what a caller owns is the VCF they sent,
+// the result built from it and the rows behind the table, and those go here
+// rather than waiting on the sweeper. What they do not own is the account of
+// what this installation has run, so the row stays and usage reporting is
+// unaffected by who has been tidying up.
+//
+// Refuses while the job is still running. Emptying a job out from under a
+// worker leaves it writing a result whose input has gone, and the worker finds
+// out by failing in a way that reads as a storage fault. Cancel first — the
+// caller gets told exactly that.
+func (q *Queue) DeleteJob(ctx context.Context, id string) error {
+	j, ok, err := q.GetJob(ctx, id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNoSuchJob
+	}
+	if !j.Terminal() {
+		return ErrNotDeletable
+	}
+	if err := q.purgeJobs(ctx, []string{id}); err != nil {
+		return err
+	}
+	_, err = q.pool.Exec(ctx,
+		`UPDATE job SET deleted_at = $2 WHERE id = $1 AND deleted_at IS NULL`,
+		id, q.nowFn())
+	return err
+}
+
+// RetryJob queues a failed job's failed chunks again.
+//
+// Only the failed ones. A fan-out where one piece of twenty-six failed has
+// twenty-five results already built and paid for, and re-running them would
+// cost the same again to arrive at the same answer. The collect needs no
+// special handling: it waits on its pieces, so it never ran, and it becomes
+// claimable on its own once the retried piece succeeds.
+//
+// The input has to still be there, which is the interesting precondition. A
+// purged job — swept, or deleted by its owner — has no input to run against,
+// and re-queueing it would produce a job that fails a second time for a reason
+// unrelated to the first.
+//
+// Attempts are reset. The point of the button is that a caller believes the
+// cause is gone, and a chunk that has already spent its attempts would fail
+// immediately without trying, which reads as the button doing nothing.
+func (q *Queue) RetryJob(ctx context.Context, id string) (Job, error) {
+	j, ok, err := q.GetJob(ctx, id)
+	if err != nil {
+		return Job{}, err
+	}
+	if !ok {
+		return Job{}, ErrNoSuchJob
+	}
+	if j.Status != StatusError || j.Purged() {
+		return Job{}, ErrNotRetryable
+	}
+
+	tag, err := q.pool.Exec(ctx, `
+		UPDATE chunk SET status = $2, error = NULL, started_at = NULL,
+		                 finished_at = NULL, claimed_by = NULL, lease_until = NULL,
+		                 attempts = 0
+		 WHERE job_id = $1 AND status = $3`, id, StatusQueued, StatusError)
+	if err != nil {
+		return Job{}, err
+	}
+	if tag.RowsAffected() == 0 {
+		// The job reported failure and no chunk of it is failed. That is the
+		// window between a retry and the next poll, not a state to write to.
+		return Job{}, ErrNotRetryable
+	}
+
+	// Wake a worker, the same as a submission does. Without it the retried
+	// chunks wait for the next tick, and a button whose effect appears seconds
+	// later gets pressed again.
+	if _, err := q.pool.Exec(ctx, `SELECT pg_notify($1,$2)`, chanQueued, id); err != nil {
+		log.Printf("queue: retry %s: notify: %v", id, err)
+	}
+
+	out, _, err := q.GetJob(ctx, id)
+	return out, err
 }

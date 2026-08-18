@@ -90,7 +90,10 @@ func TestNoPublishedRouteIsRegisteredOutsideTheTable(t *testing.T) {
 func TestEveryPublishedRouteDescribesItsResponse(t *testing.T) {
 	s := New(&config.Config{Version: "test"}, nil, nil, nil, nil)
 	for _, rt := range s.publishedRoutes() {
-		if rt.Response == nil && rt.Produces == "" {
+		// A 204 has no body, by definition. Declaring a response type for one
+		// would document a body that never arrives, so its absence is the
+		// correct description rather than a missing one.
+		if rt.Status != http.StatusNoContent && rt.Response == nil && rt.Produces == "" {
 			t.Errorf("%s %s describes neither a response type nor a media type",
 				rt.Method, rt.Path)
 		}

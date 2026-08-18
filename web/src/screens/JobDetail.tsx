@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { Ban, Download, RefreshCw } from "lucide-react";
+import { Ban, Download, RefreshCw, RotateCcw, Trash2 } from "lucide-react";
 
 import { api, type Chunk, type Job } from "../api";
 
@@ -68,6 +68,8 @@ export default function JobDetail() {
   const [log, setLog] = useState<{ output: string; recorded: boolean } | null>(null);
   const [err, setErr] = useState("");
   const [cancelling, setCancelling] = useState(false);
+  const [retrying, setRetrying] = useState(false);
+  const [deleting, setDeleting] = useState(false);
   const [downloading, setDownloading] = useState(false);
   // The chunk whose own output is open, and what it printed. One at a time:
   // a split chromosome has twenty-eight, and opening them all would be a page
@@ -146,6 +148,43 @@ export default function JobDetail() {
     }
   }
 
+  async function retry() {
+    setRetrying(true);
+    try {
+      setJob(await api.retryJob(jobId));
+      // Straight back to polling: the job is queued again, so the effect below
+      // starts following it on the next render.
+      window.setTimeout(load, 600);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setRetrying(false);
+    }
+  }
+
+  async function remove() {
+    // Says what goes and what stays. "Delete" reads as "erase every trace",
+    // and someone deleting for privacy reasons deserves to know before they
+    // press it that the record of the run remains.
+    if (
+      !confirm(
+        "Delete this job's data?\n\n" +
+          "The variants you submitted and the annotated results are destroyed " +
+          "and cannot be recovered. The record that the job ran — when, against " +
+          "which snapshot, how many variants — is kept.",
+      )
+    )
+      return;
+    setDeleting(true);
+    try {
+      await api.deleteJob(jobId);
+      nav("/jobs");
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+      setDeleting(false);
+    }
+  }
+
   // Follow a job that is still going, and stop once it settles.
   useEffect(() => {
     if (!job || job.status === "done" || job.status === "error" || job.status === "cancelled")
@@ -197,6 +236,24 @@ export default function JobDetail() {
           {live && (
             <button className="btn secondary" onClick={cancel} disabled={cancelling}>
               <Ban size={14} /> {cancelling ? "Cancelling…" : "Cancel job"}
+            </button>
+          )}
+          {/* Only a failure that still has its input. A purged job would be
+              refused by the server, and offering a button that cannot work is
+              worse than not offering one. */}
+          {job.status === "error" && !job.purged_at && (
+            <button className="btn secondary" onClick={retry} disabled={retrying}>
+              <RotateCcw size={14} /> {retrying ? "Queueing…" : "Retry"}
+            </button>
+          )}
+          {!live && (
+            <button
+              className="btn secondary"
+              onClick={remove}
+              disabled={deleting}
+              title="Destroy this job's data. The record that it ran is kept."
+            >
+              <Trash2 size={14} /> {deleting ? "Deleting…" : "Delete"}
             </button>
           )}
           <button className="btn secondary" onClick={load} title="Refresh">

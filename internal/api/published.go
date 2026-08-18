@@ -147,8 +147,20 @@ func (s *Server) publishedRoutes() []publishedRoute {
 			}},
 		},
 		{
+			Method: "DELETE", Path: "/api/v1/jobs/{id}", OpID: "deleteJob",
+			Summary: "Remove a job from your list and destroy its stored input " +
+				"and results. Needs an account: anonymous work is removed on the " +
+				"installation's own schedule. The record that the job ran is kept.",
+			Handler: s.handleDeleteJob,
+			Status:  http.StatusNoContent,
+			Params: []param{{
+				Name: "id", In: "path", Required: true, Type: "string",
+				Doc: "The job identifier.",
+			}},
+		},
+		{
 			Method: "GET", Path: "/api/v1/jobs/{id}/export", OpID: "exportResults",
-			Public:  true,
+			Public: true,
 			Summary: "Download a finished job's results, whole, in a chosen format. " +
 				"format=vcf may answer 302 with a short-lived link straight to " +
 				"object storage, so follow redirects.",
