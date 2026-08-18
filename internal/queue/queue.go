@@ -135,6 +135,7 @@ type Chunk struct {
 	CreatedAt  int64  `json:"created_at" doc:"Unix seconds."`
 	StartedAt  int64  `json:"started_at,omitempty" doc:"Unix seconds. Absent until a worker claims it."`
 	FinishedAt int64  `json:"finished_at,omitempty" doc:"Unix seconds. Absent until it finishes."`
+	Runner     string `json:"runner,omitempty" doc:"What executed it: local for this deployment's worker pool. Written when the chunk is claimed."`
 
 	// MaxVariants is the variant cap this chunk was admitted under; 0 is
 	// unlimited. Stamped at submit, so the terms a chunk runs under are the
@@ -270,7 +271,7 @@ const chunkCols = `id, kind, snapshot, selection, status, COALESCE(error,''), ` 
 	`COALESCE(n_variants,0), client_ip, session_id, COALESCE(user_id,''), label, weight, ` +
 	`COALESCE(origin,''), COALESCE(max_variants,0), COALESCE(job_id,''), chunk_index, ` +
 	`awaits_pieces, completes_job, created_at, COALESCE(started_at,0), ` +
-	`COALESCE(finished_at,0)`
+	`COALESCE(finished_at,0), COALESCE(runner,'')`
 
 // chunkColsJ is chunkCols qualified with the "j" alias, for the claim query's
 // join.
@@ -427,6 +428,13 @@ type Queue struct {
 	// is in here for as long as this process is really working on it.
 	running map[string]*runningChunk
 
+	// runner names what kind of thing executes a chunk — "local" for this
+	// deployment's own worker pool, and one day "slurm" for work handed to a
+	// cluster. Written at claim rather than derived later, because it is only
+	// knowable while the work is being taken: nothing about a finished job says
+	// what picked it up.
+	runner string
+
 	// workerID identifies this process in the claims it holds. Random per
 	// process rather than derived from a hostname or pid, both of which a
 	// container reuses across restarts — a restarted worker must not look like
@@ -489,6 +497,7 @@ func New(pool *pgxpool.Pool) (*Queue, error) {
 		queued:     make(chan struct{}, 1),
 		running:    map[string]*runningChunk{},
 		workerID:   id,
+		runner:     RunnerLocal,
 		leaseTTL:   defaultLeaseTTL,
 		leaseRenew: defaultLeaseRenew,
 	}, nil
@@ -1055,7 +1064,7 @@ func scanChunk(row rowScanner) (Chunk, error) {
 	if err := row.Scan(&j.ID, &j.Kind, &j.Snapshot, &j.Selection, &j.Status,
 		&j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID, &j.Label, &j.Weight,
 		&j.Origin, &j.MaxVariants, &j.JobID, &j.ChunkIndex, &j.AwaitsPieces,
-		&j.CompletesJob, &j.CreatedAt, &j.StartedAt, &j.FinishedAt); err != nil {
+		&j.CompletesJob, &j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.Runner); err != nil {
 		return Chunk{}, err
 	}
 	return j, nil
@@ -1125,18 +1134,33 @@ func (q *Queue) List(ctx context.Context, f ChunkFilter, limit, offset int) ([]C
 	return out, rows.Err()
 }
 
-// DeleteOlderThan removes terminal jobs (finished_at set) whose finished_at is
-// before cutoff, along with their chunks and every blob those own. Queued and
-// running jobs are never touched. Returns the number of jobs deleted.
+// PurgeOlderThan empties terminal jobs finished before cutoff, keeping the job
+// row and its summary. Queued and running jobs are never touched. Returns the
+// number of jobs purged.
 //
-// Jobs rather than chunks, since 0037: a chunk belongs to a job and goes when
-// it does. Ageing chunks out on their own would leave a split job whose pieces
-// had been collected while the job still claimed to have twenty-six of them.
+// It used to delete the job outright, and everything cascaded off it. That threw
+// away the record along with the payload: seven days on there was no trace a job
+// had run, who submitted it, or whether it worked. A record and a payload have
+// different lifetimes — see migration 0037.
 //
-// The chunks go with the job, and the blobs with the chunks, via ON DELETE
-// CASCADE — so unlike the SQLite version this is one statement rather than
-// several inside a transaction.
-func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error) {
+// So what goes is the payload: the submitted input, the built result, the rows
+// behind the results table, the run log, and the chunks that carried them. What
+// stays is the job, with the summary frozen onto it first — status, finish time,
+// variant count, and what ran it.
+//
+// Order is load-bearing throughout, and every step is chosen so that a failure
+// midway leaves a state that is merely wasteful rather than untrue:
+//
+//  1. Freeze the summary. If this fails, nothing has been destroyed yet and the
+//     next sweep tries again.
+//  2. Delete the payload rows. A job whose summary is frozen but whose chunks
+//     are still there reads exactly as it did before — the view prefers the
+//     derivation while it exists.
+//  3. Stamp purged_at, which is what makes the view switch over.
+//  4. Dispose the objects last. Losing an object whose row is gone leaks
+//     storage, which a bucket listing can recover; deleting the object first and
+//     failing afterwards leaves a job that still claims to have a result.
+func (q *Queue) PurgeOlderThan(ctx context.Context, cutoff int64) (int64, error) {
 	// The objects these jobs own — inputs and built results alike — read before
 	// their rows go.
 	//
@@ -1150,13 +1174,13 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		SELECT i.uri FROM chunk_input i
 		  JOIN chunk c ON c.id = i.chunk_id
 		  JOIN job_state j ON j.id = c.job_id
-		 WHERE i.uri IS NOT NULL
+		 WHERE i.uri IS NOT NULL AND j.purged_at IS NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1
 		UNION ALL
 		SELECT r.vcf_uri FROM chunk_result r
 		  JOIN chunk c ON c.id = r.chunk_id
 		  JOIN job_state j ON j.id = c.job_id
-		 WHERE r.vcf_uri IS NOT NULL
+		 WHERE r.vcf_uri IS NOT NULL AND j.purged_at IS NULL
 		   AND j.finished_at IS NOT NULL AND j.finished_at < $1`, cutoff); err == nil {
 		for rows.Next() {
 			var uri string
@@ -1172,19 +1196,75 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		log.Printf("queue: could not list the objects of expiring jobs: %v", err)
 	}
 
-	// Through the view: a job's finish time is its chunks' — see job_state — so
-	// there is no column here to compare against.
-	tag, err := q.pool.Exec(ctx, `
-		DELETE FROM job WHERE id IN (
-		  SELECT id FROM job_state
-		   WHERE finished_at IS NOT NULL AND finished_at < $1)`, cutoff)
+	// Through the view throughout: a job's finish time and status are its
+	// chunks' — see job_state — so there is no column here to compare against
+	// until this has written one.
+	//
+	// One transaction for the freeze and the emptying, because a summary taken
+	// from rows that are then only partly deleted is the one combination that
+	// produces a wrong answer rather than a retry.
+	tx, err := q.pool.Begin(ctx)
 	if err != nil {
 		return 0, err
 	}
-	// After the rows, deliberately. This order can leak an object when the
-	// disposal fails; the other order can leave a job that still looks
-	// complete with its input already gone, which is a wrong answer rather
-	// than waste.
+	defer tx.Rollback(ctx)
+
+	// One reading of the clock for the whole sweep, because it is not just a
+	// timestamp — it is the key the deletions below match on. Calling nowFn
+	// again for those would delete the rows of whatever the clock said the
+	// second time, which is nothing at all whenever the two readings differ.
+	// Unix seconds usually hide that; a sweep crossing a second boundary would
+	// have frozen every summary and freed no space, silently.
+	now := q.nowFn()
+
+	// 1. Freeze, reading the view while the chunks behind it are still there.
+	tag, err := tx.Exec(ctx, `
+		UPDATE job j SET
+		    final_status      = s.status,
+		    final_finished_at = s.finished_at,
+		    final_n_variants  = s.n_variants,
+		    runner            = COALESCE(j.runner, s.runner),
+		    purged_at         = $2
+		  FROM job_state s
+		 WHERE s.id = j.id AND j.purged_at IS NULL
+		   AND s.finished_at IS NOT NULL AND s.finished_at < $1`, cutoff, now)
+	if err != nil {
+		return 0, err
+	}
+	n := tag.RowsAffected()
+	if n == 0 {
+		return 0, tx.Commit(ctx)
+	}
+
+	// 2. The payload. Chunks last of the four, since the other three hang off
+	// them and deleting the chunk would cascade anyway — done explicitly so the
+	// set that goes is stated here rather than inferred from the schema.
+	//
+	// Keyed on purged_at rather than the cutoff, so this deletes exactly what
+	// step 1 just stamped even if the clock or the cutoff moved underneath.
+	for _, stmt := range []string{
+		`DELETE FROM chunk_variant v USING chunk c, job j
+		  WHERE v.chunk_id = c.id AND c.job_id = j.id AND j.purged_at = $1`,
+		`DELETE FROM chunk_input i USING chunk c, job j
+		  WHERE i.chunk_id = c.id AND c.job_id = j.id AND j.purged_at = $1`,
+		`DELETE FROM chunk_result r USING chunk c, job j
+		  WHERE r.chunk_id = c.id AND c.job_id = j.id AND j.purged_at = $1`,
+		`DELETE FROM chunk_log l USING chunk c, job j
+		  WHERE l.chunk_id = c.id AND c.job_id = j.id AND j.purged_at = $1`,
+		`DELETE FROM chunk c USING job j WHERE c.job_id = j.id AND j.purged_at = $1`,
+	} {
+		if _, err := tx.Exec(ctx, stmt, now); err != nil {
+			return 0, err
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+
+	// 3. The objects, after the rows that pointed at them. This order can leak
+	// an object when the disposal fails, which a bucket listing can recover; the
+	// other order leaves a job still claiming a result that is already gone,
+	// which is a wrong answer rather than waste.
 	if len(owned) > 0 && q.disposeObjects != nil {
 		q.disposeObjects(ctx, owned)
 	}
@@ -1202,12 +1282,15 @@ func (q *Queue) DeleteOlderThan(ctx context.Context, cutoff int64) (int64, error
 		`DELETE FROM queue_caller WHERE last_finished_at < $1`, cutoff); err != nil {
 		log.Printf("queue: prune fair-share timestamps: %v", err)
 	}
-	return tag.RowsAffected(), nil
+	return n, nil
 }
 
-// StartSweeper launches a goroutine that deletes terminal chunks older than
-// ttl, sweeping once immediately and then every interval until ctx is
-// cancelled. A ttl <= 0 disables GC (the goroutine is not started).
+// StartSweeper launches a goroutine that empties terminal jobs older than ttl,
+// sweeping once immediately and then every interval until ctx is cancelled. A
+// ttl <= 0 disables GC (the goroutine is not started).
+//
+// Empties, not deletes: the job record is permanent and only its payload ages
+// out. See PurgeOlderThan.
 func (q *Queue) StartSweeper(ctx context.Context, ttl, interval time.Duration) {
 	if ttl <= 0 {
 		return
@@ -1220,12 +1303,13 @@ func (q *Queue) StartSweeper(ctx context.Context, ttl, interval time.Duration) {
 		defer q.wg.Done()
 		sweep := func() {
 			cutoff := q.nowFn() - int64(ttl.Seconds())
-			if n, err := q.DeleteOlderThan(ctx, cutoff); err != nil {
+			if n, err := q.PurgeOlderThan(ctx, cutoff); err != nil {
 				if ctx.Err() == nil {
-					log.Printf("queue: chunk GC: %v", err)
+					log.Printf("queue: payload GC: %v", err)
 				}
 			} else if n > 0 {
-				log.Printf("queue: chunk GC removed %d chunk(s) older than %s", n, ttl)
+				log.Printf("queue: payload GC emptied %d job(s) finished more than %s ago; "+
+					"the job records are kept", n, ttl)
 			}
 		}
 		sweep()
@@ -1347,7 +1431,7 @@ func (q *Queue) worker(ctx context.Context, runner Runner) {
 // empty pool already guarantees.
 const claimQuery = `
 UPDATE chunk SET status = $1, started_at = $2, claimed_by = $6, lease_until = $7,
-               attempts = chunk.attempts + 1
+               attempts = chunk.attempts + 1, runner = $9
 WHERE id = (
   SELECT j.id
   FROM chunk j
@@ -1412,7 +1496,7 @@ func (q *Queue) claimNext(ctx context.Context) (Chunk, []byte, bool, error) {
 	}
 
 	row := tx.QueryRow(ctx, claimQuery, StatusRunning, q.nowFn(), StatusQueued, maxPerIP, slots,
-		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()), StatusDone)
+		q.workerID, q.nowFn()+int64(q.leaseTTL.Seconds()), StatusDone, q.runner)
 	chunk, err := scanChunk(row)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Chunk{}, nil, false, nil

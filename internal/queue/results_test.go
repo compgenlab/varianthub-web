@@ -245,7 +245,7 @@ func TestVariantsCascadeOnChunkDelete(t *testing.T) {
 	seedResults(t, q, "j1", testBody, testColumns)
 	ctx := context.Background()
 
-	if _, err := q.DeleteOlderThan(ctx, 100); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 100); err != nil {
 		t.Fatal(err)
 	}
 	var n int

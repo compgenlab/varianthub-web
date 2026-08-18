@@ -404,7 +404,7 @@ func TestAttemptsAreDeletedWithTheChunk(t *testing.T) {
 		t.Fatal("no attempt was recorded; this test would pass vacuously")
 	}
 
-	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.pool.QueryRow(ctx, `SELECT count(*) FROM chunk_attempt`).Scan(&n); err != nil {
