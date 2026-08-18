@@ -126,6 +126,12 @@ func (s *Server) Routes() http.Handler {
 	// screen for looking into one run, not something a client polls.
 	v1.Handle("GET /api/v1/jobs/{id}/chunks/{chunkId}/log",
 		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleChunkLog))))
+	// Web-only: a program that wants another attempt still holds the request
+	// that produced this job and can submit it again. What it cannot do is judge
+	// that the cause was transient, and a retry endpoint on the published API
+	// mostly invites a client to loop on a job that fails the same way each time.
+	v1.Handle("POST /api/v1/jobs/{id}/retry",
+		s.webOnly(s.requireAuth(http.HandlerFunc(s.handleRetryJob))))
 	// Web-only: this is the table feed, paged and sorted for a screen. An
 	// external caller wants the whole result, which is what export is.
 	v1.Handle("GET /api/v1/jobs/{id}/results",
