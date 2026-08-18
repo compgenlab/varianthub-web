@@ -22,6 +22,7 @@ import {
 import {
   api,
   type Build,
+  type Me,
   type Registry,
   type RegistryEntry,
   type Snapshot,
@@ -81,20 +82,23 @@ export default function Admin() {
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [files, setFiles] = useState<SourceFile[]>([]);
   const [storage, setStorage] = useState<StorageLocation[]>([]);
+  const [me, setMe] = useState<Me | null>(null);
   const [err, setErr] = useState("");
 
   async function load() {
     try {
-      const [s, n, f, st] = await Promise.all([
+      const [s, n, f, st, m] = await Promise.all([
         api.sources(),
         api.snapshots(true),
         api.files(),
         api.storage(),
+        api.me(),
       ]);
       setSources(s.sources ?? []);
       setSnapshots(n.snapshots ?? []);
       setFiles(f.files ?? []);
       setStorage(st.storage ?? []);
+      setMe(m);
       setErr("");
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));
@@ -130,9 +134,35 @@ export default function Admin() {
     <div className="page page-wide" style={{ paddingTop: 30 }}>
       <div className="between">
         <h1 className="title">Administration</h1>
-        <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>
-          Any valid token can administer — roles are not implemented yet
-        </span>
+        {/*
+          This said "any valid token can administer — roles are not implemented
+          yet", which stopped being true and was the wrong thing to be wrong
+          about: /api/v1/admin/ sits behind requireAdmin, which is Role ==
+          RoleAdmin. A banner telling an operator the area is ungated when it is
+          gated is worse than no banner.
+
+          What it was reaching for is real, though, and only during bootstrap:
+          until the first administrator account exists, the bootstrap credential
+          administers on its own. That is worth saying loudly, because the way
+          to close it is to finish the thing the operator came here to do.
+        */}
+        {me?.bootstrap ? (
+          <span
+            style={{
+              fontSize: 12.5,
+              color: "var(--warn, #b45309)",
+              maxWidth: 420,
+              textAlign: "right",
+            }}
+          >
+            Signed in with the bootstrap credential, which administers until the
+            first administrator account exists. Create one to close it.
+          </span>
+        ) : me ? (
+          <span style={{ fontSize: 12.5, color: "var(--text-2)" }}>
+            Signed in as {me.label} — administrator
+          </span>
+        ) : null}
       </div>
 
       <div
