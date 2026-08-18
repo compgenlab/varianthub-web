@@ -79,7 +79,37 @@ type Job struct {
 	// chunk.
 	InputChunkID  string `json:"-"`
 	ResultChunkID string `json:"-"`
+
+	// PurgedAt is when this job's payload aged out, or 0 while it is still
+	// there. The record is permanent; the input, the result, the rows behind
+	// the table and the log are not — see queue.PurgeOlderThan.
+	//
+	// It is the difference between "this job had no results" and "this job's
+	// results have expired", which nothing else on this row can express: after
+	// a purge the counts read zero and the result chunk is empty, which is
+	// exactly what a job that produced nothing looks like.
+	PurgedAt int64 `json:"purged_at,omitempty"`
+
+	// Runner is what executed the job — "local" for this deployment's own
+	// worker pool. Empty for jobs that ran before it was recorded.
+	Runner string `json:"runner,omitempty"`
 }
+
+// Purged reports whether the job's payload has aged out. A purged job still has
+// its record: status, timing, variant count and who ran it.
+func (j Job) Purged() bool { return j.PurgedAt > 0 }
+
+// What kinds of thing execute a chunk.
+//
+// Recorded per chunk and frozen onto the job when its payload is swept, so the
+// permanent record says what ran the work. RunnerSlurm is declared before there
+// is anything to set it: the column has to exist from the first release that
+// keeps records, or every job predating it becomes indistinguishable from a
+// local one rather than merely unknown.
+const (
+	RunnerLocal = "local"
+	RunnerSlurm = "slurm"
+)
 
 // Terminal reports whether the job has reached a final status.
 func (j Job) Terminal() bool {
@@ -207,7 +237,7 @@ const jobCols = `id, kind, snapshot, selection, COALESCE(label,''), status, ` +
 	`COALESCE(session_id,''), COALESCE(user_id,''), COALESCE(origin,''), ` +
 	`created_at, COALESCE(started_at,0), COALESCE(finished_at,0), ` +
 	`chunks, done, failed, COALESCE(prefix,''), COALESCE(input_chunk_id,''), ` +
-	`COALESCE(result_chunk_id,'')`
+	`COALESCE(result_chunk_id,''), COALESCE(purged_at,0), COALESCE(runner,'')`
 
 func scanJob(row rowScanner) (Job, error) {
 	var j Job
@@ -215,7 +245,7 @@ func scanJob(row rowScanner) (Job, error) {
 		&j.Status, &j.Error, &j.NVariants, &j.ClientIP, &j.Session, &j.UserID,
 		&j.Origin, &j.CreatedAt, &j.StartedAt, &j.FinishedAt,
 		&j.Chunks, &j.Done, &j.Failed, &j.Prefix,
-		&j.InputChunkID, &j.ResultChunkID); err != nil {
+		&j.InputChunkID, &j.ResultChunkID, &j.PurgedAt, &j.Runner); err != nil {
 		return Job{}, err
 	}
 	return j, nil

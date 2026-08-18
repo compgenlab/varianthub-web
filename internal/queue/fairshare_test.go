@@ -237,7 +237,7 @@ func TestSweepingChunksAlsoPrunesTheFairShareRows(t *testing.T) {
 	}
 
 	// A cutoff after everything: the chunk goes, and so does its timestamp.
-	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
 	}
 	if err := q.pool.QueryRow(ctx, `SELECT COUNT(*) FROM queue_caller`).Scan(&n); err != nil {

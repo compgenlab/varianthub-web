@@ -33,7 +33,7 @@ func TestSweepingAChunkOffersItsStoredInputForRemoval(t *testing.T) {
 	}
 	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
-	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
 	}
 	if len(disposed) != 1 || disposed[0] != uri {
@@ -71,7 +71,7 @@ func TestSweepingLeavesARunningChunksInputAlone(t *testing.T) {
 		t.Fatalf("claim: %v ok=%v", err, ok)
 	}
 	// Claimed and not finished: no finished_at, so nothing to collect.
-	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
 	}
 	if len(disposed) != 0 {
@@ -99,7 +99,7 @@ func TestSweepingAnInlineChunkOffersNothing(t *testing.T) {
 	}
 	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
-	if _, err := q.DeleteOlderThan(ctx, 1<<62); err != nil {
+	if _, err := q.PurgeOlderThan(ctx, 1<<62); err != nil {
 		t.Fatal(err)
 	}
 	if called {
@@ -125,7 +125,7 @@ func TestSweepingWorksWithNoDisposer(t *testing.T) {
 	}
 	q.finish(ctx, chunk, StatusDone, "", Outcome{})
 
-	n, err := q.DeleteOlderThan(ctx, 1<<62)
+	n, err := q.PurgeOlderThan(ctx, 1<<62)
 	if err != nil {
 		t.Fatalf("the sweep failed with no disposer set: %v", err)
 	}

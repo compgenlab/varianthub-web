@@ -238,15 +238,28 @@ func TestQueueListAndGC(t *testing.T) {
 		t.Fatalf("List(queued) = %d, want 1", len(qd))
 	}
 
-	n, err := q.DeleteOlderThan(ctx, 50)
+	n, err := q.PurgeOlderThan(ctx, 50)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if n != 1 {
-		t.Fatalf("DeleteOlderThan removed %d, want 1", n)
+		t.Fatalf("PurgeOlderThan purged %d, want 1", n)
 	}
-	if _, ok, _ := q.GetJob(ctx, oldID); ok {
-		t.Errorf("old done chunk should be gone")
+	// The record survives the sweep — that is the point of it. What went is the
+	// payload; what is left says the job ran and how it ended.
+	old, ok, err := q.GetJob(ctx, oldID)
+	if err != nil {
+		t.Fatalf("get the purged job: %v", err)
+	}
+	if !ok {
+		t.Fatalf("the swept job is gone; the record is meant to outlive its payload")
+	}
+	if old.Status != StatusDone {
+		t.Errorf("purged job status = %q, want %q — the frozen summary is what "+
+			"answers once the chunks are gone", old.Status, StatusDone)
+	}
+	if old.PurgedAt == 0 {
+		t.Error("the purged job carries no purged_at, so nothing can tell why its results are missing")
 	}
 	if _, ok, _ := q.GetJob(ctx, newID); !ok {
 		t.Errorf("recent done chunk should remain")
@@ -255,8 +268,8 @@ func TestQueueListAndGC(t *testing.T) {
 		t.Errorf("queued chunk must never be GC'd")
 	}
 	if page, err := q.Results(ctx, oldID, ResultQuery{}); err != nil || page.Total != 0 {
-		t.Errorf("GC'd chunk's variant rows should be gone (ON DELETE CASCADE): "+
-			"total=%d err=%v", page.Total, err)
+		t.Errorf("the purged job's variant rows should be gone: total=%d err=%v",
+			page.Total, err)
 	}
 }
 
