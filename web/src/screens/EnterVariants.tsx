@@ -37,6 +37,13 @@ export default function EnterVariants() {
   const batchLines = batch.split("\n").map((l) => l.trim()).filter(Boolean);
   const count = mode === "single" ? chips.length : mode === "batch" ? batchLines.length : 0;
 
+  // Behind a disclosure, because it is for a service rather than a person: the
+  // page it submits from is already watching the job, so anyone filling this in
+  // wants something *else* told. Putting it in front of everyone would ask most
+  // of them a question that does not apply.
+  const [showCallback, setShowCallback] = useState(false);
+  const [callback, setCallback] = useState("");
+
   function addChip() {
     const v = draft.trim();
     if (!v) return;
@@ -56,6 +63,7 @@ export default function EnterVariants() {
           sources: sources.length ? sources : undefined,
           build: build || undefined,
           annotations: annotations.length ? annotations.join(",") : undefined,
+          callback_url: callback.trim() || undefined,
         });
       } else {
         const variants = mode === "single" ? chips : batchLines;
@@ -66,6 +74,7 @@ export default function EnterVariants() {
           build: build || undefined,
           variants,
           annotations: annotations.length ? annotations : undefined,
+          callback_url: callback.trim() || undefined,
         });
       }
       nav(`/annotate/running/${job.job_id}`);
@@ -220,6 +229,43 @@ export default function EnterVariants() {
           {err}
         </p>
       )}
+
+      <div style={{ marginTop: 24 }}>
+        {!showCallback ? (
+          <button
+            className="btn link"
+            style={{ fontSize: 12.5, padding: 0 }}
+            onClick={() => setShowCallback(true)}
+          >
+            + Notify a server when this finishes
+          </button>
+        ) : (
+          <div>
+            <label
+              style={{ display: "block", fontSize: 12.5, marginBottom: 6, color: "var(--text-2)" }}
+            >
+              Callback URL
+            </label>
+            <input
+              className="input mono"
+              style={{ width: "100%", fontSize: 12.5 }}
+              placeholder="https://your-service.example.org/varianthub-hook"
+              value={callback}
+              onChange={(e) => setCallback(e.target.value)}
+              spellCheck={false}
+            />
+            <p style={{ fontSize: 11.5, color: "var(--text-3)", margin: "8px 0 0", lineHeight: 1.5 }}>
+              When the job finishes we POST{" "}
+              <code>{`{"job_id", "status"}`}</code> here — nothing more, and it is
+              not signed, so treat the status as a hint and fetch the job when you
+              need certainty. It may arrive more than once; the{" "}
+              <code>X-VariantHub-Delivery</code> header is the job id to
+              deduplicate on. The address must be reachable from the internet;
+              this page will keep showing you the job either way.
+            </p>
+          </div>
+        )}
+      </div>
 
       <div
         className="between"

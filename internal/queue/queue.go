@@ -428,6 +428,11 @@ type Queue struct {
 	// is in here for as long as this process is really working on it.
 	running map[string]*runningChunk
 
+	// notify is called when a job reaches a terminal status and asked to be
+	// told. Nil disables callbacks, which is every deployment that has not
+	// wired one up. See callback.go.
+	notify Notifier
+
 	// runner names what kind of thing executes a chunk — "local" for this
 	// deployment's own worker pool, and one day "slurm" for work handed to a
 	// cluster. Written at claim rather than derived later, because it is only
@@ -1711,6 +1716,11 @@ func (q *Queue) finish(ctx context.Context, chunk Chunk, status, errMsg string, 
 		log.Printf("queue: commit chunk %s: %v", id, err)
 		return
 	}
+
+	// After the commit, so a notification is never sent for an outcome that was
+	// then rolled back — the one ordering that produces a lie rather than a
+	// delay.
+	q.notifyIfDone(wctx, chunk.JobID)
 }
 
 // nullable renders an empty string as SQL NULL.
