@@ -154,6 +154,13 @@ func annotateRequestSchema() *schema {
 			"variants": {Type: "array", Items: &schema{Type: "string"},
 				Description: "Variants as chrom:pos:ref:alt, e.g. chr12:25245350:C:T. " +
 					"HGVS and rsIDs are not accepted."},
+			"callback_url": {Type: "string", Description: "An https URL to POST to " +
+				"when the job reaches a terminal status, so a service need not poll. " +
+				"The body is {\"job_id\", \"status\"} and nothing else; it is not " +
+				"signed, so treat the status as a hint and call GET /jobs/{id} when " +
+				"you need certainty. Delivery is at-least-once — deduplicate on the " +
+				"X-VariantHub-Delivery header, which is the job id. Requires an " +
+				"account, and the address must be publicly routable."},
 			"annotations": {
 				Description: "Which fields to return. Omit for the snapshot's defaults.",
 				OneOf: []*schema{

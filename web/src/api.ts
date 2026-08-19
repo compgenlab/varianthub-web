@@ -588,6 +588,9 @@ export const api = {
     build?: string;
     variants: string[];
     annotations?: string | string[];
+    /** POSTed to when the job finishes, so a service need not poll. Needs an
+     *  account, and the address must be publicly routable. */
+    callback_url?: string;
   }) =>
     req<{ job_id: string }>("/annotate", {
       method: "POST",
@@ -602,14 +605,20 @@ export const api = {
       sources?: string[];
       build?: string;
       annotations?: string;
+      callback_url?: string;
     },
   ) => {
     const fd = new FormData();
-    fd.append("vcf", file);
+    // Fields before the file. The server reads the parts as they arrive, so one
+    // sent after the upload is one it has already had to decide without — it
+    // copes, by storing and then discarding, but that is a whole VCF moved for
+    // nothing when the only problem was a mistyped callback.
     if (opts.snapshot) fd.append("snapshot", opts.snapshot);
     if (opts.sources?.length) fd.append("sources", opts.sources.join(","));
     if (opts.build) fd.append("build", opts.build);
     if (opts.annotations) fd.append("annotations", opts.annotations);
+    if (opts.callback_url) fd.append("callback_url", opts.callback_url);
+    fd.append("vcf", file);
     return req<{ job_id: string }>("/annotate/vcf", {
       method: "POST",
       body: fd,
