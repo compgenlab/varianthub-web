@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/compgenlab/varianthub-web/internal/callback"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/identity"
@@ -38,6 +39,10 @@ type Server struct {
 	tierLimiter *limit.Limiter
 	remote      *remoteSizer
 	oidc        *oidcProvider // nil when no external sign-in is configured
+	// callbacks validates a submitted callback URL. Held here rather than
+	// constructed per request because its policy — https required, which
+	// addresses are reachable — is a property of the deployment.
+	callbacks *callback.Sender
 }
 
 // New builds the server. cat may be nil, in which case the catalog endpoints
@@ -56,6 +61,7 @@ func New(cfg *config.Config, q *queue.Queue, cat *catalog.Store, ids *identity.S
 		tierLimiter: limit.New(1, 1),
 		remote:      newRemoteSizer(),
 		oidc:        newCILogon(cfg),
+		callbacks:   callback.NewSender(),
 	}
 }
 

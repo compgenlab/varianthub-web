@@ -149,6 +149,10 @@ type NewJob struct {
 	// carrying; InputURI locates it in job storage otherwise. Exactly one.
 	Body     []byte
 	InputURI string
+
+	// CallbackURL is posted to when the job reaches a terminal status. Empty
+	// for the callers that poll, which is most of them.
+	CallbackURL string
 }
 
 // Submit records a submission — one job and the chunk that starts it — and
@@ -188,10 +192,11 @@ func (q *Queue) Submit(ctx context.Context, n NewJob) (string, error) {
 	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO job (id,kind,snapshot,selection,label,client_ip,session_id,user_id,
-		                 origin,input_chunk_id,created_at)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+		                 origin,input_chunk_id,created_at,callback_url)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
 		id, kind, n.Snapshot, n.Selection, n.Label, n.ClientIP, n.Session,
-		nullable(n.UserID), nullable(n.Origin), chunkID, q.nowFn()); err != nil {
+		nullable(n.UserID), nullable(n.Origin), chunkID, q.nowFn(),
+		nullable(n.CallbackURL)); err != nil {
 		return "", err
 	}
 

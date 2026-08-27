@@ -109,7 +109,9 @@ func (s *Server) publishedRoutes() []publishedRoute {
 		},
 		{
 			Method: "POST", Path: "/api/v1/annotate/vcf", OpID: "annotateVCF",
-			Summary: "Submit a VCF file for annotation.",
+			Summary: "Submit a VCF file for annotation. multipart/form-data with a " +
+				"`vcf` file part; `snapshot`, `sources`, `build`, `annotations` and " +
+				"`callback_url` may be sent as fields, and must precede the file.",
 			Handler: s.handleAnnotateVCF, Throttled: true,
 			Response: AcceptedResponse{},
 			Status:   http.StatusAccepted,

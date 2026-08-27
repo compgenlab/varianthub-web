@@ -23,6 +23,7 @@ import (
 	"github.com/compgenlab/varianthub-web/internal/api"
 	"github.com/compgenlab/varianthub-web/internal/blob"
 	"github.com/compgenlab/varianthub-web/internal/cacherunner"
+	"github.com/compgenlab/varianthub-web/internal/callback"
 	"github.com/compgenlab/varianthub-web/internal/catalog"
 	"github.com/compgenlab/varianthub-web/internal/config"
 	"github.com/compgenlab/varianthub-web/internal/fanout"
@@ -271,6 +272,7 @@ func worker(ctx context.Context, cfg *config.Config) error {
 	defer closeCache()
 
 	log.Printf("worker: %d worker(s), varhub=%s", cfg.Workers, cfg.VarhubBin)
+	q.SetNotifier(callbackNotifier(ctx))
 	q.SetSlots(cfg.JobSlots)
 	q.StartWorkers(ctx, cfg.Workers, adapt(q, annotator, cat, cfg.JobStorage, cfg.Version, siteFor(ctx, cfg, cat)))
 
@@ -435,6 +437,40 @@ func verifyDownloadCORS(ctx context.Context, cfg *config.Config) {
 
 	for _, note := range blob.VerifyPublicSites(ctx, origins) {
 		log.Printf("serve: %s", note)
+	}
+}
+
+// callbackNotifier posts a job's terminal status to the URL its caller gave.
+//
+// In its own goroutine, always. The queue calls this from the path that closes
+// a chunk, and a worker blocked on somebody else's web server — one that
+// accepts the connection and then does nothing for its full timeout — is a
+// worker not annotating anything. The job is finished and recorded either way;
+// a notification is the only thing at stake.
+//
+// Every attempt is logged whether it worked or not, with the address actually
+// reached beside the URL that was asked for. The two differ exactly when
+// something has gone wrong or been redirected, which is when somebody will be
+// reading this.
+func callbackNotifier(ctx context.Context) queue.Notifier {
+	sender := callback.NewSender()
+	return func(jobID, url, status string) {
+		go func() {
+			// Its own deadline, and not the process's: shutting down should not
+			// abandon a notification mid-flight, but nor should one hold the
+			// process open indefinitely.
+			cctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+			defer cancel()
+
+			res := sender.Send(cctx, url, callback.Notification{
+				JobID: jobID, Status: status,
+			})
+			if res.Err != nil || res.Status < 200 || res.Status >= 300 {
+				log.Printf("worker: job %s callback FAILED — %s", jobID, res.Log())
+				return
+			}
+			log.Printf("worker: job %s %s", jobID, res.Log())
+		}()
 	}
 }
 

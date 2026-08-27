@@ -290,6 +290,33 @@ type annotateRequest struct {
 	Build       string   `json:"build"`   // assembly, required with Sources
 	Variants    []string `json:"variants"`
 	Annotations any      `json:"annotations"` // omitted | "all" | "a,b" | ["a","b"]
+	CallbackURL string   `json:"callback_url"`
+}
+
+// callbackURL validates a requested callback and says who may have one.
+//
+// Named callers only. An anonymous visitor is a session that outlives nothing,
+// and handing one the ability to make this service issue an HTTP request to an
+// address of their choosing is the SSRF surface with the accountability removed
+// — the address checks still apply, but nobody is left to ask about it
+// afterwards. Anonymous callers poll, which is what a browser does anyway.
+//
+// The URL is checked here for shape and again, properly, when it is dialled:
+// this catches a typo while somebody is watching, and cannot say where a name
+// will point hours later when the job finishes. See internal/callback.
+func (s *Server) callbackURL(r *http.Request, raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if callerOf(r).Anonymous() {
+		return "", errors.New(
+			"a callback needs an account; anonymous submissions are polled for")
+	}
+	if err := s.callbacks.ValidateURL(raw); err != nil {
+		return "", err
+	}
+	return raw, nil
 }
 
 // resolveSnapshot turns a request's snapshot-or-sources into a snapshot name.
@@ -437,6 +464,11 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	cb, err := s.callbackURL(r, in.CallbackURL)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	// An individual-source selection becomes a snapshot here, so everything
 	// downstream — materialization, results columns, reproducibility — is
@@ -479,14 +511,15 @@ func (s *Server) handleAnnotate(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !s.submit(w, r, queue.NewJob{
-		ID:        id,
-		Kind:      queue.KindLocus,
-		Snapshot:  snapshot,
-		Selection: sel,
-		Session:   sessionOf(r),
-		UserID:    callerOf(r).UserID(),
-		Label:     label,
-		InputURI:  uri,
+		ID:          id,
+		Kind:        queue.KindLocus,
+		Snapshot:    snapshot,
+		Selection:   sel,
+		Session:     sessionOf(r),
+		UserID:      callerOf(r).UserID(),
+		Label:       label,
+		InputURI:    uri,
+		CallbackURL: cb,
 		// Kept alongside the stored file until the worker reads the file
 		// instead. Two copies of a locus list is a few hundred bytes; two code
 		// paths, briefly, is the thing being removed.
@@ -657,6 +690,12 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	cb, err := s.callbackURL(r, fields["callback_url"])
+	if err != nil {
+		discard()
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
 	snapshot, err := s.resolveSnapshot(r, strings.TrimSpace(fields["snapshot"]),
 		sources, strings.TrimSpace(fields["build"]), splitSelection(sel))
 	if err != nil {
@@ -674,14 +713,15 @@ func (s *Server) handleAnnotateVCF(w http.ResponseWriter, r *http.Request) {
 	// use — so the other is the one that breaks, and it breaks for the largest
 	// files, which are the ones nobody wants to resubmit.
 	if !s.submit(w, r, queue.NewJob{
-		ID:        id,
-		Kind:      queue.KindSplit,
-		Snapshot:  snapshot,
-		Selection: sel,
-		Session:   sessionOf(r),
-		UserID:    callerOf(r).UserID(),
-		Label:     filename,
-		InputURI:  uri,
+		ID:          id,
+		Kind:        queue.KindSplit,
+		Snapshot:    snapshot,
+		Selection:   sel,
+		Session:     sessionOf(r),
+		UserID:      callerOf(r).UserID(),
+		Label:       filename,
+		InputURI:    uri,
+		CallbackURL: cb,
 	}) {
 		discard()
 	}
